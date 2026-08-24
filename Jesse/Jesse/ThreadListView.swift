@@ -1,4 +1,5 @@
 import SwiftUI
+import JesseOps
 import SwiftData
 import JesseCore
 import JesseConversations
@@ -136,6 +137,11 @@ struct ThreadListView: View {
 
     var body: some View {
         VStack(spacing: 0) {
+            // The away banner sits ABOVE the offline one, and the order is deliberate: being
+            // away is a standing fact about how the bridge is reading dates, while being
+            // offline is about this moment. It renders nothing at all while the profile is
+            // home, which is nearly always.
+            AwayProfileBanner(configuration: ConfigStore.opsConfiguration())
             if showOfflineBanner {
                 offlineBanner
             }
@@ -218,6 +224,7 @@ struct ThreadListView: View {
             }
             ToolbarItem(placement: .topBarLeading) {
                 Button { showSettings = true } label: { Image(systemName: "gearshape") }
+                    .accessibilityLabel("Settings")
             }
         }
         // A tap starts a routine that runs for minutes, so confirm first. The leading

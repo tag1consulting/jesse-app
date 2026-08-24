@@ -126,6 +126,17 @@ public struct JesseBridgeClient: BridgeClientProtocol {
         return URLSession(configuration: c)
     }()
 
+    // MARK: - The device's zone
+
+    /// The IANA zone this device is standing in, as every `/jesse` request reports it.
+    ///
+    /// Read fresh at each call rather than cached: `TimeZone.current` changes under a
+    /// travelling phone, and a value captured at launch would keep telling the bridge where
+    /// the person WAS. An unnamed zone (a raw GMT offset) yields an identifier the tz
+    /// database does not know, which the bridge ignores in favour of the profile — the same
+    /// path an older app build takes.
+    public static var clientTimeZone: String { TimeZone.current.identifier }
+
     // MARK: - Request building
 
     /// Build a bearer-authed request for `path`. Returns nil for an unconfigured/invalid
@@ -169,7 +180,11 @@ public struct JesseBridgeClient: BridgeClientProtocol {
     public func sendPrepared(_ request: JesseRequest) async throws -> JesseSendResult {
         guard var req = authorized("/jesse", method: "POST") else { throw JesseError.notConfigured }
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.httpBody = try Self.encodeBody(request)
+        // THE ONE PLACE a turn's `client_tz` is set. Stamped here rather than by each
+        // caller: the iOS layer builds its own health-laden `JesseRequest` and calls
+        // straight into this method, so a per-caller stamp would be one build away from a
+        // turn whose dates are derived in the wrong zone.
+        req.httpBody = try Self.encodeBody(request.withClientTz(Self.clientTimeZone))
         let data: Data, resp: URLResponse
         do {
             (data, resp) = try await session.data(for: req)
@@ -579,17 +594,15 @@ public struct JesseBridgeClient: BridgeClientProtocol {
     public func fetchDietSnapshot(date: String? = nil) async throws -> DietSnapshot {
         guard !config.normalizedHost.isEmpty, !config.token.isEmpty,
               let base = config.endpoint("/jesse/diet") else { throw DietFetchError.notConfigured }
-        let url: URL
-        if let date {
-            guard var comps = URLComponents(url: base, resolvingAgainstBaseURL: false) else {
-                throw DietFetchError.notConfigured
-            }
-            comps.queryItems = [URLQueryItem(name: "date", value: date)]
-            guard let dated = comps.url else { throw DietFetchError.notConfigured }
-            url = dated
-        } else {
-            url = base
+        guard var comps = URLComponents(url: base, resolvingAgainstBaseURL: false) else {
+            throw DietFetchError.notConfigured
         }
+        // `client_tz` rides on every read as well as every write: a diet day starts at 04:00
+        // in the zone the eater is standing in, so which day this answers for depends on it.
+        var items = [URLQueryItem(name: "client_tz", value: Self.clientTimeZone)]
+        if let date { items.insert(URLQueryItem(name: "date", value: date), at: 0) }
+        comps.queryItems = items
+        guard let url = comps.url else { throw DietFetchError.notConfigured }
         var req = URLRequest(url: url)
         req.httpMethod = "GET"
         req.setValue("Bearer \(config.token)", forHTTPHeaderField: "Authorization")

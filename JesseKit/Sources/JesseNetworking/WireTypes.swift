@@ -534,6 +534,12 @@ public struct JesseRequest: Encodable, Equatable, Sendable {
     // and per device and send it on every turn; a nil field omits the key, so the bridge
     // uses its stored default (byte-for-byte today's behavior for an older client).
     public let model: String?
+    // The IANA zone the DEVICE is standing in ("Europe/London"), stamped onto every turn by
+    // `JesseBridgeClient.sendPrepared` rather than by each caller — see `withClientTz`. The
+    // bridge lets it outrank the away profile for that one request, because the phone's own
+    // zone is a more specific claim than a fortnight-long declaration. `private(set)` so the
+    // stamp is the only way it is set.
+    public private(set) var clientTz: String?
 
     public init(mode: String, text: String, sessionId: String?, conversationId: String? = nil,
                 voice: Bool?,
@@ -555,6 +561,17 @@ public struct JesseRequest: Encodable, Equatable, Sendable {
         self.mealCorrectionsAck = mealCorrectionsAck
         self.requestId = requestId
         self.model = model
+        self.clientTz = nil
+    }
+
+    /// The same request, carrying the zone this device is in. The ONE place a turn's
+    /// `client_tz` is set: every caller (the Mac's plain send, the iOS layer's
+    /// health-laden `sendPrepared`) goes through the client, and the client stamps it, so
+    /// there is no path that can build a turn body without it.
+    public func withClientTz(_ tz: String) -> JesseRequest {
+        var copy = self
+        copy.clientTz = tz.isEmpty ? nil : tz
+        return copy
     }
 
     public struct Attachment: Encodable, Equatable, Sendable {
@@ -585,6 +602,7 @@ public struct JesseRequest: Encodable, Equatable, Sendable {
         case mealCorrectionsAck = "meal_corrections_ack"
         case requestId = "request_id"
         case model
+        case clientTz = "client_tz"
     }
 }
 

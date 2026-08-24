@@ -124,6 +124,14 @@ struct TodayCheckBody: Encodable {
     var checked: Bool
     var evidence: String?
     var at: String
+    /// The zone this device is standing in, IANA. The bridge derives the date it stamps into
+    /// `Today.md` in it, so a tick made abroad lands on the day the person is living.
+    var clientTz: String = JesseBridgeClient.clientTimeZone
+
+    enum CodingKeys: String, CodingKey {
+        case checked, evidence, at
+        case clientTz = "client_tz"
+    }
 }
 
 struct TodayMoveBody: Encodable {
@@ -132,6 +140,13 @@ struct TodayMoveBody: Encodable {
     /// as a `400` when it is absent or blank.
     var section: String?
     var at: String
+    /// The zone this device is standing in, IANA — see `TodayCheckBody.clientTz`.
+    var clientTz: String = JesseBridgeClient.clientTimeZone
+
+    enum CodingKeys: String, CodingKey {
+        case op, section, at
+        case clientTz = "client_tz"
+    }
 }
 
 struct TodayGlanceBody: Encodable {
@@ -142,6 +157,15 @@ struct TodayGlanceBody: Encodable {
 struct TodayDeferBody: Encodable {
     var deferred: Bool
     var atMs: UInt64
+    /// Accepted for symmetry with `check` and `move` — one body shape, not three — though a
+    /// defer writes no date anywhere. `POST /jesse/today/glance` is the one write that has no
+    /// such field at all (`GlanceBody` in `bridge/src/todaywrite.rs`), so it is not sent one.
+    var clientTz: String = JesseBridgeClient.clientTimeZone
+
+    enum CodingKeys: String, CodingKey {
+        case deferred, atMs
+        case clientTz = "client_tz"
+    }
 }
 
 // MARK: - The concrete client
@@ -150,7 +174,10 @@ extension JesseBridgeClient: TodayProviding {
 
     /// `GET /jesse/today`, conditional on `ifNoneMatch`.
     public func getToday(ifNoneMatch: String? = nil) async throws -> TodayFetchResult {
-        guard var req = todayRequest("/jesse/today", method: "GET") else {
+        guard var req = todayRequest("/jesse/today", method: "GET",
+                                     query: [URLQueryItem(name: "client_tz",
+                                                          value: JesseBridgeClient.clientTimeZone)])
+        else {
             throw JesseError.notConfigured
         }
         if let tag = ifNoneMatch, !tag.isEmpty {
@@ -216,9 +243,19 @@ extension JesseBridgeClient: TodayProviding {
     /// `TodayItemDetail.swift` is the same family of endpoints and must compose its
     /// request the same way, and a second copy of "bearer + endpoint + nil when
     /// unconfigured" is how one of them ends up sending a request with no token.
-    func todayRequest(_ path: String, method: String) -> URLRequest? {
+    func todayRequest(_ path: String, method: String,
+                      query: [URLQueryItem] = []) -> URLRequest? {
         guard !config.normalizedHost.isEmpty, !config.token.isEmpty,
-              let url = config.endpoint(path) else { return nil }
+              let base = config.endpoint(path) else { return nil }
+        var url = base
+        if !query.isEmpty {
+            guard var comps = URLComponents(url: base, resolvingAgainstBaseURL: false) else {
+                return nil
+            }
+            comps.queryItems = query
+            guard let built = comps.url else { return nil }
+            url = built
+        }
         var req = URLRequest(url: url)
         req.httpMethod = method
         req.setValue("Bearer \(config.token)", forHTTPHeaderField: "Authorization")

@@ -173,9 +173,9 @@ public struct KeychainConfigStore: BridgeConfigStoring {
 
     public func load() -> JesseConfig {
         JesseConfig(
-            host: read("host") ?? "",
-            port: Int(read("port") ?? "") ?? JesseConfig.defaultPort,
-            token: read("token") ?? ""
+            host: readAccount("host") ?? "",
+            port: Int(readAccount("port") ?? "") ?? JesseConfig.defaultPort,
+            token: readAccount("token") ?? ""
         )
     }
 
@@ -184,13 +184,16 @@ public struct KeychainConfigStore: BridgeConfigStoring {
     /// rather than silently losing it.
     @discardableResult
     public func save(_ c: JesseConfig) -> Bool {
-        let okHost = write("host", c.host)
-        let okPort = write("port", String(c.port))
-        let okToken = write("token", c.token)
+        let okHost = writeAccount("host", c.host)
+        let okPort = writeAccount("port", String(c.port))
+        let okToken = writeAccount("token", c.token)
         return okHost && okPort && okToken
     }
 
-    private func read(_ key: String) -> String? {
+    /// Read one account in this service. Package-internal rather than file-private so the
+    /// sentinel's own slot (see `SentinelConfig.swift`) goes through this one implementation
+    /// instead of growing a second Keychain reader beside it.
+    func readAccount(_ key: String) -> String? {
         let q: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -204,8 +207,10 @@ public struct KeychainConfigStore: BridgeConfigStoring {
         return String(data: data, encoding: .utf8)
     }
 
+    /// Write one account in this service. Package-internal for the same reason as
+    /// `readAccount`: one place decides accessibility, and it is this one.
     @discardableResult
-    private func write(_ key: String, _ value: String) -> Bool {
+    func writeAccount(_ key: String, _ value: String) -> Bool {
         let base: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,

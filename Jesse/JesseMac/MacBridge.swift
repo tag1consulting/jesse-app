@@ -1,4 +1,5 @@
 import Foundation
+import JesseOps
 import Observation
 import Security
 // Re-export the shared networking layer so the rest of the macOS target sees JesseConfig,
@@ -104,6 +105,39 @@ final class MacConfigStore {
         store.save(cfg)
         config = cfg
         if !previous.isSameBridge(as: cfg) { SnapshotCache.shared?.removeAll() }
+    }
+
+    // MARK: - The sentinel
+
+    /// The sentinel's own host/port/token, in the SAME Keychain service under one extra
+    /// account. Read through rather than cached, because the Ops screens are opened rarely
+    /// and a stale copy of a credential is the one thing worth avoiding here.
+    var sentinel: SentinelConfig { store.loadSentinel() }
+
+    @discardableResult
+    func saveSentinel(host rawHost: String, port rawPort: Int?, token: String) -> Bool {
+        let (host, liftedPort) = JesseConfig.sanitize(rawHost)
+        return store.saveSentinel(SentinelConfig(
+            host: host,
+            port: liftedPort ?? rawPort ?? SentinelConfig.defaultPort,
+            token: token.trimmingCharacters(in: .whitespacesAndNewlines)))
+    }
+
+    /// Both configs, as the shared Ops screens take them.
+    var opsConfiguration: OpsConfiguration {
+        OpsConfiguration(bridge: config, sentinel: sentinel)
+    }
+
+    /// Apply one scanned/pasted pairing payload.
+    ///
+    /// A payload with no `shost`/`stoken` says NOTHING about the sentinel — it is what a
+    /// bridge with no sentinel configured emits — so it leaves a sentinel this Mac already
+    /// has exactly where it is.
+    func applyPairing(_ payload: PairingPayload) {
+        save(host: payload.bridge.host, port: payload.bridge.port, token: payload.bridge.token)
+        if let s = payload.sentinel {
+            saveSentinel(host: s.host, port: s.port, token: s.token)
+        }
     }
 
     // MARK: - Legacy migration (pre App 1.0 (61))

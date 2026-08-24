@@ -57,4 +57,82 @@ final class SettingsSaveTests: XCTestCase {
         XCTAssertTrue(promptsPersisted, "the prompt editors persist on the success path")
         XCTAssertEqual(persistedToken, "tok", "the token must actually be written")
     }
+
+    /// The sentinel is written BESIDE the bridge, in the same Keychain service under one
+    /// extra account holding a small JSON object — one item, because the three fields are
+    /// only ever meaningful together and the Keychain gives no transaction across three.
+    func testSaveWritesTheSentinelBesideTheBridge() {
+        var written: [String: String] = [:]
+        ConfigStore.addItem = { dict, _ in
+            let ns = dict as NSDictionary
+            if let account = ns[kSecAttrAccount as String] as? String,
+               let data = ns[kSecValueData as String] as? Data {
+                written[account] = String(data: data, encoding: .utf8)
+            }
+            return errSecSuccess
+        }
+        let outcome = settingsSaveOutcome(
+            config: JesseConfig(host: "laptop", port: 8765, token: "tok"),
+            sentinel: SentinelConfig(host: "laptop", port: 8766, token: "s3nt")
+        ) {}
+
+        XCTAssertEqual(outcome, .dismiss)
+        XCTAssertEqual(written["token"], "tok")
+        let blob = written["sentinel"] ?? ""
+        XCTAssertTrue(blob.contains("\"host\":\"laptop\""), blob)
+        XCTAssertTrue(blob.contains("\"port\":8766"), blob)
+        XCTAssertTrue(blob.contains("\"token\":\"s3nt\""), blob)
+    }
+
+    /// A sentinel write that fails is `.showError` too, and the prompt editors do not
+    /// half-commit: an ops screen pointed at a half-saved sentinel 401s on every press with
+    /// nothing on screen to explain why.
+    func testAFailedSentinelWriteAlsoShowsAnError() {
+        // The bridge's three fields succeed; the sentinel's one item is refused.
+        ConfigStore.addItem = { dict, _ in
+            let ns = dict as NSDictionary
+            let account = ns[kSecAttrAccount as String] as? String
+            return account == "sentinel" ? errSecMissingEntitlement : errSecSuccess
+        }
+        var promptsPersisted = false
+        let outcome = settingsSaveOutcome(
+            config: JesseConfig(host: "laptop", port: 8765, token: "tok"),
+            sentinel: SentinelConfig(host: "laptop", port: 8766, token: "s3nt")
+        ) { promptsPersisted = true }
+
+        XCTAssertEqual(outcome, .showError)
+        XCTAssertFalse(promptsPersisted)
+    }
+
+    /// THE ADDITIVE RULE, where the app actually implements it: a scan REPLACES the three
+    /// bridge fields and leaves the three sentinel ones alone unless the payload carried
+    /// them. Without this, re-scanning an ordinary bridge QR would blank a paired sentinel on
+    /// screen and the next Save would make that permanent.
+    func testABridgeOnlyScanLeavesTheSentinelFieldsAlone() throws {
+        let existing = PairingFields(host: "old", port: "8765", token: "oldtok",
+                                     sentinelHost: "laptop", sentinelPort: "8766",
+                                     sentinelToken: "s3nt")
+        let payload = try XCTUnwrap(
+            PairingPayload.parse("jesse://pair?host=laptop&port=8765&token=fresh"))
+
+        let after = fieldsAfterScan(payload, existing: existing)
+
+        XCTAssertEqual(after.host, "laptop")
+        XCTAssertEqual(after.token, "fresh", "the bridge half IS replaced")
+        XCTAssertEqual(after.sentinelHost, "laptop")
+        XCTAssertEqual(after.sentinelPort, "8766")
+        XCTAssertEqual(after.sentinelToken, "s3nt", "…and the sentinel half is untouched")
+    }
+
+    /// …and a payload that DOES carry the three keys fills both halves from the one scan.
+    func testAScanWithSentinelKeysFillsBothHalves() throws {
+        let payload = try XCTUnwrap(PairingPayload.parse(
+            "jesse://pair?host=laptop&port=8765&token=fresh&shost=laptop&sport=8766&stoken=s3nt"))
+
+        let after = fieldsAfterScan(payload, existing: PairingFields())
+
+        XCTAssertEqual(after, PairingFields(host: "laptop", port: "8765", token: "fresh",
+                                            sentinelHost: "laptop", sentinelPort: "8766",
+                                            sentinelToken: "s3nt"))
+    }
 }

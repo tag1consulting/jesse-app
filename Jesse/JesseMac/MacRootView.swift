@@ -1,4 +1,5 @@
 import SwiftUI
+import JesseOps
 import SwiftData
 import JesseCore
 import JesseConversations
@@ -36,8 +37,17 @@ struct MacShellView: View {
     var body: some View {
         TabView {
             MacRootView(storeError: storeError)
+                .safeAreaInset(edge: .top, spacing: 0) {
+                    AwayProfileBanner(configuration: coordinator.configStore.opsConfiguration)
+                }
                 .tabItem { Label("Chats", systemImage: "bubble.left.and.bubble.right") }
             MacTodayView(configStore: coordinator.configStore)
+                // The profile the day is derived in, above the day itself — the same shared
+                // banner the phone shows, from the same model.
+                .safeAreaInset(edge: .top, spacing: 0) {
+                    AwayProfileBanner(configuration: coordinator.configStore.opsConfiguration,
+                                      alwaysShowName: true)
+                }
                 .tabItem { Label("Today", systemImage: "sunrise") }
             MacHealthView(configStore: coordinator.configStore)
                 .tabItem { Label("Health", systemImage: "heart.text.square") }

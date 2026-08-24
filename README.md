@@ -333,6 +333,14 @@ other audio, without muting the Mac.
 3. Manual entry is the fallback: type the `host`, `port`, and `token` from the
    printed line into the Settings fields.
 
+If the bridge is running a **sentinel**, its QR carries three extra keys
+(`shost`, `sport`, `stoken`) and the same scan pairs both — the sentinel fields
+appear under **Settings → Sentinel**, and you can fill them in by hand instead.
+Those keys are **additive**: scanning a QR from a bridge with no sentinel pairs
+the bridge and leaves a sentinel you already paired exactly where it is. A blank
+sentinel is a supported state; everything except the Ops screen works the same
+without one.
+
 Use the **MagicDNS hostname** (`…ts.net`) as the host, not the raw `100.x` IP —
 see the ATS note in [Known installation problems](#known-installation-problems).
 
@@ -363,6 +371,42 @@ see the ATS note in [Known installation problems](#known-installation-problems).
   starts nothing until you send. Asking about the same thing twice in a day continues the
   same conversation. An ask never writes — no meal, weigh-in or workout is logged from
   one, and no routine is started.
+- **Ops (Settings → Bridge ops)** — the laptop's health as cards with a green,
+  amber, red, or grey dot: the bridge (version, latency, profile), the launchd
+  services, Tailscale, disk and the artifact store, git (branch, ahead/behind,
+  dirty, index lock, last autocommit), the QMD index, and the watchdog. Grey is
+  **not** a shade of red — it means a probe did not finish, which is a different
+  thing from a probe that failed. The actions below the cards each name the exact
+  verb and launchd label before they run: restart the bridge, reload its
+  environment, restart the autocommit / lock reaper / QMD index / dashboard
+  server, unlock git, prune artifacts. A **Ledger** disclosure lists the last
+  scheduler outcomes, and a **Deploy** card offers to build and swap in
+  `origin/main` — enabled only when its commit differs from the running one *and*
+  CI is green on that commit, then polling the phases with the build's log tail.
+  The Ops screen needs a paired sentinel; without one it shows a single call to
+  action explaining what a sentinel is.
+- **Schedule (Ops → Schedule)** — every `[[schedule]]` entry grouped into its
+  chain, the head first and its links indented beneath it. Each row carries the
+  clock (or what it hangs off), the resolved days, the profiles it is in scope
+  for, the next fire **in both your phone's zone and the bridge's**, the last
+  outcome coloured, how long it took, a badge when it has failed several times
+  running, and the output file it was contracted to produce. A toggle turns one
+  job off — optionally until a date, which is the form to reach for, because a
+  disabled job is silent and an override nobody remembers is a job that never
+  runs again — and **Fire now** runs a chain immediately (refused while it is
+  already running, with the bridge's own reason). **Reload config** re-reads the
+  file, and entries the bridge rejected are listed in red at the bottom. The
+  schedule is reachable with or without a sentinel: it is read from the bridge,
+  and its two verbs go through the sentinel when one is paired and straight to
+  the bridge when not.
+- **Away mode (Settings → Away mode)** — tells the bridge you are somewhere else:
+  a zone, a deadline (default a week out; the bridge refuses a period with no
+  future end), and a short note that rides on every prompt. While it is in force
+  the Chats list wears a thin "Away until …" banner and the Today header names
+  the profile. **Back home** ends it early, which is also what runs the schedule's
+  on-return job. Note that a period stays on record after it lapses, so the screen
+  distinguishes "away until Sunday" from "was away until Sunday, and Sunday has
+  passed".
 - **Offline** — Today and Health keep the last thing the bridge sent them on disk,
   so both tabs still render after a cold launch with no network, behind a banner
   saying how old what you are reading is. Browsing works; **changing does not**.
