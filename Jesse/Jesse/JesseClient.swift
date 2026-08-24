@@ -1,4 +1,5 @@
 import Foundation
+import JesseOps
 import Security
 import JesseCore
 import JesseDietDisplay
@@ -573,6 +574,20 @@ enum ConfigStore {
 
     static func load() -> JesseConfig { store.load() }
 
+    /// The sentinel's own host/port/token, in the SAME Keychain service under one extra
+    /// account. Empty (and `isConfigured == false`) when no sentinel has ever been paired,
+    /// which is what every Ops surface's "pair the sentinel" call to action keys off.
+    static func loadSentinel() -> SentinelConfig { store.loadSentinel() }
+
+    @discardableResult
+    static func saveSentinel(_ c: SentinelConfig) -> Bool { store.saveSentinel(c) }
+
+    /// Both configs, as the Ops screens take them.
+    static func opsConfiguration() -> OpsConfiguration {
+        OpsConfiguration(bridge: load(), sentinel: loadSentinel())
+    }
+
+
     /// Persist the config. Returns `false` if any field's write failed (e.g. the Keychain
     /// was locked), so a caller can surface "couldn't save the token".
     ///
@@ -636,7 +651,13 @@ struct SemVer: Comparable {
 enum BridgeCompatibility {
     /// The oldest bridge this app build expects. Bump when the app starts relying on a
     /// bridge behavior newer than the value here.
-    static let minimumBridgeVersion = "0.33.0"
+    ///
+    /// `0.94.0` is the bridge that shipped the sentinel's deploy card (`GET
+    /// /sentinel/deploy/status`, `POST /sentinel/deploy`), which is the newest thing this
+    /// build reads. Everything else the Ops screens use — the schedule's control verbs, the
+    /// away profile, `client_tz` — landed earlier, and each screen degrades on its own, so
+    /// this stays the NON-BLOCKING advisory it has always been.
+    static let minimumBridgeVersion = "0.94.0"
 
     /// True iff `bridgeVersion` is present, parseable, AND strictly older than `minimum`.
     static func isOutdated(bridgeVersion: String?,

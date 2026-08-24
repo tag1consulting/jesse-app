@@ -28,6 +28,7 @@ let package = Package(
         .library(name: "JesseSearch", targets: ["JesseSearch"]),
         .library(name: "JesseDietDisplay", targets: ["JesseDietDisplay"]),
         .library(name: "JesseTodayDisplay", targets: ["JesseTodayDisplay"]),
+        .library(name: "JesseOps", targets: ["JesseOps"]),
     ],
     targets: [
         .target(
@@ -199,6 +200,40 @@ let package = Package(
         .testTarget(
             name: "JesseTodayDisplayTests",
             dependencies: ["JesseTodayDisplay", "JesseNetworking"],
+            swiftSettings: [
+                .swiftLanguageMode(.v6),
+            ]
+        ),
+        // The OPERATIONS layer — the bridge and its sentinel as a screen. It holds the four
+        // documents the ops endpoints answer with (the sentinel status page, the schedule,
+        // the away profile, the deploy card), the pure decisions over them (chain grouping,
+        // deploy-button enablement, which process a control verb is routed to), and the three
+        // SwiftUI screens both apps embed. iOS and macOS each contribute one Settings row and
+        // one menu item; neither owns a line of the logic.
+        //
+        // The DOCUMENTS live here rather than beside the wire types in JesseNetworking, and
+        // that is the load-bearing choice: the schedule document arrives from three different
+        // endpoints through two different processes (the bridge directly, and the sentinel's
+        // proxy, which wraps it), so the clients answer with raw bytes and exactly one layer —
+        // this one — knows what a schedule row is.
+        //
+        // Isolation: default (nonisolated), matching JesseNetworking and the two display
+        // targets rather than the app targets' MainActor default. The documents are `Sendable`
+        // value types decoded off the main actor by the models' own tasks, and the pure
+        // functions over them are called from both; the views get MainActor from their `View`
+        // conformance and each model is explicitly @MainActor with a `nonisolated deinit` (an
+        // off-main release in a unit-test host must never route through the isolated-deinit
+        // executor hop).
+        .target(
+            name: "JesseOps",
+            dependencies: ["JesseNetworking"],
+            swiftSettings: [
+                .swiftLanguageMode(.v6),
+            ]
+        ),
+        .testTarget(
+            name: "JesseOpsTests",
+            dependencies: ["JesseOps", "JesseNetworking"],
             swiftSettings: [
                 .swiftLanguageMode(.v6),
             ]

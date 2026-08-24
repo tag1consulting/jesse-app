@@ -12,6 +12,12 @@ final class TodayRequestShapeTests: XCTestCase {
 
     private let instant = Date(timeIntervalSince1970: 1_772_530_200)  // 2026-03-03T09:30:00Z
 
+    /// The zone this device is standing in, which every day-file WRITE but the glance now
+    /// carries. Read from the client rather than hardcoded: the value is the running device's
+    /// and these assertions are about the KEY being present in the right place, not about
+    /// which zone a developer's Mac happens to be in.
+    private var tz: String { JesseBridgeClient.clientTimeZone }
+
     /// `stamp_from_iso` wants `YYYY-MM-DDTHH:MM…` and parses the first 16 characters.
     /// Fractional seconds and a local offset are what a naive formatter emits; neither
     /// is what this sends.
@@ -32,7 +38,7 @@ final class TodayRequestShapeTests: XCTestCase {
     func testCheckBodyOmitsEvidenceWhenThereIsNone() throws {
         let bare = try body(TodayCheckBody(checked: true, evidence: nil,
                                            at: JesseBridgeClient.isoInstant(instant)))
-        XCTAssertEqual(bare, #"{"at":"2026-03-03T09:30:00Z","checked":true}"#,
+        XCTAssertEqual(bare, #"{"at":"2026-03-03T09:30:00Z","checked":true,"client_tz":"\#(tz)"}"#,
                        "an absent evidence field is what makes a bare check write no sub-line")
 
         let noted = try body(TodayCheckBody(checked: true, evidence: "sent the date to Ada",
@@ -44,7 +50,8 @@ final class TodayRequestShapeTests: XCTestCase {
         let op = TodayMoveOp.toDoNow
         let encoded = try body(TodayMoveBody(op: op.wireOp, section: op.destinationSection,
                                              at: JesseBridgeClient.isoInstant(instant)))
-        XCTAssertEqual(encoded, #"{"at":"2026-03-03T09:30:00Z","op":"to_do_now"}"#,
+        XCTAssertEqual(encoded,
+                       #"{"at":"2026-03-03T09:30:00Z","client_tz":"\#(tz)","op":"to_do_now"}"#,
                        "the section field is OMITTED for every op that names no destination")
     }
 
@@ -57,7 +64,7 @@ final class TodayRequestShapeTests: XCTestCase {
                                              at: JesseBridgeClient.isoInstant(instant)))
         XCTAssertEqual(
             encoded,
-            #"{"at":"2026-03-03T09:30:00Z","op":"to_section","section":"Do Now (carried, owed replies and decisions)"}"#)
+            #"{"at":"2026-03-03T09:30:00Z","client_tz":"\#(tz)","op":"to_section","section":"Do Now (carried, owed replies and decisions)"}"#)
     }
 
     /// Milliseconds, like a glance and unlike the two file mutations: nothing about a
@@ -66,13 +73,15 @@ final class TodayRequestShapeTests: XCTestCase {
     func testDeferBodyCarriesTheFlagAndMillis() throws {
         let encoded = try body(TodayDeferBody(deferred: true,
                                               atMs: JesseBridgeClient.unixMillis(instant)))
-        XCTAssertEqual(encoded, #"{"atMs":1772530200000,"deferred":true}"#)
+        XCTAssertEqual(encoded, #"{"atMs":1772530200000,"client_tz":"\#(tz)","deferred":true}"#)
     }
 
     func testGlanceBodyCarriesIdAndMillis() throws {
         let encoded = try body(TodayGlanceBody(id: "8dd0678d544b",
                                                glancedAt: JesseBridgeClient.unixMillis(instant)))
-        XCTAssertEqual(encoded, #"{"glancedAt":1772530200000,"id":"8dd0678d544b"}"#)
+        XCTAssertEqual(encoded, #"{"glancedAt":1772530200000,"id":"8dd0678d544b"}"#,
+                       "a glance carries NO client_tz — `GlanceBody` on the bridge has no such "
+                       + "field, and a glance derives no date")
     }
 
     /// Ids are hex plus an optional ordinal suffix, so escaping never changes one.

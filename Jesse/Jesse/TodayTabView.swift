@@ -3,6 +3,7 @@ import SwiftData
 import JesseCore
 import JesseNetworking
 import JesseTodayDisplay
+import JesseOps
 
 // The iOS Today tab: a thin shell around the SHARED day-file screen (`TodayListView`
 // in JesseTodayDisplay, which the Mac will render identically when it gets one).
@@ -103,6 +104,13 @@ struct TodayTabView: View {
                     TodayDetailView(model: detailModel, item: item, onOpenLink: openLink)
                         .navigationTitle("Item")
                         .navigationBarTitleDisplayMode(.inline)
+                }
+                // The profile the day is being derived in, under the day's own title. It
+                // shows the NAME whatever it is — "home" is an answer here, because the
+                // question this line answers is "whose clock is this day on".
+                .safeAreaInset(edge: .top, spacing: 0) {
+                    AwayProfileBanner(configuration: ConfigStore.opsConfiguration(),
+                                      alwaysShowName: true)
                 }
         }
         .sheet(item: $openedThread, onDismiss: dropUnsentContext) { thread in

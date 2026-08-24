@@ -1,5 +1,6 @@
 import SwiftUI
 import JesseNetworking
+import JesseOps
 
 // Bridge connection settings. MVP pairing is the manual field (host + token) the plan
 // puts first; a paste-able `jesse://pair?...` link and camera QR are later polish. The
@@ -14,6 +15,17 @@ struct MacSettingsView: View {
     @State private var port: String = ""
     @State private var token: String = ""
     @State private var pasteLink: String = ""
+
+    // The SENTINEL's own host, port and token — a second process on its own port under its
+    // own token, so it stays reachable when the bridge is not. Blank is a supported state:
+    // most bridges do not run one.
+    @State private var sentinelHost: String = ""
+    @State private var sentinelPort: String = ""
+    @State private var sentinelToken: String = ""
+
+    /// Opens the two Ops windows (see the "Ops" menu in `JesseMacApp`), so the same two
+    /// screens are reachable from the settings window and from the menu bar.
+    @Environment(\.openWindow) private var openWindow
 
     // Master switch for the on-device query-expansion tier (Tier 2), matching the
     // iPhone's Settings toggle. Same key and default (ON). Off -> sidebar search is
@@ -33,7 +45,23 @@ struct MacSettingsView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            Text("Bridge Connection").font(.title2.weight(.semibold)).padding()
+            HStack {
+                Text("Bridge Connection").font(.title2.weight(.semibold))
+                Spacer()
+                // The toolbar affordance the settings window has instead of a navigation
+                // stack: one button through to the operations screens.
+                Button {
+                    openWindow(id: MacOpsWindow.ops)
+                } label: {
+                    Label("Ops", systemImage: "stethoscope")
+                }
+                Button {
+                    openWindow(id: MacOpsWindow.away)
+                } label: {
+                    Label("Away mode", systemImage: "airplane")
+                }
+            }
+            .padding()
             Divider()
             Form {
                 Section {
@@ -57,6 +85,19 @@ struct MacSettingsView: View {
                     Text("Pairing link")
                 } footer: {
                     Text("Paste a jesse://pair link to fill the fields above.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+
+                Section {
+                    TextField("Host", text: $sentinelHost,
+                              prompt: Text("usually the same host as the bridge"))
+                    TextField("Port", text: $sentinelPort,
+                              prompt: Text("\(SentinelConfig.defaultPort)"))
+                    SecureField("Sentinel token", text: $sentinelToken)
+                } header: {
+                    Text("Sentinel")
+                } footer: {
+                    Text("A second process on the Studio, on its own port and its own token, that watches the bridge and can restart it. A pairing link from a bridge that has one fills these in. Leave blank if you don't run one.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
 
@@ -85,11 +126,15 @@ struct MacSettingsView: View {
             }
             .padding()
         }
-        .frame(width: 480, height: 440)
+        .frame(width: 480, height: 520)
         .onAppear {
             host = configStore.config.host
             port = configStore.config.port == JesseConfig.defaultPort ? "" : String(configStore.config.port)
             token = configStore.config.token
+            let sentinel = configStore.sentinel
+            sentinelHost = sentinel.host
+            sentinelPort = sentinel.port == SentinelConfig.defaultPort ? "" : String(sentinel.port)
+            sentinelToken = sentinel.token
         }
     }
 
@@ -230,16 +275,25 @@ struct MacSettingsView: View {
 
     private func save() {
         configStore.save(host: host, port: Int(port), token: token)
+        configStore.saveSentinel(host: sentinelHost, port: Int(sentinelPort), token: sentinelToken)
         dismiss()
     }
 
     /// Fill the fields from a `jesse://pair?url=host:port&token=…` link.
+    ///
+    /// The three sentinel keys are ADDITIVE: a link without them says nothing about the
+    /// sentinel, so the sentinel fields are left exactly as they are rather than cleared.
     private func applyPairLink() {
         guard let parsed = MacPairLink.parse(pasteLink) else { return }
         let (h, p) = JesseConfig.sanitize(parsed.host)
         host = h
         if let port = p ?? parsed.port { self.port = String(port) }
         token = parsed.token
+        if let s = PairingPayload.parse(pasteLink)?.sentinel {
+            sentinelHost = s.host
+            sentinelPort = String(s.port)
+            sentinelToken = s.token
+        }
         pasteLink = ""
     }
 }

@@ -13,6 +13,88 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [App 1.0 (113)] - 2026-08-24
+
+### Added
+
+- **The laptop is now operable from the phone.** The bridge grew a sentinel, a
+  schedule with control verbs, an away profile and a deploy pipeline over the last
+  several releases; none of it had a screen. Three shared screens close that, in a
+  new `JesseOps` library both apps embed — iOS contributes two Settings rows, macOS
+  an "Ops" menu and two windows, and neither owns a line of the logic.
+
+  - **Bridge ops** (Settings → Bridge ops on iOS, ⇧⌘O on the Mac) renders
+    `GET /sentinel/status` as cards with a green/amber/red/**grey** dot. Grey is a
+    state of its own and not a shade of red: a probe that timed out reports a stated
+    absence of knowledge, and "the disk is not full" and "I could not find out
+    whether the disk is full" lead to different actions. Cards for the bridge,
+    the five launchd services, Tailscale, disk and the artifact store, git, QMD and
+    the watchdog — whose `gave_up` line is the one that says the bridge is down
+    *and nothing is trying to fix it any more*.
+
+    Eight verbs sit under the cards, each behind a confirmation that names the exact
+    verb and the launchd label rather than asking "are you sure": restart the bridge
+    (whose reply's `healthy` and `version` are shown, because that is the question
+    that was actually asked), reload the bridge's environment, restart the
+    autocommit / lock reaper / QMD index / dashboard server, unlock git, prune
+    artifacts.
+
+    A **Deploy** card reads `GET /sentinel/deploy/status` and offers the button only
+    when the origin/main commit differs from the running one **and** CI is green on
+    it — `pending` is not green, and a card that treated "CI has not answered yet" as
+    permission would deploy a commit nothing has vouched for. While one runs the card
+    polls every three seconds and shows the phase with the build's log tail.
+
+  - **Schedule** groups the flat job list into chains client-side from each link's
+    `after`, head first and links indented. Every row answers "why did that not
+    happen" without a terminal: the outcome coloured, the reason, how long it took,
+    a badge when it has failed several nights running, the output contract, an
+    override note, and the next fire **in both the phone's zone and the bridge's** —
+    a job fires where the bridge stands and is read where its owner is, and while
+    they are away those are not the same clock. A toggle turns one job off, offering
+    a deadline; **Fire now** runs a chain, and a `409` lands on the row carrying the
+    bridge's own sentence. Entries the bridge rejected at validation are listed in
+    red rather than merely absent.
+
+    The two verbs go **through the sentinel when one is paired** and straight to the
+    bridge when not — the proxy is the path that still works when the bridge's HTTP
+    surface is wedged and its process is alive, which is the only moment anyone
+    reaches for these buttons. The schedule itself is always read from the bridge,
+    and the screen is reachable with no sentinel at all.
+
+  - **Away mode** posts `GET`/`POST /jesse/profile`: a searchable zone picker, a
+    deadline defaulting a week out, and a note. The Chats list wears a thin
+    "Away until … (zone)" banner while a period is in force and the Today header
+    names the profile. The screen distinguishes a period that is **stored** from one
+    that is **effective**, because a lapsed period is still on disk — reading
+    `until_ms` as proof of being away is how a banner comes to say "away until last
+    Tuesday".
+
+- **The sentinel is paired from the same QR.** `SentinelConfig` (host, port, token)
+  is stored in the Keychain beside `JesseConfig`, under one extra account holding a
+  small JSON object — one item, because the three fields are only meaningful
+  together and the Keychain offers no transaction across three. One parser reads
+  both halves of a `jesse://pair?…` payload. The three sentinel keys are
+  **additive**: a QR from a bridge with no sentinel says nothing about the sentinel
+  rather than "there is none", so re-scanning an ordinary bridge code no longer has
+  any way to silently unpair the Ops screen.
+
+### Changed
+
+- **Every request now tells the bridge which zone this device is standing in.**
+  `client_tz` rides on every `POST /jesse` body, on `GET /jesse/today` and
+  `GET /jesse/diet` as a query item, and in the day file's check/move/defer bodies.
+  The bridge lets it outrank the away profile for that one request — the phone's own
+  zone is a more specific claim than a fortnight-long declaration, and when they
+  disagree the phone is where the person is. It is stamped by the client rather than
+  by each caller, so there is no code path that can build a turn without it.
+  `POST /jesse/today/glance` is the one write that does not carry it, matching the
+  bridge, which has no such field there: a glance derives no date.
+
+- `BridgeCompatibility.minimumBridgeVersion` is now `0.94.0` — the release that
+  shipped the deploy card. It remains a non-blocking advisory; every screen degrades
+  on its own.
+
 ## [bridge 0.94.0] - 2026-08-23
 
 ### Added

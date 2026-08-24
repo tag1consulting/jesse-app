@@ -1,6 +1,7 @@
 import SwiftUI
 import SwiftData
 import JesseCore
+import JesseOps
 
 // Root of the app: a NavigationStack hosting the thread list. Cross-cutting
 // concerns live here — re-attaching to backgrounded runs on foreground, draining
@@ -215,10 +216,52 @@ enum SaveOutcome: Equatable {
 /// and does NOT run `persistPrompts`, so a failed token write can't half-commit the
 /// prompt editors behind a dismissed sheet. Only on a successful Keychain write
 /// does it run `persistPrompts` (the prompt-editor saves) and return `.dismiss`.
-func settingsSaveOutcome(config: JesseConfig, persistPrompts: () -> Void) -> SaveOutcome {
+///
+/// `sentinel` is written in the SAME order and with the same rule: the bridge first,
+/// because that is the pairing everything else depends on, and a sentinel write that
+/// fails is still `.showError` — a screen full of ops buttons pointed at a half-saved
+/// sentinel would 401 on every press with no explanation. A sentinel with a blank host
+/// or token is a legitimate "I don't run one" and is stored as such.
+func settingsSaveOutcome(config: JesseConfig,
+                         sentinel: SentinelConfig = SentinelConfig(host: "", token: ""),
+                         persistPrompts: () -> Void) -> SaveOutcome {
     guard ConfigStore.save(config) else { return .showError }
+    guard ConfigStore.saveSentinel(sentinel) else { return .showError }
     persistPrompts()
     return .dismiss
+}
+
+/// The six connection fields the Settings form holds, as a value.
+///
+/// It exists so the ONE rule a scan has to get right is testable without a camera: see
+/// `fieldsAfterScan`.
+struct PairingFields: Equatable {
+    var host = ""
+    var port = ""
+    var token = ""
+    var sentinelHost = ""
+    var sentinelPort = ""
+    var sentinelToken = ""
+}
+
+/// What a scanned pairing payload does to the fields already on screen.
+///
+/// THE RULE, and the only reason this is a function rather than six assignments in a closure:
+/// the three sentinel keys are ADDITIVE. A QR from a bridge with no sentinel configured
+/// carries none of them, and that says NOTHING about the sentinel rather than "there is none".
+/// Blanking the sentinel fields on such a scan would silently unpair the Ops screen every time
+/// someone re-scanned an ordinary bridge code — and the next Save would make it permanent.
+func fieldsAfterScan(_ payload: PairingPayload, existing: PairingFields) -> PairingFields {
+    var out = existing
+    out.host = payload.bridge.host
+    out.port = String(payload.bridge.port)
+    out.token = payload.bridge.token
+    if let sentinel = payload.sentinel {
+        out.sentinelHost = sentinel.host
+        out.sentinelPort = String(sentinel.port)
+        out.sentinelToken = sentinel.token
+    }
+    return out
 }
 
 struct SettingsView: View {
@@ -232,6 +275,13 @@ struct SettingsView: View {
     @State private var host = ""
     @State private var port = ""
     @State private var token = ""
+
+    // The SENTINEL's own host, port and token — a different process on a different port
+    // under a different token, so it stays reachable when the bridge is not. Seeded from
+    // the Keychain on appear and written by Save alongside the bridge's.
+    @State private var sentinelHost = ""
+    @State private var sentinelPort = ""
+    @State private var sentinelToken = ""
 
     @State private var showScanner = false
     @State private var scanError: String?
@@ -327,6 +377,36 @@ struct SettingsView: View {
                             .font(.callout)
                             .foregroundStyle(.red)
                     }
+                }
+
+                Section {
+                    TextField("host — name or 100.x IP", text: $sentinelHost)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                    TextField("port", text: $sentinelPort)
+                        .keyboardType(.numberPad)
+                    SecureField("sentinel token", text: $sentinelToken)
+                } header: {
+                    Text("Sentinel")
+                } footer: {
+                    Text("The sentinel is a second process on the laptop, on its own port and its own token, that watches the bridge and can restart it. A pairing QR from a bridge that has one fills these in for you. Leave them blank if you don't run one — everything else works the same.")
+                }
+
+                Section {
+                    NavigationLink {
+                        OpsView(configuration: opsConfiguration)
+                    } label: {
+                        Label("Bridge ops", systemImage: "stethoscope")
+                    }
+                    NavigationLink {
+                        AwayModeView(configuration: opsConfiguration)
+                    } label: {
+                        Label("Away mode", systemImage: "airplane")
+                    }
+                } header: {
+                    Text("Operations")
+                } footer: {
+                    Text("Ops shows the laptop's health and the buttons that act on it, and leads to the schedule. Away mode tells the bridge which zone to derive dates in while you're travelling.")
                 }
 
                 Section {
@@ -444,7 +524,8 @@ struct SettingsView: View {
                         // anything else — on a Keychain failure we keep the sheet up
                         // and surface the error rather than half-committing the
                         // prompt editors and the in-memory config behind a dismiss.
-                        let outcome = settingsSaveOutcome(config: cfg) {
+                        let outcome = settingsSaveOutcome(config: cfg,
+                                                          sentinel: enteredSentinel) {
                             config = cfg
                             // Persist the prompt editors. `save` re-derives each
                             // slot's customized flag (non-empty AND differs from the
@@ -471,6 +552,10 @@ struct SettingsView: View {
                 host = config.host
                 port = String(config.port)
                 token = config.token
+                let sentinel = ConfigStore.loadSentinel()
+                sentinelHost = sentinel.host
+                sentinelPort = String(sentinel.port)
+                sentinelToken = sentinel.token
                 askPrompt = PromptStore.text(.ask, .wrapper)
                 tellPrompt = PromptStore.text(.tell, .wrapper)
                 askDefault = PromptStore.cachedDefault(.ask, .wrapper)
@@ -494,6 +579,33 @@ struct SettingsView: View {
                 scannerSheet
             }
         }
+    }
+
+    // MARK: - Ops
+
+    /// The six connection fields as they currently read, for `fieldsAfterScan`.
+    private var currentFields: PairingFields {
+        PairingFields(host: host, port: port, token: token,
+                      sentinelHost: sentinelHost, sentinelPort: sentinelPort,
+                      sentinelToken: sentinelToken)
+    }
+
+    /// The sentinel as the fields currently read. A blank host or token is an unconfigured
+    /// sentinel, which is a supported state rather than an error: most bridges do not run one.
+    private var enteredSentinel: SentinelConfig {
+        SentinelConfig(host: sentinelHost,
+                       port: Int(sentinelPort) ?? SentinelConfig.defaultPort,
+                       token: sentinelToken)
+    }
+
+    /// What the two Ops screens are built from — the SAVED bridge config plus the sentinel as
+    /// entered, so pairing the sentinel and opening Ops can happen in one visit without a
+    /// round trip through Save.
+    private var opsConfiguration: OpsConfiguration {
+        OpsConfiguration(bridge: JesseConfig(host: host.isEmpty ? config.host : host,
+                                             port: Int(port) ?? config.port,
+                                             token: token.isEmpty ? config.token : token),
+                         sentinel: enteredSentinel)
     }
 
     // MARK: - Version
@@ -820,10 +932,14 @@ struct SettingsView: View {
         NavigationStack {
             QRScannerView(
                 onScan: { raw in
-                    if let parsed = JesseConfig.fromPairing(raw) {
-                        host = parsed.host
-                        port = String(parsed.port)
-                        token = parsed.token
+                    if let parsed = PairingPayload.parse(raw) {
+                        let fields = fieldsAfterScan(parsed, existing: currentFields)
+                        host = fields.host
+                        port = fields.port
+                        token = fields.token
+                        sentinelHost = fields.sentinelHost
+                        sentinelPort = fields.sentinelPort
+                        sentinelToken = fields.sentinelToken
                         scanError = nil
                         showScanner = false
                     } else {
