@@ -31,14 +31,18 @@ final class OpsModelTests: XCTestCase {
     func testAFailedRefreshKeepsTheLastGoodStatusOnScreen() async throws {
         let model = OpsModel(configuration: configuration())
 
-        StagedProtocol.stage(status: 200, body: OpsDocumentDecodeTests.healthyStatus)
-        StagedProtocol.stage(status: 200, body: OpsDocumentDecodeTests.deployRunning)
+        StagedProtocol.stage(status: 200, body: OpsDocumentDecodeTests.healthyStatus,
+                             for: "/sentinel/status")
+        StagedProtocol.stage(status: 200, body: OpsDocumentDecodeTests.deployRunning,
+                             for: "/sentinel/deploy/status")
         await model.refresh()
         XCTAssertEqual(model.status?.sentinel?.version, "0.94.0")
         XCTAssertNil(model.refreshError)
 
-        StagedProtocol.stage(status: 502, body: #"{"error":"the sentinel is not answering"}"#)
-        StagedProtocol.stage(status: 502, body: #"{"error":"the sentinel is not answering"}"#)
+        StagedProtocol.stage(status: 502, body: #"{"error":"the sentinel is not answering"}"#,
+                             for: "/sentinel/status")
+        StagedProtocol.stage(status: 502, body: #"{"error":"the sentinel is not answering"}"#,
+                             for: "/sentinel/deploy/status")
         await model.refresh()
 
         XCTAssertEqual(model.status?.sentinel?.version, "0.94.0",
@@ -69,8 +73,10 @@ final class OpsModelTests: XCTestCase {
         StagedProtocol.stage(status: 200,
                              body: #"{"service":"bridge","label":"com.example.jesse-bridge","restarted":true,"healthy":true,"version":"0.94.0"}"#)
         // …then the refresh the verb triggers.
-        StagedProtocol.stage(status: 200, body: OpsDocumentDecodeTests.healthyStatus)
-        StagedProtocol.stage(status: 200, body: OpsDocumentDecodeTests.deployRunning)
+        StagedProtocol.stage(status: 200, body: OpsDocumentDecodeTests.healthyStatus,
+                             for: "/sentinel/status")
+        StagedProtocol.stage(status: 200, body: OpsDocumentDecodeTests.deployRunning,
+                             for: "/sentinel/deploy/status")
 
         await model.restart(.bridge)
 
@@ -86,8 +92,8 @@ final class OpsModelTests: XCTestCase {
 
         StagedProtocol.stage(status: 200,
                              body: #"{"service":"bridge","restarted":true,"healthy":false,"version":null}"#)
-        StagedProtocol.stage(status: 500, body: "{}")
-        StagedProtocol.stage(status: 500, body: "{}")
+        StagedProtocol.stage(status: 500, body: "{}", for: "/sentinel/status")
+        StagedProtocol.stage(status: 500, body: "{}", for: "/sentinel/deploy/status")
 
         await model.restart(.bridge)
         XCTAssertEqual(model.lastVerb?.detail, "restarted, but it did not come back healthy")
@@ -100,8 +106,10 @@ final class OpsModelTests: XCTestCase {
 
         StagedProtocol.stage(status: 409,
                              body: #"{"removed":false,"reason":"no index.lock present"}"#)
-        StagedProtocol.stage(status: 200, body: OpsDocumentDecodeTests.healthyStatus)
-        StagedProtocol.stage(status: 200, body: OpsDocumentDecodeTests.deployRunning)
+        StagedProtocol.stage(status: 200, body: OpsDocumentDecodeTests.healthyStatus,
+                             for: "/sentinel/status")
+        StagedProtocol.stage(status: 200, body: OpsDocumentDecodeTests.deployRunning,
+                             for: "/sentinel/deploy/status")
 
         await model.unlockGit()
         XCTAssertEqual(model.lastVerb?.succeeded, false)
@@ -290,9 +298,23 @@ final class AwayModelTests: XCTestCase {
 /// canned reply. The models make several calls per action — a verb and then the refresh it
 /// triggers — and a single canned answer cannot express "the verb was refused and the refresh
 /// then worked", which is most of what is worth testing here.
+///
+/// ## Why a reply may name the path it is for
+///
+/// Arrival order is NOT declaration order when a caller issues requests CONCURRENTLY, and
+/// `OpsModel.refresh()` does exactly that (`async let statusBytes` / `async let
+/// deployBytes`). A strictly first-in-first-out queue therefore hands whichever request
+/// happens to reach `startLoading` first the reply meant for the other one — the status
+/// document decodes the deploy card, `status` stays nil, and the test fails with a
+/// `keyNotFound` for a key the fixture never had.
+///
+/// That is a race in the STUB, not in the model, and it passed for a long time on luck.
+/// So a reply may declare the path it answers, and a request prefers a reply that names
+/// its own path. Un-named replies keep the plain FIFO behaviour every sequential test
+/// relies on; only the concurrent pair needs naming.
 final class StagedProtocol: URLProtocol, @unchecked Sendable {
     private static let lock = NSLock()
-    nonisolated(unsafe) private static var queue: [(Int, Data)] = []
+    nonisolated(unsafe) private static var queue: [(path: String?, status: Int, body: Data)] = []
     nonisolated(unsafe) private static var seen: [URLRequest] = []
     nonisolated(unsafe) private static var seenBodies: [Data] = []
 
@@ -303,9 +325,18 @@ final class StagedProtocol: URLProtocol, @unchecked Sendable {
         seenBodies = []
     }
 
+    /// Stage the next reply for whichever request arrives next. Correct for a sequential
+    /// caller, which is most of them.
     static func stage(status: Int, body: String) {
         lock.lock(); defer { lock.unlock() }
-        queue.append((status, Data(body.utf8)))
+        queue.append((nil, status, Data(body.utf8)))
+    }
+
+    /// Stage a reply for a NAMED path — what a concurrent caller needs, so which reply
+    /// each request gets is a fact rather than a race. See the note on this type.
+    static func stage(status: Int, body: String, for path: String) {
+        lock.lock(); defer { lock.unlock() }
+        queue.append((path, status, Data(body.utf8)))
     }
 
     static var requests: [URLRequest] {
@@ -336,7 +367,21 @@ final class StagedProtocol: URLProtocol, @unchecked Sendable {
         Self.seenBodies.append(Self.drain(request))
         // An empty queue answers 200 `{}` rather than hanging: a test that staged too few
         // replies should fail on its assertion, not time out.
-        let (status, body) = Self.queue.isEmpty ? (200, Data("{}".utf8)) : Self.queue.removeFirst()
+        //
+        // A reply that NAMES this request's path wins over the head of the queue; that is
+        // what makes a concurrently-issued pair deterministic. Nothing else changes: with
+        // no named replies staged, this is the FIFO it always was.
+        let path = request.url?.path ?? ""
+        let index = Self.queue.firstIndex { $0.path == path }
+            ?? Self.queue.firstIndex { $0.path == nil }
+            ?? (Self.queue.isEmpty ? nil : 0)
+        let status: Int, body: Data
+        if let index {
+            let staged = Self.queue.remove(at: index)
+            (status, body) = (staged.status, staged.body)
+        } else {
+            (status, body) = (200, Data("{}".utf8))
+        }
         Self.lock.unlock()
 
         let response = HTTPURLResponse(url: request.url!, statusCode: status,
