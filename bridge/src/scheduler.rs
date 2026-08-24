@@ -1745,7 +1745,10 @@ pub async fn push_schedule_outcome(
         );
         return;
     };
-    let payload = build_scheduled_payload(schedule_id, outcome.label(), reason, job_id);
+    // The morning chain (by default) rewrites the day file in full, so its outcome push
+    // also asks the phone to refresh the two cached snapshots — see `push_prefetch_jobs`.
+    let prefetch = wants_prefetch(schedule_id, &push_prefetch_jobs());
+    let payload = build_scheduled_payload(schedule_id, outcome.label(), reason, job_id, prefetch);
     match apns.push_payload(&token, payload).await {
         PushOutcome::Sent => eprintln!(
             "jesse-bridge: schedule PUSH id={schedule_id} outcome={} sent",

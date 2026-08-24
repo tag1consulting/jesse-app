@@ -1581,6 +1581,23 @@ the app and the reply is there).
   (which it already does on each foreground). Any other failure (a transient
   5xx, a transport error) leaves the token in place to retry. Without this, a
   stale token after an app reinstall would be re-pushed forever.
+- **Every push asks the phone to wake up.** Each payload carries
+  `"content-available": 1` **inside `aps`**, and each request is sent with
+  `apns-priority: 10`. The push is still an ordinary alert — it appears on the lock
+  screen exactly as before — but iOS now also gives the app a bounded background
+  window in which to fetch the reply, so a turn that finishes while the phone is in a
+  pocket is delivered without the app being opened. The bridge sends this on *every*
+  push it makes (turn completion, scheduled outcome, failure escalation, config-reload
+  failure); it is a hint to the phone and changes nothing server-side. An app build
+  that does not implement the background handler ignores it and behaves as before.
+- **A scheduled run can tell the phone its caches are stale.** A scheduled-outcome
+  push whose `schedule_id` is listed in `JESSE_PUSH_PREFETCH_JOBS` also carries a
+  top-level `"prefetch": ["today","diet"]`, naming the two browsable documents
+  (`GET /jesse/today`, `GET /jesse/diet`) the phone should refresh on arrival. The
+  default list is `morning-start-of-day` — the chain that rewrites the day file in
+  full, and therefore the one run after which what the phone is holding is certainly
+  out of date. Matching is **exact**, never a prefix. The key is absent (not an empty
+  array) on every other push.
 
 The APNs auth JWT (ES256, signed with your `.p8`) is cached and reused for ~50
 minutes (Apple allows up to 60) rather than re-signed per push.
@@ -1617,6 +1634,7 @@ Set all four required vars (and the binary picks up the rest). If they're only
 | `JESSE_APNS_TEAM_ID` | yes | Your 10-char Apple Developer Team ID (the JWT `iss`). |
 | `JESSE_APNS_TOPIC` | yes | The app's bundle id, sent as `apns-topic` (e.g. `com.tag1.Jesse`, or your own). |
 | `JESSE_APNS_ENV` | no | `sandbox` (default) or `production`. Selects `api.sandbox.push.apple.com` vs `api.push.apple.com`. |
+| `JESSE_PUSH_PREFETCH_JOBS` | no | Comma list of `[[schedule]]` ids whose outcome push also carries `"prefetch": ["today","diet"]`, asking the phone to refresh its cached day file and diet snapshot. Default `morning-start-of-day`; matched **exactly**. Set it to an explicitly **blank** value to turn the hint off without turning push off. Independent of the `JESSE_APNS_*` four — it only shapes a push that was going to be sent anyway. |
 
 > **Which environment?** An Xcode "Run to device" (development) build uses the
 > **development** APS environment → **`sandbox`** (the default here). A TestFlight /
@@ -2396,6 +2414,7 @@ persona-rendered defaults so the app's cached "default" matches what a turn buil
 | `JESSE_APNS_TEAM_ID` | _(off)_ | Apple Developer Team ID (10 chars; the JWT `iss`) |
 | `JESSE_APNS_TOPIC` | _(off)_ | App bundle id, sent as `apns-topic` (e.g. `com.tag1.Jesse`) |
 | `JESSE_APNS_ENV` | `sandbox` | APNs host: `sandbox` (development builds) or `production` (TestFlight/App Store) |
+| `JESSE_PUSH_PREFETCH_JOBS` | `morning-start-of-day` | Comma list of schedule ids whose outcome push carries `"prefetch": ["today","diet"]`. Exact match; an explicitly blank value disables the hint |
 
 The server refuses to start if `JESSE_TOKEN` is unset, the vault isn't a
 directory, the `claude` binary can't be found, or `JESSE_BIND` is an unsafe

@@ -13,6 +13,40 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [bridge 0.95.0] - 2026-08-24
+
+### Added
+
+- **Every push now asks the phone to wake up.** Each APNs payload carries
+  `"content-available": 1` inside `aps`, and each request goes out with
+  `apns-priority: 10`. Nothing about the alert changes — it still appears on the lock
+  screen, with the same title, body and sound — but iOS additionally hands the app a
+  bounded background window on arrival, which is what lets a reply that finishes while
+  the phone is in a pocket be fetched then rather than the next time the app is opened.
+  Applied to all four payloads the bridge builds (turn completion, scheduled outcome,
+  consecutive-failure escalation, config-reload failure) rather than only the one that
+  motivated it, because "which pushes wake the app" is not a distinction worth having.
+
+  This is a hint to the phone and changes nothing server-side; an app build with no
+  background handler ignores it and behaves exactly as it did.
+
+- **A scheduled run can say that the phone's caches are stale.** A scheduled-outcome
+  push whose `schedule_id` appears in the new `JESSE_PUSH_PREFETCH_JOBS` (comma list,
+  default `morning-start-of-day`) also carries a top-level `"prefetch": ["today","diet"]`
+  — the two browsable documents (`GET /jesse/today`, `GET /jesse/diet`) the phone should
+  refresh on arrival.
+
+  The default is the morning chain because that is the run that **rewrites the day file
+  in full**: after it, whatever the phone is holding is certainly out of date, and there
+  is already a push in flight to say the run happened. The hint rides that push instead
+  of adding a second one.
+
+  Matching is **exact** — `morning-start-of-day-dry-run` is a different job and does not
+  match — and the key is **absent**, not an empty array, on every other push, so a client
+  that keys off `prefetch` at all never refreshes on a push that did not ask it to. An
+  explicitly blank `JESSE_PUSH_PREFETCH_JOBS` is a list of nothing: it disables the hint
+  without disabling push.
+
 ## [App 1.0 (113)] - 2026-08-24
 
 ### Added

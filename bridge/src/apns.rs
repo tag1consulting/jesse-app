@@ -223,6 +223,12 @@ impl ApnsTransport for ReqwestApns {
                 .header("authorization", format!("bearer {}", req.jwt))
                 .header("apns-topic", req.topic)
                 .header("apns-push-type", "alert")
+                // Priority 10 = "deliver immediately". Every push this bridge sends is an
+                // alert about something that has ALREADY happened — a turn that finished, a
+                // scheduled run that failed — so there is nothing to gain from APNs holding
+                // it back, and the `content-available` flag inside each payload is only
+                // worth carrying if it arrives while the phone still cares.
+                .header("apns-priority", "10")
                 .header("content-type", "application/json")
                 .body(req.payload)
                 .send()
@@ -397,6 +403,11 @@ pub fn mint_apns_jwt(
 /// The APNs payload for a finished turn: a short alert plus the `job_id` so the
 /// tap routes to the right thread and re-attaches.
 ///
+/// It also carries `content-available: 1`, which is what lets the
+/// phone fetch the reply while it is still in a pocket instead of only when the app is
+/// next opened. The alert is unchanged by it: an alert push with `content-available: 1`
+/// is still shown, and additionally wakes the app for a bounded background fetch.
+///
 /// A turn that returned files NAMES them, and carries nothing else about them — no id, no
 /// size, and certainly no bytes. A push is a lock-screen line: "Jesse finished — chart.png"
 /// is the whole useful difference between it and "Jesse finished", and everything else the
@@ -409,7 +420,8 @@ pub fn build_apns_payload(job_id: &str, artifacts: &[Artifact]) -> Vec<u8> {
     json!({
         "aps": {
             "alert": { "title": "Jesse", "body": push_body(artifacts) },
-            "sound": "default"
+            "sound": "default",
+            "content-available": 1
         },
         "job_id": job_id
     })
@@ -452,6 +464,47 @@ fn push_body(artifacts: &[Artifact]) -> String {
 /// and a lock-screen alert shows far less; a reason is a sentence, not a stack trace.
 pub const MAX_PUSH_REASON_CHARS: usize = 180;
 
+/// The snapshot documents a `prefetch` push asks the phone to refresh: the day file
+/// (`GET /jesse/today`) and the diet snapshot (`GET /jesse/diet`). Named here, in the one
+/// place the wire value is written, rather than spelled out at each use.
+pub const PREFETCH_SNAPSHOTS: [&str; 2] = ["today", "diet"];
+
+/// The default `JESSE_PUSH_PREFETCH_JOBS` list: the morning chain, which is the run that
+/// rewrites the day file in full. Waking to a day the bridge rebuilt an hour ago is the
+/// case this exists for.
+pub const DEFAULT_PUSH_PREFETCH_JOBS: &str = "morning-start-of-day";
+
+/// The schedule ids whose outcome push asks the phone to refresh its cached snapshots,
+/// from `JESSE_PUSH_PREFETCH_JOBS` (comma list). Unset — the default — is the morning
+/// chain alone; an explicitly blank value is a list of nothing, which turns the prefetch
+/// hint off without turning the push off.
+pub fn push_prefetch_jobs() -> Vec<String> {
+    match std::env::var("JESSE_PUSH_PREFETCH_JOBS") {
+        // An explicitly-set value is honoured verbatim, INCLUDING a blank one — that is
+        // how the hint is disabled. `env_string` cannot express this: it folds a blank
+        // value back to `None`, which here would mean "the default", the opposite.
+        Ok(spec) => parse_prefetch_jobs(&spec),
+        Err(_) => parse_prefetch_jobs(DEFAULT_PUSH_PREFETCH_JOBS),
+    }
+}
+
+/// Parse the comma list. Items are trimmed and blanks dropped, so `"a,,b "` is `[a, b]`
+/// and `""` is empty. Pure, so the matching rule is tested without the environment.
+pub fn parse_prefetch_jobs(spec: &str) -> Vec<String> {
+    spec.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Whether this schedule id's outcome push carries the prefetch hint. An exact match on
+/// the id — never a prefix or a substring, because a schedule id is a name the operator
+/// writes and `morning-start-of-day-dry-run` is a different job.
+pub fn wants_prefetch(schedule_id: &str, jobs: &[String]) -> bool {
+    jobs.iter().any(|j| j == schedule_id)
+}
+
 /// The APNs payload for a `[[schedule]]` run: the job's id and what happened to it, plus
 /// the turn's `job_id` WHEN THERE IS ONE so the tap opens the finished turn exactly as a
 /// completion push does. A skipped run has no turn, so it carries the alert alone.
@@ -459,11 +512,18 @@ pub const MAX_PUSH_REASON_CHARS: usize = 180;
 /// The body always names the outcome, and a failure or skip always names its reason —
 /// "Jesse finished" would be worse than useless for the failure this feature exists to
 /// make visible.
+///
+/// `prefetch` adds a top-level `prefetch` array naming the snapshots the phone should
+/// refresh on arrival (see [`PREFETCH_SNAPSHOTS`]). It is a HINT and nothing more: the
+/// push is identical without it, and a phone that does not understand the key ignores it.
+/// It rides the outcome push rather than a second push because the run that rewrote the
+/// day file is exactly the run whose completion the phone is already being told about.
 pub fn build_scheduled_payload(
     schedule_id: &str,
     outcome: &str,
     reason: &str,
     job_id: Option<&str>,
+    prefetch: bool,
 ) -> Vec<u8> {
     let reason: String = reason.trim().chars().take(MAX_PUSH_REASON_CHARS).collect();
     let body = if reason.is_empty() {
@@ -474,13 +534,17 @@ pub fn build_scheduled_payload(
     let mut payload = json!({
         "aps": {
             "alert": { "title": "Jesse schedule", "body": body },
-            "sound": "default"
+            "sound": "default",
+            "content-available": 1
         },
         "schedule_id": schedule_id,
         "outcome": outcome,
     });
     if let Some(id) = job_id {
         payload["job_id"] = json!(id);
+    }
+    if prefetch {
+        payload["prefetch"] = json!(PREFETCH_SNAPSHOTS);
     }
     payload.to_string().into_bytes()
 }
@@ -497,7 +561,8 @@ pub fn build_escalation_payload(schedule_id: &str, streak: u32, reason: &str) ->
     json!({
         "aps": {
             "alert": { "title": "Jesse schedule", "body": body },
-            "sound": "default"
+            "sound": "default",
+            "content-available": 1
         },
         "schedule_id": schedule_id,
         "outcome": "escalation",
@@ -518,7 +583,8 @@ pub fn build_reload_failure_payload(error: &str) -> Vec<u8> {
                 "title": "Jesse schedule",
                 "body": format!("config reload failed: {error}")
             },
-            "sound": "default"
+            "sound": "default",
+            "content-available": 1
         },
         "outcome": "reload-failed",
     })
@@ -783,6 +849,113 @@ mod tests {
         let v: Value = serde_json::from_slice(&build_apns_payload("j", &[art("\u{7}")])).unwrap();
         assert_eq!(v["aps"]["alert"]["body"], "Jesse finished");
     }
+    /// EVERY push the bridge sends carries `content-available: 1`, and it is inside `aps`
+    /// (a top-level key of that name means nothing to iOS). This is the whole mechanism by
+    /// which a reply reaches a phone in a pocket, so it is asserted on every builder rather
+    /// than on the one that happened to be edited.
+    #[test]
+    fn every_payload_is_content_available() {
+        let art = Artifact {
+            id: random_hex(),
+            filename: "chart.png".into(),
+            mime: "image/png".into(),
+            bytes: 1,
+            sha256: "ff".into(),
+        };
+        let payloads = [
+            build_apns_payload("j", &[]),
+            build_apns_payload("j", &[art]),
+            build_scheduled_payload("morning-start-of-day", "ok", "", Some("j"), false),
+            build_scheduled_payload("morning-start-of-day", "ok", "", None, true),
+            build_escalation_payload("nightly", 3, "timed out"),
+            build_reload_failure_payload("bad toml"),
+        ];
+        for payload in payloads {
+            let v: Value = serde_json::from_slice(&payload).unwrap();
+            assert_eq!(
+                v["aps"]["content-available"], 1,
+                "content-available must live INSIDE aps: {v}"
+            );
+            // The alert survives it — this is an alert push that ALSO wakes the app, not a
+            // silent one. A silent push would be invisible on the lock screen, which is the
+            // opposite of what every one of these is for.
+            assert!(
+                v["aps"]["alert"]["body"].is_string(),
+                "still an alert push: {v}"
+            );
+        }
+    }
+
+    /// The prefetch hint: present, top-level, and exactly the two documents — only for a
+    /// job the operator listed.
+    #[test]
+    fn scheduled_payload_carries_prefetch_only_when_asked() {
+        let with: Value =
+            serde_json::from_slice(&build_scheduled_payload("m", "ok", "", Some("j"), true))
+                .unwrap();
+        assert_eq!(with["prefetch"], json!(["today", "diet"]));
+        assert_eq!(with["job_id"], "j", "the deep link is unaffected");
+        assert_eq!(with["schedule_id"], "m");
+
+        let without: Value =
+            serde_json::from_slice(&build_scheduled_payload("m", "ok", "", Some("j"), false))
+                .unwrap();
+        assert!(
+            without.get("prefetch").is_none(),
+            "absent, not an empty array — a phone reading `prefetch` at all must not \
+             refresh on a push that did not ask it to: {without}"
+        );
+        // Without the hint the payload is byte-for-byte what it was before this existed,
+        // modulo the content-available flag asserted above.
+        assert_eq!(without["aps"]["alert"]["title"], "Jesse schedule");
+    }
+
+    /// A skipped run has no turn and so no `job_id`, and can still carry the hint: the day
+    /// file may have been rewritten by an earlier link of the same chain.
+    #[test]
+    fn prefetch_is_independent_of_the_deep_link() {
+        let v: Value = serde_json::from_slice(&build_scheduled_payload(
+            "m",
+            "skipped",
+            "already ran",
+            None,
+            true,
+        ))
+        .unwrap();
+        assert!(v.get("job_id").is_none());
+        assert_eq!(v["prefetch"], json!(["today", "diet"]));
+    }
+
+    /// The list is matched EXACTLY. A prefix match would fire on a differently-named job
+    /// that merely starts the same way, which is a real shape for a dry-run twin.
+    #[test]
+    fn prefetch_matching_is_exact() {
+        let jobs = parse_prefetch_jobs("morning-start-of-day, evening-wrap ,");
+        assert_eq!(jobs, vec!["morning-start-of-day", "evening-wrap"]);
+        assert!(wants_prefetch("morning-start-of-day", &jobs));
+        assert!(wants_prefetch("evening-wrap", &jobs));
+        assert!(!wants_prefetch("morning-start-of-day-dry-run", &jobs));
+        assert!(!wants_prefetch("morning", &jobs));
+        assert!(!wants_prefetch("", &jobs));
+    }
+
+    /// A blank spec is a list of NOTHING — the off switch for the hint — and the default
+    /// spec is the morning chain. Both are checked on the pure parser rather than through
+    /// the environment, which a parallel test run shares.
+    #[test]
+    fn blank_prefetch_spec_disables_the_hint() {
+        assert!(parse_prefetch_jobs("").is_empty());
+        assert!(parse_prefetch_jobs("   ,  ,").is_empty());
+        assert!(!wants_prefetch(
+            "morning-start-of-day",
+            &parse_prefetch_jobs("")
+        ));
+        assert_eq!(
+            parse_prefetch_jobs(DEFAULT_PUSH_PREFETCH_JOBS),
+            vec!["morning-start-of-day"]
+        );
+    }
+
     #[test]
     fn pushable_only_for_done_or_failed() {
         assert!(job_state_is_pushable(&JobState::Done {
