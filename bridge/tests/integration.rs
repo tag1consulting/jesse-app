@@ -8345,6 +8345,188 @@ async fn today_move_to_section_on_the_lead_item_is_409() {
     let _ = std::fs::remove_dir_all(&vault);
 }
 
+// ---- The day guard (`day` on the three mutation bodies) --------------------
+//
+// What these pin is the one thing that makes an OFFLINE CAPTURE QUEUE safe to
+// replay. `Today.md` is rewritten in full every morning and an item id is a content
+// hash over `(section, lead, added date)`, so a tap captured yesterday can still
+// RESOLVE today — against a line the person never saw. An `If-Match` does not close
+// that: a replaying client has just refetched, so its tag is perfectly current and
+// perfectly about the wrong day.
+//
+// So the client says which day it meant. When the file has moved on, the answer is a
+// `409` carrying a machine-readable reason, and NOTHING is touched.
+
+#[tokio::test]
+async fn today_check_carries_the_requests_own_time_not_the_servers() {
+    // THE REPLAY GUARANTEE. A tap captured at 07:05 and sent hours later must be
+    // written into the vault as 07:05 — the stamp records when the USER acted, and
+    // the morning routine reads these lines when it decides what to carry over.
+    //
+    // Evidence is what makes the stamp VISIBLE (a bare check writes no sub-line at
+    // all — see `apply_check`), so both requests carry a note.
+    let (st, vault) = today_write_state();
+    let (snapshot, etag) = today_snapshot(&st).await;
+    let id = id_of(&snapshot, "Reply to Ada");
+
+    let resp = app(st.clone())
+        .oneshot(today_check_request(
+            Some("Bearer test-token"),
+            &id,
+            Some(&etag),
+            r#"{"checked":true,"at":"2026-03-03T07:05:00Z","day":"2026-03-03",
+                "evidence":"sent the date to Ada","client_tz":"Europe/London"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let written = std::fs::read_to_string(vault.join("vault/Today.md")).unwrap();
+    assert!(
+        written.contains("*(app-completed 2026-03-03 07:05"),
+        "the sub-line renders the request's own `at`, never the bridge's clock: {written}"
+    );
+
+    // ...and it renders in the EFFECTIVE zone, so a replay sent from another country
+    // still lands on the wall clock the person was looking at. Same instant, one hour
+    // later on the continent.
+    let (snapshot, etag) = today_snapshot(&st).await;
+    let other = id_of(&snapshot, "Order the replacement thermocouple");
+    let resp = app(st.clone())
+        .oneshot(today_check_request(
+            Some("Bearer test-token"),
+            &other,
+            Some(&etag),
+            r#"{"checked":true,"at":"2026-03-03T07:05:00Z","day":"2026-03-03",
+                "evidence":"ordered two","client_tz":"Europe/Rome"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let written = std::fs::read_to_string(vault.join("vault/Today.md")).unwrap();
+    assert!(
+        written.contains("*(app-completed 2026-03-03 08:05"),
+        "the same instant, stamped in the zone the request named: {written}"
+    );
+    let _ = std::fs::remove_dir_all(&vault);
+}
+
+#[tokio::test]
+async fn today_check_refuses_a_day_that_moved_on_and_writes_nothing() {
+    let (st, vault) = today_write_state();
+    let day_file = vault.join("vault/Today.md");
+    let before = std::fs::read_to_string(&day_file).unwrap();
+    let (snapshot, etag) = today_snapshot(&st).await;
+    let id = id_of(&snapshot, "Reply to Ada");
+
+    // A CURRENT etag — this is the case `If-Match` cannot catch, and the whole
+    // reason the guard exists.
+    let resp = app(st.clone())
+        .oneshot(today_check_request(
+            Some("Bearer test-token"),
+            &id,
+            Some(&etag),
+            r#"{"checked":true,"at":"2026-03-02T21:40:00Z","day":"2026-03-02"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(body["reason"], "day-mismatch");
+    assert_eq!(
+        body["live_date"], "2026-03-03",
+        "the refusal names the day the file actually is, so the client can say so"
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(&day_file).unwrap(),
+        before,
+        "a refused replay touches not one byte of the day"
+    );
+    let _ = std::fs::remove_dir_all(&vault);
+}
+
+#[tokio::test]
+async fn today_check_with_the_live_day_is_applied_exactly_as_one_without() {
+    // The guard must be INERT on the happy path: same day named, same outcome as the
+    // request that names none at all.
+    let (st, vault) = today_write_state();
+    let (snapshot, etag) = today_snapshot(&st).await;
+    let id = id_of(&snapshot, "Reply to Ada");
+
+    let resp = app(st.clone())
+        .oneshot(today_check_request(
+            Some("Bearer test-token"),
+            &id,
+            Some(&etag),
+            r#"{"checked":true,"at":"2026-03-03T09:30:00Z","day":"2026-03-03"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert!(item_state(&body, "Reply to Ada").0, "the box is ticked");
+    let _ = std::fs::remove_dir_all(&vault);
+}
+
+#[tokio::test]
+async fn today_move_refuses_a_day_that_moved_on() {
+    let (st, vault) = today_write_state();
+    let day_file = vault.join("vault/Today.md");
+    let before = std::fs::read_to_string(&day_file).unwrap();
+    let (snapshot, etag) = today_snapshot(&st).await;
+    let id = id_of(&snapshot, "Reply to Ada");
+
+    let resp = app(st.clone())
+        .oneshot(today_move_request(
+            Some("Bearer test-token"),
+            &id,
+            Some(&etag),
+            r#"{"op":"top_of_section","at":"2026-03-02T21:40:00Z","day":"2026-03-02"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(body["reason"], "day-mismatch");
+    assert_eq!(
+        std::fs::read_to_string(&day_file).unwrap(),
+        before,
+        "nothing was reordered"
+    );
+    let _ = std::fs::remove_dir_all(&vault);
+}
+
+#[tokio::test]
+async fn today_defer_refuses_a_day_that_moved_on_and_records_nothing() {
+    let (st, vault) = today_write_state();
+    let (snapshot, etag) = today_snapshot(&st).await;
+    let id = id_of(&snapshot, "Reply to Ada");
+
+    let resp = app(st.clone())
+        .oneshot(today_defer_request(
+            Some("Bearer test-token"),
+            &id,
+            Some(&etag),
+            r#"{"deferred":true,"atMs":1772000000000,"day":"2026-03-02"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(body["reason"], "day-mismatch");
+
+    // The defer store writes no vault markdown, so "nothing happened" is proved by
+    // the store file rather than by the day file.
+    assert!(
+        !vault.join("state/defer.json").exists(),
+        "a refused postponement records no claim"
+    );
+    let (after, _) = today_snapshot(&st).await;
+    assert!(!deferred_state(&after, "Reply to Ada"));
+    let _ = std::fs::remove_dir_all(&vault);
+}
+
 /// Whether one item of a snapshot body is flagged postponed.
 fn deferred_state(snapshot: &Value, lead_starts: &str) -> bool {
     let mut items: Vec<&Value> = snapshot["leadItems"].as_array().unwrap().iter().collect();

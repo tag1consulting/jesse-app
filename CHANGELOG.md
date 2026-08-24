@@ -13,6 +13,38 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [bridge 0.96.0] - 2026-08-24
+
+### Added
+
+- **A day guard on the three Today writes.** `check`, `move` and `defer` now accept an
+  optional `day` (`YYYY-MM-DD`) naming the day the change was *made against*. When it
+  names a different day from the one `Today.md` currently carries, the request is
+  refused with `409` and `{"reason":"day-mismatch","live_date":"…"}` — **before any
+  edit, any journal entry and any store write**. Absent, blank, or matching is a no-op,
+  so every live tap and every older app build behaves exactly as before.
+
+  It exists for one caller: a phone replaying a change it captured while it had no
+  network. The day file is rewritten in full every morning and an item id is a content
+  hash over `(section, lead, added date)`, so an id captured yesterday can still
+  *resolve* today — against a line the person never saw. `If-Match` cannot close that:
+  a replaying client has just refetched, so its etag is perfectly current and perfectly
+  about the wrong day.
+
+  The guard is asked **ahead of** the `If-Match` precondition on purpose. The two
+  statuses ask for opposite client behaviour — a `412` means "refetch and try again",
+  a day mismatch means "stop, the thing you were acting on is gone" — and a replay
+  that raced the morning rebuild would otherwise be told to try again.
+
+### Changed
+
+- The `app-completed` stamp's contract is now pinned by tests rather than only by its
+  doc comment: it renders from the request's own `at`, in the effective zone, however
+  late that request arrives. A check made at 07:05 and replayed at noon is written into
+  the vault as `07:05`. Nothing in this path reads the bridge's clock — a missing or
+  malformed `at` is a `400`, never a substituted server time — which is what makes a
+  replayed tap an honest record instead of a lie about when the work was done.
+
 ## [App 1.0 (114)] - 2026-08-24
 
 ### Added
