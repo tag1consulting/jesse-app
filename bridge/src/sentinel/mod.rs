@@ -6,12 +6,14 @@
 use crate::*;
 use chrono::{Local, SecondsFormat};
 
+mod deploy;
 mod http;
 mod probes;
 mod state;
 mod verbs;
 mod watchdog;
 
+pub use deploy::*;
 pub use http::*;
 pub use probes::*;
 pub use state::*;
@@ -158,6 +160,9 @@ pub struct Bins {
     pub pgrep: Option<PathBuf>,
     pub qmd: Option<PathBuf>,
     pub node: Option<PathBuf>,
+    /// The deploy verb's compiler. `cargo` is on nobody's launchd PATH, so the rustup shim's
+    /// usual home is in the fallbacks — and `JESSE_SENTINEL_CARGO_BIN` pins it outright.
+    pub cargo: Option<PathBuf>,
 }
 
 impl Bins {
@@ -177,6 +182,15 @@ impl Bins {
             pgrep: resolve_bin("pgrep", &["/usr/bin/pgrep"]),
             qmd: resolve_bin("qmd", &["/opt/homebrew/bin/qmd", "/usr/local/bin/qmd"]),
             node: resolve_bin("node", &[]),
+            // `~/.cargo/bin` is not on a launchd job's PATH, and `$HOME` is not expanded by
+            // `resolve_bin`'s literal fallbacks, so it is built here.
+            cargo: resolve_bin(
+                "cargo",
+                &[&format!(
+                    "{}/.cargo/bin/cargo",
+                    env_string("HOME").unwrap_or_default()
+                )],
+            ),
         };
         let mut missing = Vec::new();
         for (name, found) in [
@@ -187,6 +201,7 @@ impl Bins {
             ("pgrep", bins.pgrep.is_some()),
             ("qmd", bins.qmd.is_some()),
             ("node", bins.node.is_some()),
+            ("cargo", bins.cargo.is_some()),
         ] {
             if !found {
                 missing.push(name);
@@ -260,6 +275,28 @@ pub struct SentinelConfig {
     /// The bridge's registered device token file. READ-ONLY here: the sentinel pushes to
     /// whatever device the bridge has paired and never registers, clears or rewrites one.
     pub device_json: PathBuf,
+    /// The deploy verb's own clone of the repository (`~/deploy/jesse-app`). SEPARATE from any
+    /// checkout a person works in, on purpose: every deploy leaves it on a detached head, and
+    /// doing that to someone's working tree mid-edit is not a thing a background service does.
+    pub deploy_clone: PathBuf,
+    /// Where the three symlinks live (`~/.local/bin`).
+    pub bin_dir: PathBuf,
+    /// A fine-grained, READ-ONLY GitHub token (Actions: read, Contents: read). Absent means the
+    /// deploy verb cannot verify CI, and a deploy that cannot verify CI is refused.
+    pub github_token: Option<String>,
+    /// The API root. Configurable so the tests can point it at a loopback stand-in — a deploy
+    /// test that reached the real api.github.com would be a test of the network.
+    pub github_api: String,
+    /// `owner/repo`, whose CI job vouches for a commit.
+    pub github_repo: String,
+    /// The name of the CI job that must be green. Matched by [`job_matches`] against the
+    /// DISPLAY name GitHub reports, not by equality — see that function.
+    pub ci_job: String,
+    /// How long a deploy waits for the restarted bridge to come back CORRECT, and how long a
+    /// rollback waits for the old one. Deployment configuration rather than a constant: this
+    /// host boots the bridge in a couple of seconds, a loaded one takes longer, and the value
+    /// decides whether a slow boot is read as a failure and rolled back.
+    pub deploy_health_timeout: Duration,
 }
 
 impl SentinelConfig {
@@ -367,6 +404,24 @@ impl SentinelConfig {
                 .map(PathBuf::from)
                 .unwrap_or_else(|| vault_repo.join("vault/Inbox/scheduled-jobs-ledger.jsonl")),
             device_json: bridge_state_dir.join("device.json"),
+            deploy_clone: env_string("JESSE_SENTINEL_DEPLOY_CLONE")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| home.join("deploy/jesse-app")),
+            bin_dir: env_string("JESSE_SENTINEL_BIN_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| home.join(".local/bin")),
+            github_token: env_string("JESSE_SENTINEL_GITHUB_TOKEN"),
+            github_api: env_string("JESSE_SENTINEL_GITHUB_API")
+                .unwrap_or_else(|| "https://api.github.com".to_string())
+                .trim_end_matches('/')
+                .to_string(),
+            github_repo: env_string("JESSE_SENTINEL_GITHUB_REPO")
+                .unwrap_or_else(|| "tag1consulting/jesse-app".to_string()),
+            ci_job: env_string("JESSE_SENTINEL_CI_JOB").unwrap_or_else(|| CI_JOB_NAME.to_string()),
+            deploy_health_timeout: Duration::from_secs(env_parse(
+                "JESSE_SENTINEL_DEPLOY_HEALTH_SECS",
+                DEPLOY_HEALTH_TIMEOUT.as_secs(),
+            )),
             vault_repo,
             bridge_state_dir,
             autocommit_log,
@@ -564,6 +619,12 @@ pub struct Sentinel {
     pub verb_lock: tokio::sync::Mutex<()>,
     pub http: reqwest::Client,
     pub apns: Option<Arc<ApnsClient>>,
+    /// Whether a deploy is running IN THIS PROCESS. The lock file is the record across
+    /// processes; this is what closes the read-then-write window inside one.
+    pub deploy_running: std::sync::atomic::AtomicBool,
+    /// One `origin/main` refresh at a time, so a phone polling the deploy card cannot start a
+    /// second `git fetch` in the same clone.
+    pub origin_refresh: tokio::sync::Mutex<()>,
 }
 
 impl Sentinel {
@@ -581,6 +642,8 @@ impl Sentinel {
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
             apns,
+            deploy_running: std::sync::atomic::AtomicBool::new(false),
+            origin_refresh: tokio::sync::Mutex::new(()),
             cfg: Arc::new(cfg),
         })
     }
@@ -815,6 +878,15 @@ mod tests {
             autocommit_log: None,
             ledger: PathBuf::from("/nonexistent/ledger.jsonl"),
             device_json: PathBuf::from("/nonexistent/device.json"),
+            deploy_clone: PathBuf::from("/nonexistent/deploy/jesse-app"),
+            bin_dir: PathBuf::from("/nonexistent/bin"),
+            github_token: None,
+            // A host that resolves to nothing, so a unit test that reached the network would
+            // fail rather than quietly asking GitHub about a real commit.
+            github_api: "http://127.0.0.1:1".to_string(),
+            github_repo: "example/example".to_string(),
+            ci_job: CI_JOB_NAME.to_string(),
+            deploy_health_timeout: DEPLOY_HEALTH_TIMEOUT,
         }
     }
 }

@@ -1991,9 +1991,11 @@ miles away.
 The sentinel is the answer: **a second process, with no model, no free text, and
 a fixed verb table**, listening on its own port with its own token. It can
 restart this deployment's launchd jobs, reload the bridge's plist environment,
-clear a stale git index lock, prune the artifact store, and forward the
-scheduler's two control verbs. It cannot read the vault, cannot run a model, and
-cannot accept a command that is not in the table below. It is **not** a tool the
+clear a stale git index lock, prune the artifact store, forward the scheduler's
+two control verbs, and **deploy a merged commit — building it, swapping the
+binaries, and rolling back if the bridge does not come up on it**. It cannot read
+the vault, cannot run a model, and cannot accept a command that is not in the
+table below. It is **not** a tool the
 agent can call, and nothing on a turn's path can reach it.
 
 Built by the same `cargo build --release` the bridge is
@@ -2019,6 +2021,20 @@ than having them retyped, renders
 bootstrap line. Every default is overridable by an environment variable; see the
 header of the script.
 
+It also sets up remote deploy: it creates the deploy clone
+(`~/deploy/jesse-app`) and `~/.local/bin/jesse-bridge.d/`, and writes
+`<state dir>/deploys/previous` from the bridge plist's current
+`ProgramArguments[0]` — the rollback target for the **first** deploy, before any
+symlink exists. It then **prints, and does not run**, the one `plutil` line that
+points the bridge's `ProgramArguments` at `~/.local/bin/jesse-bridge` plus the
+`bootout`/`bootstrap` pair that makes it take effect. Until that edit is made a
+deploy will swap the symlink and restart a bridge that re-execs the old binary,
+so the version check will not match and every deploy will roll itself back.
+
+**`running_sha` is empty until the first deploy after install.** Nothing on the
+host records which commit an existing binary was built from; the status card
+shows `null` rather than a guess, and the first successful deploy fills it in.
+
 ### The verb table
 
 | Route | What it does |
@@ -2030,7 +2046,8 @@ header of the script.
 | `POST /sentinel/artifacts/prune` | Deletes artifact directories older than 7 days; answers with the bytes freed. |
 | `POST /sentinel/jobs/{id}/fire` | Validates `{id}` against the bridge's live schedule, then forwards to `POST /jesse/schedule/{id}/fire` with the bridge token. |
 | `POST /sentinel/jobs/{id}/enable` | The same, for `/enable`. |
-| `GET /sentinel/deploy/status`, `POST /sentinel/deploy` | `501 {"error":"deploy not built yet"}`. Declared now so clients can be written against the final route table; P5 fills them in. |
+| `GET /sentinel/deploy/status` | The deploy card: the last deploy, what is running, and what `origin/main` is. See below. |
+| `POST /sentinel/deploy` | Build a merged commit, swap the three binaries, restart, roll back on any failure. `202 {deploy_id}`; progress on the status route. See below. |
 
 The `{service}` segment is one of **five fixed slugs**, never a launchd label:
 the labels are deployment configuration (`JESSE_SENTINEL_LABEL_*`), so there is
@@ -2091,6 +2108,117 @@ failure that is the value you need.
 **`last exit code = (never exited)` is reported as absent, not as `0`.** For a
 `KeepAlive` job those are opposite facts.
 
+### Remote deploy (`POST /sentinel/deploy`)
+
+The pipeline this completes: a coding session opens a bridge PR, CI goes green,
+the PR is merged from the GitHub app, and the owner — holding nothing but a
+phone — taps **Deploy**. The sentinel builds the commit, swaps the binaries,
+restarts the bridge, checks that what came back is what was asked for, and
+**puts the old one back if it is not**.
+
+Nothing on this path involves a model turn. `cargo` is permanently refused to
+the agent and stays refused; it is run here by a process with no model in it, on
+a commit a human merged and CI has already built. **The containment record is
+untouched.**
+
+```bash
+curl -s -X POST -H "Authorization: Bearer $JESSE_SENTINEL_TOKEN" \
+  -H 'content-type: application/json' -d '{"ref":"main"}' $S/sentinel/deploy
+# → 202 { "deploy_id": "1756000000000-a1b2c3d4", "phase": "resolve" }
+```
+
+Body: `{"ref": "main" | "<40 hex sha>", "force": bool}` — `ref` defaults to
+`main`, and **any other shape is a `400`**. That closed alphabet is what makes
+"a literal argument vector" mean something here: a ref like
+`--upload-pack=…` is an option to `git`, not a revision.
+
+It answers `202` and runs in a task, because the work is a twenty-minute build.
+**One deploy at a time**, held by `<state dir>/deploy.lock` for the whole
+pipeline — the service's own single-flight permit is released when the `202`
+goes out, so it cannot be what serialises this. The lock carries a pid, and one
+naming a **dead** pid is reclaimed (a sentinel killed mid-build leaves exactly
+that behind, and without reclamation every later deploy would refuse until
+someone reached the host). A pid that is alive — including one this user cannot
+signal, where `EPERM` reads as *alive* — is a `409`.
+
+Without `force` it also refuses `409` while any `[[schedule]]` row is
+`running: true`: a deploy kills the bridge, and a chain that dies mid-turn is
+lost invisibly.
+
+| Phase | What happens |
+| --- | --- |
+| `resolve` | In the deploy clone: `git fetch origin --prune`, resolve the ref (`main` means `origin/main`), then **refuse unless `git merge-base --is-ancestor <sha> origin/main`**. Also refuses a sha equal to the running one, unless `force`. |
+| `ci` | `GET /repos/<repo>/actions/runs?head_sha=…`, then that run's jobs listing. Requires a **completed, successful** run containing a **job named `bridge` that concluded `success`**. `force` does **not** bypass this. |
+| `build` | `git checkout --detach <sha>`, then `cargo build --release --locked --bin jesse-bridge --bin jesse-hook --bin jesse-build-mcp` in `bridge/`, 20-minute ceiling, both streams to the log **as they arrive**. |
+| `stage` | Copy the three binaries to `<bin dir>/jesse-bridge.d/<sha>/`, `chmod 755`, record where the links pointed in `deploys/previous`, then **atomically** repoint the three symlinks (create temp link, `rename`). |
+| `restart` | `launchctl kickstart -k`, then poll `/health` every 2 s for 90 s. Success needs `ok == true`, **`version` equal to the `[package] version` the commit declares**, and no harness newly `containment_stale`. |
+| `rollback` | Any failure in `restart`: repoint to `previous`, kickstart, poll again. `result: rolled_back`, or **`rolled_back_unhealthy`** if the old one did not come up either. |
+| `finish` | Prune `jesse-bridge.d/` to the three newest builds, push the outcome, record `running_sha`. |
+
+**The job is matched by the name GitHub reports, which is the workflow's
+`name:` and not its key.** This repository's `bridge` job renders as
+`bridge (build, test, clippy, guards, audit, coverage)`, so the gate accepts the
+wanted name followed by a space or a `(` — but never a `-`, so a
+`bridge-nightly` job could not vouch for `bridge`. `JESSE_SENTINEL_CI_JOB`
+renames what is required.
+
+**Three binaries move together.** `jesse-hook` is exec'd by the agent child and
+`jesse-build-mcp` is an MCP server it talks to; a bridge from one commit running
+against a hook from another is a combination nobody tested.
+
+**The version check is the point.** "It answered `/health`" is not "the new
+binary is running" — a symlink swap that silently did nothing looks identical at
+a heartbeat, and without this a deploy that changed nothing would report
+success. A version mismatch keeps polling (a `kickstart -k` takes a moment) and
+only fails once the window closes; a **newly** stale containment record fails at
+once, because waiting cannot make a record match the host. A harness that was
+*already* stale before the deploy does not count against it, and if the bridge
+was not answering beforehand there is no baseline and the rule does not vote.
+
+Every phase appends to `<state dir>/deploys/<deploy_id>.log` and updates
+`state.json.deploy = {deploy_id, phase, ref, sha, started_ms, finished_ms,
+result, reason, log_tail}`. **A failure leaves `phase` where it stopped** —
+that field is the answer to "where did it break" — and `result` is one of `ok`,
+`failed`, `rolled_back`, `rolled_back_unhealthy`. Every deploy pushes when it
+ends, successes included: a silent success is indistinguishable from a sentinel
+that died halfway.
+
+A rolled-back deploy does **not** write `running_sha` — nothing about what is
+running changed — and its build directory is **not** pruned: it is the evidence.
+
+### `GET /sentinel/deploy/status`
+
+```json
+{ "deploy": { "…": "the record above, or null" },
+  "running":     { "version": "0.93.0", "sha": "3dbea71…" },
+  "origin_main": { "sha": "…", "version": "0.94.0", "ci": "green",
+                   "ci_detail": "run 42 (CI) passed the \"bridge\" job",
+                   "checked_ms": 1756000000000 } }
+```
+
+`running.version` comes from the **live** `/health` (what is actually up);
+`running.sha` from state (what was last deployed — `null` until the first
+successful deploy, because nothing else on the host records which commit a
+binary came from, and inventing one would be worse than admitting the gap).
+
+`origin_main` is refreshed at most every **five minutes** from the clone and the
+API. A refresh that fails, or one skipped because a deploy is in flight, returns
+the **cached** value with `"stale": true` and a `stale_reason` — never a
+silently old value, because a card that cannot tell "green five minutes ago"
+from "green just now" will eventually offer a deploy of a commit whose CI has
+since gone red.
+
+`ci` is `green` | `red` | `pending` | `none`. Those are four states rather than a
+boolean because "CI has not run yet" and "CI failed" are the same red light and
+completely different problems. **`green` is narrow**: a commit usually has
+several workflow runs, and "some run succeeded" is not the claim that matters —
+a run whose own jobs do not include a successful `bridge` is reported `red`, with
+a detail that says exactly that.
+
+The app enables **Deploy** only when `origin_main.sha != running.sha` and
+`ci == "green"` — the same two conditions the verb enforces, from the same code,
+so the button cannot be lit for a commit the verb would refuse.
+
 ### The watchdog
 
 One task, a 60 s tick, seven rules, state persisted to `<state dir>/state.json`
@@ -2122,7 +2250,11 @@ owns that record. The payload is
  "sentinel":{"kind":"bridge-down|autocommit|lock|disk|tailscale|qmd|silence"}}
 ```
 
-with no `job_id`, because a sentinel alert has no turn to deep-link into.
+with no `job_id`, because a sentinel alert has no turn to deep-link into. A
+finished deploy pushes under `"kind":"deploy"` with **no dedupe window**: it is
+the answer to something a person just did, and suppressing it because another
+deploy pushed an hour ago would be suppressing the one message they are waiting
+for.
 
 ### Pairing
 
@@ -2154,8 +2286,15 @@ carrying a token that pairs nothing is worse than one carrying neither.
 | `JESSE_SENTINEL_LEDGER` | `<vault repo>/vault/Inbox/scheduled-jobs-ledger.jsonl` | |
 | `JESSE_SENTINEL_AUTOCOMMIT_LOG` | read from the autocommit job's plist | |
 | `JESSE_SENTINEL_LABEL_{BRIDGE,AUTOCOMMIT,LOCK_REAPER,QMD_UPDATE,MINISERVE}` | `com.example.*` placeholders (except `com.qmd.update`) | The launchd labels the restart verbs address. **Any still on a placeholder is named, loudly, at startup** — a label in someone's reverse-DNS namespace is personal infrastructure and cannot be a compiled-in default (`scripts/ci-guards.sh` §5). |
+| `JESSE_SENTINEL_DEPLOY_CLONE` | `~/deploy/jesse-app` | The clone the deploy verb builds in. **Never a checkout someone works in** — every deploy leaves it on a detached head. Created by the installer. |
+| `JESSE_SENTINEL_BIN_DIR` | `~/.local/bin` | Where the three symlinks and `jesse-bridge.d/` live. |
+| `JESSE_SENTINEL_GITHUB_TOKEN` | — | A **fine-grained, read-only** token (Actions: read, Contents: read). Absent → `POST /sentinel/deploy` refuses, because a deploy that cannot verify CI is not one this service performs. |
+| `JESSE_SENTINEL_GITHUB_REPO` | `tag1consulting/jesse-app` | `owner/repo` whose `bridge` job vouches for a commit. The installer derives it from this checkout's `origin`. |
+| `JESSE_SENTINEL_GITHUB_API` | `https://api.github.com` | The API root. Configurable so the tests can point it at a loopback stand-in. |
+| `JESSE_SENTINEL_CI_JOB` | `bridge` | The CI job that must be green. Matched against the **display** name GitHub reports (an exact match, or the name followed by a space or `(`), because the jobs API does not return the workflow key. |
+| `JESSE_SENTINEL_DEPLOY_HEALTH_SECS` | `90` | How long a deploy waits for the restarted bridge, and a rollback for the old one. A slow host needs more; too little reads a slow boot as a failure and rolls it back. |
 | `JESSE_SENTINEL_ADVERTISE_HOST` | the bridge's advertise host | Read by the **bridge**, for the QR. |
-| `JESSE_SENTINEL_<NAME>_BIN` | resolved from `PATH`, then well-known locations | Pins one external command (`LAUNCHCTL`, `TAILSCALE`, `GIT`, `DF`, `PGREP`, `QMD`, `NODE`). Every command is resolved to an **absolute path once at startup**; a shim here is how the tests drive it. |
+| `JESSE_SENTINEL_<NAME>_BIN` | resolved from `PATH`, then well-known locations | Pins one external command (`LAUNCHCTL`, `TAILSCALE`, `GIT`, `DF`, `PGREP`, `QMD`, `NODE`, `CARGO`). Every command is resolved to an **absolute path once at startup**; a shim here is how the tests drive it. |
 | `JESSE_APNS_*` | — | The bridge's five push variables, unchanged. |
 
 A missing binary, an unnamed label, an absent bridge token: each costs its own

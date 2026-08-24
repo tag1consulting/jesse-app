@@ -2352,10 +2352,10 @@ for the verb table and the watchdog rules.
   agent cannot call it, and the containment posture is byte-for-byte what it was.
 - **What it can do.** Restart the five launchd jobs this deployment names,
   `bootout`/`bootstrap` the bridge from its plist, delete a provably-stale
-  `.git/index.lock`, delete artifact directories older than seven days, and
-  forward two of the bridge's own scheduler control verbs. After P5 it will also
-  **replace the bridge binary**. That is a genuinely privileged set, and the
-  boundaries below are what contain it.
+  `.git/index.lock`, delete artifact directories older than seven days, forward
+  two of the bridge's own scheduler control verbs, and **replace the bridge
+  binary with a build of any commit on `origin/main`**. That is a genuinely
+  privileged set, and the boundaries below are what contain it.
 - **What it cannot do.** It has no model, runs no agent, reads no vault content,
   and executes nothing a caller names. Its external commands are a **fixed list**
   (`launchctl`, `tailscale`, `git`, `df`, `pgrep`, `qmd`, `node`), each resolved to
@@ -2405,6 +2405,53 @@ for the verb table and the watchdog rules.
   **never writes a token into the repository** — the tracked template carries only
   placeholders. The installer **never runs `launchctl`**; it prints the bootstrap
   line for a person to run.
+- **Remote deploy: `main` plus a green `bridge` job is the whole authority.**
+  `POST /sentinel/deploy` will build and install a commit only if
+  `git merge-base --is-ancestor <sha> origin/main` succeeds **and** GitHub reports
+  a completed, successful workflow run for that exact sha whose jobs listing
+  contains a job named `bridge` — matched against the display name the jobs API
+  reports, never a `-`-suffixed neighbour — that also concluded `success`. `force` relaxes the
+  "a scheduled job is running" check and the "that sha is already deployed" check;
+  **it does not relax either of these**, and there is no argument to the verb that
+  installs a commit CI has not passed.
+
+  **This makes branch protection on `main` part of the deployment boundary.** The
+  set of things this service can install is exactly the set of commits that reach
+  `main`, so the required-pull-request and required-status-check rules on that
+  branch are what decides who can put code on this host. Weakening them —
+  allowing a direct push, dropping the required check, granting a bypass — widens
+  what a stolen sentinel token can deploy, even though the token itself grants
+  nothing new. Anyone who can merge to `main` can, with the token, run code as
+  this user.
+
+  The caller-supplied `ref` is `main` or 40 lowercase hex and **nothing else**; a
+  400 otherwise, before it can become an argument to `git`, where a value like
+  `--upload-pack=…` would be an option rather than a revision. `cargo` is invoked
+  with a literal argument vector in the deploy clone, never through a shell, and
+  the clone is a directory of the sentinel's own — never a checkout a person
+  works in.
+
+- **The GitHub token is read-only and is the only credential this adds.** A
+  fine-grained token with **Actions: read** and **Contents: read**. It cannot
+  merge, push, dispatch a workflow, or write anything; the only question the
+  sentinel asks GitHub is what CI concluded about a commit. It lives in the
+  rendered plist at mode `0600` with the two bearer tokens, and never in the
+  repository. Without it the deploy verb refuses outright — a deploy that cannot
+  verify CI is not one this service performs.
+
+- **A deploy that goes wrong undoes itself, and says so when it cannot.** The
+  three binaries are swapped by an atomic symlink `rename` after the previous
+  targets are recorded to `deploys/previous`, so there is no instant at which the
+  path launchd runs does not exist. The restarted bridge must answer `/health`
+  with `ok`, with **the version the deployed commit declares**, and with no
+  harness newly `containment_stale`; anything else repoints to `previous` and
+  restarts again. If *that* does not come up either the result is
+  `rolled_back_unhealthy` and the push says the host needs hands — the one
+  outcome where nobody is told the system is fine. **No containment record, tool
+  allowlist or MCP list is read or written by any of this**; a binary built
+  against a record that fails this host's gate refuses to start by design, which
+  the health poll sees as a failure and rolls back.
+
 - **The watchdog's automatic actions are bounded.** At most five bridge kickstarts
   in a rolling hour and then it stops and says so; `tailscale up` once per outage;
   the unlock verb only under the proof above. It never resolves a git conflict and

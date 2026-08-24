@@ -28,7 +28,7 @@ pub type VerbResult = Result<(StatusCode, Value), (StatusCode, Value)>;
 /// reported as `healthy: false` and NOT as a failed restart: the kickstart happened, and
 /// conflating "I could not restart it" with "I restarted it and it did not come back" would
 /// send an operator looking in the wrong place.
-async fn poll_health(sen: &Sentinel, window: Duration) -> (bool, Option<String>) {
+pub async fn poll_health(sen: &Sentinel, window: Duration) -> (bool, Option<String>) {
     let deadline = Instant::now() + window;
     loop {
         if let Ok((status, body)) = sen.bridge_get("/health", Duration::from_secs(3)).await {
