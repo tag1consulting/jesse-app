@@ -13,6 +13,102 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [App 1.0 (114)] - 2026-08-24
+
+### Added
+
+- **Jesse now watches the network, and recovers by itself.** There was no
+  `NWPathMonitor` anywhere in this app. Every recovery was therefore a human one: a
+  failed poll ended in a manual "Re-check", the send outbox retried only on a tap, and
+  three tabs each stood up their own reachability model and fired a `GET /health` on
+  every activation. The phone knew the whole time that it had walked back into signal,
+  and nothing asked it.
+
+  A single `ConnectivityMonitor` now does. When the path goes from unsatisfied to
+  satisfied, one recovery runs: reconcile the outbox, re-attach every persisted
+  in-flight job, drain the send outbox, and replay whatever an offline intent queue is
+  holding. An interface SWAP — Wi-Fi to cellular, both satisfied — is deliberately not a
+  recovery: nothing was waiting on it, and treating it as one turns a walk past the
+  front door into a burst of refetches.
+
+  `BridgeReachabilityModel` is now one shared instance rather than one per tab, fed by
+  the monitor and by the outcome of every real bridge call. That last part is the cheap
+  half of the whole thing: a `POST /jesse` that answered is better evidence than a
+  `GET /health` will ever be, so the probe becomes what it should have been — the thing
+  that runs when nothing else has happened lately, at most once every 30 seconds.
+
+- **The send outbox retries itself.** Five automatic sends on a 5s / 30s / 2min / 10min
+  backoff, plus one immediately on a network recovery (coming back onto Wi-Fi is new
+  information, not another tick of a timer), and then it is the per-message **Retry**
+  button's again. Re-sending is safe by construction and not by hope: the item's `id` IS
+  the wire `request_id`, the bridge dedups on it, and a re-send of a POST that landed
+  returns the same job with no second turn spawned.
+
+  The attempt count and the next-due date are persisted on the item, so a relaunch
+  resumes the same schedule rather than granting a fresh budget. A manual Retry resets
+  it — a human saying "try again" is a statement that the situation has changed —
+  which is also why tapping Retry never spends an automatic attempt and exhausting the
+  automatic attempts never disables the button.
+
+- **A reply that finishes while the phone is in a pocket is delivered then.** The app
+  had no `UIBackgroundModes` at all; the ~30s `beginBackgroundTask` grant was the only
+  continuation, so anything longer waited for the app to be opened. It now declares
+  `remote-notification` and `fetch`, and a push carrying a `job_id` wakes it to fetch
+  the reply and write it into the conversation — through the SAME `TurnWriter` the
+  foreground uses, so a second push for the same job appends nothing and the
+  idempotency is not a second implementation. The spinner, the retained job and the
+  Live Activity are cleared too, so a foregrounded app does not poll to discover a
+  reply already in its own transcript.
+
+  A push whose payload carries `prefetch` (bridge 0.95.0, the morning chain by default)
+  refreshes the day file and the diet snapshot into the on-disk cache and pushes the day
+  to the watch, so the Today tab is current the first time it is opened rather than after
+  a spinner. And because a push is never guaranteed — APNs drops them, a phone off the
+  network never gets one — a `BGAppRefreshTask` (`com.tag1.Jesse.refresh`, every four
+  hours) does the same work as a backstop, re-arming itself FIRST so one bad run cannot
+  silently end it.
+
+- **Frugal mode.** On cellular, in Low Data Mode, or with the new **Settings → Data →
+  "Frugal on cellular"** toggle: photos go out at 1280px and quality 0.7, the completion
+  poll has a 5-second floor, the send button's sweep drops to 1fps, Settings stops
+  re-polling the model list while it is open, and the pre-send health summary is reused
+  from cache when it is under 12 hours old rather than re-fetching the largest single
+  body on the send path.
+
+  Not one of those decisions is a refusal. Every one makes something cheaper, and none
+  makes anything unavailable — frugal mode on a phone with one bar must still be able to
+  send. A small leaf beside the composer's attach button says it is in force, and
+  explains on tap which of the three reasons it is; the whole decision table is a pure
+  function with a unit test, so the six sites cannot disagree about what "frugal" means.
+
+### Changed
+
+- **A send waits for connectivity instead of failing fast.** `POST /jesse` moved off the
+  shared bounded session onto its own (`waitsForConnectivity`, 30s request / 120s
+  resource): a send is the one call whose failure LOSES something, so walking into a
+  tunnel with a message half-sent should mean it completes on the far side rather than
+  leaving a "Not delivered" line to notice. On a transport error the send is re-sent
+  once with the same `request_id` — safe for the same reason the outbox retry is.
+
+- **Every `POST /jesse` carries `sent_at`** (RFC3339 with the device's offset) beside
+  `client_tz`, stamped once in the same one place, and the re-send reuses it. That is
+  the point of the field: an entry the message gave no time for is dated from when the
+  phone SENT it, so a turn that waited two minutes for a tunnel does not get dated from
+  the far side of it.
+
+- **A dropped poll no longer blames the laptop.** While the device has no network at
+  all, a transport error in the completion poll waits for the path to come back
+  (bounded, 30s) instead of surfacing "tap Re-check". The turn is still running on the
+  laptop, which never noticed; the old behaviour was the app reporting the phone's own
+  radio as the bridge's failure. With a satisfied path the same error still means the
+  laptop is asleep, and still surfaces a recoverable error with Re-check.
+
+- **Device-token registration retries** (1s, 10s, 60s, then hourly) until the bridge
+  accepts it, and remembers the accepted `(token, host, port)` across launches so a
+  restored device with a new token re-registers. It was a single `try?`: one attempt,
+  and a laptop that happened to be asleep at that moment left the bridge with no token
+  until the next foreground — in the single worst place in the app to swallow a failure,
+  since every push depends on that one write having landed.
 ## [bridge 0.95.0] - 2026-08-24
 
 ### Added

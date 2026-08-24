@@ -46,7 +46,7 @@ struct MacHealthView: View {
 
     /// The Mac's reachability probe — the same shared model the phone drives, and the
     /// thing this tab previously had no version of.
-    @State private var reachability = BridgeReachabilityModel()
+    private let reachability = BridgeReachabilityModel.shared
 
     init(configStore: MacConfigStore) {
         self.configStore = configStore

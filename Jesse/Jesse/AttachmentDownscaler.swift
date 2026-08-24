@@ -1,6 +1,7 @@
 import Foundation
 import UIKit
 import ImageIO
+import JesseNetworking
 
 // Fit an oversized IMAGE under the per-file attachment cap by re-encoding it as a
 // smaller JPEG, so a >10 MB photo can still attach instead of being rejected with
@@ -48,16 +49,27 @@ nonisolated enum AttachmentDownscaler {
     /// because this unit is `nonisolated` and that constant is MainActor-isolated —
     /// a default argument would evaluate in a nonisolated context and not compile.
     /// The production caller (`addAttachment`, on the main actor) supplies the cap.
-    static func fitToCap(_ data: Data, cap: Int) -> Data? {
-        guard data.count > cap else { return nil }                                    // under cap → verbatim, never decoded
+    ///
+    /// `frugal` adds a SECOND, independent reason to re-encode: on a metered link an image
+    /// is capped by PIXELS as well as by bytes, so a 3 MB photo that fits the size cap
+    /// comfortably is still sent as a 1280px JPEG. The byte-verbatim invariant is
+    /// preserved exactly where it was — with the policy inactive, `frugalLongEdge` is nil
+    /// and the first line below is the whole behaviour, unchanged.
+    static func fitToCap(_ data: Data, cap: Int, frugal: FrugalPolicy = .off) -> Data? {
+        let frugalLongEdge = frugal.attachmentMaxLongEdge
+        guard data.count > cap || frugalLongEdge != nil else { return nil }            // under cap, not frugal → verbatim, never decoded
         guard let mime = JesseAttachment.sniffMime(data), mime.hasPrefix("image/") else { return nil } // non-image → leave to caps
         guard let source = CGImageSourceCreateWithData(data as CFData, nil),
               let longEdge = pixelLongEdge(source) else { return nil }                 // undecodable → leave to caps
 
+        let quality = frugal.attachmentJPEGQuality.map { CGFloat($0) } ?? jpegQuality
         let target = Int(Double(cap) * targetFraction)
-        var maxPixel = longEdge                     // first pass: full resolution, re-encode only (never upscales)
+        // Start at the frugal ceiling when there is one — `encode` never upscales, so an
+        // image already smaller than the ceiling is re-encoded at its own size rather than
+        // blown up to it.
+        var maxPixel = frugalLongEdge.map { min(longEdge, $0) } ?? longEdge
         while true {
-            guard let jpeg = encode(source, maxPixel: maxPixel) else { return nil }
+            guard let jpeg = encode(source, maxPixel: maxPixel, quality: quality) else { return nil }
             if jpeg.count <= target || maxPixel <= minLongEdge { return jpeg }
             maxPixel = max(Int(Double(maxPixel) * scaleStep), minLongEdge)
         }
@@ -85,7 +97,8 @@ nonisolated enum AttachmentDownscaler {
     /// applying EXIF orientation so the result is upright. ImageIO decodes only the
     /// reduced image. `maxPixel` never exceeds the source's own size, so this never
     /// upscales.
-    private static func encode(_ source: CGImageSource, maxPixel: Int) -> Data? {
+    private static func encode(_ source: CGImageSource, maxPixel: Int,
+                               quality: CGFloat = jpegQuality) -> Data? {
         let options: [CFString: Any] = [
             kCGImageSourceCreateThumbnailFromImageAlways: true,
             kCGImageSourceCreateThumbnailWithTransform: true,
@@ -94,6 +107,6 @@ nonisolated enum AttachmentDownscaler {
         guard let cg = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else {
             return nil
         }
-        return UIImage(cgImage: cg).jpegData(compressionQuality: jpegQuality)
+        return UIImage(cgImage: cg).jpegData(compressionQuality: quality)
     }
 }

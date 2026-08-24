@@ -257,6 +257,15 @@ struct JesseClient: JesseClientProtocol {
     /// for, read at send time and attached to every turn so the bridge can prune its queue.
     let mealCorrectionsAck: @Sendable () -> Int?
 
+    /// The frugal decision in force, read at send time. Injected so a test drives the
+    /// cellular path without a radio.
+    let frugal: @Sendable () -> FrugalPolicy
+
+    /// The on-disk cache the frugal path reads the diet snapshot back out of instead of
+    /// re-fetching it. `nil` means "no cache available", which degrades to always fetching
+    /// — exactly the pre-frugal behaviour.
+    let snapshotCacheForReads: SnapshotCache?
+
     init(config: JesseConfig,
          session: URLSession = JesseBridgeClient.boundedSession,
          streamSession: URLSession? = nil,
@@ -264,9 +273,12 @@ struct JesseClient: JesseClientProtocol {
          isHealthContextEnabled: @escaping @Sendable () -> Bool = { HealthContextSettings.isEnabled },
          healthClassifier: any HealthRelevanceClassifying = UnionHealthClassifier(),
          mealCorrectionsAck: @escaping @Sendable () -> Int? = { MealCorrectionsAckStore.pendingSeq },
+         frugal: @escaping @Sendable () -> FrugalPolicy = { FrugalSettings.current() },
          // Only the Health tab passes one: a client built for a send, a probe, or a
-         // per-turn context read has no business writing the screen's offline fallback.
-         snapshotCache: SnapshotCache? = nil) {
+         // per-turn context read has no business WRITING the screen's offline fallback.
+         // Reading it is a different matter — see `dietRollupBlock`.
+         snapshotCache: SnapshotCache? = nil,
+         readableSnapshotCache: SnapshotCache? = SnapshotCache.shared) {
         self.config = config
         self.bridge = JesseBridgeClient(config: config, session: session,
                                         streamSession: streamSession,
@@ -275,6 +287,8 @@ struct JesseClient: JesseClientProtocol {
         self.isHealthContextEnabled = isHealthContextEnabled
         self.healthClassifier = healthClassifier
         self.mealCorrectionsAck = mealCorrectionsAck
+        self.frugal = frugal
+        self.snapshotCacheForReads = readableSnapshotCache
     }
 
     // MARK: - Send (with the iOS health_context body)
@@ -322,14 +336,44 @@ struct JesseClient: JesseClientProtocol {
 
     /// The compact multi-window nutrient rollup for the coach's `health_context`, or nil.
     /// Best-effort and gated on the same health-relevance decision as the HealthKit block.
+    ///
+    /// On a metered link this prefers a RECENT cached snapshot over a fresh one. The whole
+    /// `GET /jesse/diet` body is the largest single thing the send path fetches, and what
+    /// this uses it for is a multi-window nutrient TREND — what it says about the last
+    /// fortnight does not change between breakfast and lunch. Off the frugal path the
+    /// threshold is zero, so the fetch always happens, exactly as before.
     private func dietRollupBlock(enabled: Bool) async -> String? {
         guard enabled else { return nil }
-        guard let snapshot = try? await fetchDietSnapshot() else { return nil }
+        guard let snapshot = await recentDietSnapshot() else { return nil }
         guard let series = snapshot.nutrientSeries, NutrientTrends.isAvailable(series) else { return nil }
         let text = NutrientTrends.coachRollup(series: series, targets: snapshot.today.targets,
                                               meals: snapshot.today.meals,
                                               ownerName: PromptStore.ownerName)
         return text.isEmpty ? nil : text
+    }
+
+    /// The diet snapshot for this turn's rollup: a young enough cached one when the frugal
+    /// policy allows it, else a fresh fetch.
+    ///
+    /// A cache MISS falls straight through to the fetch — frugal mode makes things cheaper,
+    /// never absent — and so does a cached body that will not decode, which is the one case
+    /// where reusing it would be worse than spending the bytes.
+    private func recentDietSnapshot() async -> DietSnapshot? {
+        if let cached = cachedDietSnapshot(maxAge: frugal().skipDietPrefetchIfCacheYoungerThan) {
+            return cached
+        }
+        return try? await fetchDietSnapshot()
+    }
+
+    /// The cached live-day snapshot, if there is one no older than `maxAge`. `maxAge` of
+    /// zero (the non-frugal value) can never be satisfied by an entry with a real age, so
+    /// the whole path is off by construction rather than by a second flag.
+    func cachedDietSnapshot(maxAge: TimeInterval, now: Date = Date()) -> DietSnapshot? {
+        guard maxAge > 0, let cache = snapshotCacheForReads,
+              let entry = cache.load(key: SnapshotCacheKey.liveDiet, now: now),
+              now.timeIntervalSince(entry.fetchedAt) <= maxAge,
+              let snapshot = try? DietSnapshot.decode(from: entry.body) else { return nil }
+        return snapshot
     }
 
     /// Re-send a needs-health retry on the SAME conversation and the SAME PER-TURN `model`
