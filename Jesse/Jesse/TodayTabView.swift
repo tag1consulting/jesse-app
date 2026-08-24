@@ -227,12 +227,13 @@ struct TodayTabView: View {
     /// Propagate and wiki chips: an explicit "do this now", so the turn goes out on
     /// the tap and the sheet opens onto a conversation already running.
     private func execute(_ turn: TodayTurn) {
-        // Refused while the day is read-only, exactly as a checkbox tap is, and for the
-        // same reason: this FIRES a turn, and a turn fired at an unreachable bridge is a
-        // request that looks sent and is not. Discuss is deliberately NOT gated here —
+        // Refused while the day is read-only, and — unlike a checkbox tap — NOT captured.
+        // This FIRES a turn that rewrites project files, and a turn is not a small fact
+        // about one day that a replay could re-aim; fired at an unreachable bridge it is
+        // a request that looks sent and is not. Discuss is deliberately not gated here —
         // it starts nothing, and the conversation it opens is the one screen in this app
         // where the send outbox and its per-message Retry are visible.
-        guard !model.refuseInteractionIfReadOnly() else { return }
+        guard !model.refuseTurnIfReadOnly() else { return }
         openedThread = TodayThreadOpener.run(turn, coordinator: coordinator, context: context)
     }
 
@@ -242,7 +243,9 @@ struct TodayTabView: View {
     /// the day is read-only — the same refusal a checkbox tap gets, for the same
     /// reason. The conversation opens so the turn is watchable; it is a long one.
     private func processUpdates(_ items: [TodayItem]) {
-        guard !model.refuseInteractionIfReadOnly() else { return }
+        // Never captured: the batch is the set of rows ticked AT THIS MOMENT, and running
+        // it hours later would run it over a different set. See `PendingIntentKind`.
+        guard !model.refuseTurnIfReadOnly() else { return }
         openedThread = processRun.start(items: items, coordinator: coordinator,
                                         context: context)
     }

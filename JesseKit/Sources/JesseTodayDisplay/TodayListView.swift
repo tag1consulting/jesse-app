@@ -387,8 +387,10 @@ public struct TodayListView: View {
     /// **What ticking an item means**, in one place: the checkbox's tap and the space
     /// key both land here, so neither can develop its own idea of it.
     private func toggle(_ item: TodayItem) {
-        // Read-only is answered HERE, before the sheet: the alternative is taking a
-        // line of evidence off the user and then refusing to write it.
+        // Read-only is answered HERE, before the sheet: the alternative is taking a line
+        // of evidence off the user and then refusing to write it. With a capture queue
+        // behind the model that is no longer the outcome, so this now refuses only when
+        // the change could not be held either — see `refuseInteractionIfReadOnly`.
         guard !model.refuseInteractionIfReadOnly() else { return }
         // Unchecking never asks for a note — there is nothing to record about undoing
         // something, and the sheet would be pure friction.

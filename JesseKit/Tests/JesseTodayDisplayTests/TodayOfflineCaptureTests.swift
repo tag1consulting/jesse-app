@@ -202,6 +202,43 @@ final class TodayOfflineCaptureTests: XCTestCase {
                        "and the optimism was taken back")
     }
 
+    /// **The guard the view asks before it opens a flow must not refuse a capturable
+    /// tap.** It exists so the evidence sheet cannot take a note and then throw it away;
+    /// with a queue behind the model the note is not thrown away, and a guard that still
+    /// fired here would mean the tap never reached `check` and nothing was ever captured.
+    ///
+    /// This is a regression test for exactly that: the capture worked when the model was
+    /// driven directly and did nothing at all through the screen.
+    func testTheInteractionGuardLetsACapturableTapThrough() async {
+        let store = FakeStore()
+        let model = await offlineModel(store)
+
+        XCTAssertFalse(model.refuseInteractionIfReadOnly(),
+                       "the evidence sheet may open — the note will be held, not lost")
+        XCTAssertTrue(model.capturesOffline)
+    }
+
+    /// A turn is never captured, so the action that fires one still refuses — on the
+    /// same screen, at the same moment, through a deliberately different function.
+    func testTheTurnGuardStillRefusesOnACapturingScreen() async {
+        let store = FakeStore()
+        let model = await offlineModel(store)
+
+        XCTAssertTrue(model.refuseTurnIfReadOnly())
+        XCTAssertEqual(model.notice, TodayDashboardModel.readOnlyNotice)
+    }
+
+    /// With no queue the interaction guard behaves exactly as it always did — which is
+    /// what keeps the Mac window and every existing test honest.
+    func testTheInteractionGuardStillRefusesWithNoQueue() async {
+        let model = TodayDashboardModel(makeClient: { LiveClient() }, now: { Self.fixedNow })
+        await model.load()
+        model.isNetworkUnreachable = true
+
+        XCTAssertTrue(model.refuseInteractionIfReadOnly())
+        XCTAssertEqual(model.notice, TodayDashboardModel.readOnlyNotice)
+    }
+
     // MARK: - When capture is NOT possible
 
     /// **No queue, no promise.** A shell that wired no store keeps the honest refusal

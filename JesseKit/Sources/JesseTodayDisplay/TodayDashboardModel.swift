@@ -660,14 +660,42 @@ public final class TodayDashboardModel {
         refreshPending()
     }
 
-    /// Refuse an interaction the view has not started yet, and say so — the same
-    /// refusal a mutation would hit, reachable BEFORE the flow that would lead to
-    /// one. The evidence sheet is the case that matters: opening it while the day is
-    /// read-only would take a note off the user and then throw it away.
+    /// Refuse an interaction the view has not started yet — for the interactions that
+    /// END IN A CAPTURABLE CHANGE.
+    ///
+    /// It exists for the evidence sheet: opening one while the day was read-only used to
+    /// take a note off the user and then throw it away, so the refusal had to be
+    /// reachable before the flow rather than after it.
+    ///
+    /// **With a queue behind it, the note is no longer thrown away**, so this must NOT
+    /// refuse when the change can be held — a guard that still fired would mean the tap
+    /// never reached `check` and the capture never happened. It refuses only when capture
+    /// is impossible, which is the situation the original wording describes.
     ///
     /// Returns whether the interaction was refused, so a caller reads as a guard.
     @discardableResult
-    public func refuseInteractionIfReadOnly() -> Bool { refuseIfReadOnly() }
+    public func refuseInteractionIfReadOnly() -> Bool {
+        guard isReadOnly, !capturesOffline else {
+            if !isReadOnly { lastReadOnlyNotice = nil }
+            return false
+        }
+        lastReadOnlyNotice = Self.readOnlyNotice
+        return true
+    }
+
+    /// Refuse an action that FIRES A TURN, which is never captured.
+    ///
+    /// Propagate, a wiki chip and Process-updates all start a conversation that rewrites
+    /// project files, and none of them is a small fact about one day that a replay could
+    /// re-aim. A turn fired at an unreachable bridge is a request that looks sent and is
+    /// not, so these keep the refusal they have always had — even on a screen where a
+    /// checkbox is now held.
+    ///
+    /// A separate function rather than a flag, because the two questions genuinely
+    /// differ and a caller reading `refuseInteractionIfReadOnly` at a Propagate site
+    /// would silently get the wrong answer the day capture widened.
+    @discardableResult
+    public func refuseTurnIfReadOnly() -> Bool { refuseIfReadOnly() }
 
     /// Dismiss whichever one-line notice is showing. Both are transient by design:
     /// they describe one refused interaction, not a state of the document.

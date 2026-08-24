@@ -225,11 +225,15 @@ struct MacTodayView: View {
     /// Propagate and wiki chips: an explicit "do this now", so the turn goes out on the
     /// click and the sheet opens onto a conversation already running.
     private func execute(_ turn: TodayTurn) {
-        // Refused while the day is read-only, exactly as a checkbox click is, and for the
-        // same reason: this FIRES a turn, and a turn fired at an unreachable bridge is a
-        // request that looks sent and is not. Discuss is deliberately NOT gated here —
-        // it starts nothing.
-        guard !model.refuseInteractionIfReadOnly() else { return }
+        // Refused while the day is read-only, and NOT captured: this FIRES a turn that
+        // rewrites project files, which is not a small fact about one day that a replay
+        // could re-aim, and fired at an unreachable bridge it is a request that looks
+        // sent and is not. Discuss is deliberately NOT gated here — it starts nothing.
+        //
+        // (The Mac shell wires no capture queue, so a checkbox click here still refuses
+        // too. That is the honest behaviour rather than an oversight: this window has no
+        // pending list to show a held change on.)
+        guard !model.refuseTurnIfReadOnly() else { return }
         openedThread = MacTodayThreadOpener.run(turn, coordinator: coordinator,
                                                 context: context)
     }
@@ -241,7 +245,8 @@ struct MacTodayView: View {
     /// for the same reason. The conversation opens so the turn is watchable; it is a
     /// long one.
     private func processUpdates(_ items: [TodayItem]) {
-        guard !model.refuseInteractionIfReadOnly() else { return }
+        // Never captured on any platform — the batch is the set ticked at this moment.
+        guard !model.refuseTurnIfReadOnly() else { return }
         openedThread = processRun.start(items: items, coordinator: coordinator,
                                         context: context, day: model)
     }
