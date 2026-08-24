@@ -347,18 +347,18 @@ final class MacTodayTests: XCTestCase {
             return .snapshot(day)
         }
         func checkItem(id: String, checked: Bool, evidence: String?, at: Date,
-                       ifMatch: String) async throws -> TodayMutationResult {
+                       day: String?, ifMatch: String) async throws -> TodayMutationResult {
             checkCount += 1
-            return .snapshot(day)
+            return .snapshot(self.day)
         }
         func moveItem(id: String, op: TodayMoveOp, at: Date,
-                      ifMatch: String) async throws -> TodayMutationResult {
-            .snapshot(day)
+                      day: String?, ifMatch: String) async throws -> TodayMutationResult {
+            .snapshot(self.day)
         }
         func postpone(id: String, deferred: Bool, at: Date,
-                      ifMatch: String) async throws -> TodayMutationResult {
+                      day: String?, ifMatch: String) async throws -> TodayMutationResult {
             postponeCount += 1
-            return .snapshot(day)
+            return .snapshot(self.day)
         }
         func glance(id: String, at: Date, ifMatch: String) async throws -> TodayMutationResult {
             .snapshot(day)

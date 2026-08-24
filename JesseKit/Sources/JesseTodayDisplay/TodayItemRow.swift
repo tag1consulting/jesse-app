@@ -15,6 +15,10 @@ import JesseNetworking
 struct TodayCheckbox: View {
     let checked: Bool
     let pending: Bool
+    /// Whether the claim is being HELD for replay rather than sent. Distinct from
+    /// `pending`, which means "sent, not yet acknowledged" — the box is committed
+    /// either way, and the difference is whether the bridge has heard about it at all.
+    let queued: Bool
     let action: () -> Void
 
     var body: some View {
@@ -27,12 +31,28 @@ struct TodayCheckbox: View {
                 // as a spinner: the state is committed locally, it is just not
                 // acknowledged, and a spinner would suggest it might not stick.
                 .opacity(pending ? 0.55 : 1)
+                // A QUEUED claim wears a dotted ring — the visual grammar of "this is
+                // real but not yet delivered", and a cue that survives Grayscale because
+                // it is a shape rather than a hue. The row's caption says it in words
+                // too; neither is the only cue.
+                .overlay {
+                    if queued {
+                        Circle()
+                            .strokeBorder(.tint, style: StrokeStyle(lineWidth: 1.5, dash: [2, 2]))
+                            .frame(width: 26, height: 26)
+                    }
+                }
                 .contentShape(.rect)
                 .frame(width: 32, height: 32)
         }
         .buttonStyle(.plain)
-        .accessibilityLabel(checked ? "Completed" : "Not completed")
+        .accessibilityLabel(accessibilityLabel)
         .accessibilityAddTraits(checked ? [.isSelected, .isButton] : .isButton)
+    }
+
+    private var accessibilityLabel: String {
+        let state = checked ? "Completed" : "Not completed"
+        return queued ? "\(state), saved offline and waiting to send" : state
     }
 }
 
@@ -174,6 +194,9 @@ struct FlowRow: Layout {
 public struct TodayItemRow: View {
     let item: TodayItem
     let pending: Bool
+    /// This row's change is HELD for replay — captured while the bridge was out of
+    /// reach. See `TodayCheckbox.queued`.
+    let queued: Bool
     let evidence: String?
     let availableMoves: [TodayMoveOp]
     let focusActions: [TodayFocus]
@@ -196,7 +219,8 @@ public struct TodayItemRow: View {
     let onPropagate: () -> Void
     let onOpenLink: (TodayLinkOrigin) -> Void
 
-    public init(item: TodayItem, pending: Bool = false, evidence: String? = nil,
+    public init(item: TodayItem, pending: Bool = false, queued: Bool = false,
+                evidence: String? = nil,
                 availableMoves: [TodayMoveOp] = [],
                 focusActions: [TodayFocus] = [],
                 opensOnDoubleTap: Bool = false,
@@ -210,6 +234,7 @@ public struct TodayItemRow: View {
                 onOpenLink: @escaping (TodayLinkOrigin) -> Void = { _ in }) {
         self.item = item
         self.pending = pending
+        self.queued = queued
         self.evidence = evidence
         self.availableMoves = availableMoves
         self.focusActions = focusActions
@@ -231,7 +256,8 @@ public struct TodayItemRow: View {
             // The project, as a rule down the leading edge. Never the only cue: the
             // caption under the text names the project in words.
             TodayProjectAccentBar(project: item.project)
-            TodayCheckbox(checked: item.checked, pending: pending) { onToggle(!item.checked) }
+            TodayCheckbox(checked: item.checked, pending: pending,
+                          queued: queued) { onToggle(!item.checked) }
             VStack(alignment: .leading, spacing: 4) {
                 text
                 ForEach(TodaySemantics.continuationLines(item), id: \.self) { line in
@@ -295,8 +321,20 @@ public struct TodayItemRow: View {
     @ViewBuilder
     private var caption: some View {
         let dates = TodaySemantics.dateCaption(item)
-        if !item.project.isUnfiled || dates != nil || TodaySemantics.isPostponed(item) {
+        if !item.project.isUnfiled || dates != nil || TodaySemantics.isPostponed(item) || queued {
             HStack(spacing: 6) {
+                // The words behind the dotted ring. A ring alone says "something about
+                // this is different"; only the caption says what, and it is the half a
+                // screen reader gets.
+                if queued {
+                    Text("Queued")
+                        .font(.caption2)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 1)
+                        .background(.quaternary, in: .capsule)
+                        .foregroundStyle(.secondary)
+                        .accessibilityLabel("Saved offline, waiting to send")
+                }
                 // The chip is the cue that survives. Dimming alone says "postponed"
                 // only to someone who can see the row beside an undimmed one, which
                 // is nobody using VoiceOver and nobody looking at a section where
@@ -339,7 +377,7 @@ public struct TodayItemRow: View {
         Text(attributed)
             .font(.body)
             .strikethrough(item.checked, color: .secondary)
-            .foregroundStyle(item.checked || item.deferred
+            .foregroundStyle(item.checked || item.deferred || queued
                              ? AnyShapeStyle(.secondary) : AnyShapeStyle(.primary))
             .fixedSize(horizontal: false, vertical: true)
             // Prefixed rather than appended: a screen reader reaches the row's state

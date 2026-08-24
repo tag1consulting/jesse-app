@@ -527,8 +527,17 @@ final class RunCoordinator {
     /// rather than in the composer is deliberate — every send path (the button, a
     /// voice send, a retry) then honors it, and an empty composer with a context
     /// attached is a real turn ("just look at it") instead of a silently dropped one.
+    /// `onAck` fires ONCE with whether the bridge accepted this message — `true` on the
+    /// `202` (or the legacy inline `200`), `false` on any pre-ACK failure, and `false`
+    /// for a send that was refused before it began.
+    ///
+    /// It exists for the offline queue's replay, which must not send a day's second meal
+    /// until the first has landed: a log that arrives out of order is a log that reads as
+    /// a different day's. Nothing else uses it, and nothing else should — the transcript
+    /// and the outbox row are how a person learns a message went.
     func send(thread: JesseThread, text: String, voice: Bool, context: ModelContext,
-              attachments: [JesseAttachment] = []) {
+              attachments: [JesseAttachment] = [],
+              onAck: (@MainActor (Bool) -> Void)? = nil) {
         let threadID = thread.id
         let attached = attachedContexts[threadID]
         let typed = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -537,7 +546,10 @@ final class RunCoordinator {
         // The guards run on the COMPOSED text and before the attachment is spent, so a
         // send refused because a turn is already running leaves the context attached
         // for the send that does go through.
-        guard !trimmed.isEmpty, !isRunning(thread.id) else { return }
+        guard !trimmed.isEmpty, !isRunning(thread.id) else {
+            onAck?(false)
+            return
+        }
         attachedContexts[threadID] = nil
         errors[threadID] = nil
         // A new turn is a "next turn" drain point for any meal writes that failed
@@ -598,6 +610,7 @@ final class RunCoordinator {
         } catch {
             Log.run.error("optimistic user-turn + outbox save failed for thread \(threadID): \(error.localizedDescription) — aborting the turn")
             errors[threadID] = "Couldn't save your message — try sending it again."
+            onAck?(false)
             return
         }
         // Persist storage-optimized thumbnail previews of any attachments onto the
@@ -610,7 +623,7 @@ final class RunCoordinator {
         // 202 or the legacy inline `.reply` 200) deletes the item — after that the
         // existing InFlight/consume/Re-check machinery owns the turn unchanged; a
         // throw before that ACK flips the item to `.failed` for the per-message Retry.
-        transmit(item: item, thread: thread, context: context)
+        transmit(item: item, thread: thread, context: context, onAck: onAck)
     }
 
     /// The bridge round-trip for one staged (or retried) `OutboxItem`, keyed by its
@@ -619,7 +632,8 @@ final class RunCoordinator {
     /// entirely in the pre-ACK window. Session/instructions/floor/config are resolved
     /// FRESH here (not captured at stage time) so a Retry picks up current state and
     /// the same request_id lets the bridge dedup a POST that actually landed.
-    private func transmit(item: OutboxItem, thread: JesseThread, context: ModelContext) {
+    private func transmit(item: OutboxItem, thread: JesseThread, context: ModelContext,
+                          onAck: (@MainActor (Bool) -> Void)? = nil) {
         let threadID = thread.id
         let requestId = item.id
         let text = item.text
@@ -672,6 +686,7 @@ final class RunCoordinator {
                     // item, then finish against the live `thread` reference.
                     self.adoptRegistration(thread: thread, conversationId: remoteConversationId)
                     self.ackDelete(item, context: context)
+                    onAck?(true)
                     self.finish(threadID: threadID, thread: thread, reply: reply,
                                 voice: voice, jobId: nil, context: context)
                 case .running(let jobId, let remoteConversationId):
@@ -687,6 +702,11 @@ final class RunCoordinator {
                     // that drops the outbox item.
                     self.adoptRegistration(thread: thread, conversationId: remoteConversationId)
                     self.ackDelete(item, context: context)
+                    // The ACK, and the only place a replaying quick log learns it may
+                    // send the next one. Fired BEFORE `consume`, which runs for as long
+                    // as the turn does — a queue that waited for the ANSWER would send a
+                    // day's meals a minute apart.
+                    onAck?(true)
                     self.persist(threadID: threadID,
                                  job: InFlightJob(jobId: jobId, voice: voice, requestId: requestId))
                     await self.consume(threadID: threadID, thread: thread, jobId: jobId,
@@ -703,6 +723,7 @@ final class RunCoordinator {
                 self.failOutbox(item, threadID: threadID,
                                 message: "Cancelled before it was delivered.",
                                 voice: voice, speakFailure: false, context: context)
+                onAck?(false)
             } catch let error as JesseError {
                 // Pre-ACK failure (timeout, dead network, 429/5xx, notConfigured):
                 // the message never reached the bridge. Preserve it as `.failed` with
@@ -712,9 +733,11 @@ final class RunCoordinator {
                 self.failOutbox(item, threadID: threadID,
                                 message: error.errorDescription ?? "Couldn't send your message.",
                                 voice: voice, speakFailure: true, context: context)
+                onAck?(false)
             } catch {
                 self.failOutbox(item, threadID: threadID, message: error.localizedDescription,
                                 voice: voice, speakFailure: true, context: context)
+                onAck?(false)
             }
             self.tasks[threadID] = nil
             self.backgroundGuard.end(threadID)
@@ -1590,6 +1613,16 @@ final class RunCoordinator {
     private func replayQueuedIntents() {
         let replayer = intentReplayer
         Task { await replayer.replayAll() }
+    }
+
+    /// Drain the intent queue and WAIT for it — what the background refresh task needs,
+    /// which must not report completion while its work is still running.
+    ///
+    /// The same replayer as the recovery path's, so the "one run at a time" rule holds
+    /// across both: a background task that fired while a foreground recovery was mid-run
+    /// finds the replayer busy and returns immediately rather than racing its ETags.
+    func replayQueuedIntentsNow() async {
+        await intentReplayer.replayAll()
     }
 
     /// Manual "Re-check" for one thread: re-attach to its retained job and fetch

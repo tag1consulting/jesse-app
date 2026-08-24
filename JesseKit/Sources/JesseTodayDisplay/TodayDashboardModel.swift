@@ -1,5 +1,6 @@
 import Foundation
 import Observation
+import JesseCore
 import JesseNetworking
 
 // The Today tab's view model: it owns the server snapshot, the ETag every mutation
@@ -16,6 +17,10 @@ import JesseNetworking
 //  * A `to_do_now` move can change an item's id (the id hashes the section name).
 //    The response is authoritative: the overlay is re-keyed onto the new id and the
 //    old one is left holding nothing, so the row never renders twice or as a ghost.
+//  * A change made with no bridge to send it to is CAPTURED, not dropped — see
+//    "Capture" below. The overlay is applied exactly as it would be for a live tap, so
+//    the day reads as the user left it; what differs is only that the row says it is
+//    waiting. Replay is `IntentReplayer`'s, and every refusal rule lives there.
 //
 // The client is injected as a factory, like `HealthDashboardModel`, so re-pairing is
 // picked up on the next call and tests drive every path through a fake. `now` is
@@ -100,12 +105,28 @@ public final class TodayDashboardModel {
     /// every test that does not care about caching gets).
     private let cache: SnapshotCache?
 
+    /// **The offline capture queue**, or `nil` for the pre-queue behaviour.
+    ///
+    /// Optional rather than required, and defaulting to `nil`, because a screen with no
+    /// store still has to work: the Mac shell, a preview, and every existing test build
+    /// this model without one, and each of those must keep the honest refusal rather
+    /// than silently promise to save something nowhere.
+    private let pending: (any PendingIntentStoring)?
+
+    /// The zone a captured change records. Injected for the same reason `now` is: a
+    /// stamp a test cannot pin is a stamp a test cannot assert.
+    private let zone: @Sendable () -> String
+
     public init(makeClient: @escaping @MainActor () -> any TodayProviding,
                 now: @escaping @Sendable () -> Date = { Date() },
-                cache: SnapshotCache? = nil) {
+                cache: SnapshotCache? = nil,
+                pending: (any PendingIntentStoring)? = nil,
+                zone: @escaping @Sendable () -> String = { TimeZone.current.identifier }) {
         self.makeClient = makeClient
         self.now = now
         self.cache = cache
+        self.pending = pending
+        self.zone = zone
     }
 
     // MARK: - The cache
@@ -367,6 +388,11 @@ public final class TodayDashboardModel {
         overlay.checks[id] != nil || overlay.moves[id] != nil
     }
 
+    /// Whether this item's change is HELD for replay rather than in flight. The two are
+    /// separate questions and a row shows them differently: "sending" is a round trip
+    /// nobody has answered, "queued" is a round trip nobody has started.
+    public func isQueued(_ id: String) -> Bool { overlay.isQueued(id) }
+
     /// The evidence to show under a row — the pending note, else the file's.
     public func evidence(for item: TodayItem) -> String? {
         TodaySemantics.evidenceText(item, pending: overlay.evidence[item.id])
@@ -488,20 +514,30 @@ public final class TodayDashboardModel {
 
     // MARK: - Mutations
 
-    /// The wording a refused tap gets. Public so a shell can render it without
-    /// inventing a second sentence for the same situation.
+    /// The wording a refused change gets when there is nothing to capture it with — no
+    /// queue wired in, or no day on screen to capture it against. Public so a shell can
+    /// render it without inventing a second sentence for the same situation.
     public static let readOnlyNotice =
         "You're offline, so the day is read-only. Nothing was saved and nothing is waiting to send — try again once the bridge is reachable."
 
+    /// The wording a CAPTURED change gets. The other half of the same moment, and the
+    /// difference the whole queue exists to make.
+    public static let queuedNotice =
+        "Saved offline, will apply when the bridge is back."
+
     /// Refuse a mutation while the screen is read-only, and say so.
     ///
-    /// Deliberately NOT a queue. A queued check would be a promise about a document
-    /// the app cannot see: `Today.md` is rewritten in full every morning and edited
-    /// by the agent all day, and an ETag captured before a network outage is
-    /// worthless after it — the tap would replay against a line that has since moved,
-    /// been reworded, or been closed by someone else. Refusing costs the user one
-    /// re-tap; queueing would spend their trust on a write aimed at a file that no
-    /// longer exists.
+    /// This is now the LAST resort rather than the rule. It used to be the whole
+    /// policy, on the argument that `Today.md` is rewritten every morning so a held tap
+    /// would replay against a document that has moved on — true of a blind replay, and
+    /// not a reason to drop the capture. A change that carries the day it was made
+    /// against and the identity of what it was made about can be replayed safely and
+    /// refused honestly when neither still resolves (see `IntentReplayer`).
+    ///
+    /// So a read-only screen refuses only when it cannot capture: no queue was injected
+    /// (the Mac shell, previews, most tests), or no day has loaded, in which case there
+    /// is no `dayDate` to make the replay safe and a captured change would be exactly
+    /// the blind promise the original argument was about.
     private func refuseIfReadOnly() -> Bool {
         guard isReadOnly else {
             lastReadOnlyNotice = nil
@@ -511,14 +547,155 @@ public final class TodayDashboardModel {
         return true
     }
 
-    /// Refuse an interaction the view has not started yet, and say so — the same
-    /// refusal a mutation would hit, reachable BEFORE the flow that would lead to
-    /// one. The evidence sheet is the case that matters: opening it while the day is
-    /// read-only would take a note off the user and then throw it away.
+    // MARK: - Capture
+
+    /// The day every capture is made against: the snapshot's own `date`.
+    ///
+    /// `nil` disables capture entirely, and that is the point — a change with no day
+    /// behind it cannot be replayed safely, so it is refused instead of promised.
+    private var captureDay: String? {
+        guard let date = serverSnapshot?.date, !date.isEmpty else { return nil }
+        return date
+    }
+
+    /// Whether a change made right now would be held rather than sent or refused.
+    /// Read by a view to decide which sentence it is about to show.
+    public var capturesOffline: Bool { pending != nil && captureDay != nil }
+
+    /// Build the record for one day-file change. `nil` when nothing can be captured.
+    ///
+    /// The item is looked up in the FILE-ORDER snapshot, overlay included, because the
+    /// lead and section it carries are what a rebuilt day is searched by — and the row
+    /// the user acted on is the row they were looking at.
+    private func record(_ kind: PendingIntentKind, id: String,
+                        payload: PendingIntentPayload = PendingIntentPayload(),
+                        intentId: UUID = UUID()) -> PendingIntentRecord? {
+        guard let day = captureDay else { return nil }
+        let item = snapshot?.item(id: id) ?? serverSnapshot?.item(id: id)
+        return PendingIntentRecord(id: intentId, kind: kind, dayDate: day,
+                                   itemId: id,
+                                   leadText: item?.lead,
+                                   sectionName: item?.sectionName,
+                                   payload: payload,
+                                   createdAt: now(),
+                                   tz: zone())
+    }
+
+    /// **Hold one change and show it as held.**
+    ///
+    /// The overlay is applied by the caller exactly as it would be for a live tap —
+    /// the whole point is that the day reads as the user left it — and the id joins
+    /// `overlay.queued` so the row can say which of the two it is.
+    ///
+    /// Returns whether the change was captured. `false` means the caller must fall back
+    /// to the refusal.
+    @discardableResult
+    private func capture(_ intent: PendingIntentRecord?) -> Bool {
+        guard let pending, let intent else { return false }
+        pending.append(intent)
+        if let id = intent.itemId { overlay.queued.insert(id) }
+        lastReadOnlyNotice = Self.queuedNotice
+        lastConflictMessage = nil
+        refreshPending()
+        return true
+    }
+
+    /// The queue as THIS screen shows it: the outstanding day-file changes, oldest first.
+    ///
+    /// Narrowed to its own kinds, because the two tabs share one store and one replayer
+    /// and each shows the half it is about — a meal held for the Health tab has nothing
+    /// to do with the day file, and a list that showed both would be telling each screen
+    /// about the other's work.
+    ///
+    /// Mirrored into an observable property rather than read through the store on every
+    /// render, because the store is a plain object and `@Observable` cannot see through
+    /// it — a list bound to `pending.all()` would never redraw when a replay landed.
+    public private(set) var pendingIntents: [PendingIntentRecord] = []
+
+    /// Re-read the queue. Called after anything that can change it, and by the shell
+    /// once a replay has run.
+    ///
+    /// `overlay.queued` is DERIVED here rather than accumulated, and that is what keeps
+    /// it honest: it is exactly the ids the store is still holding an unlanded claim
+    /// for, so an intent that applied, was refused, or was discarded stops its row
+    /// saying "waiting" without anything having had to remember to say so.
+    public func refreshPending() {
+        pendingIntents = (pending?.outstanding() ?? []).filter(\.kind.isDayFileWrite)
+        overlay.queued = Set(
+            pendingIntents
+                .filter { $0.state == .queued || $0.state == .replaying }
+                .compactMap(\.itemId))
+    }
+
+    /// **Drop the local claim about one item** — what a REFUSED replay owes the day.
+    ///
+    /// A refusal means the change did not happen, so leaving the box ticked would be
+    /// the app lying about the vault. The pending row survives (carrying its reason and
+    /// its Tell-Jesse fallback); only the optimism goes.
+    public func settleOptimism(itemId: String) {
+        overlay.settle(itemId)
+    }
+
+    /// How many changes are waiting or were refused — the number on the pending header.
+    public var pendingCount: Int { pendingIntents.count }
+
+    /// **Forget one captured change**, at the user's word. The overlay entry goes with
+    /// it, so the day snaps back to what the bridge actually holds.
+    public func discardPending(id: UUID) {
+        guard let pending else { return }
+        let itemId = pendingIntents.first { $0.id == id }?.itemId
+        pending.delete(id: id)
+        if let itemId { overlay.settle(itemId) }
+        refreshPending()
+    }
+
+    /// Put a refused change back in the queue so the next replay tries it again — what
+    /// a per-row Retry means. A no-op for a row that is not refused.
+    public func retryPending(id: UUID) {
+        guard let pending, var record = pendingIntents.first(where: { $0.id == id }),
+              record.state == .refused else { return }
+        record.state = .queued
+        record.refusalReason = nil
+        pending.update(record)
+        refreshPending()
+    }
+
+    /// Refuse an interaction the view has not started yet — for the interactions that
+    /// END IN A CAPTURABLE CHANGE.
+    ///
+    /// It exists for the evidence sheet: opening one while the day was read-only used to
+    /// take a note off the user and then throw it away, so the refusal had to be
+    /// reachable before the flow rather than after it.
+    ///
+    /// **With a queue behind it, the note is no longer thrown away**, so this must NOT
+    /// refuse when the change can be held — a guard that still fired would mean the tap
+    /// never reached `check` and the capture never happened. It refuses only when capture
+    /// is impossible, which is the situation the original wording describes.
     ///
     /// Returns whether the interaction was refused, so a caller reads as a guard.
     @discardableResult
-    public func refuseInteractionIfReadOnly() -> Bool { refuseIfReadOnly() }
+    public func refuseInteractionIfReadOnly() -> Bool {
+        guard isReadOnly, !capturesOffline else {
+            if !isReadOnly { lastReadOnlyNotice = nil }
+            return false
+        }
+        lastReadOnlyNotice = Self.readOnlyNotice
+        return true
+    }
+
+    /// Refuse an action that FIRES A TURN, which is never captured.
+    ///
+    /// Propagate, a wiki chip and Process-updates all start a conversation that rewrites
+    /// project files, and none of them is a small fact about one day that a replay could
+    /// re-aim. A turn fired at an unreachable bridge is a request that looks sent and is
+    /// not, so these keep the refusal they have always had — even on a screen where a
+    /// checkbox is now held.
+    ///
+    /// A separate function rather than a flag, because the two questions genuinely
+    /// differ and a caller reading `refuseInteractionIfReadOnly` at a Propagate site
+    /// would silently get the wrong answer the day capture widened.
+    @discardableResult
+    public func refuseTurnIfReadOnly() -> Bool { refuseIfReadOnly() }
 
     /// Dismiss whichever one-line notice is showing. Both are transient by design:
     /// they describe one refused interaction, not a state of the document.
@@ -538,7 +715,14 @@ public final class TodayDashboardModel {
     /// either confirms it (the overlay entry retires) or contradicts it (the next
     /// snapshot wins). A tap on an item with no ETag in hand is dropped rather than
     /// sent: without one the bridge answers `428`, and the honest thing is to refetch.
-    public func check(id: String, checked: Bool, evidence: String? = nil) async {
+    ///
+    /// `intentId` is the id an OFFLINE CAPTURE would be stored under. It exists for one
+    /// caller: a check made on the WRIST, which carries its own `intentId` and whose
+    /// transport redelivers. Storing the capture under that id is what makes a
+    /// redelivered wrist intent land once across a phone relaunch — the in-memory
+    /// de-duper on the other side of that boundary is empty, and the queue is not.
+    public func check(id: String, checked: Bool, evidence: String? = nil,
+                      intentId: UUID = UUID()) async {
         // Order matters: the missing-tag path runs FIRST. With no ETag in hand there
         // is nothing to refuse against — the only useful act is to go and get one,
         // which is also a live re-test of whether the bridge is reachable at all.
@@ -546,21 +730,39 @@ public final class TodayDashboardModel {
             await load()
             return
         }
+        let note = evidence?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let payload = PendingIntentPayload(evidence: (note?.isEmpty ?? true) ? nil : note)
+        let intent = record(checked ? .check : .uncheck, id: id, payload: payload,
+                            intentId: intentId)
+
+        // OFFLINE: hold it rather than refuse it. The overlay below is applied either
+        // way, so the day reads the same; what a capture adds is the promise to send it.
+        if isReadOnly, capture(intent) {
+            applyCheckOverlay(id: id, checked: checked, note: note)
+            return
+        }
         if refuseIfReadOnly() { return }
         lastConflictMessage = nil
+        applyCheckOverlay(id: id, checked: checked, note: note)
+        await perform(id: id, capturing: intent) { client in
+            try await client.checkItem(id: id, checked: checked, evidence: note,
+                                       at: self.now(), day: nil, ifMatch: tag)
+        }
+    }
+
+    /// The optimism a check carries, applied identically whether the tap was sent or
+    /// captured. One function so the two paths cannot drift — a queued check that
+    /// rendered differently from a sent one would be a second definition of what
+    /// ticking a box looks like.
+    private func applyCheckOverlay(id: String, checked: Bool, note: String?) {
         // Before the box flips: ticking an item takes it out of the badge set, and the
         // row must not leave the filtered view under the finger that ticked it.
         pinRowsOnScreen()
         overlay.checks[id] = checked
-        let note = evidence?.trimmingCharacters(in: .whitespacesAndNewlines)
         if checked, let note, !note.isEmpty {
             overlay.evidence[id] = note
         } else {
             overlay.evidence.removeValue(forKey: id)
-        }
-        await perform(id: id) { client in
-            try await client.checkItem(id: id, checked: checked, evidence: note,
-                                       at: self.now(), ifMatch: tag)
         }
     }
 
@@ -569,12 +771,24 @@ public final class TodayDashboardModel {
     /// The row moves immediately under its OLD id — the new one is a hash of the
     /// destination section the client cannot compute — and the response's snapshot
     /// then decides where it really lives and under what id. See `settleMove`.
-    public func move(id: String, op: TodayMoveOp) async {
+    public func move(id: String, op: TodayMoveOp, capturable: Bool = true) async {
         // Order matters: the missing-tag path runs FIRST. With no ETag in hand there
         // is nothing to refuse against — the only useful act is to go and get one,
         // which is also a live re-test of whether the bridge is reachable at all.
         guard let tag = etag, !tag.isEmpty else {
             await load()
+            return
+        }
+        // `capturable` is false for exactly one caller: an op that is part of a DRAG's
+        // multi-write plan. See `reorder`.
+        let intent = capturable
+            ? record(.move, id: id,
+                     payload: PendingIntentPayload(moveOp: op.wireOp,
+                                                   moveSection: op.destinationSection))
+            : nil
+        if isReadOnly, capture(intent) {
+            pinRowsOnScreen()
+            overlay.moves[id] = op
             return
         }
         if refuseIfReadOnly() { return }
@@ -585,11 +799,11 @@ public final class TodayDashboardModel {
         pinRowsOnScreen()
         overlay.moves[id] = op
 
-        await perform(id: id, adopting: { [weak self] snap in
+        await perform(id: id, capturing: intent, adopting: { [weak self] snap in
             guard let self else { return }
             self.settleMove(id: id, item: item, knownIds: knownIds, in: snap)
         }) { client in
-            try await client.moveItem(id: id, op: op, at: self.now(), ifMatch: tag)
+            try await client.moveItem(id: id, op: op, at: self.now(), day: nil, ifMatch: tag)
         }
     }
 
@@ -638,11 +852,19 @@ public final class TodayDashboardModel {
             // Asked BEFORE the first write, not between the second and the third: a
             // multi-op plan that ran out of network halfway would leave the row in a
             // position nobody asked for.
+            //
+            // A DRAG IS NOT CAPTURED, unlike the single move ops the menu and the swipe
+            // offer. A landing is a plan of up to two writes whose second op is aimed at
+            // an id the FIRST one changes, so a captured drag would have to replay a
+            // sequence against a document it has not seen yet — and ordering on a
+            // rebuilt day is the one thing replay cannot mean anything about anyway
+            // (see `IntentReplayer`, which refuses a queued move whose day has rolled).
+            // Refusing the gesture and letting the row snap back is the honest answer.
             if refuseIfReadOnly() { return .refused(Self.readOnlyNotice) }
             var current = id
             for op in ops {
                 let known = Set(serverSnapshot?.allItems.map(\.id) ?? [])
-                await move(id: current, op: op)
+                await move(id: current, op: op, capturable: false)
                 // Stop at the first op that did not land. Piling the rest on would
                 // aim them at a document the bridge has already disagreed with.
                 guard lastConflictMessage == nil, !isReadOnly, let snap = serverSnapshot
@@ -708,14 +930,21 @@ public final class TodayDashboardModel {
             await load()
             return
         }
+        let intent = record(deferred ? .defer : .undefer, id: id)
+        if isReadOnly, capture(intent) {
+            pinRowsOnScreen()
+            overlay.deferrals[id] = deferred
+            return
+        }
         if refuseIfReadOnly() { return }
         lastConflictMessage = nil
         // Same reason as `check`: postponing is the other way a row leaves the badge
         // set, and it has to stay readable long enough to be undone.
         pinRowsOnScreen()
         overlay.deferrals[id] = deferred
-        await perform(id: id) { client in
-            try await client.postpone(id: id, deferred: deferred, at: self.now(), ifMatch: tag)
+        await perform(id: id, capturing: intent) { client in
+            try await client.postpone(id: id, deferred: deferred, at: self.now(),
+                                      day: nil, ifMatch: tag)
         }
     }
 
@@ -742,6 +971,7 @@ public final class TodayDashboardModel {
     /// document, because a re-key has to happen while the client still remembers
     /// which id it queued the work under.
     private func perform(id: String,
+                         capturing intent: PendingIntentRecord? = nil,
                          adopting extra: ((TodaySnapshot) -> Void)? = nil,
                          _ call: @escaping (any TodayProviding) async throws -> TodayMutationResult
     ) async {
@@ -779,6 +1009,19 @@ public final class TodayDashboardModel {
                 lastConflictMessage = message
             }
         } catch {
+            // A TRANSPORT failure is the other way a change meets an absent bridge, and
+            // the interesting one: the probe said reachable, the tap went out, and the
+            // network died under it. Capturing here is what makes the queue cover the
+            // whole outage rather than only the part the probe noticed first — without
+            // it, the tap that DISCOVERS the outage is the one tap that gets lost.
+            //
+            // Only a transport failure. A `500` means the bridge heard us and something
+            // else went wrong; replaying that is a retry loop, not a capture.
+            let unreachable = (error as? JesseError)?.isUnreachable ?? false
+            if unreachable, capture(intent) {
+                fail(error)
+                return
+            }
             overlay.settle(id)
             fail(error)
         }

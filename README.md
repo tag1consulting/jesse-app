@@ -368,7 +368,10 @@ see the ATS note in [Known installation problems](#known-installation-problems).
   The morning run's push also refreshes the day file and the health snapshot, so
   the Today tab is current the first time you look at it rather than after a spinner.
 - **Voice / Siri** — "Ask Jesse…" and "Tell Jesse…" Siri phrases route into a new
-  thread and read the reply aloud (on-device text-to-speech).
+  thread and read the reply aloud (on-device text-to-speech). **"Capture to Jesse…"**
+  is the one that does not open the app: it stages the note and sends it from the
+  background, answers "Captured", and speaks nothing. If the bridge is not reachable
+  the note waits in the send outbox and goes by itself when it is.
 - **Ask about this (Health tab)** — long-press (iOS) or right-click (macOS) any card,
   row, chart or section on the Health tab and its sub-pages to open a chat that already
   holds exactly what was on screen: the meal and its foods, the nutrient row and what fed
@@ -416,11 +419,50 @@ see the ATS note in [Known installation problems](#known-installation-problems).
   passed".
 - **Offline** — Today and Health keep the last thing the bridge sent them on disk,
   so both tabs still render after a cold launch with no network, behind a banner
-  saying how old what you are reading is. Browsing works; **changing does not**.
-  A checkbox, a move, a postpone, a Quick log, a Start new day or a Propagate is
-  refused with a one-line notice, and **nothing is queued**: the day file is
-  rewritten in full every morning, so a change held through an outage would replay
-  against a document that has since moved on.
+  saying how old what you are reading is. **Changes are saved and sent later.**
+
+  Tick a box on a boat with no signal and the box ticks: the change is held on the
+  phone, the row wears a dotted ring and says "Queued", and a **Pending (n)** block
+  at the top of the day lists everything waiting. When the bridge is reachable again
+  the queue drains by itself — on a network coming back, on the app becoming active,
+  on any successful fetch, and on the periodic background refresh. Nothing needs a
+  tap.
+
+  Checkboxes, un-checks, postpones, single moves, Quick log and Start new day are all
+  captured. **Process updates** is not: it fires one long turn over the set of items
+  ticked at that moment, and running it hours later would run it over a different set.
+  A drag is not captured either — a landing is a plan of several writes whose later
+  ops depend on the earlier ones, so the row snaps back rather than being half-applied
+  tomorrow.
+
+  **A replayed change carries the hour you made it.** A check made at 07:05 and sent at
+  noon is written into `Today.md` as 07:05, and a meal logged offline is dated when you
+  ate it — which is what keeps it on the right day either side of the diet day's 04:00
+  boundary.
+
+  **And it refuses out loud rather than guessing.** The day file is rewritten in full
+  every morning, so a change held overnight may be about a document that no longer
+  exists. Each replay therefore carries the day it was made against and the identity of
+  what it was made about, and the rules are:
+
+  | Situation | What happens |
+  |---|---|
+  | Same day, item still there | Applied, with your original time. |
+  | Same day, item gone from the file | Refused: it isn't in the day any more. |
+  | Day rolled over, the task came back with the same words | Re-aimed at its new line and applied. |
+  | Day rolled over, no match — or two identical open tasks | Refused: *"Today moved on; item not found."* |
+  | Day rolled over, and it was a **move** | Refused: ordering on a rebuilt day means nothing. |
+  | Day rolled over, and it was **Start new day** | Refused: the morning already happened. |
+  | The file changed mid-send | One refetch and one retry; a second clash refuses. |
+
+  A refused row stays on the Pending list until you dismiss it, with **Retry** and
+  **Discard** — and, for a check whose line the app can no longer find, a **Tell Jesse**
+  button that sends *"I completed "…" on 2026-08-24 at 07:05 (logged offline)"*. The
+  agent reads the vault and can close it at source, so a refusal is never a loss.
+
+  Quick logs replay in the order you made them, one at a time, and stop at the first
+  one that does not land — a day's meals arriving out of order would read as a
+  different day's.
 
   Chats are the exception, and they now recover **by themselves**. Jesse watches the
   network, so the moment the phone is back on one it re-attaches to any turn still

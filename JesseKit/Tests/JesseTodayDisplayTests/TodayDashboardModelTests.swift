@@ -62,7 +62,7 @@ final class TodayDashboardModelTests: XCTestCase {
         }
 
         func checkItem(id: String, checked: Bool, evidence: String?, at: Date,
-                       ifMatch: String) async throws -> TodayMutationResult {
+                       day: String?, ifMatch: String) async throws -> TodayMutationResult {
             lastCheck = (id, checked, evidence)
             lastIfMatch = ifMatch
             lastAt = at
@@ -72,7 +72,7 @@ final class TodayDashboardModelTests: XCTestCase {
         }
 
         func moveItem(id: String, op: TodayMoveOp, at: Date,
-                      ifMatch: String) async throws -> TodayMutationResult {
+                      day: String?, ifMatch: String) async throws -> TodayMutationResult {
             lastMove = (id, op)
             moveLog.append((id, op))
             lastIfMatch = ifMatch
@@ -83,7 +83,7 @@ final class TodayDashboardModelTests: XCTestCase {
         }
 
         func postpone(id: String, deferred: Bool, at: Date,
-                      ifMatch: String) async throws -> TodayMutationResult {
+                      day: String?, ifMatch: String) async throws -> TodayMutationResult {
             lastPostpone = (id, deferred)
             lastIfMatch = ifMatch
             lastAt = at
@@ -519,15 +519,15 @@ final class TodayDashboardModelTests: XCTestCase {
         let fetch: TodayFetchResult
         func getToday(ifNoneMatch: String?) async throws -> TodayFetchResult { fetch }
         func checkItem(id: String, checked: Bool, evidence: String?, at: Date,
-                       ifMatch: String) async throws -> TodayMutationResult {
+                       day: String?, ifMatch: String) async throws -> TodayMutationResult {
             throw JesseError.connectionLost
         }
         func moveItem(id: String, op: TodayMoveOp, at: Date,
-                      ifMatch: String) async throws -> TodayMutationResult {
+                      day: String?, ifMatch: String) async throws -> TodayMutationResult {
             throw JesseError.connectionLost
         }
         func postpone(id: String, deferred: Bool, at: Date,
-                      ifMatch: String) async throws -> TodayMutationResult {
+                      day: String?, ifMatch: String) async throws -> TodayMutationResult {
             throw JesseError.connectionLost
         }
         func glance(id: String, at: Date, ifMatch: String) async throws -> TodayMutationResult {

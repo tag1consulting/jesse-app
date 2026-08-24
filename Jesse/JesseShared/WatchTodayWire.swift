@@ -131,10 +131,21 @@ public nonisolated struct WatchTodaySummary: Equatable, Sendable {
     /// section with fourteen open items would make a complication that says ten, and
     /// a complication that undercounts is worse than none.
     public let doNowOpenCount: Int
+    /// **Ids the PHONE is holding a check for**, captured while it could not reach the
+    /// bridge.
+    ///
+    /// The watch already has a `queued` state, and it already means "saved, not gone
+    /// yet" — but it could only ever describe the wrist's own half of the trip, because
+    /// the watch cannot ask the bridge anything. A phone that had taken the check and
+    /// then found no bridge looked, from the wrist, exactly like a phone that had sent
+    /// it and was waiting: the claim stayed `pending` for the whole outage.
+    ///
+    /// So the phone says which ones it is sitting on. Same word, both halves of the trip.
+    public let queuedIds: Set<String>
 
     public nonisolated init(date: String?, etag: String?, pushedAt: Date,
                             rows: [WatchTodayRow], openCount: Int, doneCount: Int,
-                            doNowOpenCount: Int = 0) {
+                            doNowOpenCount: Int = 0, queuedIds: Set<String> = []) {
         self.date = date
         self.etag = etag
         self.pushedAt = pushedAt
@@ -142,6 +153,7 @@ public nonisolated struct WatchTodaySummary: Equatable, Sendable {
         self.openCount = max(0, openCount)
         self.doneCount = max(0, doneCount)
         self.doNowOpenCount = max(0, doNowOpenCount)
+        self.queuedIds = queuedIds
     }
 
     private enum Key {
@@ -152,6 +164,7 @@ public nonisolated struct WatchTodaySummary: Equatable, Sendable {
         nonisolated static let open = "open"
         nonisolated static let done = "done"
         nonisolated static let doNowOpen = "doNowOpen"
+        nonisolated static let queued = "queued"
         nonisolated static let id = "id"
         nonisolated static let lead = "lead"
         nonisolated static let checked = "checked"
@@ -177,6 +190,10 @@ public nonisolated struct WatchTodaySummary: Equatable, Sendable {
         ]
         if let date { dict[Key.date] = date }
         if let etag { dict[Key.etag] = etag }
+        // Omitted when empty — the common case by far, and a key nobody sends is a key
+        // an older watch cannot mis-read. `updateApplicationContext` takes property-list
+        // types only, so this crosses as an Array and comes back as a Set.
+        if !queuedIds.isEmpty { dict[Key.queued] = Array(queuedIds) }
         return dict
     }
 
@@ -208,13 +225,22 @@ public nonisolated struct WatchTodaySummary: Equatable, Sendable {
                                       section: WatchTodayWire.boundedText(raw[Key.section]) ?? ""))
         }
 
+        // CLAMPED like the rows, and for the same reason: a corrupt dictionary must not
+        // be able to force a pathological allocation, and a queued marker is decoration
+        // on a row — losing one costs a word on a screen, not a change.
+        let queued = Set(((dict[Key.queued] as? [Any]) ?? [])
+            .prefix(WatchTodayWire.maxDecodedRows)
+            .compactMap { WatchTodayWire.boundedText($0) }
+            .filter { !$0.isEmpty })
+
         return WatchTodaySummary(date: WatchTodayWire.boundedText(dict[Key.date]),
                                  etag: WatchTodayWire.boundedText(dict[Key.etag]),
                                  pushedAt: Date(timeIntervalSince1970: seconds),
                                  rows: rows,
                                  openCount: (dict[Key.open] as? Int) ?? 0,
                                  doneCount: (dict[Key.done] as? Int) ?? 0,
-                                 doNowOpenCount: (dict[Key.doNowOpen] as? Int) ?? 0)
+                                 doNowOpenCount: (dict[Key.doNowOpen] as? Int) ?? 0,
+                                 queuedIds: queued)
     }
 }
 

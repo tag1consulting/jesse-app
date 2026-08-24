@@ -57,7 +57,8 @@ nonisolated enum TodayWatchSummary {
     /// the point), and it caps the Do Now rows at ten. The one number that must agree
     /// with the phone, `doNowOpenCount`, is read from that function below, so the two
     /// devices cannot disagree about how much is left.
-    static func build(from snapshot: TodaySnapshot, etag: String?, at now: Date) -> WatchTodaySummary {
+    static func build(from snapshot: TodaySnapshot, etag: String?, at now: Date,
+                      queuedIds: Set<String> = []) -> WatchTodaySummary {
         let leadRows = snapshot.leadItems
             .filter { !TodaySemantics.isPostponed($0) }
             .compactMap(row(for:))
@@ -85,7 +86,10 @@ nonisolated enum TodayWatchSummary {
             // The complication's number, and deliberately the SAME function the
             // phone's tab badge calls. Two devices that disagreed about how much is
             // left today would each be answering a question nobody asked.
-            doNowOpenCount: TodaySemantics.doNowOpenCount(snapshot))
+            doNowOpenCount: TodaySemantics.doNowOpenCount(snapshot),
+            // Narrowed to the ids that actually made the trip: a marker for a row the
+            // watch was never sent is bytes it can do nothing with.
+            queuedIds: queuedIds.intersection(rows.map(\.id)))
     }
 
     /// One row, or nil for an item with no words to show.

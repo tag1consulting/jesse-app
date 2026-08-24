@@ -269,11 +269,11 @@ private struct FakeStatic: TodayProviding {
 
     func getToday(ifNoneMatch: String?) async throws -> TodayFetchResult { .snapshot(snapshot) }
     func checkItem(id: String, checked: Bool, evidence: String?, at: Date,
-                   ifMatch: String) async throws -> TodayMutationResult { .snapshot(snapshot) }
+                   day: String?, ifMatch: String) async throws -> TodayMutationResult { .snapshot(snapshot) }
     func moveItem(id: String, op: TodayMoveOp, at: Date,
-                  ifMatch: String) async throws -> TodayMutationResult { .snapshot(snapshot) }
+                  day: String?, ifMatch: String) async throws -> TodayMutationResult { .snapshot(snapshot) }
     func postpone(id: String, deferred: Bool, at: Date,
-                  ifMatch: String) async throws -> TodayMutationResult { .snapshot(snapshot) }
+                  day: String?, ifMatch: String) async throws -> TodayMutationResult { .snapshot(snapshot) }
     func glance(id: String, at: Date,
                 ifMatch: String) async throws -> TodayMutationResult { .snapshot(snapshot) }
 }

@@ -1,4 +1,7 @@
 import SwiftUI
+import SwiftData
+import JesseCore
+import JesseDietDisplay
 import JesseNetworking
 import JesseTodayDisplay
 
@@ -63,6 +66,9 @@ struct RootTabView: View {
 
     @State private var selection: Tab = RootTabView.defaultTab
 
+    /// The app-scoped coordinator, read here only to build the replayer's Tell sender.
+    @Environment(RunCoordinator.self) private var coordinator
+
     /// The Today screen's model lives HERE, not in `TodayTabView`, because the tab
     /// item's badge and the screen must read the same number. Injected through the
     /// same narrow `TodayProviding` seam the Health tab uses for diet data — the
@@ -75,7 +81,34 @@ struct RootTabView: View {
         makeClient: {
             JesseBridgeClient(config: ConfigStore.load(), snapshotCache: SnapshotCache.shared)
         },
-        cache: SnapshotCache.shared)
+        cache: SnapshotCache.shared,
+        pending: RootTabView.pendingStore)
+
+    /// **The offline capture queue**, one per process.
+    ///
+    /// One store, shared by both tabs and the replayer, because it is one queue: the
+    /// Today tab shows its day-file half, the Health tab its diet half, and the replayer
+    /// drains the whole thing oldest-first. Two stores would mean two replay runs racing
+    /// each other's ETags.
+    ///
+    /// It runs on its OWN `ModelContext` over the app's shared container, not on the
+    /// view's `@Environment(\.modelContext)`, for the same reason `PhoneWatchConnectivity`
+    /// resolves its own: this store is written from a Siri intent and from a watch
+    /// message, neither of which has a view hierarchy to read one from.
+    @MainActor static let pendingStore = PendingIntentStore(
+        context: ModelContext(AppModelContainer.shared.container))
+
+    /// The replayer, built once the two models exist and handed to the box the
+    /// coordinator already holds.
+    @State private var replayer: IntentReplayer?
+
+    /// The Health tab's model. It lives HERE rather than in `HealthTabView` for the one
+    /// reason the day model does: the replayer needs it (to read the live diet day) and
+    /// the replayer must outlive whichever tab happens to be on screen.
+    @State private var healthModel = HealthDashboardModel(
+        makeClient: { JesseClient(config: ConfigStore.load(), snapshotCache: SnapshotCache.shared) },
+        cache: SnapshotCache.shared,
+        pending: RootTabView.pendingStore)
 
     /// The wrist's half of the day, built the first time this view appears.
     ///
@@ -90,6 +123,10 @@ struct RootTabView: View {
     /// persistent banner tells the user their saved history couldn't be opened and
     /// this session won't be saved — so a store failure is never silent.
     var storeError: Error?
+
+    /// The box `RunCoordinator` already holds. Filled here, on the first appearance,
+    /// because this is the first moment both dashboard models exist.
+    var replayerBox: IntentReplayerBox?
 
     var body: some View {
         TabView(selection: $selection) {
@@ -112,12 +149,21 @@ struct RootTabView: View {
             // A no-op once anything has loaded, so it cannot fight a live fetch.
             todayModel.primeFromCache()
             connectTheWatch()
+            buildTheReplayer()
+            todayModel.refreshPending()
+            healthModel.refreshPending()
         }
         // EVERY successful fetch and every mutation lands a new server snapshot, and
         // each one is pushed. Not gated on the Today tab being selected: the wrist's
         // list has to be right whichever tab the phone happens to be showing, and a
         // context push is a dictionary written to a mailbox, not a network call.
-        .onChange(of: todayModel.serverSnapshot) { _, _ in watchLink?.pushCurrent() }
+        .onChange(of: todayModel.serverSnapshot) { _, _ in
+            watchLink?.pushCurrent()
+            // A fetch that produced a document is the strongest evidence there is that
+            // the bridge is reachable — better than the probe, and earlier than the next
+            // path event. It is one of the four replay triggers for that reason.
+            if !todayModel.isReadOnly { replayNow() }
+        }
     }
 
     /// Build the wrist link once and point the WatchConnectivity delegate at it.
@@ -125,9 +171,42 @@ struct RootTabView: View {
     /// The delegate is an app-lifetime singleton created at launch, long before this
     /// view exists, so the wiring is done from here — the one place that holds the
     /// day model the wrist must write through.
+    /// Build the replayer and point the coordinator's box at it.
+    ///
+    /// It is built HERE, and not in `JesseApp`, because it needs both dashboard models —
+    /// the day model to write through and the diet model to read the live diet day from —
+    /// and this view is the one place that owns both.
+    private func buildTheReplayer() {
+        guard replayer == nil, let replayerBox else { return }
+        let built = IntentReplayer(
+            store: Self.pendingStore,
+            day: todayModel,
+            makeClient: { JesseBridgeClient(config: ConfigStore.load(),
+                                            snapshotCache: SnapshotCache.shared) },
+            tell: CoordinatorTellSender(coordinator: coordinator,
+                                        context: AppModelContextProvider()),
+            dietDay: { healthModel.captureDay })
+        replayer = built
+        replayerBox.adopt(built)
+    }
+
+    /// Drain the queue now and repaint both tabs. Called on the two triggers this view
+    /// owns — a fetch that proved the bridge is back, and a per-row Retry — while the
+    /// path-satisfied event and the background task reach the same replayer through the
+    /// coordinator's box.
+    private func replayNow() {
+        guard let replayer, !replayer.isReplaying else { return }
+        Task {
+            await replayer.replayAll()
+            todayModel.refreshPending()
+            healthModel.refreshPending()
+        }
+    }
+
     private func connectTheWatch() {
         guard watchLink == nil else { return }
         let link = TodayWatchLink(model: todayModel,
+                                  pending: Self.pendingStore,
                                   push: { PhoneWatchConnectivity.shared.pushToday($0) })
         watchLink = link
         PhoneWatchConnectivity.shared.onTodayCheck = { check in
@@ -145,9 +224,11 @@ struct RootTabView: View {
         case .chats:
             ContentView()
         case .health:
-            HealthTabView(isActive: selection == .health)
+            HealthTabView(isActive: selection == .health, model: healthModel,
+                          onReplay: replayNow)
         case .today:
-            TodayTabView(isActive: selection == .today, model: todayModel)
+            TodayTabView(isActive: selection == .today, model: todayModel,
+                         onReplay: replayNow)
         }
     }
 
@@ -186,8 +267,10 @@ struct StoreErrorBanner: View {
 
 #Preview {
     RootTabView()
+        .environment(RunCoordinator())
 }
 
 #Preview("Store error") {
     RootTabView(storeError: NSError(domain: "preview", code: 1))
+        .environment(RunCoordinator())
 }
