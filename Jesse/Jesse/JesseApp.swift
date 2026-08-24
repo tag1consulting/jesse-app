@@ -12,12 +12,15 @@ struct JesseApp: App {
     // The offline capture queue's replayer, held in a box because of the order things
     // are built in: the coordinator exists before any view does, and the replayer needs
     // the two dashboard models that `RootTabView` owns. See `IntentReplayerBox`.
-    @State private var replayerBox = IntentReplayerBox()
+    @State private var replayerBox: IntentReplayerBox
 
     // App-scoped so in-flight runs outlive the view that started them. The
     // first-successful-turn hook is the moment we ask for push authorization.
     @State private var coordinator: RunCoordinator
 
+    // Both are built HERE rather than as property defaults, because the coordinator has
+    // to be handed the SAME box the tab bar later fills — two separate defaults would
+    // give it one nobody ever points at a replayer.
     init() {
         let box = IntentReplayerBox()
         _replayerBox = State(initialValue: box)

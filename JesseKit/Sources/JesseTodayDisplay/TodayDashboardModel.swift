@@ -715,6 +715,7 @@ public final class TodayDashboardModel {
     /// either confirms it (the overlay entry retires) or contradicts it (the next
     /// snapshot wins). A tap on an item with no ETag in hand is dropped rather than
     /// sent: without one the bridge answers `428`, and the honest thing is to refetch.
+    ///
     /// `intentId` is the id an OFFLINE CAPTURE would be stored under. It exists for one
     /// caller: a check made on the WRIST, which carries its own `intentId` and whose
     /// transport redelivers. Storing the capture under that id is what makes a
