@@ -160,6 +160,8 @@ nonisolated struct HealthContextProvider: HealthContextProviding {
     }
 
     /// Total asleep minutes per night over the last `days` days (one point/day).
+    /// The per-day totals go through the same `SleepReducer` union as last night's
+    /// summary — this series had the identical double count, once per extra writer.
     private static func dailySleepMinutes(days: Int) async throws -> [MetricSeriesPoint] {
         let cal = Calendar.current
         let now = Date()
@@ -175,18 +177,7 @@ nonisolated struct HealthContextProvider: HealthContextProviding {
             }
             store.execute(q)
         }
-        let asleep: Set<Int> = [
-            HKCategoryValueSleepAnalysis.asleepDeep.rawValue,
-            HKCategoryValueSleepAnalysis.asleepREM.rawValue,
-            HKCategoryValueSleepAnalysis.asleepCore.rawValue,
-            HKCategoryValueSleepAnalysis.asleepUnspecified.rawValue,
-        ]
-        var byDay: [Date: Double] = [:]
-        for s in samples where asleep.contains(s.value) {
-            let day = cal.startOfDay(for: s.endDate)
-            byDay[day, default: 0] += s.endDate.timeIntervalSince(s.startDate) / 60
-        }
-        return byDay.map { MetricSeriesPoint(date: $0.key, value: $0.value) }
+        return SleepReducer.dailyMinutes(samples.map(sleepSample(from:)), calendar: cal)
     }
 
     /// One point per workout over the last `days` days (value = duration minutes).
@@ -338,45 +329,19 @@ nonisolated struct HealthContextProvider: HealthContextProviding {
         return Self.reduceSleep(samples)
     }
 
-    /// Reduce raw sleep-stage samples to the most recent session's stage minutes.
-    /// Samples are newest-first; a gap over an hour ends the session. Only "asleep"
-    /// and "awake" stages count (bare "in bed" is ignored). Returns nil when the
-    /// session holds no actual sleep.
+    /// Map HealthKit's samples into the pure `SleepSample` value type and hand them
+    /// to `SleepReducer`, which owns every rule (session grouping, the interval
+    /// union that stops two writers double-counting the same night, and the
+    /// single-source stage breakdown). Nothing is decided here.
     private static func reduceSleep(_ samples: [HKCategorySample]) -> SleepSummary? {
-        // Group the newest contiguous run (gap ≤ 1h between adjacent samples).
-        var session: [HKCategorySample] = []
-        var boundary: Date?
-        for s in samples { // newest-first
-            if let b = boundary, b.timeIntervalSince(s.endDate) > 3600 { break }
-            session.append(s)
-            boundary = min(boundary ?? s.startDate, s.startDate)
-        }
-        guard !session.isEmpty else { return nil }
+        SleepReducer.reduce(samples.map(sleepSample(from:)), timeZone: .current)
+    }
 
-        func minutes(_ values: Set<Int>) -> Double {
-            session.filter { values.contains($0.value) }
-                .reduce(0) { $0 + $1.endDate.timeIntervalSince($1.startDate) } / 60
-        }
-        let deep = minutes([HKCategoryValueSleepAnalysis.asleepDeep.rawValue])
-        let rem = minutes([HKCategoryValueSleepAnalysis.asleepREM.rawValue])
-        let core = minutes([HKCategoryValueSleepAnalysis.asleepCore.rawValue])
-        let unspecified = minutes([HKCategoryValueSleepAnalysis.asleepUnspecified.rawValue])
-        let awake = minutes([HKCategoryValueSleepAnalysis.awake.rawValue])
-        let asleep = deep + rem + core + unspecified
-        guard asleep > 0 else { return nil }
-
-        let sStart = session.map(\.startDate).min() ?? Date()
-        let sEnd = session.map(\.endDate).max() ?? Date()
-        let midpoint = Date(timeIntervalSince1970:
-            (sStart.timeIntervalSince1970 + sEnd.timeIntervalSince1970) / 2)
-        let isNap = SleepClassifier.isNap(totalMinutes: asleep, midpoint: midpoint, timeZone: .current)
-        return SleepSummary(
-            totalMinutes: asleep,
-            deepMinutes: deep > 0 ? deep : nil,
-            remMinutes: rem > 0 ? rem : nil,
-            coreMinutes: core > 0 ? core : nil,
-            awakeMinutes: awake > 0 ? awake : nil,
-            isNap: isNap)
+    /// The one HealthKit-shaped step: a category sample's span, stage value, and the
+    /// bundle identifier of the app that wrote it.
+    private static func sleepSample(from s: HKCategorySample) -> SleepSample {
+        SleepSample(start: s.startDate, end: s.endDate, value: s.value,
+                    sourceID: s.sourceRevision.source.bundleIdentifier)
     }
 
     // MARK: HR events (last 7 days)
