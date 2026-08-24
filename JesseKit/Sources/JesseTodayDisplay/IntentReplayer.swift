@@ -161,6 +161,11 @@ public final class IntentReplayer {
     private func replayDayFileWrite(_ intent: PendingIntentRecord) async -> IntentReplayOutcome {
         guard let itemId = intent.itemId else { return .refused(Self.noItemNotice) }
         let client = makeClient()
+        // FETCHED PER INTENT, not once for the run. Every write invalidates the ETag it
+        // used, so a second intent carrying the first one's tag would earn a `412` by
+        // construction — and the day it is judged against must be the day it is written
+        // to, not the day the run started on. A run that straddles the morning rebuild is
+        // exactly when that matters.
         guard let live = await fetch(client) else { return .deferred }
         guard let etag = live.etag, !etag.isEmpty else { return .deferred }
 
