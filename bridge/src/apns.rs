@@ -305,8 +305,9 @@ impl ApnsClient {
         device_token: &str,
         job_id: &str,
         artifacts: &[Artifact],
+        summary: PushSummary<'_>,
     ) -> PushOutcome {
-        self.push_payload(device_token, build_apns_payload(job_id, artifacts))
+        self.push_payload(device_token, build_apns_payload(job_id, artifacts, summary))
             .await
     }
 
@@ -408,18 +409,21 @@ pub fn mint_apns_jwt(
 /// next opened. The alert is unchanged by it: an alert push with `content-available: 1`
 /// is still shown, and additionally wakes the app for a bounded background fetch.
 ///
-/// A turn that returned files NAMES them, and carries nothing else about them — no id, no
-/// size, and certainly no bytes. A push is a lock-screen line: "Jesse finished — chart.png"
-/// is the whole useful difference between it and "Jesse finished", and everything else the
-/// app already has (or fetches) once the tap opens the thread.
+/// A turn that returned files gets a compact `[2 files]` suffix rather than a list of
+/// names: the summary is what the notification is FOR, and the names were only ever
+/// standing in for it. The names survive in the fallback below, where there is no summary
+/// to spend the space on.
 ///
-/// The list is bounded so a ten-file turn cannot push the alert past what a lock screen
-/// shows, and each name is stripped of control characters: the filename is the MODEL's,
-/// and this one reaches a notification.
-pub fn build_apns_payload(job_id: &str, artifacts: &[Artifact]) -> Vec<u8> {
+/// The body is model-authored text landing on a lock screen, so it is sanitized rather
+/// than interpolated — see [`push_summary_snippet`].
+pub fn build_apns_payload(
+    job_id: &str,
+    artifacts: &[Artifact],
+    summary: PushSummary<'_>,
+) -> Vec<u8> {
     json!({
         "aps": {
-            "alert": { "title": "Jesse", "body": push_body(artifacts) },
+            "alert": { "title": "Jesse", "body": completion_body(summary, artifacts) },
             "sound": "default",
             "content-available": 1
         },
@@ -429,10 +433,145 @@ pub fn build_apns_payload(job_id: &str, artifacts: &[Artifact]) -> Vec<u8> {
     .into_bytes()
 }
 
+/// What a completion push has to say about the turn it is reporting on: the reply the
+/// person would have read, or the error that stopped it. Borrowed and `Copy` — the text
+/// is already owned by the terminal job state this is read from.
+#[derive(Clone, Copy)]
+pub enum PushSummary<'a> {
+    /// The RAW reply text off `JobState::Done`. Raw and not delivered on purpose: this
+    /// type is the seam, and [`completion_body`] runs it through `delivered_text` so the
+    /// notification and the chat bubble can never disagree about what the reply was.
+    Reply(&'a str),
+    /// The error off `JobState::Failed`.
+    Failure(&'a str),
+}
+
+/// The alert body for a terminal turn: what it said, in its own words.
+///
+/// Two invariants, in this order:
+///
+/// 1. **Never blank.** A summary that sanitizes away to nothing (a reply that was one
+///    code fence, an empty error) falls back to the artifact line this used to always
+///    emit, so the worst case is exactly the old behaviour rather than a bodyless alert.
+/// 2. **Never wrong about the outcome.** A failure says so first, and its blank-summary
+///    fallback is "Jesse failed" and not the artifact line — "Jesse finished" on a turn
+///    that failed is worse than useless, which is the same reason the scheduler's alert
+///    always names its reason.
+fn completion_body(summary: PushSummary<'_>, artifacts: &[Artifact]) -> String {
+    let (text, prefix) = match summary {
+        PushSummary::Reply(raw) => (delivered_text(raw), ""),
+        PushSummary::Failure(error) => (error.to_string(), "Failed: "),
+    };
+    let snippet = push_summary_snippet(&text);
+    if snippet.is_empty() {
+        return match summary {
+            PushSummary::Reply(_) => push_body(artifacts),
+            PushSummary::Failure(_) => "Jesse failed".to_string(),
+        };
+    }
+    format!("{prefix}{snippet}{}", artifact_suffix(artifacts))
+}
+
 /// How many returned filenames one alert names before it says "and N more".
 pub const MAX_PUSH_ARTIFACT_NAMES: usize = 3;
 
-/// The alert body for a finished turn.
+/// Longest summary text carried into an alert body, matching [`MAX_PUSH_REASON_CHARS`]:
+/// a lock screen shows two to four lines whatever is sent, and the tap opens the full
+/// reply anyway.
+pub const MAX_PUSH_SUMMARY_CHARS: usize = 180;
+
+/// Turn model-authored text into ONE lock-screen line.
+///
+/// Four transformations, and the order between the first two matters:
+///
+/// * **Whitespace to spaces, then control characters dropped.** A newline is a word
+///   break before it is a control character; filtering first would weld `"one\ntwo"`
+///   into `"onetwo"`. Everything else non-printing goes, for the same reason the
+///   artifact-name path has always stripped it — this string is the MODEL's and it
+///   reaches a notification.
+/// * **Whitespace runs collapsed**, so a wrapped paragraph reads as a sentence.
+/// * **Leading Markdown decoration removed**, so a reply that opens `## Done` does not
+///   put `##` on the lock screen.
+/// * **Truncated on a word boundary** with an ellipsis, never mid-word.
+///
+/// Returns an empty string when nothing survives; callers must have a fallback.
+pub fn push_summary_snippet(text: &str) -> String {
+    let flattened: String = text
+        .chars()
+        .map(|c| if c.is_whitespace() { ' ' } else { c })
+        .filter(|c| !c.is_control())
+        .collect();
+    let collapsed = flattened.split_whitespace().collect::<Vec<_>>().join(" ");
+    let stripped = strip_leading_markdown(&collapsed);
+    truncate_on_word_boundary(stripped, MAX_PUSH_SUMMARY_CHARS)
+}
+
+/// Drop the Markdown decoration a reply OPENS with — headings, fences, blockquote
+/// markers, bullets, thematic breaks — repeatedly, since `"> ## Done"` is all three.
+fn strip_leading_markdown(s: &str) -> &str {
+    let mut rest = s.trim_start();
+    while let Some(next) = strip_one_marker(rest) {
+        let next = next.trim_start();
+        if next.len() == rest.len() {
+            break; // no progress — stop rather than spin
+        }
+        rest = next;
+    }
+    rest
+}
+
+/// One marker off the front, or `None` when the text does not open with one.
+///
+/// `-` and `*` are deliberately conditional: a bullet is followed by whitespace and a
+/// thematic break is three or more, but `-5°C overnight` opens with a minus sign and
+/// must keep it. Emphasis (`**Done**`) is left alone on purpose — stripping the opening
+/// pair would leave the closing one dangling, which reads worse than both.
+fn strip_one_marker(rest: &str) -> Option<&str> {
+    let first = rest.chars().next()?;
+    match first {
+        // A run of these is decoration whatever follows it.
+        '#' | '`' => Some(rest.trim_start_matches(first)),
+        '>' => Some(&rest[1..]),
+        '-' | '*' | '+' | '_' => {
+            let run = rest.chars().take_while(|c| *c == first).count();
+            let after = &rest[run..];
+            let is_break = run >= 3;
+            let is_bullet = run == 1 && (after.is_empty() || after.starts_with(' '));
+            (is_break || is_bullet).then_some(after)
+        }
+        _ => None,
+    }
+}
+
+/// Cut to at most `max` characters on a word boundary, appending an ellipsis. The
+/// ellipsis is inside the budget, so the result never exceeds `max`. A single word
+/// longer than the budget is cut mid-word — there is no boundary to find.
+fn truncate_on_word_boundary(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let head: String = s.chars().take(max.saturating_sub(1)).collect();
+    // `' '` is ASCII, so this byte index is always a char boundary.
+    let cut = match head.rfind(' ') {
+        Some(i) if i > 0 => &head[..i],
+        _ => head.as_str(),
+    };
+    format!("{}…", cut.trim_end())
+}
+
+/// The compact file count appended to a summary: ` [1 file]`, ` [3 files]`, or nothing.
+/// A count and not a list — the summary earns the space the names used to take.
+fn artifact_suffix(artifacts: &[Artifact]) -> String {
+    match artifacts.len() {
+        0 => String::new(),
+        1 => " [1 file]".to_string(),
+        n => format!(" [{n} files]"),
+    }
+}
+
+/// The alert body when there is no usable summary: the pre-summary behaviour, verbatim.
+/// A push must never regress to blank, so this stays as the floor under
+/// [`completion_body`] rather than being replaced by it.
 fn push_body(artifacts: &[Artifact]) -> String {
     if artifacts.is_empty() {
         return "Jesse finished".to_string();
@@ -511,7 +650,10 @@ pub fn wants_prefetch(schedule_id: &str, jobs: &[String]) -> bool {
 ///
 /// The body always names the outcome, and a failure or skip always names its reason —
 /// "Jesse finished" would be worse than useless for the failure this feature exists to
-/// make visible.
+/// make visible. A CLEAN run has no reason to name, and for that case `summary` carries
+/// what the turn actually reported: the body becomes the sanitized reply and the id and
+/// outcome move into the title, so the morning chain says what it found rather than only
+/// that it happened.
 ///
 /// `prefetch` adds a top-level `prefetch` array naming the snapshots the phone should
 /// refresh on arrival (see [`PREFETCH_SNAPSHOTS`]). It is a HINT and nothing more: the
@@ -524,16 +666,31 @@ pub fn build_scheduled_payload(
     reason: &str,
     job_id: Option<&str>,
     prefetch: bool,
+    summary: Option<&str>,
 ) -> Vec<u8> {
     let reason: String = reason.trim().chars().take(MAX_PUSH_REASON_CHARS).collect();
-    let body = if reason.is_empty() {
-        format!("{schedule_id} {outcome}")
+    // A REASON OUTRANKS THE SUMMARY, and it is only ever set on a run that failed, was
+    // skipped, or produced no output. Those alerts exist to make the reason visible; the
+    // summary would bury it under whatever the turn happened to say on its way down.
+    // With no reason — a clean `ran`, which is the case worth reading — the summary
+    // becomes the body and the id + outcome move up into the title.
+    let snippet = match summary.filter(|_| reason.is_empty()) {
+        Some(raw) => push_summary_snippet(&delivered_text(raw)),
+        None => String::new(),
+    };
+    let (title, body) = if snippet.is_empty() {
+        let body = if reason.is_empty() {
+            format!("{schedule_id} {outcome}")
+        } else {
+            format!("{schedule_id} {outcome} — {reason}")
+        };
+        ("Jesse schedule".to_string(), body)
     } else {
-        format!("{schedule_id} {outcome} — {reason}")
+        (format!("{schedule_id} {outcome}"), snippet)
     };
     let mut payload = json!({
         "aps": {
-            "alert": { "title": "Jesse schedule", "body": body },
+            "alert": { "title": title, "body": body },
             "sound": "default",
             "content-available": 1
         },
@@ -616,15 +773,25 @@ pub async fn notify_if_complete(
     job_id: &str,
 ) {
     let Some(apns) = apns else { return };
-    // The returned files' NAMES, for the alert body. Read from the same terminal state the
-    // pushability check reads, so the alert can never name a file a different state
-    // produced.
-    let artifacts = match jobs.get(job_id) {
+    // WHAT THE TURN SAID, and the files it returned. Both read from the same terminal
+    // state the pushability check reads, so the alert can never describe a different
+    // state than the one that made it pushable. The reply text was always here — it is
+    // carried on `Done` beside the artifacts — and was simply not being read.
+    let (artifacts, text) = match jobs.get(job_id) {
         Some(state) if job_state_is_pushable(&state) => match state {
-            JobState::Done { artifacts, .. } => artifacts,
-            _ => Vec::new(),
+            JobState::Done {
+                artifacts,
+                response,
+                ..
+            } => (artifacts, Ok(response)),
+            JobState::Failed { error, .. } => (Vec::new(), Err(error)),
+            _ => (Vec::new(), Ok(String::new())),
         },
         _ => return, // running / cancelled / gone — nothing to push (yet)
+    };
+    let summary = match &text {
+        Ok(response) => PushSummary::Reply(response),
+        Err(error) => PushSummary::Failure(error),
     };
     if !notify.take(job_id) {
         return; // not flagged, or another path already pushed
@@ -633,7 +800,7 @@ pub async fn notify_if_complete(
         eprintln!("push: job {job_id} flagged but no device registered — skipping");
         return;
     };
-    match apns.push(&token, job_id, &artifacts).await {
+    match apns.push(&token, job_id, &artifacts, summary).await {
         PushOutcome::Sent => eprintln!("push: completion alert sent for job {job_id}"),
         PushOutcome::DeadToken => {
             // APNs reports the token is dead (410). Clear it so it isn't retried
@@ -802,19 +969,164 @@ mod tests {
         .verify(signing_input.as_bytes(), &sig)
         .expect("minted JWT must verify under its own public key");
     }
+    /// A body helper for the tests below: what the lock screen would show.
+    fn body_of(payload: &[u8]) -> String {
+        let v: Value = serde_json::from_slice(payload).unwrap();
+        v["aps"]["alert"]["body"].as_str().unwrap().to_string()
+    }
     #[test]
     fn apns_payload_has_alert_and_job_id() {
-        let payload = build_apns_payload("job-xyz", &[]);
+        let payload = build_apns_payload("job-xyz", &[], PushSummary::Reply(""));
         let v: Value = serde_json::from_slice(&payload).unwrap();
         assert_eq!(v["aps"]["alert"]["title"], "Jesse");
         assert_eq!(v["aps"]["alert"]["body"], "Jesse finished");
         assert_eq!(v["aps"]["sound"], "default");
         assert_eq!(v["job_id"], "job-xyz");
     }
-    /// A turn that returned files NAMES them on the lock screen, and carries nothing else
-    /// about them — no id, no size, no bytes. The list is bounded and control characters
-    /// are stripped, because the filename is the MODEL's and this one reaches a
-    /// notification.
+
+    /// THE POINT OF THE FEATURE: the body is what the turn said, not a fixed string.
+    #[test]
+    fn body_is_the_reply_not_a_fixed_string() {
+        let body = body_of(&build_apns_payload(
+            "j",
+            &[],
+            PushSummary::Reply("Rebooted the router; the study is back on the network."),
+        ));
+        assert_eq!(
+            body,
+            "Rebooted the router; the study is back on the network."
+        );
+        assert!(!body.starts_with("Jesse finished"));
+    }
+
+    /// A multi-line reply becomes ONE line, and a newline is a word break before it is a
+    /// control character — collapsing it away would weld two words together.
+    #[test]
+    fn a_multi_line_reply_collapses_to_one_line() {
+        let body = body_of(&build_apns_payload(
+            "j",
+            &[],
+            PushSummary::Reply("Checked the vault.\n\nThree notes\tneed   titles."),
+        ));
+        assert_eq!(body, "Checked the vault. Three notes need titles.");
+        assert!(!body.contains('\n') && !body.contains('\r'));
+    }
+
+    /// Model-authored text reaching a lock screen is stripped of control characters, the
+    /// same rule the artifact-name path has always applied and for the same reason.
+    #[test]
+    fn control_characters_are_stripped_from_the_summary() {
+        let body = body_of(&build_apns_payload(
+            "j",
+            &[],
+            PushSummary::Reply("done\u{7}\u{0}: all\u{1b}[31m clear"),
+        ));
+        assert_eq!(body, "done: all[31m clear");
+        assert!(!body.chars().any(|c| c.is_control()), "{body:?}");
+    }
+
+    /// A reply that OPENS with Markdown decoration does not put it on the lock screen.
+    #[test]
+    fn leading_markdown_decoration_is_stripped() {
+        let cases = [
+            (
+                "## Done\n\nThe backup finished.",
+                "Done The backup finished.",
+            ),
+            ("> ### Summary: two files", "Summary: two files"),
+            ("- fixed the sync bug", "fixed the sync bug"),
+            ("```\nls -la\n```", "ls -la ```"),
+        ];
+        for (raw, want) in cases {
+            assert_eq!(
+                body_of(&build_apns_payload("j", &[], PushSummary::Reply(raw))),
+                want,
+                "raw = {raw:?}"
+            );
+        }
+        // A minus sign that opens a MEASUREMENT is not a bullet and is kept.
+        assert_eq!(
+            body_of(&build_apns_payload(
+                "j",
+                &[],
+                PushSummary::Reply("-5°C overnight, so the pipes were lagged.")
+            )),
+            "-5°C overnight, so the pipes were lagged."
+        );
+    }
+
+    /// Long text is cut on a WORD boundary with an ellipsis, and the ellipsis is inside
+    /// the budget rather than pushing the body past it.
+    #[test]
+    fn a_long_reply_truncates_on_a_word_boundary() {
+        let raw = "alpha ".repeat(80);
+        let body = body_of(&build_apns_payload("j", &[], PushSummary::Reply(&raw)));
+        assert!(body.chars().count() <= MAX_PUSH_SUMMARY_CHARS, "{body:?}");
+        assert!(body.ends_with('…'), "{body:?}");
+        assert!(
+            body.trim_end_matches('…').ends_with("alpha"),
+            "cut between words, never mid-word: {body:?}"
+        );
+    }
+
+    /// THE BLANK-BODY REGRESSION. A reply that sanitizes away to nothing falls back to
+    /// the pre-summary line verbatim — a push must never arrive with an empty body.
+    #[test]
+    fn a_summary_that_sanitizes_to_empty_falls_back() {
+        for raw in ["", "   \n\t  ", "\u{7}\u{0}", "```", "## ", "---"] {
+            assert_eq!(
+                body_of(&build_apns_payload("j", &[], PushSummary::Reply(raw))),
+                "Jesse finished",
+                "raw = {raw:?}"
+            );
+        }
+        // With files, the fallback is still the NAMES — that is what the space is for
+        // when there is no summary to spend it on.
+        let art = Artifact {
+            id: random_hex(),
+            filename: "chart.png".into(),
+            mime: "image/png".into(),
+            bytes: 1,
+            sha256: "ff".into(),
+        };
+        assert_eq!(
+            body_of(&build_apns_payload("j", &[art], PushSummary::Reply("```"))),
+            "Jesse finished — chart.png"
+        );
+    }
+
+    /// The machine directives the person never sees are off the body too, because it is
+    /// derived through the same `delivered_text` the chat bubble is.
+    #[test]
+    fn the_summary_is_the_delivered_text() {
+        let raw = "The battery is low.\nSPOKEN: The battery is low.";
+        assert_eq!(
+            body_of(&build_apns_payload("j", &[], PushSummary::Reply(raw))),
+            "The battery is low."
+        );
+    }
+
+    /// A FAILED turn says so first, and never borrows "Jesse finished".
+    #[test]
+    fn a_failed_job_leads_with_failed() {
+        assert_eq!(
+            body_of(&build_apns_payload(
+                "j",
+                &[],
+                PushSummary::Failure("claude exited 1: model overloaded")
+            )),
+            "Failed: claude exited 1: model overloaded"
+        );
+        // Even with nothing to say, it does not claim the turn finished.
+        assert_eq!(
+            body_of(&build_apns_payload("j", &[], PushSummary::Failure("  "))),
+            "Jesse failed"
+        );
+    }
+    /// With NO summary to show, a turn that returned files still names them, and carries
+    /// nothing else about them — no id, no size, no bytes. The list is bounded and
+    /// control characters are stripped, because the filename is the MODEL's and this one
+    /// reaches a notification.
     #[test]
     fn payload_names_returned_files_and_nothing_more() {
         let art = |name: &str| Artifact {
@@ -824,7 +1136,7 @@ mod tests {
             bytes: 1,
             sha256: "ff".into(),
         };
-        let one = build_apns_payload("j", &[art("chart.png")]);
+        let one = build_apns_payload("j", &[art("chart.png")], PushSummary::Reply(""));
         let v: Value = serde_json::from_slice(&one).unwrap();
         assert_eq!(v["aps"]["alert"]["body"], "Jesse finished — chart.png");
         // Nothing about the artifact rides the push except its name.
@@ -832,22 +1144,59 @@ mod tests {
         assert!(!s.contains("sha256") && !s.contains("image/png") && !s.contains("bytes"));
 
         let many: Vec<Artifact> = (0..5).map(|i| art(&format!("f{i}.png"))).collect();
-        let v: Value = serde_json::from_slice(&build_apns_payload("j", &many)).unwrap();
+        let v: Value =
+            serde_json::from_slice(&build_apns_payload("j", &many, PushSummary::Reply("")))
+                .unwrap();
         assert_eq!(
             v["aps"]["alert"]["body"], "Jesse finished — f0.png, f1.png, f2.png and 2 more",
             "the list is bounded so one turn cannot overrun a lock-screen alert"
         );
 
         // A crafted filename cannot forge extra lines in the alert.
-        let v: Value =
-            serde_json::from_slice(&build_apns_payload("j", &[art("a\nb\rc.png")])).unwrap();
+        let v: Value = serde_json::from_slice(&build_apns_payload(
+            "j",
+            &[art("a\nb\rc.png")],
+            PushSummary::Reply(""),
+        ))
+        .unwrap();
         let body = v["aps"]["alert"]["body"].as_str().unwrap();
         assert!(!body.contains('\n') && !body.contains('\r'), "{body:?}");
 
         // A name that sanitizes to nothing degrades to the plain line rather than a
         // dangling em dash.
-        let v: Value = serde_json::from_slice(&build_apns_payload("j", &[art("\u{7}")])).unwrap();
+        let v: Value = serde_json::from_slice(&build_apns_payload(
+            "j",
+            &[art("\u{7}")],
+            PushSummary::Reply(""),
+        ))
+        .unwrap();
         assert_eq!(v["aps"]["alert"]["body"], "Jesse finished");
+    }
+
+    /// WITH a summary, the files become a count and the summary takes the space. The
+    /// names are one tap away; what the turn said is not.
+    #[test]
+    fn files_become_a_count_when_there_is_a_summary() {
+        let art = |name: &str| Artifact {
+            id: random_hex(),
+            filename: name.to_string(),
+            mime: "image/png".into(),
+            bytes: 1,
+            sha256: "ff".into(),
+        };
+        let reply = PushSummary::Reply("Charted the week's weight and the trend line.");
+        assert_eq!(
+            body_of(&build_apns_payload("j", &[art("chart.png")], reply)),
+            "Charted the week's weight and the trend line. [1 file]"
+        );
+        assert_eq!(
+            body_of(&build_apns_payload(
+                "j",
+                &[art("chart.png"), art("table.csv")],
+                reply
+            )),
+            "Charted the week's weight and the trend line. [2 files]"
+        );
     }
     /// EVERY push the bridge sends carries `content-available: 1`, and it is inside `aps`
     /// (a top-level key of that name means nothing to iOS). This is the whole mechanism by
@@ -863,10 +1212,18 @@ mod tests {
             sha256: "ff".into(),
         };
         let payloads = [
-            build_apns_payload("j", &[]),
-            build_apns_payload("j", &[art]),
-            build_scheduled_payload("morning-start-of-day", "ok", "", Some("j"), false),
-            build_scheduled_payload("morning-start-of-day", "ok", "", None, true),
+            build_apns_payload("j", &[], PushSummary::Reply("")),
+            build_apns_payload("j", &[art], PushSummary::Reply("all done")),
+            build_apns_payload("j", &[], PushSummary::Failure("boom")),
+            build_scheduled_payload("morning-start-of-day", "ok", "", Some("j"), false, None),
+            build_scheduled_payload(
+                "morning-start-of-day",
+                "ok",
+                "",
+                None,
+                true,
+                Some("the day file is rebuilt"),
+            ),
             build_escalation_payload("nightly", 3, "timed out"),
             build_reload_failure_payload("bad toml"),
         ];
@@ -890,16 +1247,28 @@ mod tests {
     /// job the operator listed.
     #[test]
     fn scheduled_payload_carries_prefetch_only_when_asked() {
-        let with: Value =
-            serde_json::from_slice(&build_scheduled_payload("m", "ok", "", Some("j"), true))
-                .unwrap();
+        let with: Value = serde_json::from_slice(&build_scheduled_payload(
+            "m",
+            "ok",
+            "",
+            Some("j"),
+            true,
+            None,
+        ))
+        .unwrap();
         assert_eq!(with["prefetch"], json!(["today", "diet"]));
         assert_eq!(with["job_id"], "j", "the deep link is unaffected");
         assert_eq!(with["schedule_id"], "m");
 
-        let without: Value =
-            serde_json::from_slice(&build_scheduled_payload("m", "ok", "", Some("j"), false))
-                .unwrap();
+        let without: Value = serde_json::from_slice(&build_scheduled_payload(
+            "m",
+            "ok",
+            "",
+            Some("j"),
+            false,
+            None,
+        ))
+        .unwrap();
         assert!(
             without.get("prefetch").is_none(),
             "absent, not an empty array — a phone reading `prefetch` at all must not \
@@ -920,10 +1289,72 @@ mod tests {
             "already ran",
             None,
             true,
+            None,
         ))
         .unwrap();
         assert!(v.get("job_id").is_none());
         assert_eq!(v["prefetch"], json!(["today", "diet"]));
+    }
+
+    /// A CLEAN scheduled run says what it reported. The id and outcome move into the
+    /// title so the body is all summary — "morning-start-of-day ran" was true and told
+    /// nobody anything.
+    #[test]
+    fn a_clean_scheduled_run_pushes_its_summary() {
+        let v: Value = serde_json::from_slice(&build_scheduled_payload(
+            "morning-start-of-day",
+            "ran",
+            "",
+            Some("j"),
+            false,
+            Some("## Today\n\nTwo meetings, and the vault lint is clean."),
+        ))
+        .unwrap();
+        assert_eq!(v["aps"]["alert"]["title"], "morning-start-of-day ran");
+        assert_eq!(
+            v["aps"]["alert"]["body"],
+            "Today Two meetings, and the vault lint is clean."
+        );
+        assert_eq!(v["job_id"], "j", "the deep link is unaffected");
+    }
+
+    /// A REASON OUTRANKS THE SUMMARY. Every alert that carries one is about a failure, a
+    /// skip or a missing output, and burying that under the turn's parting words is
+    /// exactly the regression the reason exists to prevent.
+    #[test]
+    fn a_reason_still_wins_over_the_summary() {
+        let v: Value = serde_json::from_slice(&build_scheduled_payload(
+            "overnight-vault-lint",
+            "fired-no-output",
+            "the turn completed but wrote nothing matching Reports/*.md",
+            Some("j"),
+            false,
+            Some("All good, nothing to report."),
+        ))
+        .unwrap();
+        assert_eq!(v["aps"]["alert"]["title"], "Jesse schedule");
+        assert_eq!(
+            v["aps"]["alert"]["body"],
+            "overnight-vault-lint fired-no-output — the turn completed but wrote nothing \
+             matching Reports/*.md"
+        );
+    }
+
+    /// A scheduled summary that sanitizes to nothing degrades to the line it always was,
+    /// never to a blank body.
+    #[test]
+    fn an_empty_scheduled_summary_falls_back() {
+        let v: Value = serde_json::from_slice(&build_scheduled_payload(
+            "m",
+            "ran",
+            "",
+            None,
+            false,
+            Some("```"),
+        ))
+        .unwrap();
+        assert_eq!(v["aps"]["alert"]["title"], "Jesse schedule");
+        assert_eq!(v["aps"]["alert"]["body"], "m ran");
     }
 
     /// The list is matched EXACTLY. A prefix match would fire on a differently-named job
@@ -1000,6 +1431,42 @@ mod tests {
         assert!(
             String::from_utf8_lossy(&req.payload).contains(&id),
             "payload carries job_id"
+        );
+        // END TO END: the reply text was ALWAYS on the terminal state and was simply not
+        // being read. This asserts it now reaches the wire.
+        assert_eq!(
+            body_of(&req.payload),
+            "the answer",
+            "the body is what the turn said"
+        );
+    }
+
+    /// A FAILED flagged turn pushes its error, not "Jesse finished" — which is what it
+    /// pushed before, on the state whose whole point is that something went wrong.
+    #[tokio::test]
+    async fn a_failed_flagged_turn_pushes_its_error() {
+        let mock = MockApns::default();
+        let mut st = test_state();
+        st.apns = Some(test_apns(Arc::new(mock.clone())));
+        st.devices.set("abc123devicetoken".to_string());
+
+        let id = st.jobs.create();
+        st.jobs.complete(
+            &id,
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "claude exited 1: overloaded".to_string(),
+            )),
+        );
+        st.notify.insert(&id);
+
+        notify_if_complete(st.apns.as_deref(), &st.devices, &st.notify, &st.jobs, &id).await;
+
+        let calls = mock.calls.lock_ok();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            body_of(&calls[0].payload),
+            "Failed: claude exited 1: overloaded"
         );
     }
     #[tokio::test]
