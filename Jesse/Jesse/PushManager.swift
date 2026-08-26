@@ -10,14 +10,57 @@ import UserNotifications
 // the bridge's APNs unconfigured, the app behaves exactly as it did before — the
 // foreground `resume` still re-attaches a backgrounded turn.
 
-/// Carries a tapped notification's `job_id` from the AppDelegate (UIKit world)
+/// The routing keys a tapped notification carries.
+///
+/// TWO of them, because `job_id` alone cannot answer the question. The app resolves a job
+/// id through `RunCoordinator.inFlight` — the turns THIS DEVICE started and has not yet
+/// settled — and two whole classes of notification are not in that map:
+///
+/// * a **scheduled job**, which the phone never started, so it never had an entry;
+/// * an **already-settled turn**, whose entry background delivery removed the moment it
+///   wrote the reply — so tapping the banner afterwards found nothing.
+///
+/// `conversationId` names the conversation itself, which the app can fetch locally or
+/// adopt from the bridge if it has never seen it. Either id may be absent: an older
+/// bridge sends no conversation, and a skipped scheduled run has no turn and so no job.
+nonisolated struct PushTap: Equatable, Sendable {
+    let jobId: String?
+    let conversationId: String?
+
+    init(jobId: String?, conversationId: String?) {
+        self.jobId = jobId
+        self.conversationId = conversationId
+    }
+
+    /// Parse a tapped notification's payload, or `nil` when it carries neither id — an
+    /// alert with nothing to route on is an ordinary push, not an error.
+    ///
+    /// Trimmed and emptiness-checked, matching `BackgroundDelivery.Payload`: this reads
+    /// the least trustworthy dictionary the app ever sees, and a whitespace-only id is
+    /// no id at all.
+    init?(userInfo: [AnyHashable: Any]) {
+        let job = PushTap.id(userInfo[BackgroundDelivery.PayloadKey.jobId])
+        let conversation = PushTap.id(userInfo[BackgroundDelivery.PayloadKey.conversationId])
+        guard job != nil || conversation != nil else { return nil }
+        self.init(jobId: job, conversationId: conversation)
+    }
+
+    private static func id(_ value: Any?) -> String? {
+        guard let s = (value as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !s.isEmpty else { return nil }
+        return s
+    }
+}
+
+/// Carries a tapped notification's routing keys from the AppDelegate (UIKit world)
 /// into SwiftUI, where `ContentView` opens the matching thread and re-attaches.
 @MainActor
 final class PushRouter: ObservableObject {
     static let shared = PushRouter()
     /// Set when the user taps a "Jesse finished" notification; consumed (cleared)
-    /// by `ContentView`. Nil at rest.
-    @Published var pendingJobId: String?
+    /// by `ContentView` ONCE ROUTING HAS RESOLVED — not before, or a tap that arrives
+    /// during launch is dropped while the fallback chain is still awaiting. Nil at rest.
+    @Published var pendingTap: PushTap?
     private init() {}
 }
 
@@ -354,13 +397,14 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
         completionHandler([.banner, .sound])
     }
 
-    // A tap: hand the job_id to the router so ContentView opens the thread and
-    // re-attaches to fetch the finished reply.
+    // A tap: hand BOTH routing keys to the router so ContentView opens the thread and
+    // re-attaches to fetch the finished reply. Parsed through `PushTap`, which reads the
+    // keys `BackgroundDelivery.PayloadKey` names rather than spelling them again here.
     func userNotificationCenter(_ center: UNUserNotificationCenter,
                                 didReceive response: UNNotificationResponse,
                                 withCompletionHandler completionHandler: @escaping () -> Void) {
-        if let jobId = response.notification.request.content.userInfo["job_id"] as? String {
-            PushRouter.shared.pendingJobId = jobId
+        if let tap = PushTap(userInfo: response.notification.request.content.userInfo) {
+            PushRouter.shared.pendingTap = tap
         }
         completionHandler()
     }

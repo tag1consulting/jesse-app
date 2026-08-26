@@ -97,6 +97,18 @@ pub struct Job {
     // (`JobsInner::request_index`) when the job is reaped, so the index can never
     // outlive its job.
     pub request_id: Option<String>,
+    // THE CONVERSATION THIS TURN BELONGS TO, bound at creation and persisted with the
+    // result. It rides the completion push so a tap can open the right thread.
+    //
+    // It lives HERE, on the job, and is deliberately not read from the in-flight
+    // conversation table at push time: that table's entry is released when the turn ends,
+    // which is precisely the moment the push fires. On the job it is answerable from both
+    // push call sites — the completion path and the `POST /jesse/notify/{job_id}`
+    // race-closer, which has nothing but a job id — and it survives a bridge restart.
+    //
+    // `None` for a job created before this field existed, and for the handful of internal
+    // paths that create a job outside a turn.
+    pub conversation_id: Option<String>,
 }
 
 /// The jobs map plus the `request_id → job_id` dedup index, behind ONE lock so a
@@ -255,6 +267,10 @@ pub fn job_to_value(id: &str, job: &Job) -> Option<Value> {
         // (the index is rebuilt from these on load). Absent/null on a turn with no
         // request_id and on any persisted file written before this field existed.
         "request_id": job.request_id,
+        // The conversation this turn belongs to, so the completion push can still name it
+        // after a restart. Null on a job created outside a turn and on any file written
+        // before this field existed — read back the same additive way as `request_id`.
+        "conversation_id": job.conversation_id,
     }))
 }
 
@@ -327,6 +343,13 @@ pub fn value_to_job(v: &Value) -> Option<(String, Job)> {
         .get("request_id")
         .and_then(|r| r.as_str())
         .map(|s| s.to_string());
+    // Same additive read as `request_id`: absent/null/non-string → None. A job file from
+    // before this field simply lacks the key and loads with no conversation, which is
+    // exactly how a completion push behaved before it existed.
+    let conversation_id = v
+        .get("conversation_id")
+        .and_then(|c| c.as_str())
+        .map(|s| s.to_string());
     Some((
         id,
         Job {
@@ -334,6 +357,7 @@ pub fn value_to_job(v: &Value) -> Option<(String, Job)> {
             completed_at,
             first_retrieved_at,
             request_id,
+            conversation_id,
         },
     ))
 }
@@ -597,12 +621,35 @@ impl JobStore {
                 completed_at: None,
                 first_retrieved_at: None,
                 request_id: request_id.clone(),
+                conversation_id: None,
             },
         );
         if let Some(rid) = request_id {
             guard.request_index.insert(rid, id.clone());
         }
         CreateOutcome::Created(id)
+    }
+
+    /// Bind this job to the conversation its turn belongs to. Called once, right after
+    /// creation, while the id is still a live local on the start path — every turn goes
+    /// through `start_turn`, so a SCHEDULED fire is bound exactly like a phone turn even
+    /// though the phone never started it.
+    ///
+    /// Nothing is written to disk here: a running job is not persisted, and the field is
+    /// carried into the snapshot the terminal transition takes. A no-op for an id the
+    /// store no longer holds.
+    pub fn bind_conversation(&self, job_id: &str, conversation_id: &str) {
+        let mut guard = self.jobs.lock_ok();
+        if let Some(job) = guard.jobs.get_mut(job_id) {
+            job.conversation_id = Some(conversation_id.to_string());
+        }
+    }
+
+    /// The conversation this job's turn belongs to, or `None` for an unknown job, a job
+    /// created outside a turn, or one persisted before this field existed.
+    pub fn conversation_id(&self, job_id: &str) -> Option<String> {
+        let guard = self.jobs.lock_ok();
+        guard.jobs.get(job_id)?.conversation_id.clone()
     }
 
     /// The job_id currently serving `request_id`, if one is mapped and its job is
@@ -1334,6 +1381,7 @@ mod tests {
                 completed_at: Some(SystemTime::now()),
                 first_retrieved_at: None,
                 request_id: None,
+                conversation_id: None,
             };
             let value = job_to_value(&id, &job).expect("a terminal job serializes");
             // Completes here even though we hold the jobs lock.
@@ -1575,6 +1623,7 @@ mod tests {
             completed_at: Some(SystemTime::now()),
             first_retrieved_at: None,
             request_id: Some("rid-abc".into()),
+            conversation_id: None,
         };
         let v = job_to_value("id1", &job).expect("a terminal job serializes");
         assert_eq!(v["request_id"], "rid-abc");
@@ -1589,6 +1638,79 @@ mod tests {
         assert!(
             back_old.request_id.is_none(),
             "a file without request_id loads with None, not an error"
+        );
+    }
+
+    /// THE ROUTING KEY, on the record. A tap has to open the conversation the turn
+    /// belonged to, and the in-flight conversation table cannot answer that at push time —
+    /// its entry is released when the turn ends, which is exactly when the push fires. So
+    /// the id lives on the job, which means it must survive a restart, and a job file
+    /// written before the field existed must still load.
+    #[test]
+    fn job_value_roundtrips_conversation_id_and_tolerates_absence() {
+        let job = Job {
+            state: JobState::Done {
+                response: "r".into(),
+                session_id: None,
+                directives: None,
+                provenance: None,
+                artifacts: Vec::new(),
+            },
+            completed_at: Some(SystemTime::now()),
+            first_retrieved_at: None,
+            request_id: None,
+            conversation_id: Some("11111111-2222-3333-4444-555555555555".into()),
+        };
+        let v = job_to_value("id1", &job).expect("a terminal job serializes");
+        assert_eq!(v["conversation_id"], "11111111-2222-3333-4444-555555555555");
+        let (_, back) = value_to_job(&v).expect("round-trips");
+        assert_eq!(
+            back.conversation_id.as_deref(),
+            Some("11111111-2222-3333-4444-555555555555")
+        );
+
+        let mut old = v.clone();
+        old.as_object_mut().unwrap().remove("conversation_id");
+        let (_, back_old) = value_to_job(&old).expect("a pre-field file still loads");
+        assert!(
+            back_old.conversation_id.is_none(),
+            "a file without conversation_id loads with None, not an error"
+        );
+    }
+
+    /// Bound at creation, readable at completion, and STILL readable after a restart —
+    /// which is the whole reason it is persisted rather than looked up live.
+    #[test]
+    fn a_bound_conversation_survives_a_restart() {
+        let dir = temp_jobs_dir();
+        let ttl = Duration::from_secs(86_400);
+        let grace = Duration::from_secs(600);
+        let id = {
+            let store = JobStore::new(ttl, grace, Some(dir.clone()));
+            let id = store.create();
+            store.bind_conversation(&id, "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
+            assert_eq!(
+                store.conversation_id(&id).as_deref(),
+                Some("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"),
+                "readable while the turn is still running"
+            );
+            store.complete(&id, Ok(("done".to_string(), None, None)));
+            assert_eq!(
+                store.conversation_id(&id).as_deref(),
+                Some("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"),
+                "and at completion, which is when the push reads it"
+            );
+            store.flush_persistence();
+            id
+        };
+        let restarted = JobStore::new(ttl, grace, Some(dir.clone()));
+        assert_eq!(
+            restarted.conversation_id(&id).as_deref(),
+            Some("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+        );
+        assert!(
+            restarted.conversation_id("no-such-job").is_none(),
+            "an unknown job has no conversation, not a panic"
         );
     }
 

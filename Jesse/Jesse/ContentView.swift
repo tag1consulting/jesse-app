@@ -136,10 +136,14 @@ struct ContentView: View {
             inbox.pendingWake = nil
             Task { await startWakeCapture(mode: wake.mode) }
         }
-        .onChange(of: pushRouter.pendingJobId) { _, jobId in
-            guard let jobId else { return }
-            pushRouter.pendingJobId = nil
-            openThread(forJobId: jobId)
+        .onChange(of: pushRouter.pendingTap) { _, tap in
+            guard let tap else { return }
+            // NOT cleared here. The other pending values above are consumed before their
+            // work because their work is synchronous; routing a tap now awaits a session
+            // sync in its third branch, and clearing first meant a tap that arrived while
+            // the view was still coming up was thrown away mid-resolve. It is cleared in
+            // `openThread`, once routing has resolved or definitively failed.
+            Task { await openThread(for: tap) }
         }
         .overlay {
             if voice.phase != .idle {
@@ -182,18 +186,32 @@ struct ContentView: View {
         }
     }
 
-    /// A "Jesse finished" notification was tapped. Find the thread whose in-flight
-    /// job matches (before `resume` delivers and clears it), re-attach to fetch the
-    /// reply, then navigate there.
-    private func openThread(forJobId jobId: String) {
-        let threadID = coordinator.threadID(forJobId: jobId)
+    /// A "Jesse finished" notification was tapped: re-attach to fetch the reply, resolve
+    /// which conversation the notification was reporting on, and navigate there.
+    ///
+    /// The in-flight lookup happens FIRST and synchronously, before `resume`, which
+    /// re-attaches and may deliver the reply and clear the entry out from under it. Its
+    /// result is handed to the resolver so the ordering is not left to chance across the
+    /// suspension points the fallback chain introduces — see
+    /// `RunCoordinator.thread(forTap:liveThreadID:context:)` for the three steps.
+    ///
+    /// The pending tap is cleared only once this has resolved or definitively failed, so a
+    /// tap that arrives before the view exists still routes.
+    private func openThread(for tap: PushTap) async {
+        let liveThreadID = tap.jobId.flatMap { coordinator.threadID(forJobId: $0) }
         coordinator.resume(context: context)
-        guard let threadID else { return }
-        var d = FetchDescriptor<JesseThread>(predicate: #Predicate { $0.id == threadID })
-        d.fetchLimit = 1
-        if let thread = try? context.fetch(d).first {
-            path = [thread]
+        let thread = await coordinator.thread(forTap: tap, liveThreadID: liveThreadID, context: context)
+        if pushRouter.pendingTap == tap { pushRouter.pendingTap = nil }
+        guard let thread else {
+            // Not silent. Landing on the thread list is the pre-existing behaviour and an
+            // acceptable one; landing there with no record of why is what made this
+            // impossible to diagnose from a phone.
+            Log.push.notice(
+                "tap did not resolve a thread (job=\(tap.jobId ?? "-") conversation=\(tap.conversationId ?? "-")) — showing the thread list"
+            )
+            return
         }
+        path = [thread]
     }
 
     // The hands-free doorbell fired: capture the spoken request in-app (Siri only

@@ -877,6 +877,11 @@ pub async fn start_turn(
             })
         }
     };
+    // Bind the job to its conversation NOW, while the id is a live local. The completion
+    // push reads it back off the job to tell the phone which thread the tap should open —
+    // see `notify_if_complete`. Every turn starts here, so a scheduled fire is bound the
+    // same way a phone turn is, which is what makes a morning-routine push routable.
+    st.jobs.bind_conversation(&job_id, &conversation_id);
     // THE ARTIFACT RETURN CHANNEL. A per-job staging directory INSIDE the turn's working
     // directory — the only place either harness can write (see `artifacts`) — plus the
     // one-sentence fragment that tells the model files written there come back.
