@@ -13,6 +13,54 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [bridge 0.97.0] - 2026-08-26
+
+### Changed
+
+- **A push now says what the turn said.** Every completion notification read `Jesse` /
+  `Jesse finished`, with the filenames of any returned artifacts appended. That is the
+  whole message: a notification that reports only that *something* happened, from an
+  assistant whose entire output is text, and which the person then has to open the app
+  to read.
+
+  The reply was never missing. `JobState::Done` carries `response` beside `artifacts`,
+  and the push path destructured `Done { artifacts, .. }` and threw the text away. The
+  fix is to widen that pattern, and to take the error off `Failed` the same way.
+
+  The body is derived through **`delivered_text`** — the same function the delivery seam
+  uses — so the notification and the chat bubble can never disagree about what the reply
+  was, then sanitized to one lock-screen line: whitespace runs (newlines included)
+  collapsed to single spaces, control characters dropped, leading Markdown decoration
+  removed so a reply that opens `## Done` does not put `##` on the lock screen, and cut
+  on a word boundary at 180 characters with an ellipsis. The control-character rule is
+  not optional — this is model-authored text landing on a notification, which is exactly
+  why the artifact-name path has always stripped it.
+
+  Two things it will not do. It **never arrives blank**: a summary that sanitizes away to
+  nothing falls back to the artifact line verbatim, so the worst case is precisely the
+  old behaviour. And it **never lies about the outcome**: a failed turn leads with
+  `Failed:` and its error, where before it pushed "Jesse finished" on the one state whose
+  whole meaning is that something went wrong.
+
+  A turn that returned files now gets a compact `[2 files]` suffix rather than a list of
+  names. The names were only ever standing in for a summary; now that there is one, it
+  gets the space, and the names remain in the no-summary fallback where nothing else is
+  competing for it.
+
+  **No model is called to write it.** The summary is a truncation. A push must never be
+  able to fail or delay a turn, and spawning a child process inside the completion path
+  would break that contract to save a few words.
+
+- **A scheduled run reports its findings, not its existence.** `morning-start-of-day ran`
+  was true and told nobody anything. A clean scheduled run now puts the schedule id and
+  outcome in the **title** and the sanitized reply in the **body**, so the morning chain
+  says what it actually found.
+
+  A reason still outranks the summary. Every alert that carries one is about a failure, a
+  skip or a missing output, and those exist to make the reason visible — burying it under
+  the turn's parting words is the exact regression the reason was added to prevent. So
+  the summary is used only when there is no reason to name.
+
 ## [App 1.0 (116)] - 2026-08-24
 
 ### Fixed

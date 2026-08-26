@@ -406,6 +406,10 @@ struct RunResult {
     reason: String,
     job_id: Option<String>,
     duration_ms: Option<u64>,
+    /// The turn's RAW reply text, when it produced one, so the outcome push can say what
+    /// the run reported instead of only that it ran. `None` for every result that never
+    /// reached a completed turn (a skip, a rejected start).
+    reply: Option<String>,
     /// This skip was TRANSIENT — the bridge was momentarily busy, nothing about the
     /// occurrence went stale — so the occurrence stays eligible and a later tick may
     /// retry it. See [`retry_should_arm`].
@@ -419,6 +423,7 @@ impl RunResult {
             reason: reason.into(),
             job_id: None,
             duration_ms: None,
+            reply: None,
             transient: false,
         }
     }
@@ -437,6 +442,7 @@ impl RunResult {
             reason: reason.into(),
             job_id: None,
             duration_ms: None,
+            reply: None,
             transient: false,
         }
     }
@@ -807,7 +813,7 @@ impl Scheduler {
                         "superseded by the {} occurrence before its retry could run",
                         human_ms(f.due_ms.saturating_sub(retry_ms))
                     );
-                    self.finish_job(st, head, Outcome::Skipped, &reason, None, None, false);
+                    self.finish_job(st, head, Outcome::Skipped, &reason, None, None, None, false);
                     f
                 }
                 (Some(retry_ms), _) => DueFire {
@@ -835,7 +841,16 @@ impl Scheduler {
             // chain — but a head has no predecessor to be transparent to: without its clock
             // there is no occurrence for the links to belong to.
             if !head.profiles.contains(active) {
-                self.finish_job(st, head, Outcome::Skipped, PROFILE_SKIP, None, None, false);
+                self.finish_job(
+                    st,
+                    head,
+                    Outcome::Skipped,
+                    PROFILE_SKIP,
+                    None,
+                    None,
+                    None,
+                    false,
+                );
                 self.skip_rest_of_chain(st, &head.id, &head.id, Outcome::Skipped);
                 continue;
             }
@@ -853,7 +868,7 @@ impl Scheduler {
             // would eventually run two of them back to back at the wrong time of day.
             if self.is_running(&head.id) {
                 let reason = "a previous run of this chain is still in progress".to_string();
-                self.finish_job(st, head, Outcome::Skipped, &reason, None, None, false);
+                self.finish_job(st, head, Outcome::Skipped, &reason, None, None, None, false);
                 continue;
             }
 
@@ -865,7 +880,7 @@ impl Scheduler {
                     human_ms(due.lateness_ms),
                     head.catch_up_secs
                 );
-                self.finish_job(st, head, Outcome::Skipped, &reason, None, None, false);
+                self.finish_job(st, head, Outcome::Skipped, &reason, None, None, None, false);
                 // The rest of the chain never ran either — say so, once per link.
                 self.skip_rest_of_chain(st, &head.id, &head.id, Outcome::Skipped);
                 continue;
@@ -895,6 +910,7 @@ impl Scheduler {
         reason: &str,
         job_id: Option<&str>,
         duration_ms: Option<u64>,
+        reply: Option<&str>,
         cascaded: bool,
     ) {
         let now = system_time_to_ms(SystemTime::now());
@@ -919,10 +935,19 @@ impl Scheduler {
             let id = job.id.clone();
             let reason = reason.to_string();
             let job_id = job_id.map(str::to_string);
+            let reply = reply.map(str::to_string);
             // Detached: the record is already written, so a slow or failing APNs round
             // trip must not hold up the next link in the chain.
             tokio::spawn(async move {
-                push_schedule_outcome(&st, &id, outcome, &reason, job_id.as_deref()).await;
+                push_schedule_outcome(
+                    &st,
+                    &id,
+                    outcome,
+                    &reason,
+                    job_id.as_deref(),
+                    reply.as_deref(),
+                )
+                .await;
             });
         }
         // THE STREAK, which is a different alert from the outcome above and deliberately
@@ -953,7 +978,7 @@ impl Scheduler {
                 continue;
             };
             let reason = format!("{breaker:?} {} — the chain never ran", cause.label());
-            self.finish_job(st, job, Outcome::Skipped, &reason, None, None, true);
+            self.finish_job(st, job, Outcome::Skipped, &reason, None, None, None, true);
         }
     }
 }
@@ -1233,7 +1258,16 @@ async fn run_chain(sched: Arc<Scheduler>, st: AppState, schedule: Arc<Schedule>,
                 human_ms(wait.as_millis() as u64),
                 head.catch_up_secs
             );
-            sched.finish_job(&st, head, Outcome::Skipped, &reason, None, None, false);
+            sched.finish_job(
+                &st,
+                head,
+                Outcome::Skipped,
+                &reason,
+                None,
+                None,
+                None,
+                false,
+            );
             sched.skip_rest_of_chain(&st, &head_id, &head_id, Outcome::Skipped);
             return;
         }
@@ -1326,6 +1360,7 @@ async fn run_chain(sched: Arc<Scheduler>, st: AppState, schedule: Arc<Schedule>,
             &result.reason,
             result.job_id.as_deref(),
             result.duration_ms,
+            result.reply.as_deref(),
             cascaded,
         );
         // A TRANSIENT skip of the HEAD leaves this occurrence eligible: the next tick
@@ -1446,7 +1481,7 @@ async fn run_one(
     let bound = Duration::from_secs(limit.saturating_mul(3)) + TERMINAL_WAIT_SLACK;
     loop {
         match st.jobs.get(&job_id) {
-            Some(JobState::Done { .. }) => {
+            Some(JobState::Done { ref response, .. }) => {
                 // THE OUTPUT CONTRACT, on the way out. The turn finished cleanly; whether
                 // the job DID ITS WORK is a separate question, and one only the job's own
                 // declaration can answer. A job with no `expect_output` skips all of this
@@ -1478,6 +1513,7 @@ async fn run_one(
                     reason,
                     job_id: Some(job_id),
                     duration_ms: Some(started.elapsed().as_millis() as u64),
+                    reply: Some(response.clone()),
                     transient: false,
                 };
             }
@@ -1487,6 +1523,7 @@ async fn run_one(
                     reason: error,
                     job_id: Some(job_id),
                     duration_ms: Some(started.elapsed().as_millis() as u64),
+                    reply: None,
                     transient: false,
                 }
             }
@@ -1496,6 +1533,7 @@ async fn run_one(
                     reason: "the turn was cancelled".to_string(),
                     job_id: Some(job_id),
                     duration_ms: Some(started.elapsed().as_millis() as u64),
+                    reply: None,
                     transient: false,
                 }
             }
@@ -1512,6 +1550,7 @@ async fn run_one(
                 ),
                 job_id: Some(job_id),
                 duration_ms: Some(started.elapsed().as_millis() as u64),
+                reply: None,
                 transient: false,
             };
         }
@@ -1727,6 +1766,7 @@ pub async fn push_schedule_outcome(
     outcome: Outcome,
     reason: &str,
     job_id: Option<&str>,
+    reply: Option<&str>,
 ) {
     let Some(apns) = st.apns.as_deref() else {
         // Not a silent drop: the operator asked to be told, and push is not configured.
@@ -1748,7 +1788,14 @@ pub async fn push_schedule_outcome(
     // The morning chain (by default) rewrites the day file in full, so its outcome push
     // also asks the phone to refresh the two cached snapshots — see `push_prefetch_jobs`.
     let prefetch = wants_prefetch(schedule_id, &push_prefetch_jobs());
-    let payload = build_scheduled_payload(schedule_id, outcome.label(), reason, job_id, prefetch);
+    let payload = build_scheduled_payload(
+        schedule_id,
+        outcome.label(),
+        reason,
+        job_id,
+        prefetch,
+        reply,
+    );
     match apns.push_payload(&token, payload).await {
         PushOutcome::Sent => eprintln!(
             "jesse-bridge: schedule PUSH id={schedule_id} outcome={} sent",
