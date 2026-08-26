@@ -2077,6 +2077,59 @@ final class RunCoordinator {
         inFlight.first(where: { $0.value.jobId == jobId })?.key
     }
 
+    /// The thread a tapped notification should open, resolved in three steps.
+    ///
+    /// This used to be step one alone, and step one answers for exactly one case: a turn
+    /// THIS DEVICE started and has not yet settled. Everything else fell off the end of it
+    /// and the tap silently landed on the thread list —
+    ///
+    /// 1. **The in-flight job.** Fastest, and the live case. `liveThreadID` is that lookup,
+    ///    performed by the caller BEFORE `resume`, which re-attaches and may deliver the
+    ///    reply and clear the entry out from under it.
+    /// 2. **The conversation, locally.** An already-settled turn has no in-flight entry —
+    ///    background delivery removes it the moment it writes the reply — but its thread is
+    ///    right there in the store under the conversation the push named.
+    /// 3. **The conversation, after a sync.** A SCHEDULED run is a conversation this phone
+    ///    has never seen: the bridge mints a fresh one per fire and the phone was not
+    ///    involved. `refreshSessions` adopts unknown remote conversations as local threads,
+    ///    so the retry after it finds one. This branch is what makes a morning-routine push
+    ///    open its own thread; without it that push is unroutable however good the payload.
+    ///
+    /// `nil` only when all three miss — an older bridge that sent no conversation, an
+    /// unreachable bridge, or a conversation that genuinely does not exist. The caller
+    /// lands on the thread list, which is the pre-existing behaviour, and says so.
+    func thread(forTap tap: PushTap, liveThreadID: UUID?, context: ModelContext) async -> JesseThread? {
+        if let liveThreadID, let thread = thread(id: liveThreadID, context: context) {
+            return thread
+        }
+        guard let conversationId = tap.conversationId else { return nil }
+        if let thread = thread(conversationId: conversationId, context: context) {
+            return thread
+        }
+        await refreshSessions(context: context)
+        return thread(conversationId: conversationId, context: context)
+    }
+
+    /// One thread by SwiftData identity.
+    private func thread(id: UUID, context: ModelContext) -> JesseThread? {
+        var d = FetchDescriptor<JesseThread>(predicate: #Predicate { $0.id == id })
+        d.fetchLimit = 1
+        return try? context.fetch(d).first
+    }
+
+    /// One thread by bridge conversation id.
+    ///
+    /// The stored value is a CANONICAL LOWERCASE uuid (see `JesseThread.mintConversationId`
+    /// — `UUID.uuidString` is uppercase and the bridge rejects it outright), and the
+    /// comparison here is a plain `==`. So the incoming id is lowercased first: matching is
+    /// exact, and the normalisation is what makes it exact rather than accidental.
+    private func thread(conversationId: String, context: ModelContext) -> JesseThread? {
+        let cid = conversationId.lowercased()
+        var d = FetchDescriptor<JesseThread>(predicate: #Predicate { $0.conversationId == cid })
+        d.fetchLimit = 1
+        return try? context.fetch(d).first
+    }
+
     // MARK: - AI titles
 
     /// Ensure a visible thread has an up-to-date AI title, generating at most ONE

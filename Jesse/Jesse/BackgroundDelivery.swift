@@ -51,6 +51,11 @@ final class BackgroundDelivery {
     nonisolated enum PayloadKey {
         static let jobId = "job_id"
         static let prefetch = "prefetch"
+        /// The conversation the turn belonged to. The routing key a TAP needs: `job_id`
+        /// only answers for a turn this device started and has not yet settled, which a
+        /// scheduled job never is and a delivered turn stops being. Absent on a push from
+        /// a bridge older than 0.98.0, and on a scheduled run that never started a turn.
+        static let conversationId = "conversation_id"
     }
 
     /// What a push actually asked for, as a value.

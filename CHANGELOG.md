@@ -13,6 +13,73 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [App 1.0 (117)] - 2026-08-26
+
+### Fixed
+
+- **Tapping a notification now opens the conversation it was reporting on.** It usually
+  did nothing. The payload's only routing key was `job_id`, and `openThread` resolved it
+  through `RunCoordinator.inFlight` — the map of turns **this device started and has not
+  yet settled**. Two whole classes of notification are never in that map:
+
+  - a **scheduled job**, which the phone never started, so it never had an entry;
+  - an **already-settled turn**, whose entry background delivery removes the moment it
+    writes the reply — so tapping the banner a minute later found nothing.
+
+  Both landed silently on the thread list, because `openThread` ended in a bare
+  `guard let threadID else { return }` with no fallback and no log line.
+
+  Routing now runs a three-step chain. The in-flight lookup stays **first**: it is the
+  fastest path and it is the live case. Failing that, the thread is fetched by the
+  conversation id the push now carries. Failing *that*, `refreshSessions` runs — which
+  adopts unknown remote conversations as local threads — and the fetch is retried. The
+  third branch is what makes a morning-routine push open its own thread on a phone that
+  has never seen that conversation; it is not optional polish.
+
+  The conversation id is normalised to lowercase before it is matched. The stored value is
+  a canonical lowercase UUID and the comparison is a plain `==`, so that normalisation is
+  the difference between matching and not.
+
+  **Cold-launch ordering changed with it.** The pending tap used to be cleared *before*
+  routing ran. Once the third branch awaits, that drops a tap that arrives while the view
+  is still coming up, so the tap is now cleared only after routing resolves or definitively
+  fails. And when nothing resolves, the app still lands on the thread list — that part was
+  always reasonable — but it says so in the log instead of returning in silence.
+
+  The tap payload is parsed through a `PushTap` value that reads the keys
+  `BackgroundDelivery.PayloadKey` names, trimming and rejecting blanks. The tap path had
+  been reading a bare `"job_id"` literal with no trimming, while the background path did
+  it properly two files away.
+
+## [bridge 0.98.0] - 2026-08-26
+
+### Added
+
+- **A push now says which conversation to open.** The completion payload carries a
+  top-level `conversation_id` beside `job_id`, and so does a scheduled run's outcome push.
+  Additive and omitted when unknown, so an app build that predates it reads the payload
+  exactly as it always did.
+
+  It is needed because `job_id` cannot answer the question. The app resolves a job id
+  through the turns it started and has not yet settled, and a scheduled job was never one
+  of those. Naming the conversation is what lets a tap open the run's own thread — adopting
+  it first, if the phone has never seen it.
+
+  The id is **persisted on the job record**, bound at creation on the one path every turn
+  starts through, and read back at push time. Deliberately not read from the in-flight
+  conversation table: that table's entry is released when the turn ends, which is exactly
+  the moment the push fires. On the job it is answerable from both push call sites — the
+  completion path and the `POST /jesse/notify/{job_id}` race-closer, which is handed
+  nothing but a job id — and it survives a bridge restart. A job file written before this
+  field simply lacks the key and loads with no conversation, the same additive read
+  `request_id` gets.
+
+### Fixed
+
+- The scheduler no longer discards the conversation id it is handed. `TurnStart::Accepted`
+  carries one and `run_one` matched `{ job_id, .. }`, so a scheduled fire's conversation
+  was dropped on the floor. It is now carried through the run result into the outcome push.
+
 ## [bridge 0.97.0] - 2026-08-26
 
 ### Changed

@@ -304,11 +304,15 @@ impl ApnsClient {
         &self,
         device_token: &str,
         job_id: &str,
+        conversation_id: Option<&str>,
         artifacts: &[Artifact],
         summary: PushSummary<'_>,
     ) -> PushOutcome {
-        self.push_payload(device_token, build_apns_payload(job_id, artifacts, summary))
-            .await
+        self.push_payload(
+            device_token,
+            build_apns_payload(job_id, conversation_id, artifacts, summary),
+        )
+        .await
     }
 
     /// Send an already-built payload. The seam [`push`](Self::push) is written in terms
@@ -401,8 +405,17 @@ pub fn mint_apns_jwt(
     Ok(format!("{signing_input}.{}", base64url_nopad(sig.as_ref())))
 }
 
-/// The APNs payload for a finished turn: a short alert plus the `job_id` so the
-/// tap routes to the right thread and re-attaches.
+/// The APNs payload for a finished turn: a short alert plus the ids the tap routes on.
+///
+/// TWO routing keys, because `job_id` alone cannot answer the question. The app resolves
+/// it through its in-flight map — the turns THIS DEVICE started and has not yet settled —
+/// so a scheduled job (which the phone never started) and an already-settled turn (whose
+/// entry the background delivery removed the moment it wrote the reply) both fall off the
+/// end of it. `conversation_id` names the conversation itself, which the app can fetch,
+/// or adopt from the bridge if it has never seen it.
+///
+/// It is additive and OMITTED when unknown, so an app build that predates it reads the
+/// payload exactly as it always did.
 ///
 /// It also carries `content-available: 1`, which is what lets the
 /// phone fetch the reply while it is still in a pocket instead of only when the app is
@@ -418,19 +431,22 @@ pub fn mint_apns_jwt(
 /// than interpolated — see [`push_summary_snippet`].
 pub fn build_apns_payload(
     job_id: &str,
+    conversation_id: Option<&str>,
     artifacts: &[Artifact],
     summary: PushSummary<'_>,
 ) -> Vec<u8> {
-    json!({
+    let mut payload = json!({
         "aps": {
             "alert": { "title": "Jesse", "body": completion_body(summary, artifacts) },
             "sound": "default",
             "content-available": 1
         },
         "job_id": job_id
-    })
-    .to_string()
-    .into_bytes()
+    });
+    if let Some(cid) = conversation_id {
+        payload["conversation_id"] = json!(cid);
+    }
+    payload.to_string().into_bytes()
 }
 
 /// What a completion push has to say about the turn it is reporting on: the reply the
@@ -665,6 +681,7 @@ pub fn build_scheduled_payload(
     outcome: &str,
     reason: &str,
     job_id: Option<&str>,
+    conversation_id: Option<&str>,
     prefetch: bool,
     summary: Option<&str>,
 ) -> Vec<u8> {
@@ -699,6 +716,13 @@ pub fn build_scheduled_payload(
     });
     if let Some(id) = job_id {
         payload["job_id"] = json!(id);
+    }
+    // THE ONE ROUTING KEY THAT CAN WORK HERE. A scheduled turn is one the phone never
+    // started, so it has no in-flight entry for its `job_id` and never will; naming the
+    // conversation is what lets the tap open the run's own thread, adopting it first if
+    // the phone has never seen it. Absent on a skipped run, which had no turn at all.
+    if let Some(cid) = conversation_id {
+        payload["conversation_id"] = json!(cid);
     }
     if prefetch {
         payload["prefetch"] = json!(PREFETCH_SNAPSHOTS);
@@ -793,6 +817,12 @@ pub async fn notify_if_complete(
         Ok(response) => PushSummary::Reply(response),
         Err(error) => PushSummary::Failure(error),
     };
+    // THE CONVERSATION THE TAP OPENS. Read off the JOB, not the in-flight conversation
+    // table — that table's entry is released when the turn ends, which is exactly when
+    // this runs. Reading it here rather than taking it as an argument is what lets BOTH
+    // call sites carry it: the completion path and the notify endpoint, which is handed
+    // nothing but a job id.
+    let conversation_id = jobs.conversation_id(job_id);
     if !notify.take(job_id) {
         return; // not flagged, or another path already pushed
     }
@@ -800,7 +830,16 @@ pub async fn notify_if_complete(
         eprintln!("push: job {job_id} flagged but no device registered — skipping");
         return;
     };
-    match apns.push(&token, job_id, &artifacts, summary).await {
+    match apns
+        .push(
+            &token,
+            job_id,
+            conversation_id.as_deref(),
+            &artifacts,
+            summary,
+        )
+        .await
+    {
         PushOutcome::Sent => eprintln!("push: completion alert sent for job {job_id}"),
         PushOutcome::DeadToken => {
             // APNs reports the token is dead (410). Clear it so it isn't retried
@@ -976,7 +1015,7 @@ mod tests {
     }
     #[test]
     fn apns_payload_has_alert_and_job_id() {
-        let payload = build_apns_payload("job-xyz", &[], PushSummary::Reply(""));
+        let payload = build_apns_payload("job-xyz", None, &[], PushSummary::Reply(""));
         let v: Value = serde_json::from_slice(&payload).unwrap();
         assert_eq!(v["aps"]["alert"]["title"], "Jesse");
         assert_eq!(v["aps"]["alert"]["body"], "Jesse finished");
@@ -989,6 +1028,7 @@ mod tests {
     fn body_is_the_reply_not_a_fixed_string() {
         let body = body_of(&build_apns_payload(
             "j",
+            None,
             &[],
             PushSummary::Reply("Rebooted the router; the study is back on the network."),
         ));
@@ -1005,6 +1045,7 @@ mod tests {
     fn a_multi_line_reply_collapses_to_one_line() {
         let body = body_of(&build_apns_payload(
             "j",
+            None,
             &[],
             PushSummary::Reply("Checked the vault.\n\nThree notes\tneed   titles."),
         ));
@@ -1018,6 +1059,7 @@ mod tests {
     fn control_characters_are_stripped_from_the_summary() {
         let body = body_of(&build_apns_payload(
             "j",
+            None,
             &[],
             PushSummary::Reply("done\u{7}\u{0}: all\u{1b}[31m clear"),
         ));
@@ -1039,7 +1081,7 @@ mod tests {
         ];
         for (raw, want) in cases {
             assert_eq!(
-                body_of(&build_apns_payload("j", &[], PushSummary::Reply(raw))),
+                body_of(&build_apns_payload("j", None, &[], PushSummary::Reply(raw))),
                 want,
                 "raw = {raw:?}"
             );
@@ -1048,6 +1090,7 @@ mod tests {
         assert_eq!(
             body_of(&build_apns_payload(
                 "j",
+                None,
                 &[],
                 PushSummary::Reply("-5°C overnight, so the pipes were lagged.")
             )),
@@ -1060,7 +1103,12 @@ mod tests {
     #[test]
     fn a_long_reply_truncates_on_a_word_boundary() {
         let raw = "alpha ".repeat(80);
-        let body = body_of(&build_apns_payload("j", &[], PushSummary::Reply(&raw)));
+        let body = body_of(&build_apns_payload(
+            "j",
+            None,
+            &[],
+            PushSummary::Reply(&raw),
+        ));
         assert!(body.chars().count() <= MAX_PUSH_SUMMARY_CHARS, "{body:?}");
         assert!(body.ends_with('…'), "{body:?}");
         assert!(
@@ -1075,7 +1123,7 @@ mod tests {
     fn a_summary_that_sanitizes_to_empty_falls_back() {
         for raw in ["", "   \n\t  ", "\u{7}\u{0}", "```", "## ", "---"] {
             assert_eq!(
-                body_of(&build_apns_payload("j", &[], PushSummary::Reply(raw))),
+                body_of(&build_apns_payload("j", None, &[], PushSummary::Reply(raw))),
                 "Jesse finished",
                 "raw = {raw:?}"
             );
@@ -1090,7 +1138,12 @@ mod tests {
             sha256: "ff".into(),
         };
         assert_eq!(
-            body_of(&build_apns_payload("j", &[art], PushSummary::Reply("```"))),
+            body_of(&build_apns_payload(
+                "j",
+                None,
+                &[art],
+                PushSummary::Reply("```")
+            )),
             "Jesse finished — chart.png"
         );
     }
@@ -1101,7 +1154,7 @@ mod tests {
     fn the_summary_is_the_delivered_text() {
         let raw = "The battery is low.\nSPOKEN: The battery is low.";
         assert_eq!(
-            body_of(&build_apns_payload("j", &[], PushSummary::Reply(raw))),
+            body_of(&build_apns_payload("j", None, &[], PushSummary::Reply(raw))),
             "The battery is low."
         );
     }
@@ -1112,6 +1165,7 @@ mod tests {
         assert_eq!(
             body_of(&build_apns_payload(
                 "j",
+                None,
                 &[],
                 PushSummary::Failure("claude exited 1: model overloaded")
             )),
@@ -1119,10 +1173,82 @@ mod tests {
         );
         // Even with nothing to say, it does not claim the turn finished.
         assert_eq!(
-            body_of(&build_apns_payload("j", &[], PushSummary::Failure("  "))),
+            body_of(&build_apns_payload(
+                "j",
+                None,
+                &[],
+                PushSummary::Failure("  ")
+            )),
             "Jesse failed"
         );
     }
+    /// THE SECOND ROUTING KEY. `job_id` alone cannot open a scheduled job's thread or an
+    /// already-settled turn's — the app resolves it through the turns THIS DEVICE started
+    /// and has not yet settled, and neither of those is in that map.
+    #[test]
+    fn the_payload_names_the_conversation_to_open() {
+        let v: Value = serde_json::from_slice(&build_apns_payload(
+            "job-xyz",
+            Some("11111111-2222-3333-4444-555555555555"),
+            &[],
+            PushSummary::Reply("done"),
+        ))
+        .unwrap();
+        assert_eq!(v["job_id"], "job-xyz");
+        assert_eq!(
+            v["conversation_id"], "11111111-2222-3333-4444-555555555555",
+            "top-level, beside job_id"
+        );
+    }
+
+    /// Absent, not null, when there is nothing to name. An app build that predates this
+    /// key reads the payload exactly as it always did.
+    #[test]
+    fn an_unknown_conversation_is_omitted_entirely() {
+        let v: Value = serde_json::from_slice(&build_apns_payload(
+            "j",
+            None,
+            &[],
+            PushSummary::Reply("done"),
+        ))
+        .unwrap();
+        assert!(
+            v.get("conversation_id").is_none(),
+            "absent, never a null the app has to special-case: {v}"
+        );
+    }
+
+    /// A SCHEDULED run's push is the one most worth tapping and the one that could never
+    /// route: the phone never started the turn. Its conversation rides the same key.
+    #[test]
+    fn a_scheduled_payload_names_its_conversation() {
+        let v: Value = serde_json::from_slice(&build_scheduled_payload(
+            "morning-start-of-day",
+            "ran",
+            "",
+            Some("j"),
+            Some("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"),
+            false,
+            None,
+        ))
+        .unwrap();
+        assert_eq!(v["conversation_id"], "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
+
+        // A SKIPPED run never started a turn, so it has neither id to give.
+        let skipped: Value = serde_json::from_slice(&build_scheduled_payload(
+            "morning-start-of-day",
+            "skipped",
+            "already ran",
+            None,
+            None,
+            false,
+            None,
+        ))
+        .unwrap();
+        assert!(skipped.get("job_id").is_none());
+        assert!(skipped.get("conversation_id").is_none());
+    }
+
     /// With NO summary to show, a turn that returned files still names them, and carries
     /// nothing else about them — no id, no size, no bytes. The list is bounded and
     /// control characters are stripped, because the filename is the MODEL's and this one
@@ -1136,7 +1262,7 @@ mod tests {
             bytes: 1,
             sha256: "ff".into(),
         };
-        let one = build_apns_payload("j", &[art("chart.png")], PushSummary::Reply(""));
+        let one = build_apns_payload("j", None, &[art("chart.png")], PushSummary::Reply(""));
         let v: Value = serde_json::from_slice(&one).unwrap();
         assert_eq!(v["aps"]["alert"]["body"], "Jesse finished — chart.png");
         // Nothing about the artifact rides the push except its name.
@@ -1144,9 +1270,13 @@ mod tests {
         assert!(!s.contains("sha256") && !s.contains("image/png") && !s.contains("bytes"));
 
         let many: Vec<Artifact> = (0..5).map(|i| art(&format!("f{i}.png"))).collect();
-        let v: Value =
-            serde_json::from_slice(&build_apns_payload("j", &many, PushSummary::Reply("")))
-                .unwrap();
+        let v: Value = serde_json::from_slice(&build_apns_payload(
+            "j",
+            None,
+            &many,
+            PushSummary::Reply(""),
+        ))
+        .unwrap();
         assert_eq!(
             v["aps"]["alert"]["body"], "Jesse finished — f0.png, f1.png, f2.png and 2 more",
             "the list is bounded so one turn cannot overrun a lock-screen alert"
@@ -1155,6 +1285,7 @@ mod tests {
         // A crafted filename cannot forge extra lines in the alert.
         let v: Value = serde_json::from_slice(&build_apns_payload(
             "j",
+            None,
             &[art("a\nb\rc.png")],
             PushSummary::Reply(""),
         ))
@@ -1166,6 +1297,7 @@ mod tests {
         // dangling em dash.
         let v: Value = serde_json::from_slice(&build_apns_payload(
             "j",
+            None,
             &[art("\u{7}")],
             PushSummary::Reply(""),
         ))
@@ -1186,12 +1318,13 @@ mod tests {
         };
         let reply = PushSummary::Reply("Charted the week's weight and the trend line.");
         assert_eq!(
-            body_of(&build_apns_payload("j", &[art("chart.png")], reply)),
+            body_of(&build_apns_payload("j", None, &[art("chart.png")], reply)),
             "Charted the week's weight and the trend line. [1 file]"
         );
         assert_eq!(
             body_of(&build_apns_payload(
                 "j",
+                None,
                 &[art("chart.png"), art("table.csv")],
                 reply
             )),
@@ -1212,14 +1345,23 @@ mod tests {
             sha256: "ff".into(),
         };
         let payloads = [
-            build_apns_payload("j", &[], PushSummary::Reply("")),
-            build_apns_payload("j", &[art], PushSummary::Reply("all done")),
-            build_apns_payload("j", &[], PushSummary::Failure("boom")),
-            build_scheduled_payload("morning-start-of-day", "ok", "", Some("j"), false, None),
+            build_apns_payload("j", None, &[], PushSummary::Reply("")),
+            build_apns_payload("j", None, &[art], PushSummary::Reply("all done")),
+            build_apns_payload("j", None, &[], PushSummary::Failure("boom")),
             build_scheduled_payload(
                 "morning-start-of-day",
                 "ok",
                 "",
+                Some("j"),
+                None,
+                false,
+                None,
+            ),
+            build_scheduled_payload(
+                "morning-start-of-day",
+                "ok",
+                "",
+                None,
                 None,
                 true,
                 Some("the day file is rebuilt"),
@@ -1252,6 +1394,7 @@ mod tests {
             "ok",
             "",
             Some("j"),
+            None,
             true,
             None,
         ))
@@ -1265,6 +1408,7 @@ mod tests {
             "ok",
             "",
             Some("j"),
+            None,
             false,
             None,
         ))
@@ -1288,6 +1432,7 @@ mod tests {
             "skipped",
             "already ran",
             None,
+            None,
             true,
             None,
         ))
@@ -1306,6 +1451,7 @@ mod tests {
             "ran",
             "",
             Some("j"),
+            Some("11111111-2222-3333-4444-555555555555"),
             false,
             Some("## Today\n\nTwo meetings, and the vault lint is clean."),
         ))
@@ -1328,6 +1474,7 @@ mod tests {
             "fired-no-output",
             "the turn completed but wrote nothing matching Reports/*.md",
             Some("j"),
+            None,
             false,
             Some("All good, nothing to report."),
         ))
@@ -1348,6 +1495,7 @@ mod tests {
             "m",
             "ran",
             "",
+            None,
             None,
             false,
             Some("```"),
@@ -1439,6 +1587,43 @@ mod tests {
             "the answer",
             "the body is what the turn said"
         );
+    }
+
+    /// END TO END for the routing key: a conversation bound at job creation reaches the
+    /// wire from `notify_if_complete`, which is handed NOTHING but a job id — the same
+    /// shape the `POST /jesse/notify/{job_id}` race-closer calls it in.
+    #[tokio::test]
+    async fn the_push_carries_the_conversation_bound_at_creation() {
+        let mock = MockApns::default();
+        let mut st = test_state();
+        st.apns = Some(test_apns(Arc::new(mock.clone())));
+        st.devices.set("abc123devicetoken".to_string());
+
+        let id = st.jobs.create();
+        st.jobs
+            .bind_conversation(&id, "11111111-2222-3333-4444-555555555555");
+        st.jobs
+            .complete(&id, Ok(("the answer".to_string(), None, None)));
+        st.notify.insert(&id);
+
+        notify_if_complete(st.apns.as_deref(), &st.devices, &st.notify, &st.jobs, &id).await;
+
+        {
+            let calls = mock.calls.lock_ok();
+            assert_eq!(calls.len(), 1);
+            let v: Value = serde_json::from_slice(&calls[0].payload).unwrap();
+            assert_eq!(v["conversation_id"], "11111111-2222-3333-4444-555555555555");
+        }
+
+        // And a job with no conversation still pushes — just without the key.
+        let bare = st.jobs.create();
+        st.jobs
+            .complete(&bare, Ok(("no conversation".to_string(), None, None)));
+        st.notify.insert(&bare);
+        notify_if_complete(st.apns.as_deref(), &st.devices, &st.notify, &st.jobs, &bare).await;
+        let calls = mock.calls.lock_ok();
+        let v: Value = serde_json::from_slice(&calls[1].payload).unwrap();
+        assert!(v.get("conversation_id").is_none());
     }
 
     /// A FAILED flagged turn pushes its error, not "Jesse finished" — which is what it
