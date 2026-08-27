@@ -966,6 +966,11 @@ Granted and omitted, enumerated live on 2026-08-10 against the running servers:
   attachment bytes to local disk — `--read-only` bounds writes to Google, not to this host)
   and `start_google_auth` (an interactive consent flow a headless turn cannot complete).
 
+**The iMessage line above is the 0.73.0 enumeration and is superseded twice over.** The server
+became `imcp` in 0.76.0 (a different, six-tool surface), and in 0.99.0 the grant on it stopped
+being purely local: `maps_search` is granted and it leaves the host. The current enumeration,
+and the egress decision that goes with it, are below — read those, not this bullet.
+
 ### The allowlist is the only boundary on the two message servers
 
 Every other read-only server in the set is read-only twice over: the credential cannot write
@@ -1060,26 +1065,49 @@ acceptable, and a temporarily-missing iMessage source is not a safety problem. I
 because a silent, unmonitored dependency on a GUI app is exactly the kind of thing that gets
 diagnosed as a bridge bug months later.
 
-### iMCP advertises Maps tools that are LIVE but ungranted
+### iMCP's `maps_search` is GRANTED, and its egress is accepted (0.99.0)
 
-iMCP is configured with only its **Messages** service switched on, and its stored preferences
-carry `messagesEnabled = 1` with no key for any other service. **The running server
-nevertheless advertises five Maps tools, and they work** — a live `maps_search` call returned
-real MapKit results on 2026-08-11. Maps touches no local user data, so the app's per-service
-toggle does not gate it.
+**Earlier revisions of this file were headed "iMCP advertises Maps tools that are LIVE but
+ungranted" and said the five Maps tools were omitted deliberately. ~~All five Maps tools are
+ungranted.~~ That is no longer true and the claim is struck.** From 0.99.0 the child is
+granted `mcp__imcp__maps_search`, to answer "find places near a location and report their
+hours and ratings". The reasoning that omitted it is not withdrawn — it is *accepted*, below.
 
-So on this server **the advertised surface is not the enabled surface**, and the bridge's
-allowlist is the only thing keeping Maps out of the child. Of the six tools iMCP advertises,
-one is granted (`messages_fetch`); the five Maps tools are omitted deliberately. They are
-`openWorldHint:true` — they leave the machine for Apple's services carrying a query string —
-which makes them a low-bandwidth egress channel from a child that reads attacker-authored
-message bodies. All six carry `readOnlyHint:true`, including the five that are not granted,
-which is the standing reason annotations are not the boundary.
+The mechanics of the server are unchanged and still worth stating. iMCP is configured with
+only its **Messages** service switched on, and its stored preferences carry
+`messagesEnabled = 1` with no key for any other service. **The running server nevertheless
+advertises five Maps tools, and they work** — a live `maps_search` call returned real MapKit
+results on 2026-08-11. Maps touches no local user data, so the app's per-service toggle does
+not gate it. So on this server **the advertised surface is not the enabled surface**, and the
+bridge's allowlist — not the app's toggle — is what decides which Maps tools the child reaches.
+
+Of the six tools iMCP advertises, **two are granted**: `messages_fetch` and `maps_search`.
+**Four are not**: `maps_directions`, `maps_explore`, `maps_eta`, `maps_generate`. All six
+carry `readOnlyHint:true`, including the four that are not granted, which is the standing
+reason annotations are not the boundary — and here it is more than a formality, because the
+tool that was granted carries the same hint as the local database reader while behaving
+completely differently.
+
+**The granted tool is `openWorldHint:true`, and that egress channel is ACCEPTED rather than
+mitigated.** `maps_search` leaves the machine for Apple's map services carrying a query
+string, out of a child that also reads attacker-authored content — WhatsApp message bodies,
+iMessage bodies, mail. Content that reaches the child can therefore influence a string that
+leaves the host, which is a low-bandwidth exfiltration channel. Nothing in 0.99.0 closes it:
+the allowlist cannot inspect a query, and no filter was added. The trade Jeremy accepted on
+2026-08-27 is one search tool's worth of that channel in exchange for the capability, with
+the other four Maps tools withheld to keep the channel as narrow as it can be while the
+capability exists. `maps_directions` was considered and rejected for this change: route
+planning is a separate request nobody has made, and it would widen the same channel for no
+capability the asked-for job needs.
+
+The grant is still pinned **as an exact set** in a test rather than guarded by a denylist —
+the permitted set simply grew from one name to two. Any other iMCP tool name, including one a
+future version starts advertising, still fails the build.
 
 **iMCP advertises no send or compose tool at all.** Where `mac-messages-mcp` had
 `tool_send_message` and the allowlist was the only thing holding it back, sending is now
-absent at the root. A version bump could change that, so the grant is pinned as an exact set
-in a test rather than guarded by a denylist of names.
+absent at the root. A version bump could change that, which is the other thing the exact-set
+test above is for.
 
 ### The second Google account is a second read surface
 

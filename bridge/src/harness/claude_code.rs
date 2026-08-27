@@ -605,8 +605,12 @@ pub const MORNING_MCP_CONFIG: &str = concat!(
 ///     not launchd-supervised, so quitting it — or ending the session — takes iMessage dark
 ///     until it is relaunched by hand. Accepted deliberately; see SECURITY.md.
 ///
-/// Of the six tools it advertises, ONE is granted (`messages_fetch`); the five Maps tools are
-/// live but ungranted. There is no send tool to withhold. See [`crate::DEFAULT_ALLOWED_TOOLS`].
+/// Of the six tools it advertises, TWO are granted: `messages_fetch`, and — since 0.99.0 —
+/// `maps_search`. The other four Maps tools (`maps_directions`, `maps_explore`, `maps_eta`,
+/// `maps_generate`) are live but ungranted. There is no send tool to withhold. Note the
+/// granted `maps_search` is `openWorldHint:true` and leaves the host for Apple's map
+/// services, so this ONE server now spans a local read surface and a network one; that
+/// egress is accepted rather than mitigated. See [`crate::DEFAULT_ALLOWED_TOOLS`].
 ///
 /// `google-perseido` is a SECOND instance of the same `workspace-mcp` the `google` entry
 /// runs, against a different account. It is a second SERVER rather than a second account on
@@ -1954,25 +1958,34 @@ mod tests {
             // version might add — the one addition that must never pass silently. iMCP has no
             // sending tool today, and this assertion is what keeps that from changing quietly
             // under a version bump.
-            // Stated as "never anything BUT `messages_fetch`" rather than "always exactly
+            // THE PERMITTED SET GREW FROM ONE NAME TO TWO IN 0.99.0 and the property did not
+            // change: `maps_search` was granted deliberately, so it is written down here by
+            // name. The other four Maps tools stay out — this assertion fails on
+            // `maps_directions`, `maps_explore`, `maps_eta` and `maps_generate` exactly as it
+            // did before, and on any name nobody has seen yet. Widening this list is a
+            // decision to be made in `DEFAULT_ALLOWED_TOOLS`, argued in SECURITY.md and
+            // re-certified in the containment record — never a one-word edit made to get a
+            // red build green.
+            // Stated as "never anything BUT the permitted set" rather than "always exactly
             // it", because the sites this loop covers do not all grant the message servers:
             // the read-only main turn loads all fourteen servers and grants only qmd's four
             // tools. An equality check would therefore assert a toolset that site does not
             // have. A subset check still fails on every addition, which is the property
             // being bought.
+            const IMCP_PERMITTED: [&str; 2] =
+                ["mcp__imcp__messages_fetch", "mcp__imcp__maps_search"];
             let imcp_granted: Vec<&str> = granted
                 .iter()
                 .copied()
                 .filter(|t| t.starts_with("mcp__imcp__"))
                 .collect();
             assert!(
-                imcp_granted
-                    .iter()
-                    .all(|t| *t == "mcp__imcp__messages_fetch"),
-                "{label}: `messages_fetch` is the ONLY iMCP tool that may ever be granted — \
-                 the five Maps tools it also advertises are live and must stay ungranted, and \
-                 anything unrecognised here must be re-decided against a fresh enumeration: \
-                 {imcp_granted:?}"
+                imcp_granted.iter().all(|t| IMCP_PERMITTED.contains(t)),
+                "{label}: `messages_fetch` and `maps_search` are the ONLY iMCP tools that may \
+                 ever be granted — the other four Maps tools it advertises \
+                 (`maps_directions`, `maps_explore`, `maps_eta`, `maps_generate`) are live and \
+                 must stay ungranted, and anything unrecognised here must be re-decided \
+                 against a fresh enumeration rather than added to this list: {imcp_granted:?}"
             );
             // THE GITHUB SERVER'S READ-ONLY POSTURE IS ITS ONLY LAYER. Its credential is a
             // personal CLASSIC PAT carrying `repo` + `workflow` — write-capable — because a
