@@ -34,7 +34,7 @@ pub enum JobState {
         // `needs_health`), stripped from `response` by the extractor. Carried on
         // the terminal state so BOTH the poll result and the SSE `done` frame
         // surface the same value. `None` for the overwhelming majority of turns.
-        directives: Option<Directives>,
+        directives: Option<Box<Directives>>,
         // Structured, display-only provenance (which backend produced the text +
         // the badge/flags it encodes), carried on the terminal state so BOTH the
         // poll result and the SSE `done` frame surface the same value. Present
@@ -216,7 +216,7 @@ pub fn job_to_value(id: &str, job: &Job) -> Option<Value> {
                 "done",
                 Some(response.clone()),
                 session_id.clone(),
-                directives_to_value(directives),
+                directives_to_value(directives.as_deref()),
                 provenance_to_value(provenance.as_deref()),
                 artifacts_to_value(artifacts),
                 None,
@@ -725,7 +725,12 @@ impl JobStore {
             Ok((response, session_id, directives)) => JobState::Done {
                 response,
                 session_id,
-                directives,
+                // Boxed on store for the same reason `provenance` is: the terminal
+                // variant sits in an enum whose other variants are units, so every
+                // move of a `Running` job pays for the biggest one. `Directives`
+                // grows by a payload with each new channel, so boxing it here is
+                // what stops the third channel re-inflating this variant.
+                directives: directives.map(Box::new),
                 // Box on store — keeps the terminal variant small (see the field docs).
                 provenance: provenance.map(Box::new),
                 artifacts,

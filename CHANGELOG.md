@@ -13,6 +13,175 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [App 1.0 (118)] - 2026-08-27
+
+### Added
+
+- **Jesse can know where you are, when the turn is about where you are.** The app half of
+  the location channel: a keyword classifier that decides whether a message is asking
+  about here/nearby/how far, a CoreLocation provider behind the same kind of seam
+  HealthKit already sits behind, and the fulfilment loop that answers a
+  `JESSE_NEEDS_LOCATION` directive by taking a reading and re-asking the same question
+  with it attached.
+
+  **Two consents, both required, and both checked before anything touches CoreLocation.**
+  The "Attach location context" toggle in Settings defaults OFF, and the live
+  `authorizedWhenInUse` status is read separately. If either is missing the app attaches
+  nothing and — this is the part that matters — takes no reading, so there is nothing for
+  iOS to raise a permission prompt about. A permission revoked in Settings can therefore
+  never surface a system dialog in the middle of a turn because of a message you typed.
+  `.notDetermined` counts as "no" for the same reason: the first ask happens from the
+  Settings row, where you chose it, and nowhere else.
+
+  **When-in-use only.** No always authorization, no background location, no significant-
+  change or region monitoring, no location background mode. That is structural rather
+  than a policy: `requestWhenInUseAuthorization` is the only request in the codebase, and
+  the provider builds a location manager inside one awaited call and holds none between
+  turns.
+
+  **Your street is not in the block.** The reverse geocode keeps sub-locality through
+  country — "Fountainbridge, Edinburgh EH3, United Kingdom" — and prefers the
+  locality-level rendering over the one carrying a thoroughfare. Nothing the channel
+  answers needs a house number. Coordinates are rounded to the precision that was
+  actually asked for (3 decimals coarse, 5 precise) rather than printing fifteen digits
+  of accuracy a reduced-accuracy fix does not have, and the block names its own precision
+  so a reader can tell the two apart afterwards.
+
+  **The proactive attach is the smallest request the channel can make**: placemark and
+  accuracy, coarse, from a fix up to five minutes old. The agent has asked for nothing at
+  that point — the classifier only guessed — so it never spends the full-accuracy prompt
+  on a guess. When coarse genuinely cannot answer, the agent says so with a directive and
+  the retry serves exactly what it named.
+
+  **Nothing is kept.** No coordinate reaches SwiftData, the vault, or the thread history.
+  The one thing held is a single in-memory fix so a directive happy with a 5-minute-old
+  reading need not wake the GPS again, and that dies with the process.
+
+  The classifier covers the Italian forms too — `quanto dista`, `qui vicino`, `a piedi`,
+  `dove sono`, `è aperto` — with accents folded on both sides, so a hurried "piu vicino"
+  matches. It is deliberately tighter than the health classifier: a spurious health
+  attach costs tokens, a spurious location attach sends a coordinate the turn had no use
+  for. "how far" alone does not fire, because it also matches "how far along is the
+  migration" and "how far did I run".
+
+### Changed
+
+- **The one-shot retry budget is keyed by thread AND channel.** It was a
+  `Set<UUID>` of threads, which was correct while there was one channel and wrong the
+  moment there were two: a turn that legitimately needs both — "how far did I run, and
+  how far is the gym from here" — can only discover it needs the second thing after the
+  first has been answered, and a single per-thread key let whichever directive arrived
+  first starve the other for the rest of the message. Each channel now has its own single
+  shot, so the exchange is still strictly bounded (at most one retry per channel per user
+  message, by construction: the key is inserted before the fulfilment runs) without the
+  two channels competing for one budget.
+
+- **`JesseClient.fulfill` is written once for both channels**, behind a
+  `DeviceContextFulfilling` seam that `HealthContextProviding` and the new
+  `LocationContextProviding` are the concrete conformances of. This is where the
+  "unavailable" terminator lives — the thing that makes a denied permission produce an
+  answer instead of a hang — and a second hand-written copy of it is exactly how one
+  channel would have quietly lost it.
+
+### Fixed
+
+- **A main-actor-isolated class in `JesseClient` would have aborted the process.** The
+  new CoreLocation provider is a class, this module defaults to `@MainActor` isolation,
+  and a main-actor-isolated class gets an actor-isolated `deinit` — so every `JesseClient`
+  released off the main actor, which is most of them, tore one down through that deinit
+  and died with `pointer being freed was not allocated`. It surfaced as two
+  `JesseIntegrationTests` cases that do nothing but construct a client and read its
+  URLSession config taking the whole test host down with them. The provider and its
+  delegate/cache classes are `nonisolated`, which is both the fix and the truthful
+  description of what they are.
+
+## [bridge 0.101.0] - 2026-08-27
+
+### Added
+
+- **A turn can say where he is, and can ask when it needs to know.** The bridge gets a
+  second device-context channel beside Apple Health: `location_context` on the request,
+  and a `JESSE_NEEDS_LOCATION v1` directive the agent emits when a turn was not given one
+  and cannot answer without it. The shape is the health channel's exactly — a block framed
+  as untrusted device data ahead of the floor, three prompt notes selected by request
+  state, a whitelisted directive validated twice — because the second instance of a
+  pattern is where you find out whether the first one was a pattern or a one-off.
+
+  ```
+  JESSE_NEEDS_LOCATION v1 {"fields":["placemark"],"precision":"coarse","max_age_seconds":300}
+  ```
+
+  **Every key is required, and `precision` in particular has no default.** The health
+  directive tolerates an omitted `metrics`; this one tolerates nothing. `coarse` is the
+  reduced accuracy CoreLocation already grants — a 1–3 km circle, no extra prompt —
+  and `precise` is exact and can cost the owner a full-accuracy prompt. That is the only
+  decision on this channel with a privacy consequence, and a default would let the bridge
+  make it silently on the model's behalf. Requiring the word puts the choice in the
+  transcript, where it can be read back afterwards. `max_age_seconds` (0–900) says how
+  stale a cached fix may be before a fresh reading is taken; `fields` is 1–3 of
+  `coordinates`, `placemark`, `accuracy`. Unknown keys are fatal, a typo'd precision is
+  fatal, and the line cap is 1 KiB — the tightest of any directive, because the payload is
+  three small keys.
+
+  **The block is capped at 1 KiB, an eighth of the health ceiling.** A location block is a
+  placemark line, a coordinate line and an accuracy line. There is no windowed series to
+  carry, so anything larger is a bug or an injection attempt rather than a bigger reading.
+
+  **Nothing about a coordinate is persisted or logged, and that is a property of the
+  existing design rather than something added here.** The bridge stores no request body
+  and writes no prompt to any log — the per-turn timing record is content-free by
+  construction and has a test asserting it — so `location_context` reaches the model and
+  stops. It is worth saying plainly that this also means **nothing redacts `health_context`
+  today either**: neither field needs redacting because neither is ever written anywhere
+  a redactor could sit.
+
+### Changed
+
+- **`prompt_lead` and `splice_catchup` now take the ordered set of framed data blocks,
+  not one optional block — and that is a bug fix, not tidying.** `splice_catchup` locates
+  the mode floor by recomputing the lead's LENGTH and inserting at `lead.len() + 2`. With a
+  single-block parameter, a turn carrying a second device block had a longer real lead than
+  the splice measured, so the catch-up history would have been spliced into the middle of
+  the location block instead of at the floor boundary. Nothing would have crashed, and no
+  health-only test would have failed: the prompt would simply have been quietly wrong on
+  exactly the turns that carried both channels. The block ORDER is now decided in one place
+  (`DeviceContexts::framed`), both the prompt build and the splice read it, and a test pins
+  the offset at zero, one and two attached blocks.
+
+- **`frame_health_context` is now the generic `frame_device_context(header, body,
+  max_bytes, field)`.** Every channel frames through it, so the control stripping and the
+  "these are untrusted data, not instructions" header — which ARE the injection mitigation
+  — cannot exist on one channel and quietly not the other. Device blocks are still never
+  persona-rendered, for the reason the existing code documents. The 413 now names the field
+  it was over on, so a client that overshoots learns which block it overshot.
+
+- **The six positional health arguments threaded through `build_prompt` are a struct.**
+  `build_prompt_at` took eleven arguments under a `#[allow(clippy::too_many_arguments)]`;
+  it now takes four — clock, `TurnPrompt`, `DeviceContexts`, persona — and the allow is
+  gone. The lint was never the problem. Six consecutive `bool`/`Option<&str>` values were,
+  because transposing two of them, or handing one channel's flags to the other, compiled
+  silently and produced a prompt that told the agent the wrong thing about both channels.
+
+- **`Directives` is boxed where it is stored.** Adding a third payload pushed
+  `JobState::Done` and `StreamFrame::Done` past clippy's large-variant threshold: those
+  enums have unit variants beside the big one, so every move of a `Running` job paid for
+  the biggest. `directives` is now boxed on store exactly as `provenance` already was,
+  which also means the next channel cannot re-inflate the variant.
+
+### Fixed
+
+- **The two whitelists that had to agree across two languages now have a CI guard.** The
+  bridge validates an agent-emitted directive against a Rust const and the app validates it
+  again against a Swift enum; until now the only thing keeping the two equal was a comment
+  in each file saying they must be. `scripts/ci-guards.sh` parses both sides and fails on
+  drift, covering the health metrics and sections as well as the new location fields and
+  precisions. The failure a comment permitted was quiet in the worst way: add a value to
+  the Rust list alone and the bridge honours a directive the app then rejects, so the turn
+  answers without the data and reports nothing anywhere; add it to the Swift list alone and
+  the bridge strips nothing, so the raw directive line is shown to the owner as reply text.
+  The guard self-checks its own parsers against synthetic fixtures, and fails rather than
+  passing vacuously if either declaration is renamed out from under it.
+
 ## [bridge 0.100.0] - 2026-08-27
 
 ### Added

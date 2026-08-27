@@ -18,7 +18,7 @@ final class HealthRetryTests: XCTestCase {
         var answerText: String
         var answerDirectives: JesseDirectives?
         private(set) var sendCalls = 0
-        private(set) var fulfillCalls: [(request: NeedsHealthRequest, sessionId: String?)] = []
+        private(set) var fulfillCalls: [(request: DeviceContextRequest, sessionId: String?)] = []
 
         init(sentinel: JesseDirectives, answer: String, answerDirectives: JesseDirectives? = nil) {
             self.sentinelDirectives = sentinel
@@ -35,7 +35,7 @@ final class HealthRetryTests: XCTestCase {
             return .running(jobId: "job-sentinel", conversationId: nil)
         }
 
-        func sendFulfilling(_ request: NeedsHealthRequest, mode: JesseMode, text: String,
+        func sendFulfilling(_ request: DeviceContextRequest, mode: JesseMode, text: String,
                             sessionId: String?, conversationId: String, voice: Bool,
                             instructions: String?, floorOverride: String?,
                             model: String?) async throws -> JesseSendResult {
@@ -90,8 +90,12 @@ final class HealthRetryTests: XCTestCase {
         XCTAssertEqual(fake.sendCalls, 1)
         XCTAssertEqual(fake.fulfillCalls.count, 1, "exactly one retry per user message")
         XCTAssertEqual(fake.fulfillCalls.first?.sessionId, "s1", "retry continues the same thread")
-        XCTAssertEqual(fake.fulfillCalls.first?.request.sections, [.daily])
-        XCTAssertEqual(fake.fulfillCalls.first?.request.metrics,
+        // The retry is dispatched on the HEALTH channel, carrying the validated request.
+        guard case .health(let request)? = fake.fulfillCalls.first?.request else {
+            return XCTFail("the retry must be dispatched on the health channel")
+        }
+        XCTAssertEqual(request.sections, [.daily])
+        XCTAssertEqual(request.metrics,
                        [ValidatedMetricRequest(metric: .restingHeartRate, windowDays: 14)])
 
         // Only the user turn and the final answer persist — the empty sentinel turn

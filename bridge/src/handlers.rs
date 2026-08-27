@@ -61,6 +61,33 @@ pub struct JesseRequest {
     // request→retry channel can never loop. Absent/false on an ordinary turn.
     #[serde(default)]
     health_context_unavailable: Option<bool>,
+    // Optional compact "where he is right now" block the phone attaches from
+    // CoreLocation, so the agent can answer "what's near me" / "how far is X" without
+    // making him type an address. The SECOND device-context channel; everything said
+    // about `health_context` above applies unchanged — capped
+    // (`MAX_LOCATION_CONTEXT_BYTES` → 413), control-stripped, framed as untrusted
+    // DEVICE DATA after the clock line, and NOT persona-rendered. Absent or empty
+    // reproduces today's behavior exactly.
+    //
+    // The cap is an eighth of the health one (1 KiB): a location block is three lines.
+    // It is also the most sensitive thing a turn carries, which is why it lives in the
+    // request and nowhere else — the bridge persists no request body and logs no
+    // prompt, so a coordinate reaches the model and stops there.
+    #[serde(default)]
+    location_context: Option<String>,
+    // This turn is a retry answering a prior `JESSE_NEEDS_LOCATION` directive: the app
+    // took a reading and re-sent the SAME question with it in `location_context`.
+    // Informational — the wrapper frames the attached data as "requested or attached,
+    // don't ask again." Absent/false on an ordinary turn.
+    #[serde(default)]
+    location_context_requested: Option<bool>,
+    // The app could NOT fulfill a location request this turn (permission denied,
+    // Location Services off, the fix timed out, no fix, or the feature toggle is off).
+    // The wrapper then tells the agent to answer without it and to say plainly that it
+    // does not know where he is, rather than re-requesting — so the channel can never
+    // loop. Absent/false on an ordinary turn.
+    #[serde(default)]
+    location_context_unavailable: Option<bool>,
     // Meal-corrections ack (JESSE_MEAL_LOG v2): the highest `corrections_seq` the app has
     // APPLIED from a delivered `meal_log`. On receipt the bridge prunes every queued batch
     // at or below this seq. Absent on an ordinary turn (old app builds simply omit it);
@@ -161,6 +188,9 @@ impl JesseRequest {
             health_context: None,
             health_context_requested: None,
             health_context_unavailable: None,
+            location_context: None,
+            location_context_requested: None,
+            location_context_unavailable: None,
             meal_corrections_ack: None,
             request_id: None,
         }
@@ -723,17 +753,39 @@ pub async fn start_turn(
         st.profile.current(now_ms).as_ref(),
         req.return_line.as_deref(),
     );
+    // Every device-context channel this turn carries, named rather than positional:
+    // with two channels the old call passed six consecutive Option/bool arguments, and
+    // handing health's `unavailable` to location would have compiled and silently told
+    // the agent the wrong thing about both.
+    let device_contexts = DeviceContexts {
+        health: ChannelContext {
+            block: req.health_context.as_deref(),
+            requested: req.health_context_requested.unwrap_or(false),
+            unavailable: req.health_context_unavailable.unwrap_or(false),
+        },
+        location: ChannelContext {
+            block: req.location_context.as_deref(),
+            requested: req.location_context_requested.unwrap_or(false),
+            unavailable: req.location_context_unavailable.unwrap_or(false),
+        },
+    };
+    // Framed ONCE here, ahead of the concurrency permit (so an oversized block on either
+    // channel is a 413 before any spawn), and MOVED INTO the turn task below, where the
+    // catch-up splice reads it. Framing it once and carrying it — rather than handing the
+    // splice a subset of the raw fields to re-derive from — is what keeps the splice's
+    // floor offset equal to the lead this prompt was actually built with.
+    let framed_device_blocks = device_contexts.framed()?;
     let prompt = build_prompt_at(
         &clock,
-        &mode,
-        &req.text,
-        is_followup,
-        req.voice,
-        req.instructions.as_deref(),
-        req.floor_override.as_deref(),
-        req.health_context.as_deref(),
-        req.health_context_requested.unwrap_or(false),
-        req.health_context_unavailable.unwrap_or(false),
+        &TurnPrompt {
+            mode: &mode,
+            text: &req.text,
+            is_followup,
+            voice: req.voice,
+            instructions: req.instructions.as_deref(),
+            floor_override: req.floor_override.as_deref(),
+        },
+        &device_contexts,
         &st.cfg.persona,
     )?;
 
@@ -954,6 +1006,10 @@ pub async fn start_turn(
     let raw_text = req.text.clone();
     // The phone-supplied health block, framed into the vault-QA child prompt the same
     // way the hosted turn frames it (already size-checked by `build_prompt` above).
+    // The local children (vault-QA, emergency) carry the HEALTH channel only: they
+    // answer from the vault, where a coordinate has nothing to match against, so
+    // sending one to a second model would spend the most sensitive field on a prompt
+    // that cannot use it.
     let health_context = req.health_context.clone();
     // Push machinery for the completion notification (no-ops when push is off).
     let apns = st.apns.clone();
@@ -1221,7 +1277,7 @@ pub async fn start_turn(
         // Splice the catch-up block into the hosted prompt (ahead of the floor, adjacent
         // to the health block). None → the prompt is byte-for-byte unchanged.
         let hosted_prompt = match &catchup_block {
-            Some(block) => splice_catchup(&prompt, block, &clock, health_context.as_deref()),
+            Some(block) => splice_catchup(&prompt, block, &clock, &framed_device_blocks),
             None => prompt.clone(),
         };
         // The RECENT CONVERSATION block for a local child (vault-QA / emergency), read
@@ -1897,7 +1953,7 @@ pub async fn jesse_result(
             "status": "done",
             "response": response,
             "session_id": session_id,
-            "directives": directives_to_value(&directives),
+            "directives": directives_to_value(directives.as_deref()),
             "provenance": provenance_to_value(provenance.as_deref()),
             // The files this turn returned, as metadata only — `null` when there are
             // none, so this response is byte-for-byte what it was for every turn that

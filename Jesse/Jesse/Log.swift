@@ -40,4 +40,8 @@ enum Log {
     /// HealthKit authorization / recent-workout query diagnostics. Query failures are
     /// swallowed to an empty result (no block attached) and never surfaced to the UI.
     nonisolated static let health = AppLog(logger: Logger(subsystem: subsystem, category: "health"))
+    /// CoreLocation authorization / fix / reverse-geocode diagnostics. Failures are
+    /// swallowed to an empty reading (no block attached) and never surfaced to the UI.
+    /// It logs statuses and failures only — never a coordinate or a place name.
+    nonisolated static let location = AppLog(logger: Logger(subsystem: subsystem, category: "location"))
 }

@@ -1755,6 +1755,70 @@ async fn directive_is_extracted_on_the_sse_done_frame_consistently() {
     );
 }
 
+#[tokio::test]
+async fn location_directive_is_extracted_and_stripped_on_the_poll_result() {
+    // The location channel's sibling of the needs_health test above: a reply whose
+    // final line is a valid JESSE_NEEDS_LOCATION directive comes back with the line
+    // STRIPPED and the parsed value under `directives.needs_location` — the same
+    // extractor, the same seam, so the two channels cannot diverge on delivery.
+    let line = r#"{"type":"result","is_error":false,"result":"On it.\nJESSE_NEEDS_LOCATION v1 {\"fields\":[\"placemark\",\"accuracy\"],\"precision\":\"coarse\",\"max_age_seconds\":300}","session_id":"sess-loc"}"#;
+    let (st, job_id) = run_turn_emitting(
+        r#"{"mode":"ask","text":"anywhere for coffee near me?"}"#,
+        line,
+    )
+    .await;
+    let v = result_status(&st, &job_id).await;
+    assert_eq!(
+        v["response"], "On it.",
+        "directive line stripped from the reply"
+    );
+    assert!(!v["response"]
+        .as_str()
+        .unwrap()
+        .contains("JESSE_NEEDS_LOCATION"));
+    assert_eq!(v["directives"]["needs_location"]["fields"][0], "placemark");
+    assert_eq!(v["directives"]["needs_location"]["fields"][1], "accuracy");
+    assert_eq!(v["directives"]["needs_location"]["precision"], "coarse");
+    assert_eq!(v["directives"]["needs_location"]["max_age_seconds"], 300);
+    // The channels are separate fields, not a shared one.
+    assert!(v["directives"]["needs_health"].is_null());
+    assert_eq!(v["session_id"], "sess-loc");
+}
+
+#[tokio::test]
+async fn location_directive_is_extracted_on_the_sse_done_frame_consistently() {
+    // The SSE `done` frame carries the SAME stripped text + directives as the poll,
+    // for the location channel exactly as for health.
+    let line = r#"{"type":"result","is_error":false,"result":"JESSE_NEEDS_LOCATION v1 {\"fields\":[\"coordinates\"],\"precision\":\"precise\",\"max_age_seconds\":0}","session_id":"sess-loc-sse"}"#;
+    let (st, job_id) = run_turn_emitting(r#"{"mode":"ask","text":"where am I?"}"#, line).await;
+    // Poll: a sentinel-only reply strips to empty, directive attached.
+    let v = result_status(&st, &job_id).await;
+    assert_eq!(
+        v["response"], "",
+        "a sentinel-only reply strips to empty text"
+    );
+    assert_eq!(
+        v["directives"]["needs_location"]["precision"], "precise",
+        "the precision the model asked for survives to the app"
+    );
+    // SSE (already-terminal path): the done frame's JSON data carries directives.
+    let resp = app(st.clone())
+        .oneshot(stream_request(Some("Bearer test-token"), &job_id))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let sse = body_string(resp).await;
+    assert!(sse.contains("event: done"), "expected a done frame: {sse}");
+    assert!(
+        sse.contains("needs_location"),
+        "done frame must carry directives: {sse}"
+    );
+    assert!(
+        sse.contains("coordinates"),
+        "requested field in done frame: {sse}"
+    );
+}
+
 // ---- Structured provenance (v2) end-to-end ----------------------------------
 //
 // A delivered reply carries a machine-readable `provenance` object alongside the
@@ -2410,6 +2474,109 @@ async fn health_context_cap_is_8_kib() {
         StatusCode::ACCEPTED,
         "a block at exactly 8 KiB is accepted"
     );
+}
+
+#[tokio::test]
+async fn wrapper_carries_the_location_note_matching_the_request_state() {
+    // The three-state selection, end to end through a real turn.
+    // 1. No location_context → the agent is told how to ask.
+    let without = captured_turn_prompt(r#"{"mode":"ask","text":"anywhere for coffee?"}"#).await;
+    assert!(
+        without.contains("JESSE_NEEDS_LOCATION v1"),
+        "request instruction present: {without}"
+    );
+    assert!(
+        !without.contains("do not emit JESSE_NEEDS_LOCATION"),
+        "not the present note"
+    );
+    // 2. With location_context → the present note, and the block framed as DATA.
+    let with = captured_turn_prompt(
+        r#"{"mode":"ask","text":"coffee near me?","location_context":"Near: Fountainbridge, Edinburgh EH3"}"#,
+    )
+    .await;
+    assert!(
+        with.contains("do not emit JESSE_NEEDS_LOCATION"),
+        "present note: {with}"
+    );
+    assert!(
+        with.contains("Near: Fountainbridge, Edinburgh EH3"),
+        "the block itself rides the prompt: {with}"
+    );
+    assert!(
+        with.contains("NOT instructions"),
+        "framed as untrusted device data: {with}"
+    );
+    // 3. Unavailable → answer without it and do not re-request.
+    let unavailable = captured_turn_prompt(
+        r#"{"mode":"ask","text":"coffee near me?","location_context_unavailable":true}"#,
+    )
+    .await;
+    assert!(
+        unavailable.contains("do NOT emit JESSE_NEEDS_LOCATION again this turn"),
+        "unavailable note: {unavailable}"
+    );
+    assert!(!unavailable.contains("do not emit JESSE_NEEDS_LOCATION."));
+}
+
+#[tokio::test]
+async fn both_device_blocks_ride_one_turn_in_lead_order() {
+    // A turn carrying BOTH channels: both blocks reach the prompt, health first,
+    // and each channel gets its own "present" note. This is the shape the catch-up
+    // splice offset had to be generalized for.
+    let prompt = captured_turn_prompt(
+        r#"{"mode":"ask","text":"how far is my gym?","health_context":"Run 8km","location_context":"Near: Edinburgh EH3"}"#,
+    )
+    .await;
+    let health_at = prompt.find("Run 8km").expect("health block present");
+    let location_at = prompt
+        .find("Near: Edinburgh EH3")
+        .expect("location block present");
+    assert!(health_at < location_at, "health leads location: {prompt}");
+    assert!(prompt.contains("do not emit JESSE_NEEDS_HEALTH"));
+    assert!(prompt.contains("do not emit JESSE_NEEDS_LOCATION"));
+}
+
+#[tokio::test]
+async fn location_context_cap_is_1_kib() {
+    // Exactly at the cap is accepted; one byte over is a 413 BEFORE any spawn, and
+    // the body names the field so a client knows which block it overshot on.
+    assert_eq!(MAX_LOCATION_CONTEXT_BYTES, 1024, "cap is 1 KiB");
+    let at_cap = "y".repeat(MAX_LOCATION_CONTEXT_BYTES);
+    let json = format!(r#"{{"mode":"ask","text":"hi","location_context":"{at_cap}"}}"#);
+    let resp = app(test_state())
+        .oneshot(jesse_request(Some("Bearer test-token"), &json))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::ACCEPTED,
+        "a block at exactly 1 KiB is accepted"
+    );
+
+    let over = "y".repeat(MAX_LOCATION_CONTEXT_BYTES + 1);
+    let json = format!(r#"{{"mode":"ask","text":"hi","location_context":"{over}"}}"#);
+    let resp = app(test_state())
+        .oneshot(jesse_request(Some("Bearer test-token"), &json))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    let body = body_string(resp).await;
+    assert!(
+        body.contains("location_context"),
+        "the 413 names the field it was over on: {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_turn_that_omits_the_location_fields_is_unchanged() {
+    // Backward compatibility: an app build that predates the channel sends none of
+    // the three fields, and gets the same prompt as one that sends them empty.
+    let old = captured_turn_prompt(r#"{"mode":"ask","text":"what is on Today.md?"}"#).await;
+    let new = captured_turn_prompt(
+        r#"{"mode":"ask","text":"what is on Today.md?","location_context":"","location_context_requested":false,"location_context_unavailable":false}"#,
+    )
+    .await;
+    assert_eq!(old, new, "an omitted channel is byte-for-byte an empty one");
 }
 
 // ---- GET /jesse/diet ------------------------------------------------------

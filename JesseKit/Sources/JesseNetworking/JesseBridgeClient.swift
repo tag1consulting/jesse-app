@@ -734,6 +734,9 @@ public struct JesseBridgeClient: BridgeClientProtocol {
                                    healthContext: String? = nil,
                                    healthContextRequested: Bool? = nil,
                                    healthContextUnavailable: Bool? = nil,
+                                   locationContext: String? = nil,
+                                   locationContextRequested: Bool? = nil,
+                                   locationContextUnavailable: Bool? = nil,
                                    mealCorrectionsAck: Int? = nil,
                                    requestId: String? = nil,
                                    model: String? = nil) -> JesseRequest {
@@ -758,6 +761,13 @@ public struct JesseBridgeClient: BridgeClientProtocol {
             // Only ever `true` or omitted — a `false` flag is meaningless to the bridge.
             healthContextRequested: healthContextRequested == true ? true : nil,
             healthContextUnavailable: healthContextUnavailable == true ? true : nil,
+            // The location channel, normalized exactly as the health one is: a blank
+            // block drops the field, and a `false` flag is meaningless to the bridge
+            // so it drops too. An app that never sets any of the three produces the
+            // pre-location bytes.
+            locationContext: nonBlank(locationContext),
+            locationContextRequested: locationContextRequested == true ? true : nil,
+            locationContextUnavailable: locationContextUnavailable == true ? true : nil,
             // Only a positive seq is meaningful (0/absent → nothing acked yet).
             mealCorrectionsAck: (mealCorrectionsAck ?? 0) > 0 ? mealCorrectionsAck : nil,
             // The outbox idempotency key; nil drops the field.

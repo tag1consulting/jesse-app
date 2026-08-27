@@ -211,6 +211,112 @@ final class JesseWireContractTests: XCTestCase {
         XCTAssertNil(reply.needsHealthRequest, "…validation rejects the out-of-range window")
     }
 
+    // MARK: - location channel wire contract
+
+    /// A location retry's exact bytes: the block plus the `requested` flag, and
+    /// NOTHING from the health channel — the two channels never bleed into each
+    /// other's fields, which is what stops one retry's flags being read as the
+    /// other's.
+    func testLocationContextRequestEncodesToExactBytes() throws {
+        let r = JesseClient.makeRequest(
+            mode: .ask, text: "coffee near me?", sessionId: "s1",
+            conversationId: "c1", voice: false, instructions: nil,
+            floorOverride: nil, attachments: [],
+            locationContext: "Near: Edinburgh EH3",
+            locationContextRequested: true)
+        XCTAssertEqual(
+            try body(r),
+            #"{"conversation_id":"c1","location_context":"Near: Edinburgh EH3","location_context_requested":true,"mode":"ask","session_id":"s1","text":"coffee near me?"}"#)
+    }
+
+    /// The unavailable terminator's bytes: no block, the flag alone. This is the
+    /// shape a denied permission produces, and it is what makes the bridge append
+    /// "answer without it and do not ask again this turn".
+    func testLocationUnavailableEncodesTheFlagAlone() throws {
+        let r = JesseClient.makeRequest(
+            mode: .ask, text: "coffee near me?", sessionId: nil,
+            conversationId: nil, voice: false, instructions: nil,
+            floorOverride: nil, attachments: [],
+            locationContextUnavailable: true)
+        XCTAssertEqual(
+            try body(r),
+            #"{"location_context_unavailable":true,"mode":"ask","text":"coffee near me?"}"#)
+    }
+
+    /// A blank block and `false` flags all drop out, so a build that sets them to
+    /// their defaults is byte-for-byte one that predates the channel.
+    func testLocationDefaultsAreOmittedEntirely() throws {
+        let r = JesseClient.makeRequest(
+            mode: .ask, text: "hi", sessionId: nil, conversationId: nil,
+            voice: false, instructions: nil, floorOverride: nil, attachments: [],
+            locationContext: "   ",
+            locationContextRequested: false,
+            locationContextUnavailable: false)
+        XCTAssertEqual(try body(r), #"{"mode":"ask","text":"hi"}"#,
+                       "a blank block and false flags produce the pre-location bytes")
+    }
+
+    /// A `done` result carrying `directives.needs_location` decodes to a validated
+    /// `NeedsLocationRequest` on the reply.
+    func testDecodeResultDoneWithLocationDirective() throws {
+        let json = #"{"status":"done","response":"","session_id":"s1","directives":{"needs_location":{"fields":["placemark","accuracy"],"precision":"coarse","max_age_seconds":300}}}"#
+        let s = try JesseClient.decodeResult(data: Data(json.utf8), resp: http(200))
+        guard case .done(let reply) = s else { return XCTFail("expected .done") }
+        let needs = reply.needsLocationRequest
+        XCTAssertEqual(needs?.fields, [.placemark, .accuracy])
+        XCTAssertEqual(needs?.precision, .coarse)
+        XCTAssertEqual(needs?.maxAgeSeconds, 300)
+        // And it dispatches as the LOCATION channel, not health.
+        XCTAssertEqual(reply.deviceContextRequest, .location(needs!))
+        XCTAssertNil(reply.needsHealthRequest)
+    }
+
+    /// No `directives` at all → nil on both channels. Backward compatible with a
+    /// bridge that predates the location channel.
+    func testDecodeResultWithoutLocationDirective() throws {
+        let json = #"{"status":"done","response":"the answer","session_id":"s1"}"#
+        let s = try JesseClient.decodeResult(data: Data(json.utf8), resp: http(200))
+        guard case .done(let reply) = s else { return XCTFail("expected .done") }
+        XCTAssertNil(reply.directives)
+        XCTAssertNil(reply.needsLocationRequest)
+        XCTAssertNil(reply.deviceContextRequest)
+    }
+
+    /// A `directives` object carrying only `needs_health` leaves `needs_location`
+    /// nil — an older bridge's shape decodes cleanly rather than throwing.
+    func testDecodeResultHealthOnlyDirectivesLeavesLocationNil() throws {
+        let json = #"{"status":"done","response":"","session_id":"s1","directives":{"needs_health":{"sections":["daily"]}}}"#
+        let s = try JesseClient.decodeResult(data: Data(json.utf8), resp: http(200))
+        guard case .done(let reply) = s else { return XCTFail("expected .done") }
+        XCTAssertNotNil(reply.needsHealthRequest)
+        XCTAssertNil(reply.directives?.needsLocation)
+        XCTAssertNil(reply.needsLocationRequest)
+    }
+
+    /// Invalid payloads DECODE (so one bad directive never throws away the whole
+    /// turn) and then validate to nil — never a partially-valid request, and in
+    /// particular never a reading at a precision the reply did not name.
+    func testDecodeResultInvalidLocationDirectiveValidatesToNil() throws {
+        let cases = [
+            (#"{"fields":["altitude"],"precision":"coarse","max_age_seconds":60}"#, "off-whitelist field"),
+            (#"{"fields":["placemark"],"precision":"exact","max_age_seconds":60}"#, "unknown precision"),
+            (#"{"fields":["placemark"],"precision":"coarse","max_age_seconds":901}"#, "age over the ceiling"),
+            (#"{"fields":["placemark"],"precision":"coarse","max_age_seconds":-1}"#, "negative age"),
+            (#"{"fields":[],"precision":"coarse","max_age_seconds":60}"#, "empty fields"),
+            (#"{"fields":["placemark"],"max_age_seconds":60}"#, "missing precision"),
+            (#"{"fields":["placemark"],"precision":"coarse"}"#, "missing age"),
+            (#"{"precision":"coarse","max_age_seconds":60}"#, "missing fields"),
+        ]
+        for (payload, why) in cases {
+            let json = #"{"status":"done","response":"","session_id":"s1","directives":{"needs_location":"# + payload + "}}"
+            let s = try JesseClient.decodeResult(data: Data(json.utf8), resp: http(200))
+            guard case .done(let reply) = s else { return XCTFail("expected .done (\(why))") }
+            XCTAssertNotNil(reply.directives?.needsLocation, "decoded, but… (\(why))")
+            XCTAssertNil(reply.needsLocationRequest, "validation rejects: \(why)")
+            XCTAssertNil(reply.deviceContextRequest, "and it never dispatches: \(why)")
+        }
+    }
+
     /// The device-registration body — one key, matching the old `["token": …]`.
     func testDeviceRegistrationEncodesToExactBytes() throws {
         let data = try JesseClient.encodeBody(JesseDeviceRegistration(token: "apns-tok"))

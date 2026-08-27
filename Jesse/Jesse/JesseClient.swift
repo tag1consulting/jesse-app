@@ -107,6 +107,30 @@ enum AttachmentLimits {
     }
 }
 
+/// Which device-context channel something belongs to. An ENUM rather than an
+/// `isLocation` boolean, because the retry budget, the request payload and the wire
+/// fields are all keyed by it — and because there will be a third one, at which point a
+/// boolean is a rewrite and this is a case.
+enum DeviceContextChannel: String, CaseIterable, Hashable, Sendable {
+    case health
+    case location
+}
+
+/// A validated directive from one channel, ready to fulfil. Carrying the channel as
+/// data is what lets `sendFulfilling` and `RunCoordinator.fulfillAndRetry` each be
+/// written once rather than once per channel.
+enum DeviceContextRequest: Equatable, Sendable {
+    case health(NeedsHealthRequest)
+    case location(NeedsLocationRequest)
+
+    var channel: DeviceContextChannel {
+        switch self {
+        case .health: return .health
+        case .location: return .location
+        }
+    }
+}
+
 /// The two bridge calls the coordinator drives a turn with, plus the iOS-only surface
 /// (health fulfillment, diet snapshot, push registration). Pulled behind a protocol
 /// purely so a fake can exercise the poll loop in tests without a server; `JesseClient`
@@ -140,10 +164,11 @@ protocol JesseClientProtocol: FlagSyncing, Sendable {
     /// does not model hydration degrades like a bridge with no such conversation.
     func hydrate(conversationId: String, after cursor: String?) async throws
         -> (turns: [HydratedTurn], nextCursor: String)
-    /// Fulfill a `JESSE_NEEDS_HEALTH` directive and re-send the SAME turn on the SAME
-    /// thread with the requested data attached (bypassing the classifier), carrying the
-    /// PER-TURN `model` so the retry answers on the same model as the original turn.
-    func sendFulfilling(_ request: NeedsHealthRequest, mode: JesseMode, text: String,
+    /// Fulfill a device-context directive (`JESSE_NEEDS_HEALTH` or
+    /// `JESSE_NEEDS_LOCATION`) and re-send the SAME turn on the SAME thread with the
+    /// requested data attached (bypassing the classifier), carrying the PER-TURN `model`
+    /// so the retry answers on the same model as the original turn.
+    func sendFulfilling(_ request: DeviceContextRequest, mode: JesseMode, text: String,
                         sessionId: String?, conversationId: String, voice: Bool,
                         instructions: String?, floorOverride: String?,
                         model: String?) async throws -> JesseSendResult
@@ -181,10 +206,10 @@ extension JesseClientProtocol {
     // the one send that requires both the conversation id and the request id. A forwarding
     // default is exactly how a call site quietly dropped one of them.
     //
-    // Default for fakes that don't exercise the needs-health retry channel: re-send the
+    // Default for fakes that don't exercise a device-context retry channel: re-send the
     // SAME turn via `send` (dropping the directive), reusing the request id so the bridge
     // still dedups a retry that actually landed.
-    func sendFulfilling(_ request: NeedsHealthRequest, mode: JesseMode, text: String,
+    func sendFulfilling(_ request: DeviceContextRequest, mode: JesseMode, text: String,
                         sessionId: String?, conversationId: String, voice: Bool,
                         instructions: String?, floorOverride: String?,
                         model: String?) async throws -> JesseSendResult {
@@ -253,6 +278,19 @@ struct JesseClient: JesseClientProtocol {
     /// when relevant (classify-then-attach).
     let healthClassifier: any HealthRelevanceClassifying
 
+    /// Reads one bounded location fix for the per-turn `location_context` block.
+    /// Defaults to the live provider; injectable so tests drive it with a fake.
+    let locationProvider: any LocationContextProviding
+
+    /// Whether the "attach location context" feature is on. Read at send time. Defaults
+    /// OFF, and it is only half the consent — the provider's live authorization is the
+    /// other half, and both are checked before anything touches CoreLocation.
+    let isLocationContextEnabled: @Sendable () -> Bool
+
+    /// Decides whether a turn's message is about where he is, so the block is attached
+    /// only when relevant (classify-then-attach, same as health).
+    let locationClassifier: any LocationRelevanceClassifying
+
     /// The highest meal-corrections `corrections_seq` the app has taken responsibility
     /// for, read at send time and attached to every turn so the bridge can prune its queue.
     let mealCorrectionsAck: @Sendable () -> Int?
@@ -272,6 +310,9 @@ struct JesseClient: JesseClientProtocol {
          healthProvider: any HealthContextProviding = HealthContextProvider(),
          isHealthContextEnabled: @escaping @Sendable () -> Bool = { HealthContextSettings.isEnabled },
          healthClassifier: any HealthRelevanceClassifying = UnionHealthClassifier(),
+         locationProvider: any LocationContextProviding = LocationContextProvider(),
+         isLocationContextEnabled: @escaping @Sendable () -> Bool = { LocationContextSettings.isEnabled },
+         locationClassifier: any LocationRelevanceClassifying = LocationKeywordClassifier(),
          mealCorrectionsAck: @escaping @Sendable () -> Int? = { MealCorrectionsAckStore.pendingSeq },
          frugal: @escaping @Sendable () -> FrugalPolicy = { FrugalSettings.current() },
          // Only the Health tab passes one: a client built for a send, a probe, or a
@@ -286,6 +327,9 @@ struct JesseClient: JesseClientProtocol {
         self.healthProvider = healthProvider
         self.isHealthContextEnabled = isHealthContextEnabled
         self.healthClassifier = healthClassifier
+        self.locationProvider = locationProvider
+        self.isLocationContextEnabled = isLocationContextEnabled
+        self.locationClassifier = locationClassifier
         self.mealCorrectionsAck = mealCorrectionsAck
         self.frugal = frugal
         self.snapshotCacheForReads = readableSnapshotCache
@@ -320,6 +364,12 @@ struct JesseClient: JesseClientProtocol {
         async let healthBlock = HealthContextResolver.resolve(
             enabled: attach, provider: healthProvider, now: Date())
         async let dietRollup = dietRollupBlock(enabled: attach)
+        // The location channel, resolved concurrently with the health one — the two are
+        // independent, and a turn that wants both should not pay for them in series.
+        // Its gate is stricter: the toggle (default OFF), the classifier, AND the live
+        // CoreLocation authorization, all checked before the provider is touched, so a
+        // revoked permission can never surface a system prompt mid-turn.
+        async let locationBlock = resolveLocationContext(text)
         let healthContext = DietContextComposer.combine(
             healthBlock: await healthBlock, dietRollup: await dietRollup)
         let request = Self.makeRequest(mode: mode, text: text, sessionId: sessionId,
@@ -328,10 +378,22 @@ struct JesseClient: JesseClientProtocol {
                                        floorOverride: floorOverride,
                                        attachments: attachments,
                                        healthContext: healthContext,
+                                       locationContext: await locationBlock,
                                        mealCorrectionsAck: mealCorrectionsAck(),
                                        requestId: requestId,
                                        model: model)
         return try await bridge.sendPrepared(request)
+    }
+
+    /// The proactive `location_context` for this turn, or nil. Classifies only when the
+    /// toggle is on, so a switched-off channel costs nothing and never asks the
+    /// classifier a question about the owner's message.
+    private func resolveLocationContext(_ text: String) async -> String? {
+        let enabled = isLocationContextEnabled()
+        guard enabled else { return nil }
+        let relevant = await locationClassifier.isRelevant(text)
+        return await LocationContextResolver.resolve(enabled: enabled, relevant: relevant,
+                                                     provider: locationProvider, now: Date())
     }
 
     /// The compact multi-window nutrient rollup for the coach's `health_context`, or nil.
@@ -376,49 +438,52 @@ struct JesseClient: JesseClientProtocol {
         return snapshot
     }
 
-    /// Re-send a needs-health retry on the SAME conversation and the SAME PER-TURN `model`
-    /// as the original turn (a nil/blank model omits the field, so the bridge uses its
-    /// stored default).
-    func sendFulfilling(_ requested: NeedsHealthRequest, mode: JesseMode, text: String,
+    /// Re-send a device-context retry on the SAME conversation and the SAME PER-TURN
+    /// `model` as the original turn (a nil/blank model omits the field, so the bridge
+    /// uses its stored default).
+    ///
+    /// One method for both channels. The directive is carried as a
+    /// `DeviceContextRequest`, so which channel is being answered is data rather than a
+    /// second copy of this function — and the "we still re-send, marked unavailable"
+    /// terminator below cannot exist on one channel and not the other.
+    func sendFulfilling(_ requested: DeviceContextRequest, mode: JesseMode, text: String,
                         sessionId: String?, conversationId: String, voice: Bool,
                         instructions: String?, floorOverride: String?,
                         model: String?) async throws -> JesseSendResult {
-        // A retry answering a JESSE_NEEDS_HEALTH directive: bypass the classifier, fulfill
-        // the request from the provider (honoring the master toggle), and re-send the SAME
-        // text on the SAME thread with the data + the flags. When it can't be fulfilled we
-        // still re-send — marked unavailable, no block — so the agent answers from vault
-        // data and never re-requests (no loop).
-        let outgoing = await fulfill(requested)
-        let request = Self.makeRequest(mode: mode, text: text, sessionId: sessionId,
-                                       conversationId: conversationId,
-                                       voice: voice, instructions: instructions,
-                                       floorOverride: floorOverride,
-                                       attachments: [],
-                                       healthContext: outgoing.block,
-                                       healthContextRequested: outgoing.requested ? true : nil,
-                                       healthContextUnavailable: outgoing.unavailable ? true : nil,
-                                       mealCorrectionsAck: mealCorrectionsAck(),
-                                       model: model)
+        // A retry answering a directive: bypass the classifier, fulfil the request from
+        // the channel's provider (honoring that channel's consents), and re-send the
+        // SAME text on the SAME thread with the data + the flags. When it can't be
+        // fulfilled we STILL re-send — marked unavailable, no block — so the agent
+        // answers without it and never re-requests. That re-send is the prompt-side
+        // terminator: without it a denied permission would return an empty sentinel and
+        // the turn would have no answer at all.
+        let outgoing: OutgoingDeviceContext
+        switch requested {
+        case .health(let r):
+            outgoing = await fulfillDeviceContext(
+                r, through: HealthChannel(provider: healthProvider,
+                                          enabled: isHealthContextEnabled))
+        case .location(let r):
+            outgoing = await fulfillDeviceContext(
+                r, through: LocationChannel(provider: locationProvider,
+                                            enabled: isLocationContextEnabled))
+        }
+        let channel = requested.channel
+        let request = Self.makeRequest(
+            mode: mode, text: text, sessionId: sessionId,
+            conversationId: conversationId,
+            voice: voice, instructions: instructions,
+            floorOverride: floorOverride,
+            attachments: [],
+            healthContext: channel == .health ? outgoing.block : nil,
+            healthContextRequested: channel == .health && outgoing.requested ? true : nil,
+            healthContextUnavailable: channel == .health && outgoing.unavailable ? true : nil,
+            locationContext: channel == .location ? outgoing.block : nil,
+            locationContextRequested: channel == .location && outgoing.requested ? true : nil,
+            locationContextUnavailable: channel == .location && outgoing.unavailable ? true : nil,
+            mealCorrectionsAck: mealCorrectionsAck(),
+            model: model)
         return try await bridge.sendPrepared(request)
-    }
-
-    /// Fulfill a validated needs-health request from the health provider, honoring the
-    /// master toggle. Off, or nothing gathered → `unavailable` (no block).
-    private func fulfill(_ request: NeedsHealthRequest) async -> OutgoingHealthContext {
-        guard isHealthContextEnabled() else {
-            return OutgoingHealthContext(block: nil, requested: false, unavailable: true)
-        }
-        let snapshot = request.sections.isEmpty ? HealthSnapshot.empty : await healthProvider.snapshot()
-        var series: [RequestableMetric: [MetricSeriesPoint]] = [:]
-        for m in request.metrics {
-            series[m.metric] = await healthProvider.series(for: m.metric, windowDays: m.windowDays)
-        }
-        let block = HealthRequestFulfiller.block(request: request, snapshot: snapshot,
-                                                 series: series, now: Date())
-        if let block {
-            return OutgoingHealthContext(block: block, requested: true, unavailable: false)
-        }
-        return OutgoingHealthContext(block: nil, requested: false, unavailable: true)
     }
 
     // MARK: - Straight forwards to the shared client
@@ -512,6 +577,9 @@ struct JesseClient: JesseClientProtocol {
                             healthContext: String? = nil,
                             healthContextRequested: Bool? = nil,
                             healthContextUnavailable: Bool? = nil,
+                            locationContext: String? = nil,
+                            locationContextRequested: Bool? = nil,
+                            locationContextUnavailable: Bool? = nil,
                             mealCorrectionsAck: Int? = nil,
                             requestId: UUID? = nil,
                             model: String? = nil) -> JesseRequest {
@@ -527,6 +595,9 @@ struct JesseClient: JesseClientProtocol {
             healthContext: healthContext,
             healthContextRequested: healthContextRequested,
             healthContextUnavailable: healthContextUnavailable,
+            locationContext: locationContext,
+            locationContextRequested: locationContextRequested,
+            locationContextUnavailable: locationContextUnavailable,
             mealCorrectionsAck: mealCorrectionsAck,
             // Encode the outbox idempotency key as its string form; nil drops the field.
             requestId: requestId?.uuidString,
@@ -576,6 +647,27 @@ extension JesseReply {
         return NeedsHealthRequest.validated(
             sections: nh.sections ?? [],
             metrics: (nh.metrics ?? []).map { (metric: $0.metric, windowDays: $0.windowDays) })
+    }
+
+    /// The validated needs-location request this reply asks for, or nil if there is no
+    /// `needs_location` directive or it fails the contract (off-whitelist field, unknown
+    /// precision, out-of-range age, a missing required key) — an invalid request is
+    /// never partially fulfilled, and in particular never fulfilled at a precision the
+    /// reply did not name.
+    var needsLocationRequest: NeedsLocationRequest? {
+        guard let nl = directives?.needsLocation else { return nil }
+        return NeedsLocationRequest.validated(fields: nl.fields,
+                                              precision: nl.precision,
+                                              maxAgeSeconds: nl.maxAgeSeconds)
+    }
+
+    /// The one device-context directive this reply carries, if any, as the channel-
+    /// tagged value the coordinator dispatches on. Health is checked first only because
+    /// exactly one directive is recognized per reply — the two can never both be set.
+    var deviceContextRequest: DeviceContextRequest? {
+        if let health = needsHealthRequest { return .health(health) }
+        if let location = needsLocationRequest { return .location(location) }
+        return nil
     }
 
     /// The validated meals this reply logged, or nil if there is no `meal_log` directive

@@ -2407,15 +2407,8 @@ mod tests {
         // A realistic wrapped first user turn (built by the real prompt builder).
         let wrapped = build_prompt_at(
             "Current date/time: Sunday, 2026-07-20 08:00 CEST (UTC+02:00).",
-            "ask",
-            "what is on Today.md?",
-            false,
-            false,
-            None,
-            None,
-            None,
-            false,
-            false,
+            &TurnPrompt::new("ask", "what is on Today.md?"),
+            &DeviceContexts::default(),
             &Persona::default(),
         )
         .unwrap();
