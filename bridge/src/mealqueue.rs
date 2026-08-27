@@ -258,6 +258,7 @@ pub fn merge_meal_corrections(
         None => (
             Directives {
                 needs_health: None,
+                needs_location: None,
                 meal_log: None,
             },
             None,
@@ -485,6 +486,7 @@ mod tests {
     fn directives_with_meal_log(ml: MealLog) -> Option<Directives> {
         Some(Directives {
             needs_health: None,
+            needs_location: None,
             meal_log: Some(ml),
         })
     }
@@ -608,6 +610,7 @@ mod tests {
         let q = MealCorrectionsQueue::from_dir(&dir);
         q.enqueue(vec![meal("q", None)], vec![]).unwrap();
         let turn = Some(Directives {
+            needs_location: None,
             needs_health: Some(NeedsHealth {
                 sections: vec!["daily".into()],
                 metrics: vec![],

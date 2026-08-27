@@ -28,7 +28,7 @@ pub enum StreamFrame {
     Done {
         response: String,
         session_id: Option<String>,
-        directives: Option<Directives>,
+        directives: Option<Box<Directives>>,
         // Boxed to match `JobState::Done` — keeps this large terminal frame small.
         provenance: Option<Box<Provenance>>,
         // The metadata for any files this turn returned — never the bytes. Mirrors

@@ -3459,6 +3459,7 @@ pub async fn run_diet_pipeline(
                 dashboard,
                 directives: Directives {
                     needs_health: None,
+                    needs_location: None,
                     meal_log: Some(meal_log),
                 },
                 micros,
@@ -3472,6 +3473,7 @@ pub async fn run_diet_pipeline(
                 dashboard,
                 directives: Directives {
                     needs_health: None,
+                    needs_location: None,
                     meal_log: None,
                 },
                 micros,
@@ -5567,8 +5569,9 @@ mod tests {
         assert!(m.satfat_g.is_none() && m.sugar_g.is_none() && m.potassium_mg.is_none());
         assert!(m.magnesium_mg.is_none(), "all-None magnesium omitted");
         // And on the wire the all-None micros produce NO key.
-        let v = directives_to_value(&Some(Directives {
+        let v = directives_to_value(Some(&Directives {
             needs_health: None,
+            needs_location: None,
             meal_log: Some(ml),
         }));
         let meal = &v["meal_log"]["meals"][0];
@@ -5672,8 +5675,9 @@ mod tests {
         );
         assert!(m.satfat_g.is_none() && m.potassium_mg.is_none() && m.magnesium_mg.is_none());
         // Serialize the whole directive and check the wire keys the app expects.
-        let v = directives_to_value(&Some(Directives {
+        let v = directives_to_value(Some(&Directives {
             needs_health: None,
+            needs_location: None,
             meal_log: Some(ml),
         }));
         let meal = &v["meal_log"]["meals"][0];
@@ -5735,8 +5739,9 @@ mod tests {
             "the unknown row contributes nothing, it does not zero the sum"
         );
 
-        let v = directives_to_value(&Some(Directives {
+        let v = directives_to_value(Some(&Directives {
             needs_health: None,
+            needs_location: None,
             meal_log: Some(ml),
         }));
         let meal = &v["meal_log"]["meals"][0];
@@ -5757,8 +5762,9 @@ mod tests {
                 .unwrap();
         let m = &bare.meals[0];
         assert!(m.cholesterol_mg.is_none() && m.selenium_ug.is_none() && m.vitamin_d_ug.is_none());
-        let v = directives_to_value(&Some(Directives {
+        let v = directives_to_value(Some(&Directives {
             needs_health: None,
+            needs_location: None,
             meal_log: Some(bare),
         }));
         for key in ["cholesterol_mg", "selenium_ug", "vitamin_d_ug"] {

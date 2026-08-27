@@ -246,6 +246,129 @@ else
   flag "expected $WRITER to exist (the meal delete guard has nothing to check)" ""
 fi
 
+# 6c) (Contract) The device-context whitelists must agree ACROSS THE TWO LANGUAGES.
+#
+#     Both halves of every device-context channel carry the same fixed whitelist: the
+#     bridge validates an agent-emitted directive against its Rust const, the app
+#     validates it again against its Swift enum, and a request that is not on BOTH lists
+#     is unfulfillable. Until now the only thing keeping them equal was a code comment
+#     in each file saying "MUST stay in exact sync with the other one".
+#
+#     A comment is not a guard, and the failure it permits is quiet in the worst way:
+#     add a metric to the Rust list alone and the bridge honours a directive the app
+#     then rejects, so the agent asks for real data, the app returns "unavailable", and
+#     the turn answers without it — no error anywhere, just a channel that silently
+#     stops working for that value. Add it to the Swift list alone and the bridge
+#     strips nothing, so the raw directive line is shown to the user as reply text.
+#
+#     So: parse both sides and compare the SETS. This is a pattern check like every
+#     other guard here — it reads the source, it does not run it — which is why it can
+#     cover Swift on a Linux runner with no Xcode.
+#
+#     Adding a THIRD channel means adding one row to CHANNELS below. If the parse finds
+#     nothing on either side the guard FAILS rather than passing vacuously: a renamed
+#     const or enum must break loudly, not silently stop checking.
+DIRECTIVES_RS="$ROOT/bridge/src/directives.rs"
+METRIC_SWIFT="$ROOT/Jesse/Jesse/RequestableMetric.swift"
+LOCATION_SWIFT="$ROOT/Jesse/Jesse/RequestableLocation.swift"
+
+# Extract a Rust `pub const NAME: &[&str] = &["a", "b"];` list as one value per line.
+# The declaration may wrap over several lines, so read from the name to the first `];`.
+rust_list() {  # $1 = file, $2 = const name
+  awk -v name="$2" '
+    $0 ~ ("pub const " name "[[:space:]]*:") { inside = 1 }
+    inside { buf = buf $0; if ($0 ~ /\];/) { inside = 0 } }
+    END { print buf }
+  ' "$1" | grep -oE '"[a-zA-Z0-9_]+"' | tr -d '"' | sort -u
+}
+
+# Extract the case names of a Swift `enum Name: String … { case a … }` as one per line.
+# Reads from the enum declaration to its closing brace at column 1. Handles both
+# `case a` and `case a = "raw"`, taking the RAW value when one is given (that is what
+# crosses the wire) and the case name otherwise (Swift's implicit raw value).
+swift_cases() {  # $1 = file, $2 = enum name
+  awk -v name="$2" '
+    $0 ~ ("enum " name "[[:space:]]*:") { inside = 1; next }
+    inside && /^\}/ { inside = 0 }
+    inside && /^[[:space:]]*case[[:space:]]/ { print }
+  ' "$1" | sed -E '
+      s/^[[:space:]]*case[[:space:]]+//
+      s/^([A-Za-z0-9_]+)[[:space:]]*=[[:space:]]*"([^"]+)".*$/\2/
+      s/^([A-Za-z0-9_]+).*$/\1/
+    ' | sort -u
+}
+
+# channel-label | rust-const | swift-file | swift-enum
+CHANNELS="health metrics|NEEDS_HEALTH_METRICS|$METRIC_SWIFT|RequestableMetric
+health sections|NEEDS_HEALTH_SECTIONS|$METRIC_SWIFT|HealthSection
+location fields|NEEDS_LOCATION_FIELDS|$LOCATION_SWIFT|RequestableLocationField
+location precisions|NEEDS_LOCATION_PRECISIONS|$LOCATION_SWIFT|LocationPrecision"
+
+while IFS='|' read -r label rust_const swift_file swift_enum; do
+  [ -n "$label" ] || continue
+  if [ ! -f "$swift_file" ]; then
+    flag "expected $swift_file to exist (the $label whitelist guard has nothing to check)" ""
+    continue
+  fi
+  rust_side="$(rust_list "$DIRECTIVES_RS" "$rust_const")"
+  swift_side="$(swift_cases "$swift_file" "$swift_enum")"
+  # Vacuous-pass check FIRST: two empty lists compare equal, which would report a pass
+  # for a check that found nothing to compare.
+  if [ -z "$rust_side" ]; then
+    flag "$label: could not parse Rust \`$rust_const\` out of bridge/src/directives.rs" \
+      "the const was renamed or reshaped — fix this guard, do not let it pass vacuously"
+    continue
+  fi
+  if [ -z "$swift_side" ]; then
+    flag "$label: could not parse Swift \`enum $swift_enum\` out of ${swift_file#"$ROOT/"}" \
+      "the enum was renamed or reshaped — fix this guard, do not let it pass vacuously"
+    continue
+  fi
+  if [ "$rust_side" != "$swift_side" ]; then
+    flag "$label whitelist has DRIFTED between the bridge and the app" \
+      "Rust  $rust_const ($(echo "$rust_side" | tr '\n' ' '))" \
+      "Swift enum $swift_enum ($(echo "$swift_side" | tr '\n' ' '))" \
+      "only in Rust:  $(comm -23 <(echo "$rust_side") <(echo "$swift_side") | tr '\n' ' ')" \
+      "only in Swift: $(comm -13 <(echo "$rust_side") <(echo "$swift_side") | tr '\n' ' ')"
+  fi
+done <<EOF
+$CHANNELS
+EOF
+
+# 6d) Self-check the whitelist parsers, in the spirit of 5a. A future edit that neuters
+#     `rust_list`/`swift_cases` (so real drift sails through green) is caught here:
+#     synthetic fixtures with a KNOWN answer must parse to exactly that answer.
+guard_selfcheck_dir="$(mktemp -d)"
+cat > "$guard_selfcheck_dir/fixture.rs" <<'FIXTURE'
+pub const SOMETHING_ELSE: &[&str] = &["ignored"];
+pub const GUARD_SELFCHECK: &[&str] = &[
+    "alpha",
+    "bravo",
+];
+pub const AFTER: &[&str] = &["also_ignored"];
+FIXTURE
+cat > "$guard_selfcheck_dir/fixture.swift" <<'FIXTURE'
+enum Unrelated: String { case ignored }
+nonisolated enum GuardSelfcheck: String, CaseIterable, Sendable {
+    /// A doc comment mentioning case charlie, which must NOT be parsed as a case.
+    case alpha
+    case bravo = "bravo"
+}
+enum After: String { case also_ignored }
+FIXTURE
+sc_rust="$(rust_list "$guard_selfcheck_dir/fixture.rs" GUARD_SELFCHECK)"
+sc_swift="$(swift_cases "$guard_selfcheck_dir/fixture.swift" GuardSelfcheck)"
+sc_want="$(printf 'alpha\nbravo')"
+if [ "$sc_rust" != "$sc_want" ]; then
+  flag "whitelist guard self-check: the RUST parser is broken" \
+    "expected 'alpha bravo', got '$(echo "$sc_rust" | tr '\n' ' ')'"
+fi
+if [ "$sc_swift" != "$sc_want" ]; then
+  flag "whitelist guard self-check: the SWIFT parser is broken" \
+    "expected 'alpha bravo', got '$(echo "$sc_swift" | tr '\n' ' ')'"
+fi
+rm -rf "$guard_selfcheck_dir"
+
 # 7) (Versioning) Mandatory version bumps. A change to a component's sources must
 #    bump that component's version and update CHANGELOG.md. Delegated to the
 #    dedicated version-guard.sh (shared with the pre-push hook); it skips cleanly

@@ -69,7 +69,7 @@ pub fn frame_to_event(frame: &StreamFrame) -> Event {
             json!({
                 "response": response,
                 "session_id": session_id,
-                "directives": directives_to_value(directives),
+                "directives": directives_to_value(directives.as_deref()),
                 "provenance": provenance_to_value(provenance.as_deref()),
                 // `null` when the turn returned no file, so the `done` frame a
                 // no-artifact turn emits is byte-for-byte the frame it emitted before

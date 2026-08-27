@@ -107,6 +107,58 @@ pub const NEEDS_HEALTH_METRICS: &[&str] = &[
 /// Max number of metric requests one directive may carry.
 pub const MAX_NEEDS_HEALTH_METRICS: usize = 4;
 
+// ---- JESSE_NEEDS_LOCATION v1 ----------------------------------------------
+//
+// The second device-context channel's directive, built on exactly the machinery
+// above: same extractor, same registry, same strictness. It asks the app for a
+// reading from CoreLocation the turn was not given.
+//
+// Every key is REQUIRED and there are no defaults, which is deliberate and is not
+// how the health directive works. A default `precision` would mean the transcript
+// records a directive that never said which precision it wanted, and precision is
+// the difference between a 1–3 km circle and an exact coordinate — the single
+// decision on this channel with a privacy consequence. Making the model state it
+// puts that choice in the reply, where it can be read back afterwards.
+
+/// Fields a `JESSE_NEEDS_LOCATION` directive may request. **Kept in exact sync with
+/// the app's `RequestableLocationField` enum**, and unlike the health whitelist that
+/// synchronisation is now checked: `scripts/ci-guards.sh` parses both sides and fails
+/// on drift.
+pub const NEEDS_LOCATION_FIELDS: &[&str] = &["coordinates", "placemark", "accuracy"];
+
+/// The precisions a directive may ask for. `coarse` is the reduced accuracy
+/// CoreLocation already provides through `CLLocationManager.accuracyAuthorization` —
+/// roughly a 1–3 km circle, and no additional prompt. `precise` is full accuracy, and
+/// on a device that granted reduced accuracy only it costs the owner a temporary
+/// full-accuracy prompt mid-turn. Kept in sync with the app's `LocationPrecision`.
+pub const NEEDS_LOCATION_PRECISIONS: &[&str] = &["coarse", "precise"];
+
+/// Max fields one directive may request — the whole whitelist, so a directive can ask
+/// for everything at once but can never repeat itself into a large payload.
+pub const MAX_NEEDS_LOCATION_FIELDS: usize = 3;
+
+/// Allowed `max_age_seconds` range (inclusive) for a location request: how stale a
+/// cached fix the agent will accept instead of a fresh reading. `0` means "take a new
+/// reading"; the 900-second ceiling is fifteen minutes, past which a fix says where he
+/// was rather than where he is.
+pub const NEEDS_LOCATION_MAX_AGE_SECONDS: std::ops::RangeInclusive<u64> = 0..=900;
+
+/// Per-directive line cap for `JESSE_NEEDS_LOCATION` — the payload is three small
+/// keys, so it takes the tightest bound of any directive (1 KiB) even though the
+/// generic ceiling is 8 KiB.
+pub const MAX_NEEDS_LOCATION_LINE_BYTES: usize = 1024;
+
+/// The parsed payload of a `JESSE_NEEDS_LOCATION v1` directive: which fields of the
+/// device's location the agent needs, at what precision, and how stale a cached fix it
+/// will accept. All three are required (enforced at parse time), so a `NeedsLocation`
+/// that exists is fully specified.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NeedsLocation {
+    pub fields: Vec<String>,
+    pub precision: String,
+    pub max_age_seconds: u32,
+}
+
 /// Allowed `window_days` range (inclusive) for a metric request.
 pub const NEEDS_HEALTH_WINDOW_DAYS: std::ops::RangeInclusive<u64> = 1..=31;
 
@@ -270,13 +322,19 @@ pub struct Directives {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub needs_health: Option<NeedsHealth>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub needs_location: Option<NeedsLocation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub meal_log: Option<MealLog>,
 }
 
 /// Serialize an optional `Directives` to the wire value used by BOTH the poll
 /// result JSON and the SSE `done` frame, so the two paths are byte-consistent.
 /// `None` → JSON `null` (the app treats null/absent identically).
-pub fn directives_to_value(directives: &Option<Directives>) -> Value {
+///
+/// Takes `Option<&Directives>` rather than `&Option<Directives>` so the stored form
+/// is free to be boxed (it is — see [`crate::JobState::Done`]) without the two
+/// serializers having to know or care.
+pub fn directives_to_value(directives: Option<&Directives>) -> Value {
     match directives {
         Some(d) => serde_json::to_value(d).unwrap_or(Value::Null),
         None => Value::Null,
@@ -371,10 +429,30 @@ fn classify_final_line(reply: &str) -> FinalLine {
             match parse_needs_health(json) {
                 Ok(needs_health) => FinalLine::Honored(Directives {
                     needs_health: Some(needs_health),
+                    needs_location: None,
                     meal_log: None,
                 }),
                 Err(reason) => FinalLine::Unhonored(format!(
                     "JESSE_NEEDS_HEALTH v1 payload rejected ({reason}) — \
+                     passing through untouched"
+                )),
+            }
+        }
+        ("JESSE_NEEDS_LOCATION", 1) => {
+            if last_line.len() > MAX_NEEDS_LOCATION_LINE_BYTES {
+                return FinalLine::Unhonored(format!(
+                    "JESSE_NEEDS_LOCATION v1 exceeds its \
+                     {MAX_NEEDS_LOCATION_LINE_BYTES}-byte cap — passing through untouched"
+                ));
+            }
+            match parse_needs_location(json) {
+                Ok(needs_location) => FinalLine::Honored(Directives {
+                    needs_health: None,
+                    needs_location: Some(needs_location),
+                    meal_log: None,
+                }),
+                Err(reason) => FinalLine::Unhonored(format!(
+                    "JESSE_NEEDS_LOCATION v1 payload rejected ({reason}) — \
                      passing through untouched"
                 )),
             }
@@ -397,6 +475,7 @@ fn classify_final_line(reply: &str) -> FinalLine {
             match parsed {
                 Ok(meal_log) => FinalLine::Honored(Directives {
                     needs_health: None,
+                    needs_location: None,
                     meal_log: Some(meal_log),
                 }),
                 Err(reason) => FinalLine::Unhonored(format!(
@@ -619,6 +698,91 @@ fn parse_needs_health(json: &str) -> Result<NeedsHealth, String> {
         return Err("at least one of `sections`/`metrics` must be present".into());
     }
     Ok(NeedsHealth { sections, metrics })
+}
+
+/// Parse + validate the JSON payload of a `JESSE_NEEDS_LOCATION v1` directive against
+/// the contract: `fields` a non-empty array (cap [`MAX_NEEDS_LOCATION_FIELDS`]) drawn
+/// from [`NEEDS_LOCATION_FIELDS`]; `precision` one of [`NEEDS_LOCATION_PRECISIONS`];
+/// `max_age_seconds` an integer in [`NEEDS_LOCATION_MAX_AGE_SECONDS`]. All three are
+/// REQUIRED — there is no default for any of them, so a directive that omits one is
+/// malformed rather than silently taking a value nobody asked for. Any violation is an
+/// `Err(reason)` the caller logs and passes through, so a bad directive never becomes a
+/// partial or wrong request.
+///
+/// Strictness matches [`parse_needs_health`] exactly, and the two failure modes that
+/// matter here are unknown keys and a typo'd `precision`: both would otherwise degrade
+/// into a reading at a precision the model did not ask for.
+fn parse_needs_location(json: &str) -> Result<NeedsLocation, String> {
+    let value: Value = serde_json::from_str(json).map_err(|e| format!("invalid JSON: {e}"))?;
+    let obj = value.as_object().ok_or("payload is not a JSON object")?;
+
+    // Reject unknown keys so a typo'd field (e.g. "field", "max_age") is a loud
+    // failure rather than silently dropping part of the request.
+    for key in obj.keys() {
+        if key != "fields" && key != "precision" && key != "max_age_seconds" {
+            return Err(format!("unknown field {key:?}"));
+        }
+    }
+
+    let fields = match obj.get("fields") {
+        Some(Value::Array(items)) => {
+            if items.is_empty() {
+                return Err("`fields` must name at least one field".into());
+            }
+            if items.len() > MAX_NEEDS_LOCATION_FIELDS {
+                return Err(format!(
+                    "`fields` has {} entries, cap is {MAX_NEEDS_LOCATION_FIELDS}",
+                    items.len()
+                ));
+            }
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                let f = item.as_str().ok_or("field entry is not a string")?;
+                if !NEEDS_LOCATION_FIELDS.contains(&f) {
+                    return Err(format!("unknown field {f:?}"));
+                }
+                out.push(f.to_string());
+            }
+            out
+        }
+        None | Some(Value::Null) => return Err("`fields` is required".into()),
+        Some(_) => return Err("`fields` is not an array".into()),
+    };
+
+    // No default: the model must SAY which precision it wants, so the transcript
+    // records the choice rather than the bridge making it silently.
+    let precision = match obj.get("precision") {
+        Some(Value::String(s)) => {
+            if !NEEDS_LOCATION_PRECISIONS.contains(&s.as_str()) {
+                return Err(format!("unknown precision {s:?}"));
+            }
+            s.clone()
+        }
+        None | Some(Value::Null) => return Err("`precision` is required".into()),
+        Some(_) => return Err("`precision` is not a string".into()),
+    };
+
+    // as_u64 rejects negatives and non-integer floats (e.g. 300.5), so an age is
+    // always a whole non-negative count of seconds.
+    let max_age = match obj.get("max_age_seconds") {
+        Some(v) => v
+            .as_u64()
+            .ok_or("`max_age_seconds` is not a non-negative integer")?,
+        None => return Err("`max_age_seconds` is required".into()),
+    };
+    if !NEEDS_LOCATION_MAX_AGE_SECONDS.contains(&max_age) {
+        return Err(format!(
+            "max_age_seconds {max_age} out of range {}..={}",
+            NEEDS_LOCATION_MAX_AGE_SECONDS.start(),
+            NEEDS_LOCATION_MAX_AGE_SECONDS.end()
+        ));
+    }
+
+    Ok(NeedsLocation {
+        fields,
+        precision,
+        max_age_seconds: max_age as u32,
+    })
 }
 
 /// Parse + validate the JSON payload of a `JESSE_MEAL_LOG v1` directive against
@@ -1018,8 +1182,9 @@ mod tests {
 
     #[test]
     fn directives_to_value_round_trips_and_nulls() {
-        assert_eq!(directives_to_value(&None), Value::Null);
+        assert_eq!(directives_to_value(None), Value::Null);
         let d = Directives {
+            needs_location: None,
             needs_health: Some(NeedsHealth {
                 sections: vec!["daily".into()],
                 metrics: vec![MetricRequest {
@@ -1029,7 +1194,7 @@ mod tests {
             }),
             meal_log: None,
         };
-        let v = directives_to_value(&Some(d));
+        let v = directives_to_value(Some(&d));
         assert_eq!(v["needs_health"]["sections"][0], "daily");
         assert_eq!(
             v["needs_health"]["metrics"][0]["metric"],
@@ -1045,6 +1210,7 @@ mod tests {
         // A meal_log-only Directives serializes under `meal_log`, with the
         // needs_health key omitted and any absent macro left OFF the wire.
         let d = Directives {
+            needs_location: None,
             needs_health: None,
             meal_log: Some(MealLog {
                 meals: vec![Meal {
@@ -1070,7 +1236,7 @@ mod tests {
                 corrections_seq: None,
             }),
         };
-        let v = directives_to_value(&Some(d));
+        let v = directives_to_value(Some(&d));
         assert!(v.get("needs_health").is_none());
         let meal = &v["meal_log"]["meals"][0];
         assert_eq!(meal["id"], "2026-07-04-lunch");
@@ -1190,13 +1356,14 @@ mod tests {
     fn empty_vecs_are_omitted_on_the_wire() {
         // sections present, metrics empty → the `metrics` key is omitted.
         let d = Directives {
+            needs_location: None,
             needs_health: Some(NeedsHealth {
                 sections: vec!["daily".into()],
                 metrics: vec![],
             }),
             meal_log: None,
         };
-        let v = directives_to_value(&Some(d));
+        let v = directives_to_value(Some(&d));
         assert!(v["needs_health"].get("metrics").is_none());
         assert_eq!(v["needs_health"]["sections"][0], "daily");
     }
@@ -1291,6 +1458,282 @@ mod tests {
         let (text, directives) = extract_directives(&reply);
         assert_eq!(text, reply);
         assert!(directives.is_none());
+    }
+
+    // ---- JESSE_NEEDS_LOCATION v1 parser matrix -----------------------------
+
+    fn needs_location(reply: &str) -> Option<NeedsLocation> {
+        extract_directives(reply).1.and_then(|d| d.needs_location)
+    }
+
+    /// A directive line carrying `payload` as its JSON, under one line of prose so
+    /// the strip is observable.
+    fn loc_line(payload: &str) -> String {
+        format!("Sure.\nJESSE_NEEDS_LOCATION v1 {payload}")
+    }
+
+    #[test]
+    fn needs_location_happy_path_is_parsed_and_stripped() {
+        let reply =
+            loc_line(r#"{"fields":["placemark"],"precision":"coarse","max_age_seconds":300}"#);
+        let (text, directives) = extract_directives(&reply);
+        assert_eq!(text, "Sure.", "the directive line is stripped, prose kept");
+        let nl = directives.unwrap().needs_location.unwrap();
+        assert_eq!(nl.fields, vec!["placemark".to_string()]);
+        assert_eq!(nl.precision, "coarse");
+        assert_eq!(nl.max_age_seconds, 300);
+    }
+
+    #[test]
+    fn every_whitelisted_field_round_trips_alone_and_together() {
+        // Each field on its own, then the whole whitelist in one directive — the
+        // full field-combination matrix the contract admits.
+        for field in NEEDS_LOCATION_FIELDS {
+            let reply = loc_line(&format!(
+                r#"{{"fields":["{field}"],"precision":"precise","max_age_seconds":0}}"#
+            ));
+            let nl = needs_location(&reply)
+                .unwrap_or_else(|| panic!("field {field} must round trip on its own"));
+            assert_eq!(nl.fields, vec![field.to_string()]);
+        }
+        let all = NEEDS_LOCATION_FIELDS
+            .iter()
+            .map(|f| format!("\"{f}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        let nl = needs_location(&loc_line(&format!(
+            r#"{{"fields":[{all}],"precision":"coarse","max_age_seconds":900}}"#
+        )))
+        .expect("the whole whitelist at once is within the cap");
+        assert_eq!(nl.fields, NEEDS_LOCATION_FIELDS.to_vec());
+        assert_eq!(nl.fields.len(), MAX_NEEDS_LOCATION_FIELDS);
+    }
+
+    #[test]
+    fn both_precisions_round_trip_and_a_typo_is_rejected() {
+        for precision in NEEDS_LOCATION_PRECISIONS {
+            let nl = needs_location(&loc_line(&format!(
+                r#"{{"fields":["coordinates"],"precision":"{precision}","max_age_seconds":60}}"#
+            )))
+            .unwrap_or_else(|| panic!("precision {precision} must round trip"));
+            assert_eq!(&nl.precision, precision);
+        }
+        // A typo, a near-miss, and a non-string all reject the WHOLE directive.
+        for bad in [
+            r#""precision":"corse""#,
+            r#""precision":"Coarse""#,
+            r#""precision":"exact""#,
+            r#""precision":true"#,
+            r#""precision":null"#,
+        ] {
+            let reply = loc_line(&format!(
+                r#"{{"fields":["coordinates"],{bad},"max_age_seconds":60}}"#
+            ));
+            assert!(
+                needs_location(&reply).is_none(),
+                "a bad precision must reject the directive: {bad}"
+            );
+            assert_eq!(
+                extract_directives(&reply).0,
+                reply,
+                "and the line stays visible rather than being silently stripped"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_field_and_unknown_key_are_both_fatal() {
+        // An off-whitelist FIELD.
+        assert!(needs_location(&loc_line(
+            r#"{"fields":["altitude"],"precision":"coarse","max_age_seconds":60}"#
+        ))
+        .is_none());
+        // A field that is not a string.
+        assert!(needs_location(&loc_line(
+            r#"{"fields":[3],"precision":"coarse","max_age_seconds":60}"#
+        ))
+        .is_none());
+        // An unknown top-level KEY — a typo like `max_age` must be a loud failure,
+        // never a request that silently drops it.
+        for extra in [
+            r#","max_age":60"#,
+            r#","radius_m":100"#,
+            r#","fields_2":[]"#,
+        ] {
+            let reply = loc_line(&format!(
+                r#"{{"fields":["placemark"],"precision":"coarse","max_age_seconds":60{extra}}}"#
+            ));
+            assert!(
+                needs_location(&reply).is_none(),
+                "unknown key must be fatal: {extra}"
+            );
+        }
+        // A whitelisted health key on a location directive is still unknown here.
+        assert!(needs_location(&loc_line(
+            r#"{"fields":["placemark"],"precision":"coarse","max_age_seconds":60,"sections":["daily"]}"#
+        ))
+        .is_none());
+    }
+
+    #[test]
+    fn max_age_seconds_boundaries_and_non_integers() {
+        // 0 and 900 are both IN range (the range is inclusive at both ends).
+        for age in [0u32, 900] {
+            let nl = needs_location(&loc_line(&format!(
+                r#"{{"fields":["accuracy"],"precision":"coarse","max_age_seconds":{age}}}"#
+            )))
+            .unwrap_or_else(|| panic!("max_age_seconds {age} must be accepted"));
+            assert_eq!(nl.max_age_seconds, age);
+        }
+        // 901 is one past the ceiling; a negative and a fractional value are not
+        // integers at all (`as_u64` rejects both).
+        for bad in ["901", "-1", "300.5", "\"300\"", "null"] {
+            let reply = loc_line(&format!(
+                r#"{{"fields":["accuracy"],"precision":"coarse","max_age_seconds":{bad}}}"#
+            ));
+            assert!(
+                needs_location(&reply).is_none(),
+                "max_age_seconds {bad} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn every_key_is_required_with_no_default() {
+        // Each key omitted in turn. None of the three has a default — a directive
+        // that does not state its precision must not silently get one.
+        for missing in [
+            r#"{"precision":"coarse","max_age_seconds":60}"#,
+            r#"{"fields":["placemark"],"max_age_seconds":60}"#,
+            r#"{"fields":["placemark"],"precision":"coarse"}"#,
+            r#"{}"#,
+        ] {
+            assert!(
+                needs_location(&loc_line(missing)).is_none(),
+                "a missing required key must reject the directive: {missing}"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_and_over_cap_fields_arrays_are_rejected() {
+        // Empty: a request for nothing is not a request.
+        assert!(needs_location(&loc_line(
+            r#"{"fields":[],"precision":"coarse","max_age_seconds":60}"#
+        ))
+        .is_none());
+        // Over the cap, by repeating a legitimate field — the count is checked
+        // before the whitelist, so a repeated valid name cannot get past it.
+        let repeated = std::iter::repeat_n("\"placemark\"", MAX_NEEDS_LOCATION_FIELDS + 1)
+            .collect::<Vec<_>>()
+            .join(",");
+        assert!(needs_location(&loc_line(&format!(
+            r#"{{"fields":[{repeated}],"precision":"coarse","max_age_seconds":60}}"#
+        )))
+        .is_none());
+        // `fields` present but not an array.
+        assert!(needs_location(&loc_line(
+            r#"{"fields":"placemark","precision":"coarse","max_age_seconds":60}"#
+        ))
+        .is_none());
+    }
+
+    #[test]
+    fn needs_location_line_over_its_1kib_cap_passes_through() {
+        // An otherwise-VALID line (every field whitelisted, no unknown keys) that
+        // exceeds the per-directive 1 KiB cap must pass through visible: the
+        // per-arm cap fires BEFORE the payload parse. Padding goes in the
+        // `precision` value so the line grows without adding an unknown key — this
+        // has to fail on the CAP, not on the contract.
+        let pad = "x".repeat(MAX_NEEDS_LOCATION_LINE_BYTES);
+        let reply = format!(
+            r#"JESSE_NEEDS_LOCATION v1 {{"fields":["placemark"],"precision":"{pad}","max_age_seconds":60}}"#
+        );
+        assert!(
+            reply.len() > MAX_NEEDS_LOCATION_LINE_BYTES && reply.len() < MAX_DIRECTIVE_LINE_BYTES,
+            "line must sit between the needs_location cap and the generic ceiling"
+        );
+        let (text, directives) = extract_directives(&reply);
+        assert_eq!(text, reply, "over-cap lines stay visible");
+        assert!(directives.is_none());
+    }
+
+    #[test]
+    fn a_location_directive_that_is_not_the_last_line_is_not_recognized() {
+        // Only the FINAL non-empty line is a directive candidate. A valid directive
+        // followed by prose is prose.
+        let reply = "JESSE_NEEDS_LOCATION v1 {\"fields\":[\"placemark\"],\"precision\":\"coarse\",\
+                     \"max_age_seconds\":60}\nand here is the answer.";
+        let (text, directives) = extract_directives(reply);
+        assert_eq!(text, reply, "text untouched");
+        assert!(directives.is_none());
+        // It IS recognized under trailing blank lines, though — `trim_end` first.
+        let trailing = format!(
+            "Sure.\nJESSE_NEEDS_LOCATION v1 {}\n\n\n",
+            r#"{"fields":["placemark"],"precision":"coarse","max_age_seconds":60}"#
+        );
+        assert!(needs_location(&trailing).is_some());
+    }
+
+    #[test]
+    fn a_sentinel_only_location_reply_strips_to_the_empty_string() {
+        // The directive line alone: the app never persists this turn — it fulfils
+        // and re-asks — so the stripped text is empty by construction.
+        let reply = r#"JESSE_NEEDS_LOCATION v1 {"fields":["coordinates"],"precision":"precise","max_age_seconds":0}"#;
+        let (text, directives) = extract_directives(reply);
+        assert_eq!(text, "", "a sentinel-only reply strips to empty");
+        assert_eq!(
+            directives.unwrap().needs_location.unwrap().precision,
+            "precise"
+        );
+    }
+
+    #[test]
+    fn an_unknown_location_version_passes_through_visible() {
+        // v2 is not in the registry: a loud contract failure, never a silent strip.
+        let reply =
+            loc_line(r#"{"fields":["placemark"],"precision":"coarse","max_age_seconds":60}"#)
+                .replace(" v1 ", " v2 ");
+        let (text, directives) = extract_directives(&reply);
+        assert_eq!(text, reply);
+        assert!(directives.is_none());
+    }
+
+    #[test]
+    fn the_two_channels_never_populate_each_others_fields() {
+        // A location directive attaches `needs_location` and NOTHING else, and a
+        // health one the reverse. `Directives` carries one field per reply.
+        let loc = extract_directives(&loc_line(
+            r#"{"fields":["placemark"],"precision":"coarse","max_age_seconds":60}"#,
+        ))
+        .1
+        .unwrap();
+        assert!(loc.needs_location.is_some());
+        assert!(loc.needs_health.is_none() && loc.meal_log.is_none());
+        let health = extract_directives("x\nJESSE_NEEDS_HEALTH v1 {\"sections\":[\"daily\"]}")
+            .1
+            .unwrap();
+        assert!(health.needs_health.is_some());
+        assert!(health.needs_location.is_none() && health.meal_log.is_none());
+    }
+
+    #[test]
+    fn a_serialized_location_directive_omits_nothing_it_carries() {
+        // The wire shape the app decodes: all three keys present, snake_case age.
+        let nl = needs_location(&loc_line(
+            r#"{"fields":["coordinates","accuracy"],"precision":"precise","max_age_seconds":120}"#,
+        ))
+        .unwrap();
+        let v = directives_to_value(Some(&Directives {
+            needs_health: None,
+            needs_location: Some(nl),
+            meal_log: None,
+        }));
+        assert_eq!(v["needs_location"]["fields"][0], "coordinates");
+        assert_eq!(v["needs_location"]["fields"][1], "accuracy");
+        assert_eq!(v["needs_location"]["precision"], "precise");
+        assert_eq!(v["needs_location"]["max_age_seconds"], 120);
+        assert!(v.get("needs_health").is_none(), "absent fields are omitted");
     }
 
     // ---- JESSE_MEAL_LOG v1 parser matrix -----------------------------------
@@ -1628,6 +2071,7 @@ mod tests {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum DirectiveField {
         NeedsHealth,
+        NeedsLocation,
         MealLog,
     }
 
@@ -1635,13 +2079,15 @@ mod tests {
         /// Every field, for the reachability direction below. Kept honest by
         /// `label`'s exhaustive match: a new variant cannot be added without
         /// touching this impl block.
-        const ALL: &'static [DirectiveField] = &[Self::NeedsHealth, Self::MealLog];
+        const ALL: &'static [DirectiveField] =
+            &[Self::NeedsHealth, Self::NeedsLocation, Self::MealLog];
 
         /// The wire field name. The match is exhaustive on purpose — a new
         /// `DirectiveField` variant stops compiling here until it is named.
         fn label(self) -> &'static str {
             match self {
                 Self::NeedsHealth => "needs_health",
+                Self::NeedsLocation => "needs_location",
                 Self::MealLog => "meal_log",
             }
         }
@@ -1656,11 +2102,15 @@ mod tests {
     fn fields_set(d: &Directives) -> Vec<DirectiveField> {
         let Directives {
             needs_health,
+            needs_location,
             meal_log,
         } = d;
         let mut set = Vec::new();
         if needs_health.is_some() {
             set.push(DirectiveField::NeedsHealth);
+        }
+        if needs_location.is_some() {
+            set.push(DirectiveField::NeedsLocation);
         }
         if meal_log.is_some() {
             set.push(DirectiveField::MealLog);
@@ -1678,6 +2128,12 @@ mod tests {
             1,
             r#"{"sections":["daily"]}"#,
             DirectiveField::NeedsHealth,
+        ),
+        (
+            "JESSE_NEEDS_LOCATION",
+            1,
+            r#"{"fields":["placemark"],"precision":"coarse","max_age_seconds":300}"#,
+            DirectiveField::NeedsLocation,
         ),
         (
             "JESSE_MEAL_LOG",

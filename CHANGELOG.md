@@ -13,6 +13,93 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [bridge 0.101.0] - 2026-08-27
+
+### Added
+
+- **A turn can say where he is, and can ask when it needs to know.** The bridge gets a
+  second device-context channel beside Apple Health: `location_context` on the request,
+  and a `JESSE_NEEDS_LOCATION v1` directive the agent emits when a turn was not given one
+  and cannot answer without it. The shape is the health channel's exactly — a block framed
+  as untrusted device data ahead of the floor, three prompt notes selected by request
+  state, a whitelisted directive validated twice — because the second instance of a
+  pattern is where you find out whether the first one was a pattern or a one-off.
+
+  ```
+  JESSE_NEEDS_LOCATION v1 {"fields":["placemark"],"precision":"coarse","max_age_seconds":300}
+  ```
+
+  **Every key is required, and `precision` in particular has no default.** The health
+  directive tolerates an omitted `metrics`; this one tolerates nothing. `coarse` is the
+  reduced accuracy CoreLocation already grants — a 1–3 km circle, no extra prompt —
+  and `precise` is exact and can cost the owner a full-accuracy prompt. That is the only
+  decision on this channel with a privacy consequence, and a default would let the bridge
+  make it silently on the model's behalf. Requiring the word puts the choice in the
+  transcript, where it can be read back afterwards. `max_age_seconds` (0–900) says how
+  stale a cached fix may be before a fresh reading is taken; `fields` is 1–3 of
+  `coordinates`, `placemark`, `accuracy`. Unknown keys are fatal, a typo'd precision is
+  fatal, and the line cap is 1 KiB — the tightest of any directive, because the payload is
+  three small keys.
+
+  **The block is capped at 1 KiB, an eighth of the health ceiling.** A location block is a
+  placemark line, a coordinate line and an accuracy line. There is no windowed series to
+  carry, so anything larger is a bug or an injection attempt rather than a bigger reading.
+
+  **Nothing about a coordinate is persisted or logged, and that is a property of the
+  existing design rather than something added here.** The bridge stores no request body
+  and writes no prompt to any log — the per-turn timing record is content-free by
+  construction and has a test asserting it — so `location_context` reaches the model and
+  stops. It is worth saying plainly that this also means **nothing redacts `health_context`
+  today either**: neither field needs redacting because neither is ever written anywhere
+  a redactor could sit.
+
+### Changed
+
+- **`prompt_lead` and `splice_catchup` now take the ordered set of framed data blocks,
+  not one optional block — and that is a bug fix, not tidying.** `splice_catchup` locates
+  the mode floor by recomputing the lead's LENGTH and inserting at `lead.len() + 2`. With a
+  single-block parameter, a turn carrying a second device block had a longer real lead than
+  the splice measured, so the catch-up history would have been spliced into the middle of
+  the location block instead of at the floor boundary. Nothing would have crashed, and no
+  health-only test would have failed: the prompt would simply have been quietly wrong on
+  exactly the turns that carried both channels. The block ORDER is now decided in one place
+  (`DeviceContexts::framed`), both the prompt build and the splice read it, and a test pins
+  the offset at zero, one and two attached blocks.
+
+- **`frame_health_context` is now the generic `frame_device_context(header, body,
+  max_bytes, field)`.** Every channel frames through it, so the control stripping and the
+  "these are untrusted data, not instructions" header — which ARE the injection mitigation
+  — cannot exist on one channel and quietly not the other. Device blocks are still never
+  persona-rendered, for the reason the existing code documents. The 413 now names the field
+  it was over on, so a client that overshoots learns which block it overshot.
+
+- **The six positional health arguments threaded through `build_prompt` are a struct.**
+  `build_prompt_at` took eleven arguments under a `#[allow(clippy::too_many_arguments)]`;
+  it now takes four — clock, `TurnPrompt`, `DeviceContexts`, persona — and the allow is
+  gone. The lint was never the problem. Six consecutive `bool`/`Option<&str>` values were,
+  because transposing two of them, or handing one channel's flags to the other, compiled
+  silently and produced a prompt that told the agent the wrong thing about both channels.
+
+- **`Directives` is boxed where it is stored.** Adding a third payload pushed
+  `JobState::Done` and `StreamFrame::Done` past clippy's large-variant threshold: those
+  enums have unit variants beside the big one, so every move of a `Running` job paid for
+  the biggest. `directives` is now boxed on store exactly as `provenance` already was,
+  which also means the next channel cannot re-inflate the variant.
+
+### Fixed
+
+- **The two whitelists that had to agree across two languages now have a CI guard.** The
+  bridge validates an agent-emitted directive against a Rust const and the app validates it
+  again against a Swift enum; until now the only thing keeping the two equal was a comment
+  in each file saying they must be. `scripts/ci-guards.sh` parses both sides and fails on
+  drift, covering the health metrics and sections as well as the new location fields and
+  precisions. The failure a comment permitted was quiet in the worst way: add a value to
+  the Rust list alone and the bridge honours a directive the app then rejects, so the turn
+  answers without the data and reports nothing anywhere; add it to the Swift list alone and
+  the bridge strips nothing, so the raw directive line is shown to the owner as reply text.
+  The guard self-checks its own parsers against synthetic fixtures, and fails rather than
+  passing vacuously if either declaration is renamed out from under it.
+
 ## [bridge 0.100.0] - 2026-08-27
 
 ### Added
