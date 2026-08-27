@@ -13,6 +13,41 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [bridge 0.99.0] - 2026-08-27
+
+### Added
+
+- **The phone child can search Apple Maps.** `mcp__imcp__maps_search` is granted, which
+  answers "find places near a location and report their hours and ratings" on its own. The
+  `imcp` server was already loaded and already advertising it; the allowlist was the only
+  thing holding it back, so nothing new starts and no credential was added.
+
+  **`maps_search` alone, and that is the whole decision.** Of the six tools iMCP advertises,
+  two are now granted — `messages_fetch` and `maps_search`. `maps_directions`, `maps_explore`,
+  `maps_eta` and `maps_generate` stay out. `maps_directions` was the one considered: route
+  planning is a separate request nobody has made, and granting it would widen the channel
+  below for no capability the asked-for job needs.
+
+  **The egress argument that omitted it is accepted, not withdrawn.** All five Maps tools are
+  `openWorldHint:true`: they leave the machine for Apple's map services carrying a query
+  string, out of a child that also reads attacker-authored content — WhatsApp bodies, iMessage
+  bodies, mail. Granting one opens a low-bandwidth exfiltration channel and nothing here
+  closes it; the allowlist cannot inspect a query and no filter was added. The trade taken is
+  one search tool's worth of that channel for the capability, with the other four withheld to
+  keep it as narrow as it can be. SECURITY.md records it as accepted and strikes the old
+  "LIVE but ungranted" heading rather than deleting it.
+
+  **The exact-set test still fails on everything else.** The iMCP grant stays pinned as a
+  permitted set rather than a denylist of names — the set grew from one name to two, and the
+  property it buys is unchanged: any iMCP tool outside it fails the build, including a send
+  tool a future version might start advertising. That assertion, not an annotation, is what
+  keeps sending absent; all six tools carry `readOnlyHint:true`, the granted network one
+  included.
+
+  The containment record was regenerated with the bridge's own environment, so the recorded
+  `toolset_args` carry the new grant. The level gate compares argv to that record by strict
+  equality at startup, so the two are only valid together.
+
 ## [App 1.0 (117)] - 2026-08-26
 
 ### Fixed
