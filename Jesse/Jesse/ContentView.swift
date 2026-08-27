@@ -369,6 +369,15 @@ struct SettingsView: View {
     @AppStorage(FrugalSettings.forcedKey) private var frugalOnCellular = false
     @State private var connectingHealth = false
 
+    // "Attach location context" — default OFF, and it stays off until BOTH this toggle
+    // and the system when-in-use permission are granted. Same UserDefaults key
+    // `JesseClient` reads at send time (`LocationContextSettings`). Turning it on from
+    // here is the ONLY place the system prompt is raised, which is what keeps it out of
+    // the middle of a turn.
+    @AppStorage(LocationContextSettings.enabledKey) private var attachLocationContext = false
+    @State private var connectingLocation = false
+    @State private var locationDenied = false
+
     // "Write meals to Apple Health" — default OFF until write access is granted, then
     // flipped on. Same key `RunCoordinator`'s meal writer reads (`WriteMealsToHealthSettings`).
     // `mealWriteDenied` reflects the queryable WRITE status (unlike read): when the
@@ -527,6 +536,30 @@ struct SettingsView: View {
                     Text("Jesse attaches a compact summary of your recent Apple Health — last night’s sleep, resting heart rate and other daily vitals, plus your recent workouts — so you can ask it to log one (“Log my swim”) or reflect on how you’re doing. With “Write meals” on, meals you log (“log lunch: …”) are also saved to Health as nutrition entries. Nothing is read or written until you connect, and you can turn either off anytime.")
                 }
                 .onAppear { mealWriteDenied = HealthKitMealWriter.isWriteDenied() }
+
+                Section {
+                    Toggle("Attach location context", isOn: $attachLocationContext)
+                        .disabled(connectingLocation)
+                    Button {
+                        Task { await connectLocation() }
+                    } label: {
+                        Label("Allow location while using Jesse", systemImage: "location")
+                    }
+                    .disabled(connectingLocation)
+                    if connectingLocation {
+                        HStack { ProgressView(); Text("Requesting access…").foregroundStyle(.secondary) }
+                    }
+                    if locationDenied {
+                        Text("Location access is off. Turn on “While Using the App” for Jesse in Settings › Privacy & Security › Location Services to use this.")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                    }
+                } header: {
+                    Text("Location")
+                } footer: {
+                    Text("With this on, Jesse attaches where you are — the neighbourhood, town and postcode, never your street address — on turns that ask about here, nearby, or how far something is. Both this switch and the system permission have to be on, nothing is read on any other turn, and your location is never saved: it goes out with that one message and is gone. Off by default.")
+                }
+                .onAppear { locationDenied = LocationPermissionStatus.isDenied() }
 
                 Section {
                     LabeledContent("App", value: AppVersion.display)
@@ -970,6 +1003,22 @@ struct SettingsView: View {
             mealWriteDenied = denied
             if !denied { writeMealsToHealth = true }
         }
+    }
+
+    /// "Allow location while using Jesse": request WHEN-IN-USE authorization, and flip
+    /// the attach toggle on only if it was granted. Unlike Health's read status, the
+    /// location status IS queryable, so a denial is reported in the row rather than
+    /// silently leaving a toggle on that can never do anything.
+    ///
+    /// This is the ONLY caller of `requestAuthorization` in the app. Every other path
+    /// reads the status and gives up if it is not `.authorizedWhenInUse`, which is what
+    /// keeps the system prompt out of the middle of a turn.
+    private func connectLocation() async {
+        connectingLocation = true
+        defer { connectingLocation = false }
+        let granted = await LocationContextProvider.requestAuthorization()
+        attachLocationContext = granted
+        locationDenied = LocationPermissionStatus.isDenied()
     }
 
     private var scannerSheet: some View {

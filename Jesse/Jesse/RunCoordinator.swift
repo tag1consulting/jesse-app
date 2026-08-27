@@ -190,17 +190,36 @@ final class RunCoordinator {
     // outbox (re-armed to the earliest due date), not one per message.
     @ObservationIgnored private var outboxRetryTask: Task<Void, Never>?
 
-    // threadIDs that have already spent their ONE health-fulfillment retry for the
-    // current user message (a reply carried JESSE_NEEDS_HEALTH → we fulfilled + re-
-    // sent). Cleared at the start of each new `send`, so the retry is at most once
-    // per user message; a second directive on the retry's reply is then ignored.
-    @ObservationIgnored private var healthRetried: Set<UUID> = []
+    // ANTI-LOOP GUARD 1 of 3: the one-shot budget.
+    //
+    // Which (thread, channel) pairs have already spent their ONE device-context
+    // fulfillment retry for the current user message (a reply carried a directive → we
+    // fulfilled + re-sent). Cleared for the thread at the start of each new `send`, so
+    // the retry is at most once per channel per user message; a second directive on the
+    // retry's reply is then ignored.
+    //
+    // Keyed by thread AND CHANNEL, not by thread alone. With one key per thread, a turn
+    // that legitimately needed both channels — "how far did I run, and how far is the
+    // gym from here" — would spend the budget on whichever directive arrived first and
+    // starve the other, so the second channel could never be answered on that message
+    // no matter what the agent asked for. Each channel gets its own single shot.
+    @ObservationIgnored private var deviceContextRetried: Set<RetryKey> = []
 
-    // What a live turn needs to fulfill a JESSE_NEEDS_HEALTH directive and re-send:
-    // the same mode/text plus the resolved wrapper/floor overrides. nil on the
-    // resume/recheck path (no original text after a relaunch), which disables the
-    // retry there — a stranded sentinel just surfaces the empty-reply Re-check.
-    struct HealthRetry {
+    /// One thread's budget for one channel. A struct rather than a string key so a
+    /// typo cannot silently address a budget nobody spends.
+    struct RetryKey: Hashable {
+        let threadID: UUID
+        let channel: DeviceContextChannel
+    }
+
+    // What a live turn needs to fulfill a device-context directive and re-send: the
+    // same mode/text plus the resolved wrapper/floor overrides.
+    //
+    // ANTI-LOOP GUARD 2 of 3: this is nil — structurally, not by a flag — on every path
+    // that must not retry. That is the resume/recheck path, which after a relaunch has
+    // no original text to re-send and so could not fulfil anything even if it wanted
+    // to. A stranded sentinel there just surfaces the empty-reply Re-check.
+    struct TurnRetry {
         let mode: JesseMode
         let text: String
         let instructions: String?
@@ -555,8 +574,12 @@ final class RunCoordinator {
         // A new turn is a "next turn" drain point for any meal writes that failed
         // earlier (device locked, transient HealthKit error) — retry them now.
         drainPendingMeals(context: context)
-        // A new user message gets a fresh health-retry budget (one per message).
-        healthRetried.remove(threadID)
+        // A new user message gets a fresh device-context retry budget — one per channel
+        // per message. Cleared for EVERY channel on this thread, so the budgets and the
+        // message they belong to always start together.
+        for channel in DeviceContextChannel.allCases {
+            deviceContextRetried.remove(RetryKey(threadID: threadID, channel: channel))
+        }
         // A new turn supersedes any retained-but-unretrieved job from a prior
         // recoverable failure on this thread — the user has moved on, so don't
         // leave a stale job that Re-check or resume could re-attach to.
@@ -711,7 +734,7 @@ final class RunCoordinator {
                                  job: InFlightJob(jobId: jobId, voice: voice, requestId: requestId))
                     await self.consume(threadID: threadID, thread: thread, jobId: jobId,
                                        voice: voice, client: client, context: context,
-                                       retry: HealthRetry(mode: mode, text: text,
+                                       retry: TurnRetry(mode: mode, text: text,
                                                           instructions: instructions,
                                                           floorOverride: floorOverride,
                                                           model: model))
@@ -1698,7 +1721,7 @@ final class RunCoordinator {
     /// resume/recheck path (after a relaunch), where `finish` re-fetches by id.
     private func consume(threadID: UUID, thread: JesseThread?, jobId: String, voice: Bool,
                          client: any JesseClientProtocol, context: ModelContext,
-                         retry: HealthRetry? = nil) async {
+                         retry: TurnRetry? = nil) async {
         let outcome: TurnOutcome? = await withTaskGroup(of: TurnOutcome?.self) { group in
             group.addTask { await self.streamForDisplay(threadID: threadID, jobId: jobId, client: client) }
             group.addTask { await self.pollForOutcome(threadID: threadID, jobId: jobId, client: client) }
@@ -1731,18 +1754,25 @@ final class RunCoordinator {
         }
         switch outcome {
         case .done(let reply):
-            // Agent-driven health channel: if this reply is a JESSE_NEEDS_HEALTH
-            // directive and we still have our one retry for this message, fulfill it
-            // and re-send the SAME turn with the data attached — DON'T persist the
-            // sentinel turn (its stripped text is empty by construction). `retry` is
-            // nil on the resume path and on the retry's own consume, so a second
-            // directive is ignored and the stripped text is persisted as the answer.
-            if let needs = reply.needsHealthRequest, let retry, !healthRetried.contains(threadID) {
-                healthRetried.insert(threadID)
-                await fulfillAndRetry(threadID: threadID, thread: thread, needs: needs,
-                                      retry: retry, voice: voice, sessionId: reply.sessionId,
-                                      client: client, context: context)
-                return
+            // Agent-driven device-context channels: if this reply is a
+            // JESSE_NEEDS_HEALTH or JESSE_NEEDS_LOCATION directive and that CHANNEL
+            // still has its one retry for this message, fulfill it and re-send the SAME
+            // turn with the data attached — DON'T persist the sentinel turn (its
+            // stripped text is empty by construction). `retry` is nil on the resume path
+            // and on the retry's own consume, so a second directive is ignored and the
+            // stripped text is persisted as the answer.
+            //
+            // The budget is per (thread, channel), so a reply that asks for location
+            // after health was already spent still gets its own retry.
+            if let needs = reply.deviceContextRequest, let retry {
+                let key = RetryKey(threadID: threadID, channel: needs.channel)
+                if !deviceContextRetried.contains(key) {
+                    deviceContextRetried.insert(key)
+                    await fulfillAndRetry(threadID: threadID, thread: thread, needs: needs,
+                                          retry: retry, voice: voice, sessionId: reply.sessionId,
+                                          client: client, context: context)
+                    return
+                }
             }
             finish(threadID: threadID, thread: thread, reply: Self.appCapped(reply), voice: voice,
                    jobId: jobId, context: context)
@@ -1763,15 +1793,27 @@ final class RunCoordinator {
         }
     }
 
-    /// Fulfill a JESSE_NEEDS_HEALTH directive and re-send the SAME turn on the SAME
-    /// thread with the data attached, then consume the answer job. The sentinel turn
-    /// is never persisted (we returned before `finish`); this delivers the real
-    /// answer. If fulfillment fails (toggle off / no data) the client re-sends marked
-    /// `unavailable` so the agent answers from vault data — either way exactly one
-    /// answer turn lands. The answer job's consume runs with `retry: nil`, so a
-    /// second directive is ignored and its stripped text is persisted (capped).
-    private func fulfillAndRetry(threadID: UUID, thread: JesseThread?, needs: NeedsHealthRequest,
-                                 retry: HealthRetry, voice: Bool, sessionId: String?,
+    /// Fulfill a device-context directive (health or location) and re-send the SAME turn
+    /// on the SAME thread with the data attached, then consume the answer job. The
+    /// sentinel turn is never persisted (we returned before `finish`); this delivers the
+    /// real answer.
+    ///
+    /// ANTI-LOOP GUARD 3 of 3, and the one that makes a refusal produce an ANSWER rather
+    /// than a hang: if fulfillment fails — toggle off, permission denied, Location
+    /// Services off, the fix timed out, no fix on the device, a simulator with no
+    /// location set — the client STILL re-sends, marked `unavailable`, so the bridge
+    /// appends its "answer without it and do NOT emit it again this turn" note. Either
+    /// way exactly one answer turn lands. Returning early on a failure instead would
+    /// leave the thread showing an empty sentinel forever.
+    ///
+    /// The answer job's consume runs with `retry: nil`, so a second directive is ignored
+    /// and its stripped text is persisted (capped).
+    ///
+    /// Written ONCE for both channels: `needs` carries which channel it belongs to, so
+    /// there is one copy of the three guards rather than one per channel.
+    private func fulfillAndRetry(threadID: UUID, thread: JesseThread?,
+                                 needs: DeviceContextRequest,
+                                 retry: TurnRetry, voice: Bool, sessionId: String?,
                                  client: any JesseClientProtocol, context: ModelContext) async {
         // The retry is the SAME turn on the SAME conversation, so it must carry the same
         // identity: a fresh id here would register a second conversation for one message.
@@ -1790,11 +1832,27 @@ final class RunCoordinator {
                        voice: voice, jobId: nil, context: context)
             case .running(let jobId, let remoteConversationId):
                 // The new job replaces the sentinel's, so Re-check/resume target the
-                // answer turn. Consume with retry:nil — one retry per user message.
+                // answer turn.
+                //
+                // `retry` is carried FORWARD rather than nilled, and the budget is what
+                // bounds the exchange. This is the whole point of keying the budget by
+                // channel: a turn that legitimately needs both — "how far did I run,
+                // and how far is the gym from here" — can only learn it needs the
+                // second thing after the first has been answered. Nilling here made
+                // whichever directive arrived first win and starved the other for the
+                // rest of the message, which is exactly the starvation the per-channel
+                // key exists to prevent.
+                //
+                // It is still strictly bounded, and by construction rather than by
+                // luck: each channel's key is inserted BEFORE its fulfilment runs, so a
+                // user message can produce at most one retry per channel —
+                // `DeviceContextChannel.allCases.count` in total, whatever the agent
+                // emits. A channel repeating itself finds its own key already spent and
+                // is ignored, exactly as before.
                 if let thread { adoptRegistration(thread: thread, conversationId: remoteConversationId) }
                 persist(threadID: threadID, job: InFlightJob(jobId: jobId, voice: voice))
                 await consume(threadID: threadID, thread: thread, jobId: jobId,
-                              voice: voice, client: client, context: context, retry: nil)
+                              voice: voice, client: client, context: context, retry: retry)
             }
         } catch is CancellationError {
             clearRun(threadID)

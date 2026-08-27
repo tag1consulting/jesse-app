@@ -13,6 +13,88 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [App 1.0 (118)] - 2026-08-27
+
+### Added
+
+- **Jesse can know where you are, when the turn is about where you are.** The app half of
+  the location channel: a keyword classifier that decides whether a message is asking
+  about here/nearby/how far, a CoreLocation provider behind the same kind of seam
+  HealthKit already sits behind, and the fulfilment loop that answers a
+  `JESSE_NEEDS_LOCATION` directive by taking a reading and re-asking the same question
+  with it attached.
+
+  **Two consents, both required, and both checked before anything touches CoreLocation.**
+  The "Attach location context" toggle in Settings defaults OFF, and the live
+  `authorizedWhenInUse` status is read separately. If either is missing the app attaches
+  nothing and — this is the part that matters — takes no reading, so there is nothing for
+  iOS to raise a permission prompt about. A permission revoked in Settings can therefore
+  never surface a system dialog in the middle of a turn because of a message you typed.
+  `.notDetermined` counts as "no" for the same reason: the first ask happens from the
+  Settings row, where you chose it, and nowhere else.
+
+  **When-in-use only.** No always authorization, no background location, no significant-
+  change or region monitoring, no location background mode. That is structural rather
+  than a policy: `requestWhenInUseAuthorization` is the only request in the codebase, and
+  the provider builds a location manager inside one awaited call and holds none between
+  turns.
+
+  **Your street is not in the block.** The reverse geocode keeps sub-locality through
+  country — "Fountainbridge, Edinburgh EH3, United Kingdom" — and prefers the
+  locality-level rendering over the one carrying a thoroughfare. Nothing the channel
+  answers needs a house number. Coordinates are rounded to the precision that was
+  actually asked for (3 decimals coarse, 5 precise) rather than printing fifteen digits
+  of accuracy a reduced-accuracy fix does not have, and the block names its own precision
+  so a reader can tell the two apart afterwards.
+
+  **The proactive attach is the smallest request the channel can make**: placemark and
+  accuracy, coarse, from a fix up to five minutes old. The agent has asked for nothing at
+  that point — the classifier only guessed — so it never spends the full-accuracy prompt
+  on a guess. When coarse genuinely cannot answer, the agent says so with a directive and
+  the retry serves exactly what it named.
+
+  **Nothing is kept.** No coordinate reaches SwiftData, the vault, or the thread history.
+  The one thing held is a single in-memory fix so a directive happy with a 5-minute-old
+  reading need not wake the GPS again, and that dies with the process.
+
+  The classifier covers the Italian forms too — `quanto dista`, `qui vicino`, `a piedi`,
+  `dove sono`, `è aperto` — with accents folded on both sides, so a hurried "piu vicino"
+  matches. It is deliberately tighter than the health classifier: a spurious health
+  attach costs tokens, a spurious location attach sends a coordinate the turn had no use
+  for. "how far" alone does not fire, because it also matches "how far along is the
+  migration" and "how far did I run".
+
+### Changed
+
+- **The one-shot retry budget is keyed by thread AND channel.** It was a
+  `Set<UUID>` of threads, which was correct while there was one channel and wrong the
+  moment there were two: a turn that legitimately needs both — "how far did I run, and
+  how far is the gym from here" — can only discover it needs the second thing after the
+  first has been answered, and a single per-thread key let whichever directive arrived
+  first starve the other for the rest of the message. Each channel now has its own single
+  shot, so the exchange is still strictly bounded (at most one retry per channel per user
+  message, by construction: the key is inserted before the fulfilment runs) without the
+  two channels competing for one budget.
+
+- **`JesseClient.fulfill` is written once for both channels**, behind a
+  `DeviceContextFulfilling` seam that `HealthContextProviding` and the new
+  `LocationContextProviding` are the concrete conformances of. This is where the
+  "unavailable" terminator lives — the thing that makes a denied permission produce an
+  answer instead of a hang — and a second hand-written copy of it is exactly how one
+  channel would have quietly lost it.
+
+### Fixed
+
+- **A main-actor-isolated class in `JesseClient` would have aborted the process.** The
+  new CoreLocation provider is a class, this module defaults to `@MainActor` isolation,
+  and a main-actor-isolated class gets an actor-isolated `deinit` — so every `JesseClient`
+  released off the main actor, which is most of them, tore one down through that deinit
+  and died with `pointer being freed was not allocated`. It surfaced as two
+  `JesseIntegrationTests` cases that do nothing but construct a client and read its
+  URLSession config taking the whole test host down with them. The provider and its
+  delegate/cache classes are `nonisolated`, which is both the fix and the truthful
+  description of what they are.
+
 ## [bridge 0.101.0] - 2026-08-27
 
 ### Added

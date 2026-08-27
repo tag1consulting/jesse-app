@@ -110,11 +110,16 @@ public struct JesseReply: Equatable, Sendable {
     }
 }
 
-/// The health context an outgoing retry turn should carry — the result of
-/// fulfilling a `JESSE_NEEDS_HEALTH` directive. Either a `block` with
-/// `requested == true` (fulfilled), or `block == nil` with `unavailable == true`
-/// (toggle off / no data). Never both flags.
-public struct OutgoingHealthContext: Sendable, Equatable {
+/// The device context an outgoing retry turn should carry — the result of fulfilling
+/// one channel's directive. Either a `block` with `requested == true` (fulfilled), or
+/// `block == nil` with `unavailable == true` (toggle off / denied / no data). Never
+/// both flags, and never neither: a retry always tells the bridge which of the two
+/// happened, because "no block and no flag" is the ordinary-turn shape and would put
+/// the agent back on the request instruction — which is the loop.
+///
+/// One type for every channel. The health and location halves of a retry differ only
+/// in which field the block lands in on the wire.
+public struct OutgoingDeviceContext: Sendable, Equatable {
     public var block: String?
     public var requested: Bool
     public var unavailable: Bool
@@ -123,7 +128,22 @@ public struct OutgoingHealthContext: Sendable, Equatable {
         self.requested = requested
         self.unavailable = unavailable
     }
+
+    /// The channel could not be fulfilled: no block, and the flag that makes the
+    /// bridge append its "answer without it, don't re-request" note. The terminator
+    /// on every failure path.
+    public static let unavailable = OutgoingDeviceContext(
+        block: nil, requested: false, unavailable: true)
+
+    /// A fulfilled channel carrying `block`.
+    public static func fulfilled(_ block: String) -> OutgoingDeviceContext {
+        OutgoingDeviceContext(block: block, requested: true, unavailable: false)
+    }
 }
+
+/// The name this carried when health was the only channel. Kept so nothing that
+/// already spells it has to change to say the same thing.
+public typealias OutgoingHealthContext = OutgoingDeviceContext
 
 /// Parsed `GET /health` result. Only the bridge `version` is modeled — the
 /// liveness `ok` flag and the auth-gated operator paths aren't needed by the app.
@@ -523,6 +543,14 @@ public struct JesseRequest: Encodable, Equatable, Sendable {
     public let healthContextRequested: Bool?
     // The app could NOT fulfill a health request this turn (toggle off, denied, etc.).
     public let healthContextUnavailable: Bool?
+    // Compact device location block from CoreLocation. Nil omits the field, so an app
+    // build that predates the channel produces byte-for-byte the old request.
+    public let locationContext: String?
+    // This turn is a retry answering a prior `JESSE_NEEDS_LOCATION` directive.
+    public let locationContextRequested: Bool?
+    // The app could NOT fulfill a location request this turn (toggle off, permission
+    // denied, Location Services off, timed out, no fix).
+    public let locationContextUnavailable: Bool?
     // Meal-corrections ack (JESSE_MEAL_LOG v2): the highest `corrections_seq` the app
     // has taken responsibility for.
     public let mealCorrectionsAck: Int?
@@ -552,7 +580,10 @@ public struct JesseRequest: Encodable, Equatable, Sendable {
                 voice: Bool?,
                 instructions: String?, floorOverride: String?, attachments: [Attachment]?,
                 healthContext: String?, healthContextRequested: Bool?,
-                healthContextUnavailable: Bool?, mealCorrectionsAck: Int?, requestId: String?,
+                healthContextUnavailable: Bool?,
+                locationContext: String? = nil, locationContextRequested: Bool? = nil,
+                locationContextUnavailable: Bool? = nil,
+                mealCorrectionsAck: Int?, requestId: String?,
                 model: String? = nil) {
         self.mode = mode
         self.text = text
@@ -565,6 +596,9 @@ public struct JesseRequest: Encodable, Equatable, Sendable {
         self.healthContext = healthContext
         self.healthContextRequested = healthContextRequested
         self.healthContextUnavailable = healthContextUnavailable
+        self.locationContext = locationContext
+        self.locationContextRequested = locationContextRequested
+        self.locationContextUnavailable = locationContextUnavailable
         self.mealCorrectionsAck = mealCorrectionsAck
         self.requestId = requestId
         self.model = model
@@ -612,6 +646,9 @@ public struct JesseRequest: Encodable, Equatable, Sendable {
         case healthContext = "health_context"
         case healthContextRequested = "health_context_requested"
         case healthContextUnavailable = "health_context_unavailable"
+        case locationContext = "location_context"
+        case locationContextRequested = "location_context_requested"
+        case locationContextUnavailable = "location_context_unavailable"
         case mealCorrectionsAck = "meal_corrections_ack"
         case requestId = "request_id"
         case model
@@ -662,13 +699,18 @@ public struct JesseResultResponse: Decodable {
 /// directive types are modeled; absent/`null` decodes to nil (the common case).
 public struct JesseDirectives: Decodable, Equatable, Sendable {
     public let needsHealth: JesseNeedsHealth?
+    public let needsLocation: JesseNeedsLocation?
     public var mealLog: JesseMealLog?
-    public init(needsHealth: JesseNeedsHealth?, mealLog: JesseMealLog? = nil) {
+    public init(needsHealth: JesseNeedsHealth?,
+                needsLocation: JesseNeedsLocation? = nil,
+                mealLog: JesseMealLog? = nil) {
         self.needsHealth = needsHealth
+        self.needsLocation = needsLocation
         self.mealLog = mealLog
     }
     enum CodingKeys: String, CodingKey {
         case needsHealth = "needs_health"
+        case needsLocation = "needs_location"
         case mealLog = "meal_log"
     }
 }
@@ -776,6 +818,25 @@ public struct JesseNeedsHealth: Decodable, Equatable, Sendable {
             case metric
             case windowDays = "window_days"
         }
+    }
+}
+
+/// The decoded (not yet validated) `needs_location` request. Every key is optional
+/// HERE and required by the CONTRACT: the decode has to survive a malformed payload so
+/// the app can reject it deliberately (`NeedsLocationRequest.validated` → nil) rather
+/// than throwing inside a reply decode and losing the whole turn.
+public struct JesseNeedsLocation: Decodable, Equatable, Sendable {
+    public let fields: [String]?
+    public let precision: String?
+    public let maxAgeSeconds: Int?
+    public init(fields: [String]?, precision: String?, maxAgeSeconds: Int?) {
+        self.fields = fields
+        self.precision = precision
+        self.maxAgeSeconds = maxAgeSeconds
+    }
+    enum CodingKeys: String, CodingKey {
+        case fields, precision
+        case maxAgeSeconds = "max_age_seconds"
     }
 }
 

@@ -181,7 +181,7 @@ enum HealthRequestFulfiller {
 
     /// Truncate to at most `maxBytes` UTF-8 bytes on WHOLE-line boundaries (never
     /// mid-line), so a capped block is never a garbled partial line.
-    static func capWholeLines(_ s: String, maxBytes: Int) -> String {
+    nonisolated static func capWholeLines(_ s: String, maxBytes: Int) -> String {
         if s.utf8.count <= maxBytes { return s }
         var kept: [String] = []
         var used = 0
