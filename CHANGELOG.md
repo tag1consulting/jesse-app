@@ -13,6 +13,48 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [App 1.0 (119)] - 2026-08-28
+
+### Fixed
+
+- **A location request hung the turn instead of answering it.** Asking for a fix never
+  came back, so a `JESSE_NEEDS_LOCATION` directive was never fulfilled and the turn had
+  no answer. Two defects in `oneFix`, one on top of the other.
+
+  **The manager was dead before it could call back.** `CLLocationManager.delegate` is a
+  WEAK reference, so the only strong owner of the `FixWaiter` was a local inside the
+  inner `Task { @MainActor in … }`, and the only strong owner of the manager was that
+  waiter. The Task body finishes the instant `requestLocation()` returns — so the local
+  went out of scope, the waiter deallocated, and it took the manager with it. A
+  deallocated manager delivers neither `didUpdateLocations` nor `didFailWithError`, so
+  the continuation was never resumed at all. The waiter is now a `let` in `oneFix`'s own
+  async frame, which keeps it alive for the whole suspension, and it owns the manager
+  outright: it creates it, configures it and calls `requestLocation()` in `begin`.
+
+  This failed on **every** real fix request, on any device, regardless of GPS or network.
+  It survived the test suite because every test injects a fake `LocationContextProviding`
+  — the whole point of the seam — so the real CoreLocation lifetime path never ran once.
+
+  **And the caller's timeout could not fire.** `reading` bounds the fix with
+  `bounded(fixTimeout, …)`, which races it against a sleep inside a `withTaskGroup`. A
+  task group cannot return until every child finishes, and `cancelAll()` only *requests*
+  cancellation — a plain non-throwing `withCheckedContinuation` ignores it. So a fix that
+  never arrives left the group unable to close and hung the turn rather than degrading to
+  `.empty`. `oneFix` is now wrapped in `withTaskCancellationHandler` and resumes with nil
+  on cancel, so the 2-second bound is real: airplane mode, a device with no fix, and a
+  simulator with no location set all return `.empty` on time. `bounded` itself is
+  unchanged — the bug was the child ignoring cancellation, not the race.
+
+  The continuation is now resumed exactly once on every path: by the delegate on success
+  or failure, or by cancellation on timeout. Three things can race to finish one request
+  (iOS can deliver both a location and an error), and resuming a `CheckedContinuation`
+  twice traps, so the single-resume guard is load-bearing rather than defensive. Every
+  resume and teardown runs on the main actor — where the manager is created and delivers
+  — so that one guard is sufficient without further locking. The waiter stays
+  `nonisolated`, hopping to the main actor rather than being isolated to it, because a
+  main-actor class reachable from `JesseClient` gets an isolated deinit that aborts the
+  process when released off the main actor — the crash fixed in build 118.
+
 ## [App 1.0 (118)] - 2026-08-27
 
 ### Added

@@ -139,25 +139,41 @@ nonisolated final class LocationContextProvider: LocationContextProviding, @unch
     /// so a coarse request cannot produce a prompt. A `precise` request on a device that
     /// granted reduced accuracy asks for temporary full accuracy — the one prompt this
     /// channel can raise, and only because the model explicitly stated `"precise"`.
+    ///
+    /// TWO THINGS HERE ARE LOAD-BEARING, and the first was the bug.
+    ///
+    /// **The waiter is a `let` in THIS frame.** `CLLocationManager.delegate` is a WEAK
+    /// reference, so the waiter's only strong owner is whoever holds it — and the
+    /// manager's only strong owner is the waiter. When both were locals inside the inner
+    /// `Task { @MainActor in … }`, they died the instant that Task body finished, which
+    /// is immediately after `requestLocation()` returns. A deallocated manager delivers
+    /// neither `didUpdateLocations` nor `didFailWithError`, so the continuation was
+    /// never resumed at all. Declared out here, the async frame keeps the waiter alive
+    /// for the whole suspension, and the waiter keeps the manager alive with it.
+    ///
+    /// **The cancellation handler is what makes the caller's timeout real.** `bounded`
+    /// races this against a sleep inside a `withTaskGroup`, and a task group cannot
+    /// return until every child finishes — `cancelAll()` only *requests* cancellation. A
+    /// plain non-throwing `withCheckedContinuation` ignores that request entirely, so a
+    /// fix that never arrives (airplane mode, no GPS, a simulator with no location set)
+    /// left the group unable to return and hung the whole turn rather than degrading to
+    /// `.empty`. Resuming with `nil` on cancel is what lets the group close.
     private func oneFix(precision: LocationPrecision) async -> CLLocation? {
-        await withCheckedContinuation { (cont: CheckedContinuation<CLLocation?, Never>) in
-            Task { @MainActor in
-                let manager = CLLocationManager()
-                if precision == .precise,
-                   manager.accuracyAuthorization == .reducedAccuracy {
-                    manager.requestTemporaryFullAccuracyAuthorization(
-                        withPurposeKey: "PreciseDistance")
+        // Owned by this frame, NOT by the Task below — see above.
+        let waiter = FixWaiter()
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { (cont: CheckedContinuation<CLLocation?, Never>) in
+                Task { @MainActor in
+                    waiter.begin(precision: precision) { cont.resume(returning: $0) }
                 }
-                manager.desiredAccuracy = precision == .precise
-                    ? kCLLocationAccuracyBest
-                    : kCLLocationAccuracyReduced
-                let delegate = FixWaiter { location in cont.resume(returning: location) }
-                manager.delegate = delegate
-                // Retain the delegate for the life of the request; the waiter drops
-                // its own reference once it has resumed.
-                delegate.retain(manager)
-                manager.requestLocation()
             }
+        } onCancel: {
+            // Hop to the main actor rather than isolating the waiter to it: this type is
+            // held by `JesseClient` and released off the main actor, and a main-actor
+            // class gets an isolated deinit that aborts the process on such a release.
+            // The hop keeps every resume/teardown on the actor the manager delivers on,
+            // which is what makes the single-resume guard sufficient against this race.
+            Task { @MainActor in waiter.cancel() }
         }
     }
 
@@ -250,36 +266,90 @@ nonisolated enum LocationPermissionStatus {
 
 // MARK: - Delegates (the only stateful CoreLocation surface)
 
-/// Resumes once with the first fix, or nil on failure. One-shot: a second callback (iOS
-/// can deliver both a location and an error) is ignored, so the continuation is never
-/// resumed twice.
+/// Owns one location request end to end: it creates the `CLLocationManager`, holds the
+/// only strong reference to it (`delegate` is weak, so nothing else does), and resumes
+/// its caller EXACTLY ONCE — with the first fix, with nil on failure, or with nil on
+/// cancellation.
+///
+/// One-shot by design, and the guard in `finish` is what enforces it. Three things can
+/// race to finish a request: `didUpdateLocations`, `didFailWithError` (iOS can deliver
+/// both for one request), and the caller's timeout cancelling. Resuming a
+/// `CheckedContinuation` twice traps, so a second arrival must be a silent no-op rather
+/// than a second resume.
+///
+/// `begin`, `cancel` and both delegate callbacks all run on the main actor — the manager
+/// is created there and delivers there, and `cancel` hops there — so the guard is
+/// checked and cleared on one actor and needs no further locking.
+///
+/// `nonisolated`/`@unchecked Sendable` deliberately: an instance is reachable from
+/// `LocationContextProvider`, which `JesseClient` holds and releases off the main actor.
+/// A main-actor-isolated class gets an isolated deinit and aborts the process on such a
+/// release, which is a crash this file has already had once.
 private nonisolated final class FixWaiter: NSObject, CLLocationManagerDelegate, @unchecked Sendable {
     private var resume: ((CLLocation?) -> Void)?
     private var manager: CLLocationManager?
 
-    init(resume: @escaping (CLLocation?) -> Void) {
+    /// Arm the request: configure accuracy for `precision`, take the one strong
+    /// reference to the manager, and ask for a single fix. `requestLocation()` delivers
+    /// exactly one callback, so the `resume` stored here is called once and then cleared.
+    ///
+    /// `precision == .coarse` never touches full accuracy, so a coarse request cannot
+    /// raise a prompt.
+    @MainActor
+    func begin(precision: LocationPrecision, resume: @escaping (CLLocation?) -> Void) {
+        // A request that was cancelled before it could be armed: resume immediately
+        // rather than starting a manager nobody is waiting on.
+        guard !isFinished else {
+            resume(nil)
+            return
+        }
         self.resume = resume
+        let manager = CLLocationManager()
+        if precision == .precise, manager.accuracyAuthorization == .reducedAccuracy {
+            manager.requestTemporaryFullAccuracyAuthorization(withPurposeKey: "PreciseDistance")
+        }
+        manager.desiredAccuracy = precision == .precise
+            ? kCLLocationAccuracyBest
+            : kCLLocationAccuracyReduced
+        manager.delegate = self
+        // The ONLY strong reference to the manager. `delegate` is weak, so without this
+        // the manager deallocates and never calls back.
+        self.manager = manager
+        manager.requestLocation()
     }
 
-    func retain(_ manager: CLLocationManager) { self.manager = manager }
+    /// The caller's timeout fired. Resume with nil and tear the manager down, so the
+    /// awaiting task group can close instead of waiting on a fix that is not coming.
+    @MainActor
+    func cancel() {
+        finish(nil)
+    }
 
+    /// Whether a resume has already happened — including a cancel that landed before
+    /// `begin` ran, which is why this is a stored flag rather than `resume == nil`
+    /// (that is also nil before arming).
+    private var isFinished = false
+
+    @MainActor
     private func finish(_ location: CLLocation?) {
-        guard let resume else { return }
+        guard !isFinished else { return }
+        isFinished = true
+        let resume = self.resume
         self.resume = nil
         manager?.delegate = nil
         manager = nil
-        resume(location)
+        resume?(location)
     }
 
     func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
-        finish(locations.last)
+        MainActor.assumeIsolated { finish(locations.last) }
     }
 
     func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
         // Never log the request, only that it failed — a failure reason can name a
         // region and this file logs no place data at all.
         Log.location.notice("location: fix failed (\(error.localizedDescription))")
-        finish(nil)
+        MainActor.assumeIsolated { finish(nil) }
     }
 }
 
