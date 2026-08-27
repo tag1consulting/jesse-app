@@ -382,6 +382,100 @@ in any case. The asymmetry is deliberate and is recorded rather than introduced 
 `cargo build --release --bin jesse-build-mcp`. If it is absent the server simply fails to
 start and the two tools are missing from the turn; nothing else degrades.
 
+It is one of the four binaries `sentinel::deploy::DEPLOY_BINS` moves together, so an
+`origin/main` deploy installs it. **Adding an MCP-server binary to the child's config without
+adding it to `DEPLOY_BINS` ships a config naming a command that is not installed** — the
+bridge starts cleanly, answers `/health`, and registers zero tools for that server on every
+turn thereafter, with no error written anywhere.
+
+### Places (`places`, 2026-08-27)
+
+The child has had Apple Maps search since 0.99.0, and that tool returns **no opening hours and
+no ratings, ever** — a limit of its upstream data source, not of its configuration. "What is
+near me and is it open right now" was therefore unanswerable. `places` supplies the missing
+half.
+
+#### What shipped
+
+Two MCP tools, served by `jesse-places-mcp` (this repository's own binary, `bridge/src/bin/`),
+over the same inline `--mcp-config` + `--strict-mcp-config` channel every other server uses.
+The logic is Rust in the bridge crate (`bridge/src/places.rs`); the binary is transport. Both
+tools are granted; there is no third tool to withhold and no write verb anywhere in the
+server. This pass is backed by OpenStreetMap (Overpass for nearby search, Nominatim for the
+address of a specific object); neither needs an API key.
+
+| Tool | What it does |
+| --- | --- |
+| `mcp__places__places_search` | free-text query + latitude/longitude/radius → nearby places with hours |
+| `mcp__places__place_details` | one id from a search result → the fullest record for it |
+
+#### The tool names name no provider, and that is a containment decision
+
+A second provider is expected behind these same two names, carrying the ratings OSM does not
+have. Because the names do not move, that provider changes neither `DEFAULT_ALLOWED_TOOLS` nor
+`MAIN_CHILD_MCP_CONFIG` — so it changes no `toolset_args`, and therefore **costs no live
+battery re-run**. A provider baked into a tool name would have made every backend swap a
+$20 re-record.
+
+#### Egress: this does not widen the channel `maps_search` opened
+
+`maps_search` sends a caller-authored **query string** to Apple, out of a child that also
+reads attacker-authored message bodies. That is a low-bandwidth egress channel, accepted
+rather than mitigated, and it is recorded above.
+
+`places` does not have that shape, and the difference is structural rather than one of degree.
+Its free-text query is resolved against a **closed compile-time category table** and then used
+to filter the *response* on this side. The only caller-supplied string that leaves the host is
+a place id, validated against `^(node|way|relation)/[0-9]+$` before it is sent. What goes out
+is a coordinate, a radius, and constants. **There is no string a turn can author that reaches
+a remote service.**
+
+The cost of that shape is a real capability limit, recorded rather than hidden: a query naming
+no known category falls back to a broad POI tag set filtered by name on this side, which is
+not a geocoder. A caller that knows the category should say the category.
+
+#### What IS new: inbound untrusted content, and a refusal to guess
+
+OSM is a publicly editable wiki, so a place name or an `opening_hours` value is untrusted text
+arriving in a turn's context. That is the same trust level as any page the browser server
+fetches, which this set has carried since 0.66.0.
+
+It is also why the hours parser **fails loudly rather than guessing**. `opening_hours` is its
+own small grammar with a very long tail (month ranges, week numbers, `sunrise`/`sunset`, nth
+weekday selectors). A regex that "mostly works" over that tail does not fail visibly; it
+returns a confident wrong answer that a caller cannot distinguish from a right one. So the
+parser handles the common forms and returns an explicit failure for the rest, and the response
+carries **two fields, never one**: `opening_hours_raw` (the source string, verbatim) and
+`opening_hours` (per-weekday intervals plus `open_now`, evaluated in a named timezone). On a
+failed parse `open_now` is `null`, not `false` — a `false` there would be indistinguishable
+from "closed right now", and reporting a venue as shut because a string was unreadable is
+precisely the wrong answer this design exists to avoid.
+
+There are **no ratings** in this data source and no `rating` key is emitted, not even as null:
+a null would teach a caller the concept exists and invite it to render "0" or "unrated" for a
+place that is simply outside the provider's coverage.
+
+#### Rate limiting is enforced in the server, not asked of the caller
+
+Nominatim's usage policy caps a client at roughly one request per second and forbids bulk
+querying. That is a limit on the *client*, so a single gate inside the server serialises all
+outbound requests across both backends. A caller convention would not have held: the caller is
+a language model that will fan out three lookups in one turn. Responses are cached for five
+minutes, so the usual "what's near me / is that one open / what's their number" sequence is
+one round trip rather than three. Both services also require a descriptive `User-Agent` with a
+route to a human and will block a generic client; the default names the software and this
+repository, and `JESSE_PLACES_USER_AGENT` overrides it.
+
+#### Deployment
+
+`jesse-places-mcp` must be on the bridge's `PATH`, on the same terms as `jesse-build-mcp`
+above, and it is in `DEPLOY_BINS`. Configuration is entirely by environment
+(`JESSE_PLACES_OVERPASS_URL`, `JESSE_PLACES_NOMINATIM_URL`, `JESSE_PLACES_USER_AGENT`,
+`JESSE_PLACES_MIN_INTERVAL_MS`, `JESSE_PLACES_CACHE_TTL_SECS`, `JESSE_PLACES_HTTP_TIMEOUT_SECS`,
+`JESSE_PLACES_TIMEZONE`) and never by argv — deliberately, so that repointing a backend when
+the public instance is unavailable does not change the argv the containment record commits by
+strict equality. None of these grant a tool; the startup gate says so itself.
+
 ### Web access (`WebSearch` and `WebFetch`, 2026-08-05)
 
 Both tools are granted on the main turn. `WebFetch` required removing the deny
