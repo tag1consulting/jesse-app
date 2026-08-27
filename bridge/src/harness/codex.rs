@@ -1113,6 +1113,22 @@ impl Harness for Codex {
     /// `write` on this deployment in any case. Naming [`MESSAGES_MCP_CONFIG`] explicitly (rather
     /// than tracking whatever `MAIN_CHILD_MCP_CONFIG` happens to be) is what keeps this
     /// harness's recorded posture true as the other harness's set grows.
+    ///
+    /// **`places` (0.100.0) IS THE SECOND SERVER THIS HARNESS DOES NOT GET, and the decision
+    /// was taken rather than inherited.** The argument for adding it is real: unlike `build`,
+    /// it is a plain read capability with no code-execution surface, and the standing rule is
+    /// that a capability lands on every harness in the same change. The argument against won
+    /// on the same three facts that decided `build`, none of which have moved — adding it
+    /// re-keys this harness's row labels from `…+google-perseido` to a new string, which
+    /// orphans BOTH `[[accepted]]` blocks in `containment-codex.toml`, which makes them
+    /// re-signable only after a live Codex battery this change does not run and did not
+    /// budget. Shipping it here without that battery would mean a record vouching for a
+    /// posture nobody probed, which is the one thing this file exists to prevent.
+    ///
+    /// So the asymmetry is now two servers wide and is RECORDED, not accumulated by neglect:
+    /// when a Codex battery is next re-run for any reason, `places` should land in the same
+    /// pass. Until then Codex answers "is it open" exactly as well as it did before, which is
+    /// to say not at all.
     fn main_mcp_config(&self) -> &'static str {
         MESSAGES_MCP_CONFIG
     }

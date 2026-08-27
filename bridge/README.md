@@ -2205,7 +2205,7 @@ lost invisibly.
 | --- | --- |
 | `resolve` | In the deploy clone: `git fetch origin --prune`, resolve the ref (`main` means `origin/main`), then **refuse unless `git merge-base --is-ancestor <sha> origin/main`**. Also refuses a sha equal to the running one, unless `force`. |
 | `ci` | `GET /repos/<repo>/actions/runs?head_sha=…`, then that run's jobs listing. Requires a **completed, successful** run containing a **job named `bridge` that concluded `success`**. `force` does **not** bypass this. |
-| `build` | `git checkout --detach <sha>`, then `cargo build --release --locked --bin jesse-bridge --bin jesse-hook --bin jesse-build-mcp` in `bridge/`, 20-minute ceiling, both streams to the log **as they arrive**. |
+| `build` | `git checkout --detach <sha>`, then `cargo build --release --locked --bin jesse-bridge --bin jesse-hook --bin jesse-build-mcp --bin jesse-places-mcp` in `bridge/`, 20-minute ceiling, both streams to the log **as they arrive**. |
 | `stage` | Copy the three binaries to `<bin dir>/jesse-bridge.d/<sha>/`, `chmod 755`, record where the links pointed in `deploys/previous`, then **atomically** repoint the three symlinks (create temp link, `rename`). |
 | `restart` | `launchctl kickstart -k`, then poll `/health` every 2 s for 90 s. Success needs `ok == true`, **`version` equal to the `[package] version` the commit declares**, and no harness newly `containment_stale`. |
 | `rollback` | Any failure in `restart`: repoint to `previous`, kickstart, poll again. `result: rolled_back`, or **`rolled_back_unhealthy`** if the old one did not come up either. |

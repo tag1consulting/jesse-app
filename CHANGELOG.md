@@ -13,6 +13,104 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [bridge 0.100.0] - 2026-08-27
+
+### Added
+
+- **A turn can say whether somewhere is open right now.** The child got Apple Maps search one
+  version ago and it answered half the question: `maps_search` returns name, address,
+  postcode, coordinates, phone and website, and returns **no opening hours and no ratings,
+  ever**. That is a hard limit of its upstream data source, not a flag nobody set. So the
+  child could find the café on Fountainbridge and could not say whether walking there was
+  worth doing.
+
+  A new `places` server supplies the missing half: `mcp__places__places_search` and
+  `mcp__places__place_details`, served by this repository's own `jesse-places-mcp` over the
+  same strict `--mcp-config` channel as every other server. Sixteen servers on the Claude Code
+  main turn, up from fifteen.
+
+  **Opening hours come back in TWO fields, never one.** `opening_hours_raw` is the source
+  string verbatim; `opening_hours` is per-weekday intervals plus an `open_now` boolean
+  evaluated against a timezone the response names. A single prettified string cannot answer
+  "is it open at 07:00 on a Thursday" without the caller re-parsing prose, and a parsed
+  structure alone leaves nothing to fall back to when a value cannot be read. Intervals that
+  run past midnight carry an explicit `crosses_midnight` flag, because a caller comparing
+  "20:00" and "02:00" itself gets Friday night wrong every time, silently.
+
+  **The parser fails loudly rather than guessing.** `opening_hours` is its own small grammar
+  with a very long tail — month ranges, week numbers, `sunrise`/`sunset`, nth-weekday
+  selectors. A regex that mostly works over that tail does not fail visibly; it returns a
+  confident wrong answer indistinguishable from a right one. The common forms are parsed
+  properly and everything else returns `parsed: false` with a reason naming the rule it could
+  not read, `open_now: null`, and the raw string still in hand. `null` rather than `false` is
+  deliberate: a `false` there is indistinguishable from "closed right now", and calling a
+  venue shut because a string was unreadable is the specific wrong answer this shape exists to
+  avoid. `PH off` is recognised, flagged as unevaluated, and NOT applied — there is no holiday
+  calendar here and inventing one is the same class of guess.
+
+  **There are no ratings, and no `rating` key is emitted — not even null.** OSM carries none
+  and no proxy for one exists in the data. A null would teach a caller the concept exists and
+  invite it to render "0" or "unrated" for a place simply outside the provider's coverage.
+  Ratings arrive with the second provider or they do not arrive.
+
+  **The tool names name no provider, and that is a containment decision rather than a style
+  one.** This pass is backed by OpenStreetMap — Overpass for nearby search, Nominatim for the
+  address of a specific object, neither needing an API key, which is why it goes first. A
+  second provider is expected behind these SAME two names. Because the names do not move, that
+  provider changes neither `DEFAULT_ALLOWED_TOOLS` nor `MAIN_CHILD_MCP_CONFIG` — so it changes
+  no `toolset_args`, and therefore costs no live battery re-run. A provider baked into a tool
+  name would have made every backend swap a $20 re-record.
+
+  **It does not widen the egress channel `maps_search` opened, and the difference is
+  structural.** `maps_search` sends a caller-authored query string to Apple out of a child that
+  also reads attacker-authored message bodies; that channel was accepted rather than
+  mitigated. Here the free-text query is resolved against a closed compile-time category table
+  and then used to filter the *response* on this side, and the only caller-supplied string
+  that leaves the host is a place id validated as `^(node|way|relation)/[0-9]+$` first. What
+  goes out is a coordinate, a radius and constants. There is no string a turn can author that
+  reaches a remote service. What IS new is inbound: OSM is a publicly editable wiki, so a place
+  name or an hours string is untrusted text entering a turn's context — the same trust level
+  as any page the browser server fetches, which this set has carried since 0.66.0.
+
+  **Rate limiting is enforced inside the server, not asked of the caller.** Nominatim's policy
+  caps a client at roughly one request per second and forbids bulk querying; a single gate
+  serialises all outbound requests across both backends. A convention would not have held —
+  the caller is a language model that will fan out three lookups in one turn. Responses cache
+  for five minutes, so "what's near me / is that one open / what's their number" is one round
+  trip rather than three. Both services require a descriptive `User-Agent` with a route to a
+  human and will block a generic client; the default names this software and repository and
+  `JESSE_PLACES_USER_AGENT` overrides it. The Overpass endpoint is configurable
+  (`JESSE_PLACES_OVERPASS_URL`) because the public instance genuinely returns 504 under load —
+  measured, not anticipated — and one bounded retry covers 429 and 5xx for the same reason.
+
+  **Coverage is reported rather than implied.** `opening_hours` is present on some cafés and
+  missing on others, and a caller that cannot see how many results carried the field has no
+  way to tell "nothing is open" from "nobody has tagged this street". Every search response
+  carries `with_opening_hours` and `without_opening_hours`. Measured live at Fountainbridge,
+  Edinburgh: **6 of 15 cafés within 400 m carried hours, 9 did not.**
+
+  **Configuration is entirely by environment, never argv**, so the `"places"` entry in the
+  child's config has an empty `args` array and repointing a backend does not change the argv
+  the containment record commits by strict equality.
+
+  **Codex does not get this server, and the decision was taken rather than inherited.** It is a
+  plain read capability with no code-execution surface, so the standing rule would put it on
+  every harness in the same change. It lost on the three facts that decided `build` in 0.86.0,
+  none of which have moved: adding it re-keys Codex's row labels, which orphans both
+  `[[accepted]]` blocks in `containment-codex.toml`, which makes them re-signable only after a
+  live Codex battery this change does not run. The asymmetry is now two servers wide and is
+  recorded in `CodexHarness::main_mcp_config` rather than accumulated by neglect.
+
+### Fixed
+
+- **The sentinel's deploy would have shipped a config naming an uninstalled command.**
+  `DEPLOY_BINS` was a fixed list of three binaries and the deploy's `cargo build` named the
+  same three. A bridge deployed with `places` in its config but no `jesse-places-mcp` on the
+  `PATH` starts cleanly, answers `/health` with the right version, and then registers zero
+  tools for that server on every turn thereafter — with no error written anywhere. Both the
+  list and the build now carry the fourth binary, and the const's doc comment says why adding
+  an MCP-server binary to the child's config means adding it here in the same change.
+
 ## [bridge 0.99.0] - 2026-08-27
 
 ### Added

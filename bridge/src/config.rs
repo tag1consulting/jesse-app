@@ -665,6 +665,42 @@ pub const DEFAULT_MAX_ATTACHMENTS_TOTAL_BYTES: usize = 20 * 1024 * 1024;
 // the child can edit the checkout and then cause that checkout to be compiled and run, so
 // this is a write-then-execute path BY CONSTRUCTION. The mitigation is the macOS sandbox the
 // build runs inside (see `buildsvc::build_sandbox_profile`), not the shape of the tool.
+//
+// PLACES: BOTH OF TWO, and the count will still read "both of two" when the surface grows,
+// because these two names are a CONTRACT rather than a description of a backend.
+//
+// The server is this repo's own `jesse-places-mcp`. It advertises `places_search` and
+// `place_details` and nothing else, and both are granted: there is no third tool to withhold
+// and no write verb anywhere in it — it reads two public web services and returns JSON.
+//
+// WHY IT EXISTS. The child got Apple Maps search in 0.99.0 and that tool returns name,
+// address, postcode, coordinates, phone and website. It returns NO OPENING HOURS AND NO
+// RATINGS, EVER — a hard limit of the upstream data source, not something a flag fixes. So
+// "is that café open right now" was unanswerable with the set this joins. `places` answers
+// exactly that half: hours, raw and parsed, with an `open_now` evaluated in a named timezone.
+//
+// THE NAMES ARE PROVIDER-AGNOSTIC AND THAT IS WHY THEY ARE CHEAP TO KEEP. Nothing here names
+// a backend, and nothing the tools return does either. This pass is backed by OpenStreetMap;
+// a second provider carrying the ratings OSM does not have is expected behind these SAME two
+// names. Because the names do not move, that provider changes neither this const nor
+// `MAIN_CHILD_MCP_CONFIG` — so it changes no `toolset_args`, so it costs NO LIVE BATTERY
+// RE-RUN. Naming a provider in a tool would have made every backend swap a $20 re-record.
+// Do not "clarify" these names by adding one.
+//
+// WHAT THEY COST, STATED AGAINST THE MAPS GRANT DIRECTLY ABOVE. `maps_search` sends a
+// caller-authored QUERY STRING to Apple out of a child that reads attacker-authored message
+// bodies, and that egress was accepted rather than mitigated. These two DO NOT WIDEN IT, and
+// the reason is structural rather than a matter of degree: the free-text query is resolved
+// against a closed compile-time category table and then used to filter the RESPONSE on this
+// side, and the only caller-supplied string that leaves the host is a place id validated as
+// `^(node|way|relation)/[0-9]+$` first. What goes out is a coordinate, a radius and
+// constants. There is no string a turn can author that reaches a remote service.
+//
+// WHAT IS GENUINELY NEW is inbound: OSM is a public wiki, so a place name or an
+// `opening_hours` value is untrusted text arriving in a turn's context. That is the same
+// trust level as any page the browser server fetches, which this list has carried since
+// 0.66.0, and it is why the hours parser refuses a string it cannot read instead of guessing
+// — a confident wrong answer from attacker-editable data is the failure mode worth avoiding.
 pub const DEFAULT_ALLOWED_TOOLS: &str = "\
 Read(//${WORKSPACE}/**),Edit(//${WORKSPACE}/**),\
 Grep(//${WORKSPACE}/**),Glob(//${WORKSPACE}/**),\
@@ -793,7 +829,8 @@ mcp__google-perseido__get_drive_file_content,mcp__google-perseido__get_drive_fil
 mcp__google-perseido__list_drive_items,mcp__google-perseido__get_drive_file_permissions,\
 mcp__google-perseido__check_drive_file_public_access,\
 mcp__google-perseido__get_drive_shareable_link,\
-mcp__build__build_bridge,mcp__build__test_bridge";
+mcp__build__build_bridge,mcp__build__test_bridge,\
+mcp__places__places_search,mcp__places__place_details";
 
 // Defense-in-depth: tools that must never run from the bridge even if they slip
 // into the allowlist. Override with JESSE_DISALLOWED_TOOLS.

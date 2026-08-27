@@ -108,6 +108,7 @@ mod mealqueue;
 mod metrics;
 mod modelstore;
 mod persona;
+mod places;
 // The LIVE battery only (`containment-probe` feature): probe prompts, the runner and its
 // loopback listener. The record it produces, and the rules for reading one, are in
 // `containment` and are always compiled — the startup gate reads them.
@@ -190,6 +191,7 @@ pub use mealqueue::*;
 pub use metrics::*;
 pub use modelstore::*;
 pub use persona::*;
+pub use places::*;
 #[cfg(feature = "containment-probe")]
 pub use probe::*;
 pub use profile::*;

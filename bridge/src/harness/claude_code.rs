@@ -640,7 +640,15 @@ pub const MESSAGES_MCP_CONFIG: &str = concat!(
 );
 
 /// The fourteen-server set PLUS **`build`** — every **Claude Code** main turn from bridge
-/// 0.86.0. Fifteen servers.
+/// 0.86.0 until `places` landed in 0.100.0. Fifteen servers.
+///
+/// # Why this const survives its retirement
+///
+/// No shipped spawn site uses it today, and it is SPLIT OUT rather than deleted for exactly
+/// the reason [`QMD_SLACK_MCP_CONFIG`] and [`MESSAGES_MCP_CONFIG`] are: [`McpSet::MessagesBuild`]
+/// still names it, and folding it into the current main set would silently re-point the
+/// `…+google-perseido+build` row label at a set that ALSO reaches two public web services on
+/// every call. A row label has to keep meaning what it meant when somebody probed it.
 ///
 /// # What is new is that a turn can now EXECUTE THE SOURCE IT JUST EDITED
 ///
@@ -668,10 +676,71 @@ pub const MESSAGES_MCP_CONFIG: &str = concat!(
 /// command here, so this const reads identically on every deployment. Unlike the others it is
 /// THIS repository's own binary; installing it on the bridge's `PATH` is host setup,
 /// documented in SECURITY.md.
-pub const MAIN_CHILD_MCP_CONFIG: &str = concat!(
+pub const MESSAGES_BUILD_MCP_CONFIG: &str = concat!(
     r#"{"mcpServers":{"qmd":{"type":"stdio","command":"qmd","args":["mcp"]},"slack":{"type":"stdio","command":"npx","args":["-y","slack-mcp-server@latest","--transport","stdio"]},"browser":{"type":"stdio","command":"npx","args":["-y","@playwright/mcp@latest","--headless","--isolated","--output-dir","/tmp/jesse-browser","--output-max-size","104857600"]},"homeassistant":{"type":"http","url":""#,
     home_assistant_mcp_url!(),
     r#"","headers":{"Authorization":"Bearer ${HA_MCP_TOKEN}"}},"roon":{"type":"http","url":"http://10.40.0.2:8088/mcp"},"google":{"type":"stdio","command":"workspace-mcp","args":["--single-user","--read-only","--tools","calendar","gmail","drive"]},"github":{"type":"stdio","command":"github-mcp-server","args":["stdio","--read-only","--toolsets","repos,actions,issues,pull_requests"]},"fastmail":{"type":"stdio","command":"npx","args":["-y","github:jeremyandrews/jmap-mcp-server"]},"unifi":{"type":"stdio","command":"unifi-network-mcp","args":[]},"routeros":{"type":"stdio","command":"routeros-mcp","args":[]},"proxmox":{"type":"stdio","command":"mcp-proxmox","args":[]},"whatsapp":{"type":"stdio","command":"whatsapp-mcp","args":[]},"imcp":{"type":"stdio","command":"/Applications/iMCP.app/Contents/MacOS/imcp-server","args":[]},"google-perseido":{"type":"stdio","command":"workspace-mcp-perseido","args":["--single-user","--read-only","--tools","calendar","gmail","drive"]},"build":{"type":"stdio","command":"jesse-build-mcp","args":[]}}}"#
+);
+
+/// The fifteen-server set PLUS **`places`** — every **Claude Code** main turn from bridge
+/// 0.100.0. Sixteen servers.
+///
+/// # What `places` is for, and why `imcp` did not already cover it
+///
+/// The child has had Apple Maps search since 0.99.0, and that tool returns name, street
+/// address, postcode, coordinates, phone and website. It returns **no opening hours and no
+/// ratings, ever** — a hard limit of the upstream data source, not a misconfiguration. So
+/// "what is near me and is it open right now" was unanswerable from the set this replaces:
+/// the child could find the café and could not say whether walking there was worth doing.
+/// `places` supplies the missing half — hours, in both a raw and a parsed form, with an
+/// `open_now` computed against a named timezone.
+///
+/// # THE TOOL NAMES ARE PROVIDER-AGNOSTIC ON PURPOSE, AND THAT IS A CONTAINMENT DECISION
+///
+/// `places_search` and `place_details` name no backend, and neither does anything they
+/// return. This pass is backed by OpenStreetMap and a second provider is expected behind the
+/// same two names, carrying the ratings OSM does not have. Because the names do not move,
+/// **that provider costs no change to `DEFAULT_ALLOWED_TOOLS` and no change to this const** —
+/// which means it costs no `toolset_args` change, and therefore no live battery re-run. Bake
+/// a provider into a tool name and every backend swap becomes a $20 re-record. See
+/// [`crate::places`].
+///
+/// # What it adds to the child's reach: outbound HTTP to two public services
+///
+/// This is the second network-egress addition in two versions and it should be read against
+/// the first. `maps_search` (0.99.0) sends a caller-authored QUERY STRING to Apple, out of a
+/// child that also reads attacker-authored message bodies — a low-bandwidth egress channel
+/// accepted rather than mitigated.
+///
+/// `places` does NOT have that shape, and the difference is structural rather than one of
+/// degree. Its free-text query is resolved against a closed compile-time category table and
+/// then used to filter the RESPONSE on this side; the only caller-supplied string that leaves
+/// the host is a place id, validated as `^(node|way|relation)/[0-9]+$` before it is sent.
+/// What goes out is a coordinate, a radius, and constants. There is no string a turn can
+/// author that reaches a remote service, so the egress channel `maps_search` opened is not
+/// widened by this server.
+///
+/// What IS new is that the child's set now reaches two more third-party hosts, whose
+/// responses are attacker-influenceable in the ordinary way any public wiki is: anyone can
+/// edit OSM, so a place name or an `opening_hours` string is untrusted text arriving in a
+/// turn's context. That is the same trust level as a web page fetched by the browser server,
+/// which this set has carried since 0.66.0.
+///
+/// `jesse-places-mcp` is a BARE NAME resolved from the child's `PATH`, like every other stdio
+/// command here, so this const reads identically on every deployment. Like `jesse-build-mcp`
+/// it is THIS repository's own binary; installing it on the bridge's `PATH` is host setup,
+/// documented in SECURITY.md.
+///
+/// **THIS SET IS CLAUDE CODE'S ONLY**, on the same reasoning that kept `build` off Codex in
+/// 0.86.0: Codex stays on [`MESSAGES_MCP_CONFIG`]. Giving it `places` would move ITS row
+/// labels, orphan the two operator `[[accepted]]` blocks in `containment-codex.toml` that are
+/// keyed by those labels, and demand a live Codex battery this change does not run. The
+/// asymmetry is deliberate and recorded rather than quietly introduced. See
+/// [`crate::CodexHarness::main_mcp_config`].
+pub const MAIN_CHILD_MCP_CONFIG: &str = concat!(
+    r#"{"mcpServers":{"qmd":{"type":"stdio","command":"qmd","args":["mcp"]},"slack":{"type":"stdio","command":"npx","args":["-y","slack-mcp-server@latest","--transport","stdio"]},"browser":{"type":"stdio","command":"npx","args":["-y","@playwright/mcp@latest","--headless","--isolated","--output-dir","/tmp/jesse-browser","--output-max-size","104857600"]},"homeassistant":{"type":"http","url":""#,
+    home_assistant_mcp_url!(),
+    r#"","headers":{"Authorization":"Bearer ${HA_MCP_TOKEN}"}},"roon":{"type":"http","url":"http://10.40.0.2:8088/mcp"},"google":{"type":"stdio","command":"workspace-mcp","args":["--single-user","--read-only","--tools","calendar","gmail","drive"]},"github":{"type":"stdio","command":"github-mcp-server","args":["stdio","--read-only","--toolsets","repos,actions,issues,pull_requests"]},"fastmail":{"type":"stdio","command":"npx","args":["-y","github:jeremyandrews/jmap-mcp-server"]},"unifi":{"type":"stdio","command":"unifi-network-mcp","args":[]},"routeros":{"type":"stdio","command":"routeros-mcp","args":[]},"proxmox":{"type":"stdio","command":"mcp-proxmox","args":[]},"whatsapp":{"type":"stdio","command":"whatsapp-mcp","args":[]},"imcp":{"type":"stdio","command":"/Applications/iMCP.app/Contents/MacOS/imcp-server","args":[]},"google-perseido":{"type":"stdio","command":"workspace-mcp-perseido","args":["--single-user","--read-only","--tools","calendar","gmail","drive"]},"build":{"type":"stdio","command":"jesse-build-mcp","args":[]},"places":{"type":"stdio","command":"jesse-places-mcp","args":[]}}}"#
 );
 
 /// qmd PLUS slack PLUS browser — the main turn's server set from bridge 0.66.0 until Home
@@ -1868,10 +1937,10 @@ mod tests {
             // loads the new set.
             assert_eq!(
                 servers.len(),
-                15,
+                16,
                 "{label}: the main path must declare qmd, slack, browser, homeassistant, roon, \
                  google, github, fastmail, unifi, routeros, proxmox, whatsapp, imessage, \
-                 google-perseido and build and nothing else: {mcp:?}"
+                 google-perseido, build and places and nothing else: {mcp:?}"
             );
             // THE BUILD SERVER IS THE ONE THAT RUNS CODE, so it is asserted BY NAME on top of
             // the count above. The count alone would be satisfied by any fifteenth server;
@@ -1891,6 +1960,26 @@ mod tests {
                     .expect("args")
                     .is_empty(),
                 "{label}: the build server takes no arguments: {mcp:?}"
+            );
+            // THE PLACES SERVER IS ASSERTED BY NAME for the same reason `build` is: the count
+            // above would be satisfied by any sixteenth server, and this is the one whose
+            // absence takes "is it open right now" back to unanswerable — `imcp`'s Maps
+            // search returns no opening hours at all, ever, which is why this server exists.
+            assert!(
+                servers.contains_key("places"),
+                "{label}: the main path declares the places server: {mcp:?}"
+            );
+            // Empty `args` HERE means something different from what it means for `build`:
+            // everything configurable about this server (both endpoints, the User-Agent, the
+            // rate limit, the cache TTL) is read from the environment, deliberately, so that
+            // repointing a backend does not change the argv the containment record commits by
+            // strict equality. A flag appearing here would end that property silently.
+            assert!(
+                servers["places"]["args"]
+                    .as_array()
+                    .expect("args")
+                    .is_empty(),
+                "{label}: the places server is configured by environment, not argv: {mcp:?}"
             );
             // BOTH GOOGLE SERVERS MUST STAY READ-ONLY AT THE SERVER LAYER. `--read-only` is
             // what deregisters their write tools (event create, send, Drive mutate) so they
@@ -2407,10 +2496,18 @@ mod tests {
     /// array is the machine-checkable form of "the build server takes no configuration", and
     /// a flag appearing in it would mean something tunable had reached the one server that
     /// compiles and runs code.
+    ///
+    /// `places` is pinned with an empty `args` array for a DIFFERENT reason, and the two
+    /// should not be conflated. The build server takes no arguments because it must not; the
+    /// places server takes none HERE because everything it can be pointed at — the two
+    /// endpoints, the `User-Agent`, the rate limit, the cache TTL — is read from the
+    /// environment at startup, so none of it appears in the argv the containment record
+    /// commits. That is what lets an operator repoint a backend without invalidating a
+    /// record, and a flag appearing here would silently end that property.
     const GOLDEN_QMD_MCP: &str = concat!(
         r#"{"mcpServers":{"qmd":{"type":"stdio","command":"qmd","args":["mcp"]},"slack":{"type":"stdio","command":"npx","args":["-y","slack-mcp-server@latest","--transport","stdio"]},"browser":{"type":"stdio","command":"npx","args":["-y","@playwright/mcp@latest","--headless","--isolated","--output-dir","/tmp/jesse-browser","--output-max-size","104857600"]},"homeassistant":{"type":"http","url":""#,
         home_assistant_mcp_url!(),
-        r#"","headers":{"Authorization":"Bearer ${HA_MCP_TOKEN}"}},"roon":{"type":"http","url":"http://10.40.0.2:8088/mcp"},"google":{"type":"stdio","command":"workspace-mcp","args":["--single-user","--read-only","--tools","calendar","gmail","drive"]},"github":{"type":"stdio","command":"github-mcp-server","args":["stdio","--read-only","--toolsets","repos,actions,issues,pull_requests"]},"fastmail":{"type":"stdio","command":"npx","args":["-y","github:jeremyandrews/jmap-mcp-server"]},"unifi":{"type":"stdio","command":"unifi-network-mcp","args":[]},"routeros":{"type":"stdio","command":"routeros-mcp","args":[]},"proxmox":{"type":"stdio","command":"mcp-proxmox","args":[]},"whatsapp":{"type":"stdio","command":"whatsapp-mcp","args":[]},"imcp":{"type":"stdio","command":"/Applications/iMCP.app/Contents/MacOS/imcp-server","args":[]},"google-perseido":{"type":"stdio","command":"workspace-mcp-perseido","args":["--single-user","--read-only","--tools","calendar","gmail","drive"]},"build":{"type":"stdio","command":"jesse-build-mcp","args":[]}}}"#
+        r#"","headers":{"Authorization":"Bearer ${HA_MCP_TOKEN}"}},"roon":{"type":"http","url":"http://10.40.0.2:8088/mcp"},"google":{"type":"stdio","command":"workspace-mcp","args":["--single-user","--read-only","--tools","calendar","gmail","drive"]},"github":{"type":"stdio","command":"github-mcp-server","args":["stdio","--read-only","--toolsets","repos,actions,issues,pull_requests"]},"fastmail":{"type":"stdio","command":"npx","args":["-y","github:jeremyandrews/jmap-mcp-server"]},"unifi":{"type":"stdio","command":"unifi-network-mcp","args":[]},"routeros":{"type":"stdio","command":"routeros-mcp","args":[]},"proxmox":{"type":"stdio","command":"mcp-proxmox","args":[]},"whatsapp":{"type":"stdio","command":"whatsapp-mcp","args":[]},"imcp":{"type":"stdio","command":"/Applications/iMCP.app/Contents/MacOS/imcp-server","args":[]},"google-perseido":{"type":"stdio","command":"workspace-mcp-perseido","args":["--single-user","--read-only","--tools","calendar","gmail","drive"]},"build":{"type":"stdio","command":"jesse-build-mcp","args":[]},"places":{"type":"stdio","command":"jesse-places-mcp","args":[]}}}"#
     );
     const GOLDEN_EMPTY_MCP: &str = r#"{"mcpServers":{}}"#;
 

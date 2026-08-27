@@ -5,7 +5,7 @@ use serde::Serialize;
 //
 // The pipeline this completes: a coding session opens a bridge PR, CI goes green, the PR is
 // merged from the GitHub app, and the owner — holding nothing but a phone — taps Deploy.
-// This module is the half that runs on the host: it builds a commit, swaps three binaries,
+// This module is the half that runs on the host: it builds a commit, swaps the deploy binaries,
 // restarts the bridge, verifies that what came back is what was asked for, and PUTS THE OLD
 // ONE BACK if it is not.
 //
@@ -25,10 +25,22 @@ use serde::Serialize;
 //
 // Gate 2 means BRANCH PROTECTION ON `main` IS PART OF THIS BOUNDARY. See SECURITY.md.
 
-/// The three binaries a bridge deployment is made of. They MOVE TOGETHER: `jesse-hook` is
-/// exec'd by the agent child and `jesse-build-mcp` is an MCP server the child speaks to, so a
-/// bridge from one commit running against a hook from another is a combination nobody tested.
-pub const DEPLOY_BINS: [&str; 3] = ["jesse-bridge", "jesse-hook", "jesse-build-mcp"];
+/// The four binaries a bridge deployment is made of. They MOVE TOGETHER: `jesse-hook` is
+/// exec'd by the agent child, and `jesse-build-mcp` and `jesse-places-mcp` are MCP servers the
+/// child speaks to, so a bridge from one commit running against a hook from another is a
+/// combination nobody tested.
+///
+/// **ADDING AN MCP SERVER BINARY TO `MAIN_CHILD_MCP_CONFIG` MEANS ADDING IT HERE, IN THE SAME
+/// CHANGE.** The config names commands by BARE NAME, resolved from the child's `PATH`; a
+/// deployment that ships the config but not the binary starts cleanly, passes `/health`, and
+/// then registers zero tools for that server on every turn — a silent capability loss with no
+/// error anywhere. `jesse-places-mcp` was added here in 0.100.0 for exactly that reason.
+pub const DEPLOY_BINS: [&str; 4] = [
+    "jesse-bridge",
+    "jesse-hook",
+    "jesse-build-mcp",
+    "jesse-places-mcp",
+];
 
 /// The DEFAULT name of the CI job that must be green — the one that builds and tests the crate
 /// being deployed. [`SentinelConfig::ci_job`] is what is actually required, so a fork whose
@@ -183,7 +195,7 @@ impl SentinelConfig {
         self.state_dir.join("deploys")
     }
 
-    /// The rollback record: where each of the three symlinks pointed before the last stage.
+    /// The rollback record: where each deploy symlink pointed before the last stage.
     pub fn previous_file(&self) -> PathBuf {
         self.deploys_dir().join("previous")
     }
@@ -729,7 +741,7 @@ pub async fn check_ci(sen: &Sentinel, sha: &str) -> Result<CiStatus, String> {
 
 /// Where each of the three names pointed before the last stage, as `deploys/previous`.
 ///
-/// A map rather than a single path because the three binaries are staged independently and a
+/// A map rather than a single path because the deploy binaries are staged independently and a
 /// stage that fails halfway must be undoable for exactly the ones it changed. A name absent
 /// from the map had NOTHING at `<bin dir>/<name>` beforehand, and rolling it back means
 /// removing the link, not pointing it somewhere invented.
@@ -798,7 +810,7 @@ fn capture_one(bin_dir: &Path, store: &Path, name: &str) -> Result<Option<String
     Ok(Some(kept.to_string_lossy().to_string()))
 }
 
-/// Capture all three, as one `previous` map.
+/// Capture every deployed name, as one `previous` map.
 pub fn capture_previous(bin_dir: &Path, store: &Path) -> Result<Previous, String> {
     let mut prev = Previous::new();
     for name in DEPLOY_BINS {
@@ -838,7 +850,7 @@ pub fn repoint(bin_dir: &Path, name: &str, target: &Path) -> Result<(), String> 
     })
 }
 
-/// Put the three names back where `previous` says they were.
+/// Put every deployed name back where `previous` says it was.
 ///
 /// Every name is attempted even after one fails: a rollback that stopped at the first error
 /// would leave the deployment in a state that is neither the old one nor the new one, which is
@@ -1195,7 +1207,7 @@ async fn phase_resolve(
     Ok(sha)
 }
 
-/// PHASE 3 — check the commit out and build the three binaries.
+/// PHASE 3 — check the commit out and build the deploy binaries.
 async fn phase_build(sen: &Sentinel, log: &DeployLog, sha: &str) -> Result<(), String> {
     let checkout = dgit(sen, log, &["checkout", "--detach", sha]).await;
     if !checkout.ok() {
@@ -1227,6 +1239,8 @@ async fn phase_build(sen: &Sentinel, log: &DeployLog, sha: &str) -> Result<(), S
             "jesse-hook",
             "--bin",
             "jesse-build-mcp",
+            "--bin",
+            "jesse-places-mcp",
         ],
         &[],
         BUILD_TIMEOUT,
@@ -1244,7 +1258,7 @@ async fn phase_build(sen: &Sentinel, log: &DeployLog, sha: &str) -> Result<(), S
     Ok(())
 }
 
-/// PHASE 4 — copy the three binaries into the store and repoint the three symlinks.
+/// PHASE 4 — copy the deploy binaries into the store and repoint their symlinks.
 ///
 /// Returns the `previous` map, which is what a rollback is written in terms of.
 async fn phase_stage(sen: &Sentinel, log: &DeployLog, sha: &str) -> Result<Previous, String> {
