@@ -13,6 +13,45 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [bridge 0.102.0] - 2026-08-28
+
+### Changed
+
+- **Asking where he is now gets a precise fix, not a ~km circle.** The
+  `JESSE_NEEDS_LOCATION` directive carries a `precision` the model picks per turn, and
+  the guidance in `NEEDS_LOCATION_REQUEST` biased hard against the accurate one: it told
+  the agent to ask for `precise` "only when a coarse fix genuinely cannot answer", and
+  the worked example hardcoded `"precision":"coarse"` with a 300-second cache window. So
+  "precisely, where am I" still requested coarse, and the answer came back off by a
+  kilometre or more. Nothing fuzzes the fix server-side — the coarseness was entirely
+  what the model asked for.
+
+  The bias is now inverted. The example directive is
+  `{"fields":["placemark"],"precision":"precise","max_age_seconds":0}`, and the guidance
+  says plainly to use `precise` whenever he asks where he is, how far away something is,
+  or for his exact location — and ALWAYS on words like precisely, exactly, or right here.
+  `coarse` is left for incidental context where a rough neighbourhood is plainly enough
+  and he did not ask about his position. The note that precise may raise a one-time iOS
+  prompt survives as a fact, no longer as a reason to avoid it, and `max_age_seconds` 0
+  stops a live "where am I now" being answered from a stale cached fix.
+
+  The wire format is unchanged: same three required keys, same `fields` whitelist, same
+  0–900 age range, same emit-at-most-once rule. The proactive context-attach path stays
+  coarse on purpose — that one is a privacy default, not a bug.
+
+## [App 1.0 (120)] - 2026-08-28
+
+### Fixed
+
+- **Precise location degraded silently on a device with Precise Location off.**
+  `LocationContextProvider` asks for a temporary upgrade with
+  `requestTemporaryFullAccuracyAuthorization(withPurposeKey: "PreciseDistance")`, but
+  `Info.plist` carried no `NSLocationTemporaryUsageDescriptionDictionary`, so iOS had no
+  string to show and the call did nothing at all — no prompt, no error, just a coarse fix
+  where a precise one was requested. The dictionary is now present with the
+  `PreciseDistance` key matching the provider's purpose key exactly, so a
+  reduced-accuracy device gets offered the upgrade instead of quietly falling back.
+
 ## [App 1.0 (119)] - 2026-08-28
 
 ### Fixed

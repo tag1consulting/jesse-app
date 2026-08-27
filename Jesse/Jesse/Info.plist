@@ -32,6 +32,11 @@
 	<string>Jesse attaches a compact summary of your recent Apple Health — sleep, resting heart rate and other daily vitals, plus recent workouts — so you can ask it to log a workout or reflect on how you’re doing.</string>
 	<key>NSHealthUpdateUsageDescription</key>
 	<string>Jesse records meals you log into Apple Health.</string>
+	<key>NSLocationTemporaryUsageDescriptionDictionary</key>
+	<dict>
+		<key>PreciseDistance</key>
+		<string>Jesse uses your exact location to tell you precisely where you are and how far away nearby places are, only on turns where you ask.</string>
+	</dict>
 	<key>NSLocationWhenInUseUsageDescription</key>
 	<string>Jesse attaches where you are — the neighbourhood, town and postcode, not your street address — so it can answer questions about what is near you, how far something is, and whether somewhere is open right now. Only while you are using the app, and only on turns that ask about where you are.</string>
 	<key>NSMicrophoneUsageDescription</key>
