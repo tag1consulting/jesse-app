@@ -25,22 +25,104 @@ use serde::Serialize;
 //
 // Gate 2 means BRANCH PROTECTION ON `main` IS PART OF THIS BOUNDARY. See SECURITY.md.
 
-/// The four binaries a bridge deployment is made of. They MOVE TOGETHER: `jesse-hook` is
-/// exec'd by the agent child, and `jesse-build-mcp` and `jesse-places-mcp` are MCP servers the
-/// child speaks to, so a bridge from one commit running against a hook from another is a
-/// combination nobody tested.
+/// The manifest, relative to the crate directory, that names the binaries a deployment is
+/// made of: `bridge/deploy-bins.toml`.
 ///
-/// **ADDING AN MCP SERVER BINARY TO `MAIN_CHILD_MCP_CONFIG` MEANS ADDING IT HERE, IN THE SAME
-/// CHANGE.** The config names commands by BARE NAME, resolved from the child's `PATH`; a
-/// deployment that ships the config but not the binary starts cleanly, passes `/health`, and
-/// then registers zero tools for that server on every turn — a silent capability loss with no
-/// error anywhere. `jesse-places-mcp` was added here in 0.100.0 for exactly that reason.
-pub const DEPLOY_BINS: [&str; 4] = [
-    "jesse-bridge",
-    "jesse-hook",
-    "jesse-build-mcp",
-    "jesse-places-mcp",
-];
+/// # Why the list is READ FROM THE TREE and not compiled in
+///
+/// A deploy is executed by the ALREADY-RUNNING `jesse-sentinel`, and the sentinel is not one
+/// of the binaries a deploy replaces — so its compiled-in knowledge is as old as the last
+/// time somebody installed it by hand. While this list was a `const`, that made it frozen:
+/// `jesse-places-mcp` joined the deploy set in 0.100.0, and every deploy after it went on
+/// building, staging and repointing THREE binaries and reporting complete success, because
+/// by its own list it was complete. The binary was never installed, the child's `places`
+/// server failed to connect on every turn, and nothing said so.
+///
+/// That is a class of bug, not one missed name: a deploy that introduces a new binary can
+/// never install it on its own first run while the list travels with the deployer instead of
+/// with the code. Reading the manifest out of the CHECKED-OUT COMMIT closes it — the commit
+/// that adds a binary carries the name, so however old the sentinel is, it stages what that
+/// commit says it is made of.
+pub const DEPLOY_BINS_MANIFEST: &str = "deploy-bins.toml";
+
+/// The manifest COMPILED IN, used only where there is no tree to read: a commit older than
+/// the manifest itself (see [`deploy_bins_at`]), and the tests that need "the set this build
+/// knows about".
+const EMBEDDED_DEPLOY_BINS: &str = include_str!("../../deploy-bins.toml");
+
+#[derive(Debug, Deserialize)]
+struct DeployBinsManifest {
+    bins: Vec<String>,
+}
+
+/// Parse a `deploy-bins.toml`, rejecting anything that would make the stage phase write
+/// outside the build directory or leave the deployment without its own service.
+///
+/// The name checks are not defensive decoration: every entry is joined onto the build store
+/// path AND onto `~/.local/bin`, so a `/` or a `..` in one would repoint something that is
+/// not a deploy binary. The manifest comes out of a commit that reached `main`, so this is
+/// not the boundary — the ancestry gate is — but a typo must fail here rather than in the
+/// filesystem.
+pub fn parse_deploy_bins(text: &str) -> Result<Vec<String>, String> {
+    let manifest: DeployBinsManifest =
+        toml::from_str(text).map_err(|e| format!("{DEPLOY_BINS_MANIFEST} is not readable: {e}"))?;
+    if manifest.bins.is_empty() {
+        return Err(format!("{DEPLOY_BINS_MANIFEST} names no binaries"));
+    }
+    for name in &manifest.bins {
+        if name.is_empty()
+            || name.contains('/')
+            || name.starts_with('.')
+            || name.contains(char::is_whitespace)
+        {
+            return Err(format!(
+                "{DEPLOY_BINS_MANIFEST} names {name:?}, which is not a plain binary name"
+            ));
+        }
+    }
+    let mut seen = manifest.bins.clone();
+    seen.sort();
+    seen.dedup();
+    if seen.len() != manifest.bins.len() {
+        return Err(format!("{DEPLOY_BINS_MANIFEST} names a binary twice"));
+    }
+    // Without it there is nothing to kickstart and nothing whose `/health` version could
+    // decide whether to keep the deploy — a manifest that omits it is not a deployment.
+    if !manifest.bins.iter().any(|b| b == BRIDGE_BIN) {
+        return Err(format!("{DEPLOY_BINS_MANIFEST} does not name {BRIDGE_BIN}"));
+    }
+    Ok(manifest.bins)
+}
+
+/// The service binary itself — the one the restart phase kickstarts.
+pub const BRIDGE_BIN: &str = "jesse-bridge";
+
+/// The binary set THIS build knows about, from the manifest committed beside it. The
+/// fallback for a tree that predates the manifest, and what the tests mean by "the deploy
+/// set".
+pub fn embedded_deploy_bins() -> &'static [String] {
+    static PARSED: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    PARSED.get_or_init(|| {
+        parse_deploy_bins(EMBEDDED_DEPLOY_BINS)
+            .expect("the committed deploy-bins.toml must parse — a test asserts it")
+    })
+}
+
+/// The binary set the COMMIT BEING DEPLOYED is made of, read from `<crate dir>/deploy-bins.toml`.
+///
+/// A tree with no manifest is a commit older than this mechanism, and it is deployable —
+/// rolling back to one is a real operation. There the compiled-in set is the only list there
+/// is, so it is used and the caller says so in the log rather than the deploy failing.
+pub fn deploy_bins_at(crate_dir: &Path) -> Result<(Vec<String>, bool), String> {
+    let path = crate_dir.join(DEPLOY_BINS_MANIFEST);
+    match std::fs::read_to_string(&path) {
+        Ok(text) => Ok((parse_deploy_bins(&text)?, true)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Ok((embedded_deploy_bins().to_vec(), false))
+        }
+        Err(e) => Err(format!("could not read {}: {e}", path.display())),
+    }
+}
 
 /// The DEFAULT name of the CI job that must be green — the one that builds and tests the crate
 /// being deployed. [`SentinelConfig::ci_job`] is what is actually required, so a fork whose
@@ -811,9 +893,13 @@ fn capture_one(bin_dir: &Path, store: &Path, name: &str) -> Result<Option<String
 }
 
 /// Capture every deployed name, as one `previous` map.
-pub fn capture_previous(bin_dir: &Path, store: &Path) -> Result<Previous, String> {
+///
+/// `bins` is the set the COMMIT BEING DEPLOYED declares (see [`deploy_bins_at`]), so a name
+/// this deploy introduces is captured too — as absent, which is what tells
+/// [`restore_previous`] to remove rather than repoint it if the deploy is rolled back.
+pub fn capture_previous(bin_dir: &Path, store: &Path, bins: &[String]) -> Result<Previous, String> {
     let mut prev = Previous::new();
-    for name in DEPLOY_BINS {
+    for name in bins {
         if let Some(target) = capture_one(bin_dir, store, name)? {
             prev.insert(name.to_string(), target);
         }
@@ -855,9 +941,20 @@ pub fn repoint(bin_dir: &Path, name: &str, target: &Path) -> Result<(), String> 
 /// Every name is attempted even after one fails: a rollback that stopped at the first error
 /// would leave the deployment in a state that is neither the old one nor the new one, which is
 /// the single worst outcome available here. The errors are collected and reported together.
-pub fn restore_previous(bin_dir: &Path, prev: &Previous) -> Vec<String> {
+pub fn restore_previous(bin_dir: &Path, prev: &Previous, bins: &[String]) -> Vec<String> {
     let mut errors = Vec::new();
-    for name in DEPLOY_BINS {
+    // The UNION of what this deploy touched and what `previous` recorded. The two can differ
+    // in both directions — a deploy that adds a binary has a name with no `previous` entry,
+    // and a deploy that drops one has a `previous` entry for a name it no longer stages —
+    // and a rollback that ranged over only one of them would leave the other where the failed
+    // deploy put it.
+    let mut names: Vec<&str> = bins.iter().map(String::as_str).collect();
+    for name in prev.keys() {
+        if !names.contains(&name.as_str()) {
+            names.push(name);
+        }
+    }
+    for name in names {
         match prev.get(name) {
             Some(target) => {
                 if let Err(e) = repoint(bin_dir, name, Path::new(target)) {
@@ -886,9 +983,15 @@ pub fn restore_previous(bin_dir: &Path, prev: &Previous) -> Vec<String> {
 /// `previous` names. Pruning either would delete the running bridge or the thing a rollback
 /// would need — and mtime is not a safe proxy for "in use", because a rollback makes an OLD
 /// directory the live one without touching its timestamp.
-pub fn prune_builds(bin_dir: &Path, store: &Path, prev: &Previous, keep: usize) -> Vec<String> {
+pub fn prune_builds(
+    bin_dir: &Path,
+    store: &Path,
+    prev: &Previous,
+    keep: usize,
+    bins: &[String],
+) -> Vec<String> {
     let mut protected: Vec<PathBuf> = Vec::new();
-    for name in DEPLOY_BINS {
+    for name in bins {
         if let Ok(t) = std::fs::read_link(bin_dir.join(name)) {
             let abs = if t.is_absolute() { t } else { bin_dir.join(t) };
             if let Some(p) = abs.parent() {
@@ -1089,6 +1192,38 @@ fn read_health(body: &Value, want_version: &str, baseline: Option<&[String]>) ->
             "the bridge reports version {reported:?}, but {want_version:?} was deployed"
         ));
     }
+    // THE MCP PREFLIGHT, reported by the bridge that just came up. It resolves every stdio
+    // server in the config THE CHILD IS ACTUALLY SPAWNED WITH against the PATH the child
+    // actually inherits, so this is the one reader that cannot be fooled by a second copy of
+    // the server list written for the check. A name that does not resolve means the child
+    // registers zero tools for that server on every turn — the exact silent capability loss
+    // that shipped in 0.100.0 — so it is FATAL rather than a retry: waiting cannot install a
+    // binary. A bridge too old to report the field says nothing here, which reads as "not
+    // checked" rather than "checked and clean".
+    let unresolved: Vec<String> = body
+        .get("mcp_servers_unresolved")
+        .and_then(Value::as_array)
+        .map(|rows| {
+            rows.iter()
+                .map(|r| {
+                    let server = r.get("server").and_then(Value::as_str).unwrap_or("?");
+                    let command = r.get("command").and_then(Value::as_str).unwrap_or("?");
+                    format!("{server} ({command})")
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if !unresolved.is_empty() {
+        return Step::Fatal(format!(
+            "the deployed bridge cannot resolve the binary for {} of its MCP server(s): {} — \
+             the child would register no tools for {} on every turn. Add the binary to {} and \
+             deploy again.",
+            unresolved.len(),
+            unresolved.join(", "),
+            if unresolved.len() == 1 { "it" } else { "them" },
+            DEPLOY_BINS_MANIFEST,
+        ));
+    }
     let Some(before) = baseline else {
         return Step::Done(reported);
     };
@@ -1207,8 +1342,28 @@ async fn phase_resolve(
     Ok(sha)
 }
 
-/// PHASE 3 — check the commit out and build the deploy binaries.
-async fn phase_build(sen: &Sentinel, log: &DeployLog, sha: &str) -> Result<(), String> {
+/// The `cargo build` argv for one binary set. The ONLY place `--bin` is spelled, and it
+/// consumes the same list the stage phase does — two hand-maintained lists that must agree is
+/// the shape of the bug this file is fixing, so there is one list and one reader of it.
+pub fn build_args(bins: &[String]) -> Vec<String> {
+    let mut args: Vec<String> = vec![
+        "build".to_string(),
+        "--release".to_string(),
+        "--locked".to_string(),
+    ];
+    for name in bins {
+        args.push("--bin".to_string());
+        args.push(name.clone());
+    }
+    args
+}
+
+/// PHASE 3 — check the commit out, read what it says it is made of, and build exactly that.
+///
+/// Returns the binary set, which every later phase (stage, repoint, rollback, prune) ranges
+/// over. It comes from the CHECKED-OUT TREE, so a commit that adds a binary is deployed
+/// complete by a sentinel built before that binary existed.
+async fn phase_build(sen: &Sentinel, log: &DeployLog, sha: &str) -> Result<Vec<String>, String> {
     let checkout = dgit(sen, log, &["checkout", "--detach", sha]).await;
     if !checkout.ok() {
         return Err(format!(
@@ -1220,6 +1375,25 @@ async fn phase_build(sen: &Sentinel, log: &DeployLog, sha: &str) -> Result<(), S
     // from there. `--locked` because a deploy that silently resolved a different dependency
     // graph than CI did is a deploy CI did not vouch for.
     let crate_dir = sen.cfg.deploy_clone.join("bridge");
+    let (bins, from_tree) = deploy_bins_at(&crate_dir)?;
+    if from_tree {
+        log.line(&format!(
+            "{} names {} binaries: {}",
+            DEPLOY_BINS_MANIFEST,
+            bins.len(),
+            bins.join(", ")
+        ));
+    } else {
+        // Never silent: the operator is being told that the set staged here is this
+        // SENTINEL's idea of the set, which is exactly the situation the manifest exists to
+        // end. It happens only when deploying a commit older than the manifest.
+        log.line(&format!(
+            "{sha} carries no {DEPLOY_BINS_MANIFEST}, so the binaries this sentinel was built \
+             with are used instead: {}",
+            bins.join(", ")
+        ));
+    }
+    let args = build_args(&bins);
     log.line(&format!(
         "cargo build --release --locked (in {}, up to {} min)",
         crate_dir.display(),
@@ -1229,19 +1403,7 @@ async fn phase_build(sen: &Sentinel, log: &DeployLog, sha: &str) -> Result<(), S
         log,
         Some(&crate_dir),
         sen.cfg.bins.cargo.as_ref(),
-        &[
-            "build",
-            "--release",
-            "--locked",
-            "--bin",
-            "jesse-bridge",
-            "--bin",
-            "jesse-hook",
-            "--bin",
-            "jesse-build-mcp",
-            "--bin",
-            "jesse-places-mcp",
-        ],
+        &args.iter().map(String::as_str).collect::<Vec<_>>(),
         &[],
         BUILD_TIMEOUT,
     )
@@ -1255,19 +1417,24 @@ async fn phase_build(sen: &Sentinel, log: &DeployLog, sha: &str) -> Result<(), S
     if !out.ok() {
         return Err(format!("cargo build failed: {}", out.summary()));
     }
-    Ok(())
+    Ok(bins)
 }
 
 /// PHASE 4 — copy the deploy binaries into the store and repoint their symlinks.
 ///
 /// Returns the `previous` map, which is what a rollback is written in terms of.
-async fn phase_stage(sen: &Sentinel, log: &DeployLog, sha: &str) -> Result<Previous, String> {
+async fn phase_stage(
+    sen: &Sentinel,
+    log: &DeployLog,
+    sha: &str,
+    bins: &[String],
+) -> Result<Previous, String> {
     let store = sen.cfg.build_store();
     let dest = store.join(sha);
     std::fs::create_dir_all(&dest)
         .map_err(|e| format!("could not create {}: {e}", dest.display()))?;
     let built = sen.cfg.deploy_clone.join("bridge/target/release");
-    for name in DEPLOY_BINS {
+    for name in bins {
         let src = built.join(name);
         let dst = dest.join(name);
         std::fs::copy(&src, &dst)
@@ -1278,20 +1445,20 @@ async fn phase_stage(sen: &Sentinel, log: &DeployLog, sha: &str) -> Result<Previ
 
     // BEFORE anything is repointed, and persisted before anything is repointed: a sentinel
     // killed between the swap and this write would have no way back.
-    let prev = capture_previous(&sen.cfg.bin_dir, &store)?;
+    let prev = capture_previous(&sen.cfg.bin_dir, &store, bins)?;
     write_previous(&sen.cfg.previous_file(), &prev)?;
     log.line(&format!(
         "previous: {}",
         serde_json::to_string(&prev).unwrap_or_default()
     ));
 
-    for name in DEPLOY_BINS {
+    for name in bins {
         if let Err(e) = repoint(&sen.cfg.bin_dir, name, &dest.join(name)) {
             // A half-swapped `~/.local/bin` is neither the old deployment nor the new one,
             // which is the worst state available here — so undo what did land before
             // reporting. Nothing has been restarted yet, so this is a plain failure rather
             // than a rollback.
-            let undo = restore_previous(&sen.cfg.bin_dir, &prev);
+            let undo = restore_previous(&sen.cfg.bin_dir, &prev, bins);
             for u in &undo {
                 log.line(&format!("undo: {u}"));
             }
@@ -1307,10 +1474,16 @@ async fn phase_stage(sen: &Sentinel, log: &DeployLog, sha: &str) -> Result<Previ
 }
 
 /// PHASE 6 — put the old binaries back and bring the bridge up on them.
-async fn phase_rollback(sen: &Arc<Sentinel>, log: &DeployLog, prev: &Previous, why: &str) {
+async fn phase_rollback(
+    sen: &Arc<Sentinel>,
+    log: &DeployLog,
+    prev: &Previous,
+    bins: &[String],
+    why: &str,
+) {
     enter_phase(sen, log, "rollback");
     log.line(&format!("rolling back because: {why}"));
-    let errors = restore_previous(&sen.cfg.bin_dir, prev);
+    let errors = restore_previous(&sen.cfg.bin_dir, prev, bins);
     for e in &errors {
         log.line(&format!("rollback: {e}"));
     }
@@ -1428,12 +1601,13 @@ pub async fn run_deploy(
     }
 
     enter_phase(&sen, &log, "build");
-    if let Err(e) = phase_build(&sen, &log, &sha).await {
-        return finish_deploy(&sen, &log, "failed", &e).await;
-    }
+    let bins = match phase_build(&sen, &log, &sha).await {
+        Ok(b) => b,
+        Err(e) => return finish_deploy(&sen, &log, "failed", &e).await,
+    };
 
     enter_phase(&sen, &log, "stage");
-    let prev = match phase_stage(&sen, &log, &sha).await {
+    let prev = match phase_stage(&sen, &log, &sha, &bins).await {
         Ok(p) => p,
         Err(e) => return finish_deploy(&sen, &log, "failed", &e).await,
     };
@@ -1452,11 +1626,17 @@ pub async fn run_deploy(
         }
     };
     if let Some(why) = trouble {
-        return phase_rollback(&sen, &log, &prev, &why).await;
+        return phase_rollback(&sen, &log, &prev, &bins, &why).await;
     }
 
     enter_phase(&sen, &log, "finish");
-    let pruned = prune_builds(&sen.cfg.bin_dir, &sen.cfg.build_store(), &prev, KEEP_BUILDS);
+    let pruned = prune_builds(
+        &sen.cfg.bin_dir,
+        &sen.cfg.build_store(),
+        &prev,
+        KEEP_BUILDS,
+        &bins,
+    );
     if !pruned.is_empty() {
         log.line(&format!(
             "pruned {} old build(s): {}",
@@ -1806,7 +1986,7 @@ serde = { version = "1", features = ["derive"] }
         std::os::unix::fs::symlink(old_build.join("jesse-hook"), bin.join("jesse-hook")).unwrap();
         // jesse-build-mcp: absent.
 
-        let prev = capture_previous(&bin, &store).unwrap();
+        let prev = capture_previous(&bin, &store, embedded_deploy_bins()).unwrap();
         assert_eq!(
             prev.get("jesse-bridge").map(String::as_str),
             Some(
@@ -1831,7 +2011,7 @@ serde = { version = "1", features = ["derive"] }
         // A SECOND capture must not overwrite the preserved original with whatever is live
         // now — that is the copy a rollback all the way back would need.
         std::fs::write(bin.join("jesse-bridge"), b"#!/bin/sh\n# a later build\n").unwrap();
-        let again = capture_previous(&bin, &store).unwrap();
+        let again = capture_previous(&bin, &store, embedded_deploy_bins()).unwrap();
         assert_eq!(again.get("jesse-bridge"), prev.get("jesse-bridge"));
         assert_eq!(
             std::fs::read_to_string(store.join(PRE_DEPLOY_DIR).join("jesse-bridge")).unwrap(),
@@ -1848,33 +2028,33 @@ serde = { version = "1", features = ["derive"] }
         let bin = dir.join("bin");
         let a = dir.join("a");
         let b = dir.join("b");
-        for name in DEPLOY_BINS {
+        for name in embedded_deploy_bins() {
             touch_exec(&a.join(name));
             touch_exec(&b.join(name));
         }
         std::fs::create_dir_all(&bin).unwrap();
-        for name in DEPLOY_BINS {
+        for name in embedded_deploy_bins() {
             repoint(&bin, name, &a.join(name)).unwrap();
         }
-        let prev = capture_previous(&bin, &dir.join("store")).unwrap();
-        for name in DEPLOY_BINS {
+        let prev = capture_previous(&bin, &dir.join("store"), embedded_deploy_bins()).unwrap();
+        for name in embedded_deploy_bins() {
             repoint(&bin, name, &b.join(name)).unwrap();
             assert_eq!(std::fs::read_link(bin.join(name)).unwrap(), b.join(name));
         }
         // The old targets are untouched: the rename replaced the LINK, and never wrote
         // through it into the directory it pointed at.
-        for name in DEPLOY_BINS {
+        for name in embedded_deploy_bins() {
             assert!(a.join(name).is_file());
         }
-        assert!(restore_previous(&bin, &prev).is_empty());
-        for name in DEPLOY_BINS {
+        assert!(restore_previous(&bin, &prev, embedded_deploy_bins()).is_empty());
+        for name in embedded_deploy_bins() {
             assert_eq!(std::fs::read_link(bin.join(name)).unwrap(), a.join(name));
         }
         // A name with no `previous` entry is REMOVED, not left pointing at this deploy's
         // build: leaving it would install a binary the operator never had.
         let empty = Previous::new();
-        assert!(restore_previous(&bin, &empty).is_empty());
-        for name in DEPLOY_BINS {
+        assert!(restore_previous(&bin, &empty, embedded_deploy_bins()).is_empty());
+        for name in embedded_deploy_bins() {
             assert!(std::fs::symlink_metadata(bin.join(name)).is_err());
         }
         let _ = std::fs::remove_dir_all(&dir);
@@ -1893,7 +2073,7 @@ serde = { version = "1", features = ["derive"] }
             .map(|i| format!("{i}").repeat(40)[..40].to_string())
             .collect();
         for (i, sha) in shas.iter().enumerate() {
-            for name in DEPLOY_BINS {
+            for name in embedded_deploy_bins() {
                 touch_exec(&store.join(sha).join(name));
             }
             let stamp = SystemTime::now() - Duration::from_secs((5 - i as u64) * 3600);
@@ -1908,7 +2088,7 @@ serde = { version = "1", features = ["derive"] }
 
         // The OLDEST build is the live one (a rollback makes that happen without touching
         // any timestamp) and the second oldest is the rollback target.
-        for name in DEPLOY_BINS {
+        for name in embedded_deploy_bins() {
             repoint(&bin, name, &store.join(&shas[0]).join(name)).unwrap();
         }
         let mut prev = Previous::new();
@@ -1921,7 +2101,7 @@ serde = { version = "1", features = ["derive"] }
                 .to_string(),
         );
 
-        let removed = prune_builds(&bin, &store, &prev, KEEP_BUILDS);
+        let removed = prune_builds(&bin, &store, &prev, KEEP_BUILDS, embedded_deploy_bins());
         let left: Vec<String> = std::fs::read_dir(&store)
             .unwrap()
             .flatten()
@@ -1939,10 +2119,16 @@ serde = { version = "1", features = ["derive"] }
         assert!(removed.is_empty(), "nothing was prunable here: {removed:?}");
 
         // With nothing in use, the two oldest go and the three newest stay.
-        for name in DEPLOY_BINS {
+        for name in embedded_deploy_bins() {
             let _ = std::fs::remove_file(bin.join(name));
         }
-        let removed = prune_builds(&bin, &store, &Previous::new(), KEEP_BUILDS);
+        let removed = prune_builds(
+            &bin,
+            &store,
+            &Previous::new(),
+            KEEP_BUILDS,
+            embedded_deploy_bins(),
+        );
         assert_eq!(removed.len(), 2, "{removed:?}");
         assert!(removed.contains(&shas[0]) && removed.contains(&shas[1]));
         assert!(store.join(&shas[4]).is_dir());
@@ -1983,6 +2169,154 @@ serde = { version = "1", features = ["derive"] }
         assert!(verdict.contains("codex"), "{verdict}");
         // No baseline (the bridge was down before the deploy) means this rule does not vote.
         assert_eq!(matches(&stale("codex"), None), "done:0.94.0");
+    }
+
+    /// The committed manifest parses, and it is the source the build arguments are written
+    /// from — so `--bin` and the staging loop cannot name different sets.
+    #[test]
+    fn the_committed_manifest_is_the_only_binary_list() {
+        let bins = embedded_deploy_bins();
+        assert!(
+            bins.iter().any(|b| b == BRIDGE_BIN),
+            "the deployment must contain the service: {bins:?}"
+        );
+        // The build argv is DERIVED, not spelled out a second time.
+        let args = build_args(bins);
+        assert_eq!(&args[..3], &["build", "--release", "--locked"]);
+        for name in bins {
+            let at = args.iter().position(|a| a == name).expect("named");
+            assert_eq!(args[at - 1], "--bin", "{name} must be preceded by --bin");
+        }
+        assert_eq!(args.len(), 3 + bins.len() * 2, "{args:?}");
+
+        // Each name must be a REAL cargo binary target of this crate, or the build phase
+        // fails on a deploy rather than here. `jesse-bridge` is the package's own
+        // `src/main.rs`; everything else is a file under `src/bin/`.
+        let bin_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bin");
+        for name in bins {
+            assert!(
+                name == BRIDGE_BIN || bin_dir.join(format!("{name}.rs")).is_file(),
+                "{name} is named in {DEPLOY_BINS_MANIFEST} but is not a binary target"
+            );
+        }
+    }
+
+    /// THE STATIC HALF OF THE FIX: every MCP server this repository SHIPS ITS OWN BINARY for
+    /// is named in the deploy manifest.
+    ///
+    /// This is the assertion that would have failed in 0.100.0. `places` was added to the
+    /// child MCP config as a bare `jesse-places-mcp` and not to the binary set, so every
+    /// deploy afterwards installed a config naming a binary it did not build. Nothing
+    /// compared the two lists — one lived in a harness const and the other in this file —
+    /// and the failure they produced was invisible.
+    ///
+    /// Only `jesse-*` commands are in scope: they are the ones a deploy is responsible for
+    /// installing. `qmd`, `npx` and the rest are host setup, and their absence is caught at
+    /// startup and by the deploy's health gate rather than here.
+    #[test]
+    fn every_mcp_server_this_repo_builds_is_in_the_deploy_manifest() {
+        let bins = embedded_deploy_bins();
+        for config in [crate::MAIN_CHILD_MCP_CONFIG, crate::MESSAGES_MCP_CONFIG] {
+            for (server, command) in crate::stdio_commands(config) {
+                if !command.starts_with("jesse-") {
+                    continue;
+                }
+                assert!(
+                    bins.contains(&command),
+                    "the `{server}` server runs `{command}`, which no deploy installs — add it \
+                     to bridge/{DEPLOY_BINS_MANIFEST} in the same change"
+                );
+            }
+        }
+    }
+
+    /// A manifest is read from the TREE, and a tree without one falls back to this build's
+    /// list rather than failing — deploying a commit older than the manifest is a real
+    /// operation, and rolling back to one is how an outage ends.
+    #[test]
+    fn the_binary_set_comes_from_the_tree_being_deployed() {
+        let dir = scratch("deploy-bins-manifest");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let (bins, from_tree) = deploy_bins_at(&dir).unwrap();
+        assert!(!from_tree, "there is no manifest here");
+        assert_eq!(bins, embedded_deploy_bins());
+
+        // A commit that adds a binary is deployed WITH it, by a process built before it
+        // existed — which is the whole point.
+        std::fs::write(
+            dir.join(DEPLOY_BINS_MANIFEST),
+            "bins = [\"jesse-bridge\", \"jesse-hook\", \"jesse-brand-new\"]\n",
+        )
+        .unwrap();
+        let (bins, from_tree) = deploy_bins_at(&dir).unwrap();
+        assert!(from_tree);
+        assert_eq!(bins, ["jesse-bridge", "jesse-hook", "jesse-brand-new"]);
+        assert!(build_args(&bins).contains(&"jesse-brand-new".to_string()));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// What a manifest may not say. Every entry is joined onto the build store AND onto
+    /// `~/.local/bin`, so a name with a path separator in it would repoint something that is
+    /// not a deploy binary; and a set with no service in it is not a deployment.
+    #[test]
+    fn a_manifest_that_could_repoint_the_wrong_thing_is_refused() {
+        assert!(parse_deploy_bins("bins = []").is_err());
+        assert!(parse_deploy_bins("nothing = 1").is_err());
+        assert!(
+            parse_deploy_bins("bins = [\"jesse-hook\"]").is_err(),
+            "no service"
+        );
+        for bad in ["../../../bin/sh", "sub/dir", ".hidden", "two words", ""] {
+            let text = format!("bins = [\"jesse-bridge\", \"{bad}\"]");
+            assert!(
+                parse_deploy_bins(&text).is_err(),
+                "{bad:?} must not be accepted as a binary name"
+            );
+        }
+        assert!(
+            parse_deploy_bins("bins = [\"jesse-bridge\", \"jesse-bridge\"]").is_err(),
+            "a name twice would stage the same binary twice and hide a typo"
+        );
+    }
+
+    /// A bridge that comes back green, on the right version, and unable to run one of its MCP
+    /// servers is a FAILED deploy — and it fails at once, because waiting installs nothing.
+    #[test]
+    fn a_reported_unresolvable_mcp_binary_is_fatal_to_the_deploy() {
+        let want = "0.94.0";
+        let verdict = |v: &Value| match read_health(v, want, None) {
+            Step::Done(x) => format!("done:{x}"),
+            Step::Fatal(e) => format!("fatal:{e}"),
+            Step::Retry(e) => format!("retry:{e}"),
+        };
+        let missing = json!({"ok": true, "version": want,
+        "mcp_servers_unresolved": [
+            {"harness": "claude-code", "server": "places", "command": "jesse-places-mcp"}
+        ]});
+        let said = verdict(&missing);
+        assert!(said.starts_with("fatal:"), "{said}");
+        assert!(
+            said.contains("places") && said.contains("jesse-places-mcp"),
+            "{said}"
+        );
+
+        // An EMPTY array is the bridge saying it checked and found nothing.
+        assert_eq!(
+            verdict(&json!({"ok": true, "version": want, "mcp_servers_unresolved": []})),
+            "done:0.94.0"
+        );
+        // A bridge too old to report the field says nothing, which must not read as a failure.
+        assert_eq!(
+            verdict(&json!({"ok": true, "version": want})),
+            "done:0.94.0"
+        );
+        // And the version still comes first: the OLD bridge answering is a retry, not a
+        // verdict on its MCP servers.
+        assert!(verdict(&json!({"ok": true, "version": "0.93.0",
+            "mcp_servers_unresolved": [{"server": "places", "command": "jesse-places-mcp"}]}))
+        .starts_with("retry:"));
     }
 
     /// The gate matches a job by the name GitHub actually reports, which is the workflow's

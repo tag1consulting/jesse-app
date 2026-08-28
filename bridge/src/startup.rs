@@ -248,6 +248,116 @@ pub fn binary_exists(bin: &str) -> bool {
     false
 }
 
+// ---- The child's MCP binaries ---------------------------------------------
+//
+// EVERY stdio server in a child MCP config names its command BY BARE NAME, resolved from the
+// child's `PATH` — `qmd`, `npx`, `workspace-mcp`, and this repository's own `jesse-build-mcp`
+// and `jesse-places-mcp`. Nothing anywhere used to check that those names resolve, and the
+// failure that produces is uniquely quiet: the bridge starts, `/health` is green, every other
+// server works, and the child simply registers ZERO TOOLS for the missing one on every turn.
+// That is how a missing `jesse-places-mcp` went a day without being noticed.
+//
+// So the names are resolved at startup and the result is reported: loudly in the log, and on
+// `/health` so the sentinel's deploy can refuse a deployment that lost a capability (see
+// `crate::sentinel::deploy::read_health`). It is NOT fatal. A bridge that will not start is
+// worse than a bridge missing one server, and the refuse-to-boot decision belongs to the
+// level gate, which owns the security posture; this owns visibility.
+
+/// One stdio server whose command does not resolve on the child's `PATH`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnresolvedMcpServer {
+    /// The harness whose main config names it — the sets differ per harness by design.
+    pub harness: String,
+    /// The server's key in `mcpServers`, which is what the child's error message names.
+    pub server: String,
+    /// The bare command that did not resolve.
+    pub command: String,
+}
+
+/// Whether `command` resolves to an executable file, resolved AGAINST `child_path` rather
+/// than against this process's environment.
+///
+/// The `PATH` is a parameter and not a `std::env::var` on purpose: the check must be made
+/// against the `PATH` the CHILD is spawned with. Today those are the same string — the child
+/// inherits the bridge's process environment unchanged (see `ClaudeCode::command`) — but they
+/// are the same by a property that could change silently, and a check that read the ambient
+/// environment would keep passing after it did.
+pub fn resolves_on_path(command: &str, child_path: &str) -> bool {
+    let p = Path::new(command);
+    if p.is_absolute() || command.contains('/') {
+        return is_executable_file(p);
+    }
+    child_path
+        .split(':')
+        .filter(|dir| !dir.is_empty())
+        .any(|dir| is_executable_file(&Path::new(dir).join(command)))
+}
+
+/// Every stdio server in one MCP config whose command is a BARE NAME, as `(server, command)`.
+///
+/// Non-stdio entries (the `http` ones — Home Assistant, Roon) name no local binary and are
+/// skipped; a command holding a `/` is an absolute or relative path the config pins itself
+/// (iMCP's app bundle) and is checked as that path rather than searched for.
+pub fn stdio_commands(mcp_config: &str) -> Vec<(String, String)> {
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(mcp_config) else {
+        return Vec::new();
+    };
+    let Some(servers) = parsed.get("mcpServers").and_then(|v| v.as_object()) else {
+        return Vec::new();
+    };
+    let mut out: Vec<(String, String)> = servers
+        .iter()
+        .filter(|(_, spec)| {
+            // An entry with no `type` but a `command` is stdio — the CLI's own default.
+            match spec.get("type").and_then(|t| t.as_str()) {
+                Some(t) => t == "stdio",
+                None => spec.get("command").is_some(),
+            }
+        })
+        .filter_map(|(name, spec)| {
+            let command = spec.get("command")?.as_str()?;
+            Some((name.clone(), command.to_string()))
+        })
+        .collect();
+    // A JSON object's iteration order is the map's, not the document's; sorting makes the log
+    // lines and the `/health` array reproducible.
+    out.sort();
+    out
+}
+
+/// The stdio servers in one MCP config that do NOT resolve on `child_path`.
+pub fn unresolved_stdio_commands(mcp_config: &str, child_path: &str) -> Vec<(String, String)> {
+    stdio_commands(mcp_config)
+        .into_iter()
+        .filter(|(_, command)| !resolves_on_path(command, child_path))
+        .collect()
+}
+
+/// The unresolvable stdio servers across the main config of every harness in use.
+///
+/// It reads `Harness::main_mcp_config` — THE CONFIG A CHILD IS ACTUALLY SPAWNED WITH — rather
+/// than any list written for this check. A second copy of the server set would be one more
+/// thing to keep in step, and the whole point here is that nothing was keeping the copies in
+/// step.
+pub fn detect_unresolved_mcp_servers(cfg: &Config, child_path: &str) -> Vec<UnresolvedMcpServer> {
+    let mut out = Vec::new();
+    for id in harnesses_in_use(cfg) {
+        let Some(harness) = cfg.harnesses.get(&id) else {
+            continue;
+        };
+        for (server, command) in unresolved_stdio_commands(harness.main_mcp_config(), child_path) {
+            // The same binary can be missing for two harnesses; each is reported, because
+            // each is a capability one harness's turns have lost.
+            out.push(UnresolvedMcpServer {
+                harness: id.clone(),
+                server,
+                command,
+            });
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -268,6 +378,111 @@ mod tests {
             None => std::env::remove_var("PATH"),
         }
     }
+    /// A tiny executable file at `dir/name`.
+    fn install(dir: &Path, name: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(dir).unwrap();
+        let p = dir.join(name);
+        std::fs::write(&p, b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// THE `PATH` UNDER TEST IS THE CHILD'S, not this process's.
+    ///
+    /// They are the same string in a running bridge (the child inherits the environment
+    /// unchanged), which is exactly why this has to be pinned: a check that quietly read
+    /// `std::env::var("PATH")` would pass this suite, pass in production today, and go on
+    /// passing the day the child is given a `PATH` of its own — reporting on a search it did
+    /// not perform. So the two are made to DIFFER here, in both directions.
+    #[test]
+    fn the_resolution_uses_the_childs_path_and_not_the_processs() {
+        let _guard = ENV_LOCK.lock_ok();
+        let root = std::env::temp_dir().join(format!("jesse-childpath-{}", random_hex()));
+        let ours = root.join("ours");
+        let childs = root.join("childs");
+        install(&ours, "only-on-the-process-path");
+        install(&childs, "only-on-the-child-path");
+
+        let saved = std::env::var("PATH").ok();
+        std::env::set_var("PATH", ours.to_str().unwrap());
+        let child_path = childs.to_string_lossy().to_string();
+
+        // On the child's PATH and not on ours: FOUND. The process's PATH does not vote.
+        assert!(resolves_on_path("only-on-the-child-path", &child_path));
+        // On ours and not on the child's: NOT found, however easily this process could run it.
+        assert!(!resolves_on_path("only-on-the-process-path", &child_path));
+        // Sanity: it really is on this process's PATH, so the negative above is about whose
+        // PATH was consulted and not about a missing file.
+        assert!(binary_exists("only-on-the-process-path"));
+
+        // The same asymmetry through the config-level entry point.
+        let cfg = r#"{"mcpServers":{"here":{"type":"stdio","command":"only-on-the-child-path","args":[]},"gone":{"type":"stdio","command":"only-on-the-process-path","args":[]}}}"#;
+        let missing = unresolved_stdio_commands(cfg, &child_path);
+        assert_eq!(
+            missing,
+            vec![("gone".to_string(), "only-on-the-process-path".to_string())]
+        );
+
+        match saved {
+            Some(p) => std::env::set_var("PATH", p),
+            None => std::env::remove_var("PATH"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Which entries are checked at all: stdio servers with a BARE command. An `http` server
+    /// runs no local binary, and a command carrying a `/` is a path the config pins itself.
+    #[test]
+    fn only_bare_stdio_commands_are_searched_on_the_path() {
+        let cfg = r#"{"mcpServers":{
+            "stdio_bare":{"type":"stdio","command":"qmd","args":["mcp"]},
+            "stdio_implied":{"command":"npx","args":[]},
+            "stdio_path":{"type":"stdio","command":"/Applications/X.app/Contents/MacOS/x","args":[]},
+            "over_http":{"type":"http","url":"http://example.invalid/mcp"}
+        }}"#;
+        assert_eq!(
+            stdio_commands(cfg),
+            vec![
+                ("stdio_bare".to_string(), "qmd".to_string()),
+                ("stdio_implied".to_string(), "npx".to_string()),
+                (
+                    "stdio_path".to_string(),
+                    "/Applications/X.app/Contents/MacOS/x".to_string()
+                ),
+            ]
+        );
+        // The pinned path is checked AS a path — it does not exist, so it is reported, and it
+        // is never searched for under any PATH entry.
+        let missing = unresolved_stdio_commands(cfg, "/nowhere");
+        assert!(missing.iter().any(|(s, _)| s == "stdio_path"));
+        assert!(!missing.iter().any(|(s, _)| s == "over_http"));
+        // Malformed input reports nothing rather than panicking a boot.
+        assert!(stdio_commands("not json").is_empty());
+        assert!(stdio_commands(r#"{"servers":{}}"#).is_empty());
+    }
+
+    /// The check reads THE CONFIG A CHILD IS SPAWNED WITH — every harness in use — rather
+    /// than a list written for it. The shipped set names this repository's own
+    /// `jesse-places-mcp`, which is the binary whose absence went unnoticed for a day.
+    #[test]
+    fn the_shipped_child_config_is_what_gets_checked() {
+        let cfg = test_config();
+        let missing = detect_unresolved_mcp_servers(&cfg, "/nonexistent-path-for-this-test");
+        // With nothing resolvable, every stdio server in the main set is reported, attributed
+        // to the harness whose config named it.
+        assert!(!missing.is_empty());
+        assert!(missing.iter().all(|m| m.harness == "claude-code"));
+        let places = missing
+            .iter()
+            .find(|m| m.server == "places")
+            .expect("the shipped set names a `places` server");
+        assert_eq!(places.command, "jesse-places-mcp");
+        assert!(missing.iter().any(|m| m.command == "jesse-build-mcp"));
+        // The Home Assistant and Roon entries speak HTTP and name no binary.
+        assert!(!missing.iter().any(|m| m.server == "homeassistant"));
+        assert!(!missing.iter().any(|m| m.server == "roon"));
+    }
+
     #[test]
     fn binary_exists_rejects_non_executable_file() {
         use std::os::unix::fs::PermissionsExt;

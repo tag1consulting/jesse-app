@@ -1,0 +1,38 @@
+# THE BINARIES A BRIDGE DEPLOYMENT IS MADE OF — the one declarative list, read from the
+# TREE BEING DEPLOYED rather than from anything compiled into the process doing the deploy.
+#
+# WHY THIS IS A FILE AND NOT A `const`. A deploy is executed by the already-running
+# `jesse-sentinel`, using the binary set compiled into it — and the sentinel is not itself
+# one of these binaries, so a deploy never replaces it. That made the list frozen at
+# whatever was built the last time somebody installed the sentinel by hand: `places` was
+# added to the deploy set in bridge 0.100.0 and every deploy after it went on building,
+# staging and repointing three binaries, reporting complete success because by its own list
+# it was complete. `jesse-places-mcp` was never installed, the child's `places` server
+# failed to connect on every turn, and nothing anywhere said so.
+#
+# Reading the list out of the checked-out commit is what closes that: the deploy of a commit
+# that adds a binary picks the new name up from the commit itself, with no dependency on how
+# old the process running the deploy is.
+#
+# ADDING AN MCP SERVER BINARY TO A CHILD MCP CONFIG MEANS ADDING IT HERE, IN THE SAME
+# CHANGE. The configs name commands by BARE NAME, resolved from the child's `PATH`. Since
+# 0.103.0 a deploy that ships a config naming a binary it did not install FAILS AND ROLLS
+# BACK instead of reporting success, and the bridge writes an error line per unresolvable
+# server at startup — but the fix is still to name the binary here.
+#
+# These names are `cargo` binary target names: each one is passed to
+# `cargo build --release --locked` as `--bin <name>`, so a name that is not a target of the
+# `jesse-bridge` crate fails the build loudly rather than staging nothing.
+#
+# `jesse-bridge` MUST be in this list: it is the binary the restart phase kickstarts and the
+# one whose `/health` version decides whether the deploy is kept or rolled back.
+bins = [
+    # The service itself.
+    "jesse-bridge",
+    # Exec'd by the agent child, so it MOVES WITH the bridge — a bridge from one commit
+    # running against a hook from another is a combination nobody tested.
+    "jesse-hook",
+    # MCP servers the child speaks to, named as bare commands in the child MCP config.
+    "jesse-build-mcp",
+    "jesse-places-mcp",
+]
