@@ -13,6 +13,56 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [bridge 0.103.0] - 2026-08-28
+
+### Fixed
+
+- **A deploy could never install a binary the deploying process had not heard of, and
+  said nothing while failing to.** The set of binaries a deployment is made of was a
+  `const` compiled into the crate, and a deploy is executed by the **already-running
+  `jesse-sentinel`** — which is not one of the binaries a deploy replaces, so its copy of
+  that list is as old as the last time somebody installed the sentinel by hand.
+  `jesse-places-mcp` joined the list in 0.100.0; every deploy after it built, staged and
+  repointed the previous **three** binaries and reported complete success, because by its
+  own list it was complete. `~/.local/bin/jesse-places-mcp` was never created, the child's
+  `places` server failed to connect on every turn, and no log line anywhere said so.
+
+  The list now lives in **`bridge/deploy-bins.toml`** and is read from the **tree being
+  deployed**, after checkout, by the deploy that is deploying it. That one file feeds the
+  `--bin` arguments, the staging copy, the symlink repoint, the rollback and the prune —
+  there is no second list to keep in step, which was the shape of the original bug. A
+  commit older than the manifest falls back to the set the sentinel was built with and
+  **logs that it did so**. This is not the missed name being added back: it is the class
+  of bug closed, so that a commit which introduces a binary installs it on its own first
+  run however old the process running the deploy is.
+
+- **A missing MCP binary was invisible, and now is not.** Every stdio server in a child
+  MCP config names its command by **bare name**, resolved from the child's `PATH`, and
+  nothing verified that any of them resolve. The failure that produces is uniquely quiet:
+  the bridge starts, `/health` is green, every other server works, and the child registers
+  **zero tools** for the missing one on every turn. Three checks now exist, at three
+  layers:
+
+  - **At CI.** A test asserts that every `jesse-*` command in a shipped child MCP config
+    is named in `deploy-bins.toml`. This is the assertion that would have failed in
+    0.100.0.
+  - **At boot.** The bridge resolves each harness-in-use's main MCP config — the config a
+    child is actually spawned with, not a copy — against the `PATH` the child inherits,
+    and writes one `ERROR` line per command that does not resolve. It does **not** refuse
+    to start: a bridge that will not start is worse than a bridge missing one server, and
+    the refuse-to-boot decision stays with the startup gate. The same set is reported on
+    authenticated `GET /health` as `mcp_servers_unresolved`.
+  - **At deploy.** The `restart` phase's health gate now fails on a reported
+    `mcp_servers_unresolved` and triggers the existing rollback, immediately rather than
+    after the window — waiting does not install a binary. A deployment that lost a
+    capability is no longer reported as `ok`.
+
+### Changed
+
+- The child MCP config literals are now held together by a test: the golden copy in the
+  spawn tests must equal the shipped const, and each retired server set must be an exact
+  subset of the current one. Nothing but habit was keeping the four copies in step.
+
 ## [bridge 0.102.0] - 2026-08-28
 
 ### Changed

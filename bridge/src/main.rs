@@ -5,13 +5,14 @@
 use std::path::Path;
 
 use jesse_bridge::{
-    app, binary_exists, bind_broker, build_apns, detect_binary_drift, env_string, env_truthy,
-    export_mcp_server_env, harness_bin_env, harness_default_bin, harnesses_in_use, is_bind_allowed,
-    load_local_models, manual_pairing_lines, pairing_payload, qr_env_tristate, sentinel_advert,
-    serve_broker, settings_permission_drift, show_qr_opt_in, show_token_opt_in,
-    spawn_eviction_task, spawn_scheduler, spawn_session_gc_task, start_health_prober,
-    validate_model_config, AppState, Config, ConfigError, QrArt, TokenVisibility, BINARY_DRIFT,
-    CONTAINMENT_RECORDS, SETTINGS_DRIFT,
+    app, binary_exists, bind_broker, build_apns, detect_binary_drift,
+    detect_unresolved_mcp_servers, env_string, env_truthy, export_mcp_server_env, harness_bin_env,
+    harness_default_bin, harnesses_in_use, is_bind_allowed, load_local_models,
+    manual_pairing_lines, pairing_payload, qr_env_tristate, sentinel_advert, serve_broker,
+    settings_permission_drift, show_qr_opt_in, show_token_opt_in, spawn_eviction_task,
+    spawn_scheduler, spawn_session_gc_task, start_health_prober, validate_model_config, AppState,
+    Config, ConfigError, QrArt, TokenVisibility, BINARY_DRIFT, CONTAINMENT_RECORDS, SETTINGS_DRIFT,
+    UNRESOLVED_MCP,
 };
 
 #[tokio::main]
@@ -114,6 +115,37 @@ async fn main() {
         }
     }
     let _ = SETTINGS_DRIFT.set(settings_grants);
+
+    // ADVISORY, never fatal: does every stdio server in the config a child is actually
+    // spawned with have a binary the child can execute?
+    //
+    // The commands are BARE NAMES resolved from the child's `PATH`, and a name that does not
+    // resolve fails in the quietest way this service has: the bridge starts, `/health` is
+    // green, every other server works, and the child registers ZERO TOOLS for that one on
+    // every turn with no error written anywhere. That is not hypothetical — `jesse-places-mcp`
+    // shipped in the config and not on the host in 0.100.0 and cost a capability for a day.
+    //
+    // NOT fatal, deliberately: a bridge that will not start is worse than a bridge missing one
+    // server, and the refuse-to-boot decision belongs to the startup gate above, which owns
+    // the security posture. This one owns visibility — a line per server here, the same set on
+    // `/health`, and a sentinel deploy that rolls back rather than reporting success.
+    //
+    // The child inherits this process's environment unchanged, so this process's `PATH` IS
+    // the child's; it is passed explicitly rather than read inside the check so that the
+    // check keeps naming whose `PATH` it means.
+    let child_path = std::env::var("PATH").unwrap_or_default();
+    let unresolved = detect_unresolved_mcp_servers(&cfg, &child_path);
+    for m in &unresolved {
+        eprintln!(
+            "jesse-bridge: ERROR — MCP server '{}' in the '{}' child config runs the command \
+             '{}', which does not resolve to an executable on the child's PATH ({child_path}). \
+             Every turn on that harness will register NO TOOLS for '{}'. Install the binary \
+             (for this repository's own servers, that is what a sentinel deploy does — see \
+             bridge/deploy-bins.toml).",
+            m.server, m.harness, m.command, m.server
+        );
+    }
+    let _ = UNRESOLVED_MCP.set(unresolved);
 
     // The DEPRECATED single-limit key, announced rather than silently applied. An operator who
     // set it to 1 on purpose gets a global ceiling of 1, which is exactly the pre-0.60.0

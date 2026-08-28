@@ -512,6 +512,20 @@ pub async fn health(State(st): State<AppState>, headers: HeaderMap) -> Json<Valu
         if let Some(g) = SETTINGS_DRIFT.get().filter(|g| !g.is_empty()) {
             body["settings_grants_unrecorded"] = json!(g);
         }
+        // The child MCP servers whose binary does not resolve on the child's PATH, computed
+        // once at startup. Absent = none, which is the common case. Present = the child
+        // registers no tools for those servers on every turn, and the sentinel's deploy
+        // treats a NEW one as a failed deployment rather than a successful one.
+        if let Some(missing) = UNRESOLVED_MCP.get().filter(|m| !m.is_empty()) {
+            body["mcp_servers_unresolved"] = json!(missing
+                .iter()
+                .map(|m| json!({
+                    "harness": m.harness,
+                    "server": m.server,
+                    "command": m.command,
+                }))
+                .collect::<Vec<_>>());
+        }
         if let Some(drift) = BINARY_DRIFT.get().filter(|d| !d.is_empty()) {
             body["containment_stale"] = json!(drift
                 .iter()

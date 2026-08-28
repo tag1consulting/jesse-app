@@ -2205,9 +2205,9 @@ lost invisibly.
 | --- | --- |
 | `resolve` | In the deploy clone: `git fetch origin --prune`, resolve the ref (`main` means `origin/main`), then **refuse unless `git merge-base --is-ancestor <sha> origin/main`**. Also refuses a sha equal to the running one, unless `force`. |
 | `ci` | `GET /repos/<repo>/actions/runs?head_sha=…`, then that run's jobs listing. Requires a **completed, successful** run containing a **job named `bridge` that concluded `success`**. `force` does **not** bypass this. |
-| `build` | `git checkout --detach <sha>`, then `cargo build --release --locked --bin jesse-bridge --bin jesse-hook --bin jesse-build-mcp --bin jesse-places-mcp` in `bridge/`, 20-minute ceiling, both streams to the log **as they arrive**. |
-| `stage` | Copy the three binaries to `<bin dir>/jesse-bridge.d/<sha>/`, `chmod 755`, record where the links pointed in `deploys/previous`, then **atomically** repoint the three symlinks (create temp link, `rename`). |
-| `restart` | `launchctl kickstart -k`, then poll `/health` every 2 s for 90 s. Success needs `ok == true`, **`version` equal to the `[package] version` the commit declares**, and no harness newly `containment_stale`. |
+| `build` | `git checkout --detach <sha>`, read **`bridge/deploy-bins.toml` out of the checked-out commit**, then `cargo build --release --locked` with one `--bin` per name it lists, in `bridge/`, 20-minute ceiling, both streams to the log **as they arrive**. |
+| `stage` | Copy **those** binaries to `<bin dir>/jesse-bridge.d/<sha>/`, `chmod 755`, record where the links pointed in `deploys/previous`, then **atomically** repoint each symlink (create temp link, `rename`). |
+| `restart` | `launchctl kickstart -k`, then poll `/health` every 2 s for 90 s. Success needs `ok == true`, **`version` equal to the `[package] version` the commit declares**, no harness newly `containment_stale`, and **no `mcp_servers_unresolved`** — a server whose binary the child cannot execute is a lost capability, not a successful deploy. |
 | `rollback` | Any failure in `restart`: repoint to `previous`, kickstart, poll again. `result: rolled_back`, or **`rolled_back_unhealthy`** if the old one did not come up either. |
 | `finish` | Prune `jesse-bridge.d/` to the three newest builds, push the outcome, record `running_sha`. |
 
@@ -2218,9 +2218,32 @@ wanted name followed by a space or a `(` — but never a `-`, so a
 `bridge-nightly` job could not vouch for `bridge`. `JESSE_SENTINEL_CI_JOB`
 renames what is required.
 
-**Three binaries move together.** `jesse-hook` is exec'd by the agent child and
-`jesse-build-mcp` is an MCP server it talks to; a bridge from one commit running
-against a hook from another is a combination nobody tested.
+**The binaries move together, and the list comes from the commit.**
+`jesse-hook` is exec'd by the agent child and `jesse-build-mcp` / `jesse-places-mcp`
+are MCP servers it talks to; a bridge from one commit running against a hook from
+another is a combination nobody tested. Which binaries those are is **not** compiled
+into the sentinel — it is read from `bridge/deploy-bins.toml` in the tree being
+deployed, and that one file feeds the `--bin` arguments, the staging copy, the
+symlink repoint, the rollback and the prune.
+
+*Why it is a file.* A deploy is executed by the **already-running sentinel**, and
+the sentinel is not one of the binaries a deploy replaces — so anything compiled
+into it is as old as the last hand install. While this list was a `const`, a commit
+that introduced a binary could never install it on its own first run: the deploy
+built, staged and repointed the *previous* set and reported complete success,
+because by its own list it was complete. That is exactly what happened to
+`jesse-places-mcp` in 0.100.0. A tree with no `deploy-bins.toml` (a commit older
+than the file — rolling back to one is a real operation) falls back to the set the
+sentinel was built with and **says so in the deploy log**.
+
+**Adding an MCP server binary means adding it to `deploy-bins.toml` in the same
+change.** The child MCP configs name commands by **bare name**, resolved from the
+child's `PATH`. A deployment that ships the config but not the binary starts
+cleanly, passes `/health`, and registers **zero tools** for that server on every
+turn. Three things now catch that: a test asserting every `jesse-*` command in a
+shipped child config is in the manifest, an error line per unresolvable server at
+bridge startup, and the `restart` phase's `mcp_servers_unresolved` gate, which
+rolls the deploy back.
 
 **The version check is the point.** "It answered `/health`" is not "the new
 binary is running" — a symlink swap that silently did nothing looks identical at
@@ -2457,6 +2480,18 @@ persona-rendered defaults so the app's cached "default" matches what a turn buil
 The server refuses to start if `JESSE_TOKEN` is unset, the vault isn't a
 directory, the `claude` binary can't be found, or `JESSE_BIND` is an unsafe
 address without the override.
+
+It does **not** refuse to start when an **MCP server's binary is missing**, but it
+does say so. At boot it resolves every stdio server in the child MCP config of each
+harness in use — the config a child is actually spawned with, not a copy — against
+the `PATH` the child inherits, and writes one `ERROR` line per command that does not
+resolve to an executable. The same set is reported on authenticated `GET /health` as
+`mcp_servers_unresolved: [{harness, server, command}]`, which is what the sentinel's
+deploy gate reads. This is logging, not a gate: a bridge that will not start is worse
+than a bridge missing one server, and the refuse-to-boot decision belongs to the
+startup gate above. It exists because the failure it names is otherwise **silent** —
+the child reports the server failed to connect, registers zero tools for it, and
+nothing is written anywhere the operator looks.
 
 ### Diet pipeline probation
 

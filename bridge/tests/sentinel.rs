@@ -665,8 +665,8 @@ async fn each_restart_verb_targets_its_own_label() {
 //     rollback's restart it does not come back at all".
 
 use jesse_bridge::sentinel::{
-    check_ci, is_full_sha, prune_builds, resolve_bin, DeployRecord, Previous, DEPLOY_BINS,
-    KEEP_BUILDS,
+    check_ci, embedded_deploy_bins, is_full_sha, prune_builds, resolve_bin, DeployRecord, Previous,
+    DEPLOY_BINS_MANIFEST, KEEP_BUILDS,
 };
 
 /// The version the `cargo` shim's binaries print, and the version the fake bridge reports
@@ -701,7 +701,10 @@ fn git_at(dir: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
-fn write_manifest(work: &Path, version: &str) {
+/// The two files a deploy READS OUT OF THE TREE: the version it must come back on, and the
+/// binaries it is made of. `bins` is what makes the second one testable — a commit that names
+/// a binary this build has never heard of is exactly the case the manifest exists for.
+fn write_manifest(work: &Path, version: &str, bins: &[String]) {
     let dir = work.join("bridge");
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
@@ -709,11 +712,20 @@ fn write_manifest(work: &Path, version: &str) {
         format!("[package]\nname = \"jesse-bridge\"\nversion = \"{version}\"\n\n[dependencies]\naxum = \"0.7\"\n"),
     )
     .unwrap();
+    let list = bins
+        .iter()
+        .map(|b| format!("  \"{b}\",\n"))
+        .collect::<String>();
+    std::fs::write(
+        dir.join(DEPLOY_BINS_MANIFEST),
+        format!("bins = [\n{list}]\n"),
+    )
+    .unwrap();
 }
 
 /// A bare origin with `main` (two commits) and an unmerged `side` branch, plus a clone of it.
 /// Returns `(clone, main head sha, side sha)`.
-fn make_repo(sc: &Scratch) -> (PathBuf, String, String) {
+fn make_repo(sc: &Scratch, main_bins: &[String]) -> (PathBuf, String, String) {
     let origin = sc.path("origin.git");
     let work = sc.path("work");
     let clone = sc.path("deploy/jesse-app");
@@ -724,20 +736,21 @@ fn make_repo(sc: &Scratch) -> (PathBuf, String, String) {
     git_at(&origin, &["init", "--bare", "--initial-branch=main", "."]);
     git_at(&work, &["init", "--initial-branch=main", "."]);
 
-    write_manifest(&work, OLD_VERSION);
-    git_at(&work, &["add", "bridge/Cargo.toml"]);
+    write_manifest(&work, OLD_VERSION, embedded_deploy_bins());
+    git_at(&work, &["add", "bridge/"]);
     git_at(&work, &["commit", "-m", "base"]);
 
     // A commit that was pushed but NEVER MERGED. This is the one the ancestry gate must
     // refuse, and it is a real commit on a real branch rather than an invented sha.
     git_at(&work, &["checkout", "-b", "side"]);
-    write_manifest(&work, "9.9.9");
+    write_manifest(&work, "9.9.9", embedded_deploy_bins());
     git_at(&work, &["commit", "-am", "unmerged work"]);
     let side = git_at(&work, &["rev-parse", "HEAD"]);
 
     git_at(&work, &["checkout", "main"]);
-    write_manifest(&work, NEW_VERSION);
-    git_at(&work, &["commit", "-am", "the release"]);
+    write_manifest(&work, NEW_VERSION, main_bins);
+    git_at(&work, &["add", "bridge/"]);
+    git_at(&work, &["commit", "-m", "the release"]);
     let head = git_at(&work, &["rev-parse", "HEAD"]);
 
     git_at(
@@ -843,6 +856,8 @@ struct Health {
     up: bool,
     version: String,
     stale: Vec<String>,
+    /// `(server, command)` pairs the bridge reports as unresolvable on the child's PATH.
+    unresolved: Vec<(String, String)>,
 }
 
 impl Health {
@@ -851,6 +866,7 @@ impl Health {
             up: true,
             version: version.to_string(),
             stale: Vec::new(),
+            unresolved: Vec::new(),
         }
     }
     fn down() -> Health {
@@ -858,6 +874,7 @@ impl Health {
             up: false,
             version: String::new(),
             stale: Vec::new(),
+            unresolved: Vec::new(),
         }
     }
     fn stale(version: &str, harness: &str) -> Health {
@@ -865,6 +882,17 @@ impl Health {
             up: true,
             version: version.to_string(),
             stale: vec![harness.to_string()],
+            unresolved: Vec::new(),
+        }
+    }
+    /// Up, on the right version, and missing the binary for one of its MCP servers — the
+    /// deployment that used to be reported as a complete success.
+    fn missing_mcp_binary(version: &str, server: &str, command: &str) -> Health {
+        Health {
+            up: true,
+            version: version.to_string(),
+            stale: Vec::new(),
+            unresolved: vec![(server.to_string(), command.to_string())],
         }
     }
 }
@@ -895,6 +923,17 @@ async fn scripted_health(
         ));
     }
     let mut body = json!({ "ok": true, "version": answer.version });
+    if !answer.unresolved.is_empty() {
+        body["mcp_servers_unresolved"] = json!(answer
+            .unresolved
+            .iter()
+            .map(|(server, command)| json!({
+                "harness": "claude-code",
+                "server": server,
+                "command": command,
+            }))
+            .collect::<Vec<_>>());
+    }
     if !answer.stale.is_empty() {
         body["containment_stale"] = json!(answer
             .stale
@@ -928,7 +967,13 @@ async fn start_scripted_bridge(st: Scripted) -> String {
 
 // ---- The cargo shim ----------------------------------------------------------------------
 
-/// A `cargo` that writes the three release binaries, each one a script printing `version`.
+/// A `cargo` that writes one release "binary" per `--bin` IT WAS ASKED FOR, each a script
+/// printing `version`.
+///
+/// Deriving them from the argv rather than from a list of its own is what makes the manifest
+/// test honest: a name that reaches `target/release` got there because the build phase asked
+/// for it, so the assertion is about the deploy machinery and not about a second copy of the
+/// list living in this file.
 ///
 /// Plain POSIX shell — CI's `/bin/sh` is dash — and it runs with the working directory the
 /// build phase sets, so `target/release` lands inside the clone's `bridge/` exactly where the
@@ -939,13 +984,18 @@ fn cargo_shim(path: &Path, record: &Path, version: &str, code: i32) -> PathBuf {
         "#!/bin/sh\n\
          printf '%s\\n' \"$*\" >> '{}'\n\
          mkdir -p target/release\n\
-         for b in {}; do\n\
-         \tprintf '#!/bin/sh\\necho {version}\\n' > \"target/release/$b\"\n\
-         \tchmod 755 \"target/release/$b\"\n\
+         want=0\n\
+         for a in \"$@\"; do\n\
+         \tif [ \"$want\" = 1 ]; then\n\
+         \t\tprintf '#!/bin/sh\\necho {version}\\n' > \"target/release/$a\"\n\
+         \t\tchmod 755 \"target/release/$a\"\n\
+         \t\twant=0\n\
+         \telif [ \"$a\" = --bin ]; then\n\
+         \t\twant=1\n\
+         \tfi\n\
          done\n\
          exit {code}\n",
         record.display(),
-        DEPLOY_BINS.join(" "),
     );
     std::fs::write(path, body).unwrap();
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -958,6 +1008,9 @@ struct World {
     clone: PathBuf,
     bin_dir: PathBuf,
     launchctl_record: PathBuf,
+    /// Every argv the `cargo` shim was invoked with — the record of what the build phase
+    /// actually asked to be built.
+    cargo_record: PathBuf,
     head: String,
     side: String,
     gh: GhScript,
@@ -971,10 +1024,22 @@ async fn deploy_world(
     schedule: Value,
     ci: Ci,
 ) -> (World, Arc<Sentinel>) {
-    let (clone, head, side) = make_repo(sc);
+    deploy_world_with_bins(sc, states, schedule, ci, embedded_deploy_bins()).await
+}
+
+/// The same world, with the deployed commit's `deploy-bins.toml` naming `bins`.
+async fn deploy_world_with_bins(
+    sc: &Scratch,
+    states: Vec<Health>,
+    schedule: Value,
+    ci: Ci,
+    bins: &[String],
+) -> (World, Arc<Sentinel>) {
+    let (clone, head, side) = make_repo(sc, bins);
     let launchctl_record = sc.path("launchctl.log");
     let launchctl = shim(&sc.path("launchctl"), &launchctl_record, 0, 0);
-    let cargo = cargo_shim(&sc.path("cargo"), &sc.path("cargo.log"), NEW_VERSION, 0);
+    let cargo_record = sc.path("cargo.log");
+    let cargo = cargo_shim(&sc.path("cargo"), &cargo_record, NEW_VERSION, 0);
 
     let gh: GhScript = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
     gh.lock().unwrap().insert(head.clone(), ci);
@@ -1007,6 +1072,7 @@ async fn deploy_world(
             clone,
             bin_dir,
             launchctl_record,
+            cargo_record,
             head,
             side,
             gh,
@@ -1079,7 +1145,7 @@ fn seed_installed(bin_dir: &Path, version: &str) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
     let old = bin_dir.parent().unwrap().join("already-installed");
     std::fs::create_dir_all(&old).unwrap();
-    for name in DEPLOY_BINS {
+    for name in embedded_deploy_bins() {
         let p = old.join(name);
         std::fs::write(&p, format!("#!/bin/sh\necho {version}\n")).unwrap();
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -1258,7 +1324,7 @@ async fn a_healthy_deploy_repoints_the_symlinks_and_records_the_sha() {
 
     // All three links point into this commit's build directory, and all three run.
     let built = sen.cfg.build_store().join(&w.head);
-    for name in DEPLOY_BINS {
+    for name in embedded_deploy_bins() {
         assert_eq!(
             std::fs::read_link(w.bin_dir.join(name)).unwrap(),
             built.join(name),
@@ -1268,7 +1334,7 @@ async fn a_healthy_deploy_repoints_the_symlinks_and_records_the_sha() {
     }
     // The rollback record names where they pointed BEFORE, which is the old install.
     let prev = previous_map(&sen);
-    for name in DEPLOY_BINS {
+    for name in embedded_deploy_bins() {
         assert_eq!(
             prev.get(name).map(String::as_str),
             Some(previously_installed.join(name).to_string_lossy().as_ref()),
@@ -1309,6 +1375,109 @@ async fn a_healthy_deploy_repoints_the_symlinks_and_records_the_sha() {
     );
 }
 
+/// THE BOOTSTRAPPING DEFECT, at the layer it lives in: the binary set comes from the TREE
+/// BEING DEPLOYED, so a commit that introduces a binary installs it on its own first run.
+///
+/// The name here is one this build has never heard of — it is not in `deploy-bins.toml`, not
+/// a `cargo` target, not in any list in this file. It reaches the build phase's argv, the
+/// staging directory and `~/.local/bin` for exactly one reason: the deployed commit says the
+/// deployment is made of it. That is the whole fix, and it is why nothing else in this test
+/// had to be edited to add a binary.
+///
+/// While the list was a `const` this was impossible by construction: a deploy is run by the
+/// already-running sentinel, which is not one of the binaries a deploy replaces, so its list
+/// was as old as the last hand install. `jesse-places-mcp` joined the set in 0.100.0 and was
+/// never staged by any deploy after it.
+#[tokio::test]
+async fn a_binary_the_commit_adds_is_built_staged_and_linked() {
+    let sc = Scratch::new("deploy-manifest");
+    let mut bins = embedded_deploy_bins().to_vec();
+    bins.push("jesse-newcomer-mcp".to_string());
+    let (w, sen) = deploy_world_with_bins(
+        &sc,
+        vec![Health::up(OLD_VERSION), Health::up(NEW_VERSION)],
+        json!({ "jobs": [] }),
+        Ci::Green,
+        &bins,
+    )
+    .await;
+    // The already-installed deployment does NOT have it — this is the first run that could.
+    let previously_installed = seed_installed(&w.bin_dir, OLD_VERSION);
+    assert!(!previously_installed.join("jesse-newcomer-mcp").exists());
+
+    let (status, _) = post_deploy(&sen, json!({ "ref": "main" })).await;
+    assert_eq!(status, 202);
+    let rec = await_deploy(&sen).await;
+    assert_eq!(rec.result.as_deref(), Some("ok"), "{:?}", rec.reason);
+
+    // The BUILD asked for it. One list feeds both `--bin` and the staging loop, so this and
+    // the symlink below cannot disagree.
+    let asked = std::fs::read_to_string(&w.cargo_record).unwrap();
+    assert!(
+        asked.contains("--bin jesse-newcomer-mcp"),
+        "the build phase did not ask for the binary the commit declares: {asked}"
+    );
+    // …and it is staged, linked, and runnable.
+    let built = sen.cfg.build_store().join(&w.head);
+    assert_eq!(
+        std::fs::read_link(w.bin_dir.join("jesse-newcomer-mcp")).unwrap(),
+        built.join("jesse-newcomer-mcp")
+    );
+    assert_eq!(run_link(&w.bin_dir, "jesse-newcomer-mcp"), NEW_VERSION);
+    // A name with no previous install is recorded as ABSENT, which is what would make a
+    // rollback remove it rather than leave a binary the operator never had.
+    assert_eq!(previous_map(&sen).get("jesse-newcomer-mcp"), None);
+}
+
+/// THE SILENT FAILURE, at the layer it lives in: a deployment whose child MCP config names a
+/// server with no resolvable binary is NOT a successful deployment.
+///
+/// The bridge comes back up, on the right version, with a green `/health` — and it reports
+/// that one of its MCP servers has no binary the child can execute. That is a capability the
+/// deployment lost, invisibly, on every turn; before this it was reported as `ok`. It fails
+/// IMMEDIATELY rather than waiting out the health window, because no amount of waiting
+/// installs a binary.
+#[tokio::test]
+async fn a_deployment_missing_an_mcp_binary_rolls_back_instead_of_reporting_success() {
+    let sc = Scratch::new("deploy-mcp-missing");
+    let (w, sen) = deploy_world(
+        &sc,
+        vec![
+            Health::up(OLD_VERSION),
+            Health::missing_mcp_binary(NEW_VERSION, "places", "jesse-places-mcp"),
+        ],
+        json!({ "jobs": [] }),
+        Ci::Green,
+    )
+    .await;
+    let previously_installed = seed_installed(&w.bin_dir, OLD_VERSION);
+
+    let (status, _) = post_deploy(&sen, json!({ "ref": "main" })).await;
+    assert_eq!(status, 202);
+    let rec = await_deploy(&sen).await;
+    assert_eq!(
+        rec.result.as_deref(),
+        Some("rolled_back"),
+        "{:?}",
+        rec.reason
+    );
+    let reason = rec.reason.unwrap_or_default();
+    assert!(
+        reason.contains("places") && reason.contains("jesse-places-mcp"),
+        "the rollback must name the server and the command that did not resolve: {reason}"
+    );
+
+    // Every link is back on the old install, and the commit is not recorded as running.
+    for name in embedded_deploy_bins() {
+        assert_eq!(
+            std::fs::read_link(w.bin_dir.join(name)).unwrap(),
+            previously_installed.join(name),
+            "{name} was left on the failed build"
+        );
+    }
+    assert_eq!(sen.state.lock().unwrap().running_sha, None);
+}
+
 /// THE ROLLBACK. The bridge comes back on the OLD version — the symptom of a swap that
 /// silently did nothing, and the reason the deploy checks a version rather than a heartbeat.
 #[tokio::test]
@@ -1341,7 +1510,7 @@ async fn a_version_mismatch_rolls_back_to_the_previous_symlinks() {
     );
 
     // The links are back on the old install and still executable.
-    for name in DEPLOY_BINS {
+    for name in embedded_deploy_bins() {
         assert_eq!(
             std::fs::read_link(w.bin_dir.join(name)).unwrap(),
             previously_installed.join(name),
@@ -1429,7 +1598,7 @@ async fn a_rollback_that_does_not_come_up_reports_rolled_back_unhealthy() {
     // The links were still put back, even though what they point at is not answering: the
     // rollback's job is to restore the previous deployment, and whether that deployment then
     // starts is a separate fact the result already carries.
-    for name in DEPLOY_BINS {
+    for name in embedded_deploy_bins() {
         assert_eq!(run_link(&w.bin_dir, name), OLD_VERSION, "{name}");
     }
     assert_eq!(recorded(&w.launchctl_record).len(), 2);
@@ -1558,6 +1727,13 @@ async fn a_successful_deploy_prunes_the_store_to_three_builds() {
     );
     // The pure function backing this is exercised in the unit tests; what this asserts is
     // that the finish phase actually calls it, with the live links protected.
-    assert!(prune_builds(&w.bin_dir, &store, &previous_map(&sen), KEEP_BUILDS).is_empty());
+    assert!(prune_builds(
+        &w.bin_dir,
+        &store,
+        &previous_map(&sen),
+        KEEP_BUILDS,
+        embedded_deploy_bins()
+    )
+    .is_empty());
     assert!(w.clone.join(".git").is_dir());
 }

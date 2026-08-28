@@ -2511,6 +2511,69 @@ mod tests {
     );
     const GOLDEN_EMPTY_MCP: &str = r#"{"mcpServers":{}}"#;
 
+    /// EVERY COPY OF THE CHILD MCP CONFIG SAYS THE SAME THING.
+    ///
+    /// There are four full server-set literals in this file — three shipped/retired consts
+    /// and the golden above — and nothing used to hold them together except the habit of
+    /// editing them at the same time. Two things now read the shipped set for real: the
+    /// containment record, and the startup check that resolves each stdio command on the
+    /// child's `PATH` (`crate::detect_unresolved_mcp_servers`). A copy that drifted would
+    /// make one of those describe a set nobody is spawned with.
+    ///
+    /// It does NOT replace the golden's job. The golden is asserted against a real spawned
+    /// argv elsewhere, which is what pins the literal a child actually receives; a const
+    /// compared only with a const would pass whatever the const became. This adds the
+    /// missing half — that the test's copy and the shipped one are the same string — and
+    /// fails with a message about the copies rather than about an argv.
+    #[test]
+    fn every_copy_of_the_child_mcp_config_agrees() {
+        assert_eq!(
+            MAIN_CHILD_MCP_CONFIG, GOLDEN_QMD_MCP,
+            "the golden copy of the main child MCP config has drifted from the shipped const"
+        );
+        assert_eq!(EMPTY_MCP_CONFIG, GOLDEN_EMPTY_MCP);
+
+        // The retired sets are the shipped one MINUS the servers added after them, so each
+        // is an exact subset — same key, same value. This is what makes a row label go on
+        // meaning what it meant when somebody probed it: a command or an argument edited in
+        // the current set only would silently re-point the older labels at a set nobody ran.
+        let servers = |cfg: &str| -> serde_json::Map<String, serde_json::Value> {
+            serde_json::from_str::<serde_json::Value>(cfg)
+                .expect("every MCP config const must be JSON")
+                .get("mcpServers")
+                .and_then(|v| v.as_object())
+                .cloned()
+                .expect("… with an mcpServers object")
+        };
+        let main = servers(MAIN_CHILD_MCP_CONFIG);
+        for (label, older, added) in [
+            (
+                "MESSAGES_BUILD_MCP_CONFIG",
+                MESSAGES_BUILD_MCP_CONFIG,
+                vec!["places"],
+            ),
+            (
+                "MESSAGES_MCP_CONFIG",
+                MESSAGES_MCP_CONFIG,
+                vec!["places", "build"],
+            ),
+        ] {
+            let older = servers(older);
+            for (name, spec) in &older {
+                assert_eq!(
+                    main.get(name),
+                    Some(spec),
+                    "{label} and MAIN_CHILD_MCP_CONFIG disagree about the `{name}` server"
+                );
+            }
+            assert_eq!(
+                older.len() + added.len(),
+                main.len(),
+                "{label} should be the main set minus {added:?}"
+            );
+        }
+    }
+
     /// The shared base plus a site's MCP + containment args — one full expected argv.
     fn golden(tail: &[&str]) -> Vec<String> {
         GOLDEN_BASE

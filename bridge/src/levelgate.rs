@@ -546,6 +546,12 @@ pub struct BinaryDrift {
 /// The drift detected at startup, for `/health` to report without re-spawning a process.
 pub static BINARY_DRIFT: std::sync::OnceLock<Vec<BinaryDrift>> = std::sync::OnceLock::new();
 
+/// The child MCP servers whose command did not resolve on the child's `PATH` at startup, for
+/// `/health` to report — and, through `/health`, for a deploy to roll back on. See
+/// `crate::detect_unresolved_mcp_servers`.
+pub static UNRESOLVED_MCP: std::sync::OnceLock<Vec<UnresolvedMcpServer>> =
+    std::sync::OnceLock::new();
+
 /// Compare each in-use harness's live agent binary against the version its record was taken
 /// with. **Advisory: this WARNS, it never blocks startup.**
 ///
