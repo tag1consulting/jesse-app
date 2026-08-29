@@ -571,7 +571,8 @@ fn google_rich_body() -> Value {
     let mut body = google_body();
     body["places"][0]["editorialSummary"] =
         json!({"text": "A long-established kiltmaker.", "languageCode": "en"});
-    body["places"][0]["reviews"] = json!([{
+    body["places"][0]["reviews"] = json!([
+    {
         "name": "places/ChIJFixture/reviews/Ci9DQUlR",
         "relativePublishTimeDescription": "a month ago",
         "rating": 5,
@@ -585,6 +586,21 @@ fn google_rich_body() -> Value {
         "publishTime": "2026-07-04T13:57:43.708815105Z",
         "flagContentUri": "https://www.google.com/local/content/rap/report?postId=x",
         "googleMapsUri": "https://www.google.com/maps/reviews/data=!4m6",
+    },
+    // A SECOND ONE, so the search path's volume cap is observable end to end rather than
+    // only in a unit test.
+    {
+        "name": "places/ChIJFixture/reviews/Ci9DQUlS",
+        "relativePublishTimeDescription": "a year ago",
+        "rating": 4,
+        "text": {"text": "Good, but the queue was long.", "languageCode": "en"},
+        "authorAttribution": {
+            "displayName": "Another Reviewer",
+            "uri": "https://www.google.com/maps/contrib/2/reviews",
+            "photoUri": "https://lh3.googleusercontent.com/a/y=s128",
+        },
+        "publishTime": "2025-08-04T10:00:00Z",
+        "googleMapsUri": "https://www.google.com/maps/reviews/data=!4m7",
     }]);
     body
 }
@@ -688,6 +704,26 @@ async fn a_rich_search_sends_the_rich_mask_and_still_no_caller_string() {
             .expect("the ordering notice travels with the reviews")
             .contains("order the source returned them"),
         "{p}"
+    );
+    // **THE VOLUME CAP.** The request budget bounds what a rich call costs, not what it
+    // carries; without this one search at `limit: 20` could return a hundred reviews of
+    // public-authored text into a turn's context. One per place, and both the cap and the
+    // remainder are stated rather than applied silently.
+    assert_eq!(
+        p["reviews"].as_array().map(Vec::len),
+        Some(1),
+        "a rich SEARCH sends one review per place"
+    );
+    assert_eq!(
+        p["reviews_not_sent"],
+        json!(1),
+        "and says how many it held back, which is what sends a caller to the other tool"
+    );
+    assert_eq!(
+        out["reviews_per_place_cap"],
+        json!(1),
+        "stated on the envelope too, so 'this place has one review' and 'search sends one \
+         review per place' are distinguishable"
     );
     // The standard fields are all still there — `rich` adds, it does not replace.
     assert_eq!(p["rating"], json!(4.4));
@@ -956,6 +992,21 @@ async fn rich_details_uses_the_rich_details_mask_and_returns_the_reviews() {
     assert!(out["reviews"][0]["source_url"].is_string());
     assert!(out["reviews_notice"].is_string());
     assert_eq!(out["rich_budget"]["used"], json!(1));
+    // **AND THIS TOOL RETURNS THEM ALL** — it names one place, which is the case the search
+    // path's cap exists to send here. That is what makes the second call worth making.
+    assert_eq!(
+        out["reviews"].as_array().map(Vec::len),
+        Some(2),
+        "no volume cap on a single-place lookup"
+    );
+    assert!(
+        out.get("reviews_not_sent").is_none(),
+        "nothing was held back"
+    );
+    assert!(
+        out.get("reviews_per_place_cap").is_none(),
+        "and there is no per-place cap to report on a one-place tool"
+    );
 }
 
 /// A rich request against an id from the FREE source is announced rather than answered as

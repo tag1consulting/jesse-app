@@ -574,13 +574,20 @@ reviews"* as prohibited scraping, applies to what a **turn** does with the text 
 the same operator boundary already recorded above for names and addresses, with the stakes
 raised because a review is a named private individual's words.
 
-What is genuinely new on the security side is **inbound volume**. A review is text any member
-of the public can author, which makes it the same trust level as a fetched web page — but a
-rich search over fifteen places can return five reviews each, so a single tool call can put
-tens of thousands of characters of stranger-written prose into a turn's context. That is a
-prompt-injection surface proportional to `limit`, and it is a further reason the level is
-opt-in per call and holds a ceiling of its own. The tool description says to pair `rich` with
-a small `limit`; nothing truncates it silently.
+What is genuinely new on the security side is **inbound volume**, and it is bounded rather
+than merely noted. A review is text any member of the public can author, which makes it the
+same trust level as a fetched web page — but this API returns up to five reviews per place, so
+a rich search at `limit: 20` would put a hundred of them into the context of a child that also
+reads attacker-authored message bodies and can write to the vault. **The request budget does
+not bound this**: twenty such searches sit comfortably inside the rich ceiling, so the ceiling
+caps money and not injection surface.
+
+So **a search returns one review per place** (`SEARCH_REVIEWS_PER_PLACE`), which takes the
+worst case for one call from ~100 reviews to 20, and `place_details` — which names a single
+place — returns the full set. That is the honest division of labour rather than a compromise:
+a search asks which result to look at, for which the most relevant review is a sample. The cap
+is reported, never silent: `reviews_per_place_cap` on the envelope and `reviews_not_sent` on
+any record holding more back.
 
 One term is worth flagging as a limit this tool cannot enforce: **§3.2.3(c)(vii)** forbids
 using Google Maps Content *"to improve machine learning and artificial intelligence models,

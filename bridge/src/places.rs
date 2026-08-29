@@ -89,7 +89,7 @@ use tokio::sync::Mutex;
 use crate::places_google::{
     google_details_field_mask, google_distance, google_name_hit, google_place_json,
     google_search_field_mask, BudgetState, GoogleConfig, GoogleProvider, GOOGLE_ATTRIBUTION,
-    GOOGLE_MAX_RESULTS,
+    GOOGLE_MAX_RESULTS, SEARCH_REVIEWS_PER_PLACE,
 };
 
 // ---------------------------------------------------------------------------------------
@@ -1649,6 +1649,13 @@ impl PlacesClient {
         if category_fallback && hits.places.is_empty() {
             out["no_results_explanation"] = json!(EMPTY_FALLBACK_EXPLANATION);
         }
+        // NO SILENT CAP, same rule as `limit_capped_by_provider` above. Stated on every rich
+        // search rather than only when it bites, because "this place has one review" and
+        // "search sends one review per place" are different claims and the caller needs the
+        // second one to know that `place_details` has more.
+        if provider == Provider::GooglePlaces && detail_report.served.is_rich() {
+            out["reviews_per_place_cap"] = json!(SEARCH_REVIEWS_PER_PLACE);
+        }
         self.annotate(
             &mut out,
             provider,
@@ -1841,8 +1848,10 @@ impl PlacesClient {
             .details(&self.http, place_id, detail)
             .await
             .map_err(|e| format!("{e}. Run `places_search` again to get a usable id"))?;
-        // NAN for the distance, for the reason the OpenStreetMap path states below.
-        let mut out = google_place_json(&body, f64::NAN, zone);
+        // NAN for the distance, for the reason the OpenStreetMap path states below. NO review
+        // cap either: this names ONE place, which is exactly the case the search-path cap
+        // exists to send here.
+        let mut out = google_place_json(&body, f64::NAN, zone, None);
         if !detail.is_rich() {
             out["detail_adds_nothing_here"] = json!(
                 "For a record from this source, the standard field set of `place_details` is \
@@ -2177,7 +2186,12 @@ pub(crate) fn google_hits(
     let mut kept: Vec<(f64, Value)> = scored
         .into_iter()
         .filter(|(_, hit, _)| relaxed || *hit)
-        .map(|(dist, _, p)| (dist, google_place_json(p, dist, zone)))
+        .map(|(dist, _, p)| {
+            (
+                dist,
+                google_place_json(p, dist, zone, Some(SEARCH_REVIEWS_PER_PLACE)),
+            )
+        })
         .collect();
     kept.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
     let total = kept.len();
@@ -2397,7 +2411,9 @@ impl PlacesTool {
                  per call and against a separate, much smaller allowance; every response says \
                  which level it served in `detail`, which level was asked for in \
                  `detail_requested`, and — when a billed source answered — the exact field \
-                 set it paid for in `field_mask` and its price tier in `cost_tier`."
+                 set it paid for in `field_mask` and its price tier in `cost_tier`. A rich \
+                 SEARCH carries one review per place; `place_details` is where the rest of a \
+                 chosen place's reviews live."
             }
             PlacesTool::Details => {
                 "Get the fullest record for one place, by the `id` of a `places_search` \
@@ -2416,9 +2432,10 @@ impl PlacesTool {
                  answered the search with, so calling it at the default level spends a \
                  billed request and returns values the caller already has — the response \
                  says so in `detail_adds_nothing_here` when it happens. What that source \
-                 does have to add is `detail: \"rich\"`, which returns review text and an \
-                 editorial summary for ONE place without re-running, and re-paying for, the \
-                 whole search at the dearer field set. Reviews arrive with their author and \
+                 does have to add is `detail: \"rich\"`, which returns ALL of one place's \
+                 reviews — search sends only one per place — plus an editorial summary, \
+                 without re-running, and re-paying for, the whole search at the dearer field \
+                 set. Reviews arrive with their author and \
                  a `source_url`, and both must travel with any of that text that is \
                  repeated to a person."
             }
@@ -2446,7 +2463,7 @@ impl PlacesTool {
                         "type": "string",
                         "enum": ["standard", "rich"],
                         "default": "standard",
-                        "description": "How much to fetch per place. \"standard\" (the default) returns the fields listed above. \"rich\" also returns review text and, where one exists, an editorial summary — and COSTS MATERIALLY MORE PER CALL, against a separate and much smaller daily allowance that is reported as `rich_budget`. Ask for it only when the question needs what people said rather than how they scored it, and pair it with a small `limit`: it returns up to five reviews for EVERY result, so a rich search over fifteen places is a great deal of prose. Reviews carry display obligations — each one arrives with its author and a `source_url`, and those must travel with any of the text that is repeated to a person."
+                        "description": "How much to fetch per place. \"standard\" (the default) returns the fields listed above. \"rich\" also returns ONE review per place and, where one exists, an editorial summary — and COSTS MATERIALLY MORE PER CALL, against a separate and much smaller daily allowance reported as `rich_budget`. One review per place is a sample for choosing between results, not a survey: `reviews_per_place_cap` says so on the response, `reviews_not_sent` says how many a place is holding back, and `place_details` with detail: \"rich\" returns all of them for the one place you pick. Reviews carry display obligations — each arrives with its author and a `source_url`, and both must travel with any of the text that is repeated to a person."
                     },
                     "timezone": {
                         "type": "string",

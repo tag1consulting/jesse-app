@@ -93,7 +93,9 @@
 //! individual source photo or review on Google Maps using the provided `googleMapsUri`."*
 //! [`review_json`] meets both on this side — every returned review carries its author's name,
 //! profile link and avatar URI and its own `source_url`, and a review arriving without either
-//! is DROPPED rather than passed on unshowable. Its ordering notice
+//! is DROPPED rather than passed on unshowable, and a search returns at most
+//! [`SEARCH_REVIEWS_PER_PLACE`] of them per place because the request budget bounds what a
+//! rich call COSTS and not what it CARRIES. Its ordering notice
 //! (*"Include a clear notice that describes how reviews are being ordered and filtered"*)
 //! travels with the array as [`REVIEWS_NOTICE`], which is only honest because nothing here
 //! reorders, filters or truncates the text.
@@ -1011,7 +1013,16 @@ fn google_hours_raw(hours: &Value) -> String {
 /// phone", which is a claim the data does not support.
 ///
 /// `dist_m` is `NAN` for `place_details`, which names a place rather than a search centre.
-pub(crate) fn google_place_json(place: &Value, dist_m: f64, zone: &Zone) -> Value {
+///
+/// `review_cap` bounds how many reviews this record may carry: `Some(n)` on the search path
+/// (see [`SEARCH_REVIEWS_PER_PLACE`]) and `None` on `place_details`, which names one place and
+/// is where the full set belongs.
+pub(crate) fn google_place_json(
+    place: &Value,
+    dist_m: f64,
+    zone: &Zone,
+    review_cap: Option<usize>,
+) -> Value {
     let mut out = Map::new();
     let id = place.get("id").and_then(Value::as_str).unwrap_or("");
     // The id a caller hands back to `place_details`. The prefix is a ROUTING KEY, not a label:
@@ -1111,16 +1122,29 @@ pub(crate) fn google_place_json(place: &Value, dist_m: f64, zone: &Zone) -> Valu
                 None => withheld += 1,
             }
         }
+        // The volume bound, applied AFTER the compliance filter so the cap counts reviews a
+        // caller could actually have been given rather than ones it was never going to see.
+        // Truncation only — the order is the provider's own, so the kept ones are the most
+        // relevant ones, and [`REVIEWS_NOTICE`] already says the array is a selection.
+        let showable = kept.len();
+        if let Some(cap) = review_cap {
+            kept.truncate(cap);
+        }
+        let cut = showable - kept.len();
         if !kept.is_empty() {
             out.insert("reviews".to_string(), json!(kept));
             out.insert("reviews_notice".to_string(), json!(REVIEWS_NOTICE));
         }
-        // NO SILENT DROP. A review that cannot be shown within the provider's terms is not
-        // returned (see [`review_json`]), and the count of those is reported rather than
-        // quietly absorbed — otherwise "three reviews" and "three of five reviews" read
-        // identically.
+        // NO SILENT DROP, in either direction. A review that cannot be shown within the
+        // provider's terms is not returned (see [`review_json`]); a review the volume cap cut
+        // is not returned either. Both counts are reported rather than quietly absorbed —
+        // otherwise "one review" and "one of five reviews" read identically, and a caller
+        // cannot tell that `place_details` has more to give.
         if withheld > 0 {
             out.insert("reviews_withheld".to_string(), json!(withheld));
+        }
+        if cut > 0 {
+            out.insert("reviews_not_sent".to_string(), json!(cut));
         }
     }
 
@@ -1137,6 +1161,27 @@ pub(crate) fn google_place_json(place: &Value, dist_m: f64, zone: &Zone) -> Valu
     }
     Value::Object(out)
 }
+
+/// How many reviews one place may contribute to a SEARCH response.
+///
+/// # This is a bound on inbound volume, not on money
+///
+/// The request budget caps what a rich call costs. It does not cap what a rich call *carries*:
+/// this API returns up to five reviews per place, so one rich search at `limit: 20` can put
+/// several tens of thousands of characters of text into a turn's context — and a review is
+/// text that any member of the public can author, arriving in a child that also reads
+/// attacker-authored message bodies and can write to the vault. Twenty such searches sit
+/// comfortably inside the rich ceiling, so the ceiling alone leaves that surface unbounded.
+///
+/// **So a search returns ONE review per place, and `place_details` returns them all.** That
+/// is the honest division of labour rather than a compromise: a search asks "which of these
+/// should I look at", for which the most relevant review is a sample; `place_details` asks
+/// "tell me about this one", for which the full set is the answer. It also gives the second
+/// tool the reason to exist that it has never had on this source.
+///
+/// The cap is REPORTED, never silent — [`crate::places::PlacesClient::search`] states it on
+/// the envelope and a record whose reviews were cut says how many it did not send.
+pub const SEARCH_REVIEWS_PER_PLACE: usize = 1;
 
 /// One review, mapped — or `None` when it cannot be returned within the provider's terms.
 ///
@@ -1600,7 +1645,7 @@ mod tests {
 
     #[test]
     fn a_record_names_its_own_source_and_prefixes_its_id() {
-        let p = google_place_json(&a_place(), 11.0, &zone());
+        let p = google_place_json(&a_place(), 11.0, &zone(), None);
         assert_eq!(p["provider"], json!("google_places"));
         assert_eq!(
             p["id"],
@@ -1618,19 +1663,19 @@ mod tests {
     /// tell them apart.
     #[test]
     fn a_rating_without_its_count_is_not_emitted() {
-        let p = google_place_json(&a_place(), 1.0, &zone());
+        let p = google_place_json(&a_place(), 1.0, &zone(), None);
         assert_eq!(p["rating"], json!(4.4));
         assert_eq!(p["rating_count"], json!(2183));
 
         let mut half = a_place();
         half.as_object_mut().unwrap().remove("userRatingCount");
-        let p = google_place_json(&half, 1.0, &zone());
+        let p = google_place_json(&half, 1.0, &zone(), None);
         assert!(p.get("rating").is_none(), "a bare rating must not appear");
         assert!(p.get("rating_count").is_none());
 
         let mut other_half = a_place();
         other_half.as_object_mut().unwrap().remove("rating");
-        let p = google_place_json(&other_half, 1.0, &zone());
+        let p = google_place_json(&other_half, 1.0, &zone(), None);
         assert!(p.get("rating").is_none());
         assert!(p.get("rating_count").is_none(), "nor a bare count");
     }
@@ -1644,7 +1689,7 @@ mod tests {
             "displayName": {"text": "Bare"},
             "location": {"latitude": 1.0, "longitude": 2.0},
         });
-        let p = google_place_json(&bare, f64::NAN, &zone());
+        let p = google_place_json(&bare, f64::NAN, &zone(), None);
         for absent in [
             "phone",
             "website",
@@ -1667,7 +1712,7 @@ mod tests {
     /// Both hours fields, or neither — the shape this server has kept since its first version.
     #[test]
     fn the_two_hours_fields_arrive_together() {
-        let p = google_place_json(&a_place(), 1.0, &zone());
+        let p = google_place_json(&a_place(), 1.0, &zone(), None);
         assert_eq!(
             p["opening_hours_raw"],
             json!("Monday: 8:00 AM – 5:00 PM"),
@@ -1681,7 +1726,7 @@ mod tests {
 
         let mut none = a_place();
         none.as_object_mut().unwrap().remove("regularOpeningHours");
-        let p = google_place_json(&none, 1.0, &zone());
+        let p = google_place_json(&none, 1.0, &zone(), None);
         assert!(p.get("opening_hours").is_none());
         assert!(p.get("opening_hours_raw").is_none());
     }
@@ -1692,7 +1737,7 @@ mod tests {
     fn unreadable_hours_leave_open_now_null_and_keep_the_raw_value() {
         let mut broken = a_place();
         broken["regularOpeningHours"]["periods"] = json!([{"open": {"day": 99}}]);
-        let p = google_place_json(&broken, 1.0, &zone());
+        let p = google_place_json(&broken, 1.0, &zone(), None);
         assert_eq!(p["opening_hours"]["parsed"], json!(false));
         assert_eq!(p["opening_hours"]["open_now"], Value::Null);
         assert!(p["opening_hours"]["reason"].is_string());
@@ -2277,7 +2322,7 @@ mod tests {
     /// caller that will summarise whatever it is handed.
     #[test]
     fn a_review_carries_its_author_and_its_source_link() {
-        let p = google_place_json(&a_rich_place(), 1.0, &zone());
+        let p = google_place_json(&a_rich_place(), 1.0, &zone(), None);
         let r = &p["reviews"][0];
         assert_eq!(r["author"]["name"], json!("A Reviewer"));
         assert_eq!(
@@ -2332,7 +2377,7 @@ mod tests {
         };
         place["reviews"] = json!([a_review(), no_author, no_link]);
 
-        let p = google_place_json(&place, 1.0, &zone());
+        let p = google_place_json(&place, 1.0, &zone(), None);
         assert_eq!(
             p["reviews"].as_array().map(Vec::len),
             Some(1),
@@ -2348,7 +2393,7 @@ mod tests {
         // All of them unshowable: no array at all, and no notice about an array that is not
         // there — but still the count.
         place["reviews"] = json!([no_author]);
-        let p = google_place_json(&place, 1.0, &zone());
+        let p = google_place_json(&place, 1.0, &zone(), None);
         assert!(p.get("reviews").is_none());
         assert!(p.get("reviews_notice").is_none());
         assert_eq!(p["reviews_withheld"], json!(1));
@@ -2367,7 +2412,7 @@ mod tests {
         third["rating"] = json!(1);
         place["reviews"] = json!([a_review(), second, third]);
 
-        let p = google_place_json(&place, 1.0, &zone());
+        let p = google_place_json(&place, 1.0, &zone(), None);
         let texts: Vec<&str> = p["reviews"]
             .as_array()
             .unwrap()
@@ -2394,7 +2439,7 @@ mod tests {
         r["text"] = json!({"text": "Excellent service.", "languageCode": "en"});
         r["originalText"] = json!({"text": "Servizio eccellente.", "languageCode": "it"});
         place["reviews"] = json!([r]);
-        let p = google_place_json(&place, 1.0, &zone());
+        let p = google_place_json(&place, 1.0, &zone(), None);
         assert_eq!(p["reviews"][0]["text"], json!("Excellent service."));
         assert_eq!(
             p["reviews"][0]["original_text"],
@@ -2411,7 +2456,7 @@ mod tests {
         let mut r = a_review();
         r["visitDate"] = json!({"year": 2026, "month": 6});
         place["reviews"] = json!([r]);
-        let p = google_place_json(&place, 1.0, &zone());
+        let p = google_place_json(&place, 1.0, &zone(), None);
         assert_eq!(
             p["reviews"][0]["visit_date"],
             json!({"year": 2026, "month": 6})
@@ -2422,7 +2467,7 @@ mod tests {
     /// null. The mask did not ask for them, so the record must not imply the place has none.
     #[test]
     fn a_standard_record_carries_no_review_keys_whatsoever() {
-        let p = google_place_json(&a_place(), 1.0, &zone());
+        let p = google_place_json(&a_place(), 1.0, &zone(), None);
         for absent in [
             "reviews",
             "reviews_notice",
@@ -2437,6 +2482,87 @@ mod tests {
         assert_eq!(p["provider"], json!("google_places"));
     }
 
+    /// **The search path carries ONE review per place and says both that it did and how many
+    /// it held back.** The request budget bounds what a rich call costs and not what it
+    /// carries; without this a single rich search at `limit: 20` could put a hundred reviews —
+    /// text any member of the public can author — into a turn's context.
+    #[test]
+    fn a_search_record_carries_one_review_per_place_and_says_how_many_it_did_not_send() {
+        let mut place = a_rich_place();
+        let mut second = a_review();
+        second["text"]["text"] = json!("The second one.");
+        let mut third = a_review();
+        third["text"]["text"] = json!("The third one.");
+        place["reviews"] = json!([a_review(), second, third]);
+
+        let capped = google_place_json(&place, 1.0, &zone(), Some(SEARCH_REVIEWS_PER_PLACE));
+        assert_eq!(
+            capped["reviews"].as_array().map(Vec::len),
+            Some(1),
+            "a search sends one review per place"
+        );
+        assert_eq!(
+            capped["reviews"][0]["text"],
+            json!("Treated us very well."),
+            "and it is the first the provider sent, which its own order makes the most \
+             relevant — nothing is re-ranked here"
+        );
+        assert_eq!(
+            capped["reviews_not_sent"],
+            json!(2),
+            "NO SILENT CAP: the caller is told there are more, which is what sends it to the \
+             other tool"
+        );
+        assert!(
+            capped["reviews_notice"].is_string(),
+            "the notice still travels with the one that was sent"
+        );
+
+        // THE OTHER TOOL GETS THEM ALL. `place_details` names one place, which is exactly the
+        // case the search cap exists to send here.
+        let full = google_place_json(&place, f64::NAN, &zone(), None);
+        assert_eq!(full["reviews"].as_array().map(Vec::len), Some(3));
+        assert!(
+            full.get("reviews_not_sent").is_none(),
+            "nothing was held back, so nothing to report"
+        );
+    }
+
+    /// The cap is applied AFTER the compliance filter, so it counts reviews the caller could
+    /// actually have been given — and the two counts stay distinguishable, because "withheld
+    /// because it could not be credited" and "not sent because a search sends one" are
+    /// different facts.
+    #[test]
+    fn the_volume_cap_and_the_compliance_filter_are_counted_separately() {
+        let mut place = a_rich_place();
+        let no_author = {
+            let mut r = a_review();
+            r.as_object_mut().unwrap().remove("authorAttribution");
+            r
+        };
+        let mut second = a_review();
+        second["text"]["text"] = json!("The second showable one.");
+        place["reviews"] = json!([a_review(), no_author.clone(), second, no_author]);
+
+        let p = google_place_json(&place, 1.0, &zone(), Some(1));
+        assert_eq!(p["reviews"].as_array().map(Vec::len), Some(1));
+        assert_eq!(p["reviews_withheld"], json!(2), "two could not be credited");
+        assert_eq!(
+            p["reviews_not_sent"],
+            json!(1),
+            "and of the two that could, one was above the cap"
+        );
+    }
+
+    /// A place with fewer reviews than the cap reports nothing held back — the key is a real
+    /// count, not a constant echoed back.
+    #[test]
+    fn a_place_at_or_under_the_cap_reports_nothing_held_back() {
+        let p = google_place_json(&a_rich_place(), 1.0, &zone(), Some(1));
+        assert_eq!(p["reviews"].as_array().map(Vec::len), Some(1));
+        assert!(p.get("reviews_not_sent").is_none());
+    }
+
     /// A place with the rich mask but genuinely no reviews emits no `reviews` key either —
     /// which is why `detail` is reported on the envelope. The record alone cannot say "I
     /// asked and there are none"; the envelope can.
@@ -2445,7 +2571,7 @@ mod tests {
         let mut place = a_rich_place();
         place["reviews"] = json!([]);
         place.as_object_mut().unwrap().remove("editorialSummary");
-        let p = google_place_json(&place, 1.0, &zone());
+        let p = google_place_json(&place, 1.0, &zone(), None);
         assert!(p.get("reviews").is_none(), "never an empty array");
         assert!(p.get("reviews_withheld").is_none());
         assert!(p.get("editorial_summary").is_none());

@@ -53,6 +53,15 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
   reordered, filtered, edited or truncated, which is the only thing that makes the ordering
   notice carried alongside a true statement.
 
+- **A search returns one review per place; `place_details` returns them all.** The request
+  budget bounds what a rich call *costs*, not what it *carries*, and this API returns up to
+  five reviews per place — so one rich search at `limit: 20` could put a hundred reviews of
+  public-authored text into a turn's context, well inside the rich ceiling. A search is
+  "which of these should I look at", for which the most relevant review is a sample; the full
+  set belongs to the tool that names one place. The cap is stated on the envelope as
+  `reviews_per_place_cap` and each record says how many it held back as `reviews_not_sent` —
+  never applied silently.
+
 ### Fixed
 
 - **A search that finds nothing now says why, at no cost.** `places_search` with a bare
