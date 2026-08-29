@@ -87,8 +87,9 @@ use serde_json::{json, Map, Value};
 use tokio::sync::Mutex;
 
 use crate::places_google::{
-    google_distance, google_name_hit, google_place_json, BudgetState, GoogleConfig, GoogleProvider,
-    GOOGLE_ATTRIBUTION, GOOGLE_MAX_RESULTS,
+    google_details_field_mask, google_distance, google_name_hit, google_place_json,
+    google_search_field_mask, BudgetState, GoogleConfig, GoogleProvider, GOOGLE_ATTRIBUTION,
+    GOOGLE_MAX_RESULTS,
 };
 
 // ---------------------------------------------------------------------------------------
@@ -110,6 +111,92 @@ impl Provider {
         match self {
             Provider::OpenStreetMap => "openstreetmap",
             Provider::GooglePlaces => "google_places",
+        }
+    }
+}
+
+/// How much a caller asked for, and therefore how much the answer is allowed to cost.
+///
+/// # Why this is a parameter rather than a second pair of tools
+///
+/// The expensive fields — review text above all — are worth having and are not worth paying
+/// for on every lookup. A tool cannot express that with a fixed field set: either the cheap
+/// answer is the only answer available (which is what shipped in 0.104.0) or every answer is
+/// billed at the dearest tier. So the CALLER chooses, per call, and the default is exactly
+/// what shipped.
+///
+/// **It is a parameter and not a third and fourth tool name.** `DEFAULT_ALLOWED_TOOLS` and
+/// `MAIN_CHILD_MCP_CONFIG` carry TOOL NAMES, never schemas, so an added property moves no
+/// argv, so [`crate::levelgate::validate_toolset_argv`] still finds strict equality with the
+/// recorded `toolset_args` and this costs no containment battery. A third tool would have
+/// cost one. That is the same bet the provider-agnostic names made in 0.100.0, and it is why
+/// every new capability here has to arrive as an argument.
+///
+/// # What each level means
+///
+/// [`DetailLevel::Standard`] is the 0.104.0 contract, unchanged in every byte that leaves this
+/// host: the same field mask, the same SKU, the same record shape. [`DetailLevel::Rich`] adds the
+/// two Enterprise + Atmosphere fields that were actually missing — review text and an
+/// editorial summary — and nothing else. It is **materially dearer per call**, which is why
+/// it has its own ceiling ([`crate::places_google::DEFAULT_GOOGLE_MAX_RICH_CALLS`]) rather
+/// than sharing the ordinary one.
+///
+/// The free source has no equivalent fields at all, so a `rich` request it serves is answered
+/// at `standard` with that stated in the response — the same way a fallback states itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum DetailLevel {
+    /// Exactly what 0.104.0 returned, at exactly what 0.104.0 cost.
+    #[default]
+    Standard,
+    /// Plus review text and an editorial summary, at the dearer tier.
+    Rich,
+}
+
+impl DetailLevel {
+    /// The value echoed to the caller. A VALUE, never a field name and never argv — the same
+    /// distinction [`Provider::label`] rests on.
+    pub fn label(&self) -> &'static str {
+        match self {
+            DetailLevel::Standard => "standard",
+            DetailLevel::Rich => "rich",
+        }
+    }
+
+    /// The billing tier a mask at this level sits in, in the paid provider's own vocabulary.
+    /// This is what the ledger's third column carries and what the response reports, so that
+    /// "what did this cost" is answerable from either without a lookup table.
+    pub fn cost_tier(&self) -> &'static str {
+        match self {
+            DetailLevel::Standard => "enterprise",
+            DetailLevel::Rich => "enterprise_atmosphere",
+        }
+    }
+
+    pub fn is_rich(&self) -> bool {
+        *self == DetailLevel::Rich
+    }
+
+    /// Read the `detail` argument.
+    ///
+    /// **An unrecognised value is an ERROR, not a silent downgrade to the default**, which is
+    /// the opposite of how this module treats a mistyped environment variable — and
+    /// deliberately. A bad env var must not take the capability out for the conversation. A
+    /// bad tool argument is a caller that believes it asked for something it did not get, and
+    /// answering it cheaply while it thinks it paid for reviews is the failure worth
+    /// preventing. Same reasoning as the out-of-range `radius_m` rejection.
+    pub fn parse_arg(args: &Value) -> Result<Self, String> {
+        match args.get("detail") {
+            None | Some(Value::Null) => Ok(DetailLevel::Standard),
+            Some(Value::String(s)) => match s.trim().to_ascii_lowercase().as_str() {
+                "standard" => Ok(DetailLevel::Standard),
+                "rich" => Ok(DetailLevel::Rich),
+                other => Err(format!(
+                    "detail must be \"standard\" or \"rich\", got {other:?}"
+                )),
+            },
+            Some(other) => Err(format!(
+                "detail must be a string, \"standard\" or \"rich\", got {other}"
+            )),
         }
     }
 }
@@ -1436,6 +1523,10 @@ impl PlacesClient {
         let radius = radius.round() as u32;
         let limit = num(args, "limit").unwrap_or(15.0).round().clamp(1.0, 50.0) as usize;
         let zone = resolve_zone(args.get("timezone").and_then(Value::as_str), &self.cfg);
+        // Validated up front with the rest, for the reason stated above: what a legal request
+        // is must not depend on which source would have answered it.
+        let detail = DetailLevel::parse_arg(args)?;
+        let mut detail_report = DetailReport::new(detail);
 
         let (filters, categories, category_fallback) = filters_for_query(&query);
         let terms = name_terms(&query);
@@ -1462,11 +1553,12 @@ impl PlacesClient {
                         _ => &[],
                     };
                     match g
-                        .search_nearby(&self.http, list, lat, lon, radius, limit)
+                        .search_nearby(&self.http, list, lat, lon, radius, limit, detail)
                         .await
                     {
                         Ok((body, b)) => {
                             budget = Some(b);
+                            detail_report.mask = Some(google_search_field_mask(detail));
                             answer = Some((
                                 Provider::GooglePlaces,
                                 google_hits(
@@ -1487,6 +1579,7 @@ impl PlacesClient {
         }
 
         if answer.is_none() {
+            detail_report.served_by_free_source();
             if budget.is_none() {
                 if let Some(g) = self.google.as_ref() {
                     budget = g.ledger.peek().await;
@@ -1550,11 +1643,18 @@ impl PlacesClient {
         if provider == Provider::GooglePlaces && limit > GOOGLE_MAX_RESULTS {
             out["limit_capped_by_provider"] = json!(GOOGLE_MAX_RESULTS);
         }
+        // THE EMPTY ANSWER EXPLAINS ITSELF, at no cost and from facts already in hand. A
+        // caller that gets nothing back for a bare business name is otherwise left choosing
+        // between "the place is not there" and "the tool is broken", and neither is true.
+        if category_fallback && hits.places.is_empty() {
+            out["no_results_explanation"] = json!(EMPTY_FALLBACK_EXPLANATION);
+        }
         self.annotate(
             &mut out,
             provider,
             fallback_reason.map(|cause| format!("{cause}{FELL_BACK}")),
             budget,
+            &detail_report,
         );
         Ok(out)
     }
@@ -1569,6 +1669,7 @@ impl PlacesClient {
         provider: Provider,
         fallback_reason: Option<String>,
         budget: Option<BudgetState>,
+        detail: &DetailReport,
     ) {
         let obj = out.as_object_mut().expect("responses are objects");
         if let Some(reason) = fallback_reason {
@@ -1576,7 +1677,13 @@ impl PlacesClient {
         }
         if let Some(b) = budget {
             obj.insert("budget".to_string(), b.as_json());
+            // THE SECOND CEILING IS REPORTED WHENEVER THE FIRST IS, not only on the calls it
+            // governs. `budget` keeps exactly the three keys it has always carried and
+            // exactly the values it always carried; the rich counters are a sibling rather
+            // than two more keys inside it, so nothing reading the old object sees a change.
+            obj.insert("rich_budget".to_string(), b.rich_as_json());
         }
+        detail.write_into(obj);
         if provider == Provider::GooglePlaces {
             obj.insert("attribution".to_string(), json!(GOOGLE_ATTRIBUTION));
         }
@@ -1692,16 +1799,37 @@ impl PlacesClient {
             .ok_or("id is required; use the `id` of a `places_search` result")?
             .trim();
         let zone = resolve_zone(args.get("timezone").and_then(Value::as_str), &self.cfg);
+        let detail = DetailLevel::parse_arg(args)?;
         match PlaceRef::parse(id)? {
-            PlaceRef::Google(pid) => self.google_details(id, pid, &zone).await,
+            PlaceRef::Google(pid) => self.google_details(id, pid, &zone, detail).await,
             PlaceRef::OpenStreetMap { kind, id: num_id } => {
-                self.osm_details(id, kind, num_id, &zone).await
+                self.osm_details(id, kind, num_id, &zone, detail).await
             }
         }
     }
 
     /// `place_details` against the paid provider.
-    async fn google_details(&self, id: &str, place_id: &str, zone: &Zone) -> Result<Value, String> {
+    ///
+    /// # What a `standard` call here buys, which is nothing
+    ///
+    /// [`crate::places_google::GOOGLE_DETAILS_FIELD_MASK`] names the same field set as
+    /// [`crate::places_google::GOOGLE_SEARCH_FIELD_MASK`] — one prefixed, one not — so a
+    /// `standard` details call on an id this source produced returns THE SAME VALUES the
+    /// search that produced the id already returned, for a second billed call. That is a real
+    /// property of the contract rather than an oversight, and it is now said out loud in two
+    /// places: the tool description says it, and this path returns
+    /// `detail_adds_nothing_here` so a caller can see it on the response it just paid for.
+    ///
+    /// `rich` is what gives the tool a reason to exist on this source: it is the one way to
+    /// get review text for a place already found, without re-running — and re-billing — the
+    /// whole search at the dearer mask.
+    async fn google_details(
+        &self,
+        id: &str,
+        place_id: &str,
+        zone: &Zone,
+        detail: DetailLevel,
+    ) -> Result<Value, String> {
         let g = self.preferred().map_err(|cause| {
             format!(
                 "{id:?} names the source that carries ratings, and this call cannot reach \
@@ -1710,12 +1838,29 @@ impl PlacesClient {
             )
         })?;
         let (body, budget) = g
-            .details(&self.http, place_id)
+            .details(&self.http, place_id, detail)
             .await
             .map_err(|e| format!("{e}. Run `places_search` again to get a usable id"))?;
         // NAN for the distance, for the reason the OpenStreetMap path states below.
         let mut out = google_place_json(&body, f64::NAN, zone);
-        self.annotate(&mut out, Provider::GooglePlaces, None, Some(budget));
+        if !detail.is_rich() {
+            out["detail_adds_nothing_here"] = json!(
+                "For a record from this source, the standard field set of `place_details` is \
+                 the same field set `places_search` already returned, so this call cost a \
+                 billed request and added no information. Ask with detail: \"rich\" to get \
+                 review text and an editorial summary, which search at the standard level \
+                 does not carry."
+            );
+        }
+        let mut report = DetailReport::new(detail);
+        report.mask = Some(google_details_field_mask(detail));
+        self.annotate(
+            &mut out,
+            Provider::GooglePlaces,
+            None,
+            Some(budget),
+            &report,
+        );
         Ok(out)
     }
 
@@ -1726,6 +1871,7 @@ impl PlacesClient {
         kind: &'static str,
         num_id: u64,
         zone: &Zone,
+        detail: DetailLevel,
     ) -> Result<Value, String> {
         let overpass = format!("[out:json][timeout:25];\n{kind}({num_id});\nout center;\n");
         let body = self.fetch(&self.cfg.overpass_url, Some(overpass)).await?;
@@ -1785,7 +1931,13 @@ impl PlacesClient {
             Some(g) => g.ledger.peek().await,
             None => None,
         };
-        self.annotate(&mut out, Provider::OpenStreetMap, None, budget);
+        // A `rich` request this source served is announced rather than quietly answered at
+        // the standard level — it genuinely has no review text and no editorial summary, and
+        // a caller that asked for them is owed the difference between "this place has none"
+        // and "the source that answered has none".
+        let mut report = DetailReport::new(detail);
+        report.served_by_free_source();
+        self.annotate(&mut out, Provider::OpenStreetMap, None, budget, &report);
         Ok(out)
     }
 }
@@ -1869,6 +2021,95 @@ impl<'a> PlaceRef<'a> {
 /// same way and no cause has to know it will be used there. `place_details` deliberately does
 /// not use it: there the free source does not answer, it errors.
 pub const FELL_BACK: &str = ". This answer came from the free source instead";
+
+/// The sentence a response carries when a `rich` request was answered at `standard` because
+/// the source that answered has no such fields.
+///
+/// It is a CAUSE in the same voice [`PlacesClient::preferred`] produces, and the two tools
+/// compose it the same way they compose a provider fallback — so a caller reads one kind of
+/// sentence for "you did not get the source you wanted" and the same kind for "you did not
+/// get the field set you wanted".
+pub const NO_RICH_FROM_THIS_SOURCE: &str =
+    "the source that answered carries no review text and no editorial summary, so this answer \
+     is the standard field set; a richer one is only available from the source that bills per \
+     request";
+
+/// What a response says about how much was asked for, how much was served, and what that
+/// cost — carried together so the two tools cannot disagree about them.
+///
+/// **`requested` and `served` are BOTH reported even when they are equal**, and that is the
+/// whole point of the struct. A caller looking at a response with no reviews has to be able
+/// to tell *"I did not ask for them"* from *"I asked and this place has none"*, and a single
+/// field cannot say both. `mask` is the literal field mask that went out, so "what did I pay
+/// for" is answerable from the response itself rather than from this file.
+#[derive(Clone, Debug)]
+pub struct DetailReport {
+    pub requested: DetailLevel,
+    pub served: DetailLevel,
+    /// The mask that actually left this host, and `None` when no billed call was made —
+    /// which is also what makes `cost_tier` conditional. The free source has no mask and no
+    /// tier, and inventing one for it would be reporting a price nobody paid.
+    pub mask: Option<&'static str>,
+    /// Why `served` is below `requested`, when it is.
+    pub fallback_reason: Option<String>,
+}
+
+impl DetailReport {
+    /// A request that has not reached a source yet: served at what was asked for, no mask.
+    fn new(requested: DetailLevel) -> Self {
+        Self {
+            requested,
+            served: requested,
+            mask: None,
+            fallback_reason: None,
+        }
+    }
+
+    /// Record that the free source answered. It has no rich equivalent, so a `rich` request
+    /// is downgraded HERE, with the reason, rather than silently returning a standard record.
+    fn served_by_free_source(&mut self) {
+        self.served = DetailLevel::Standard;
+        self.mask = None;
+        if self.requested.is_rich() {
+            self.fallback_reason = Some(NO_RICH_FROM_THIS_SOURCE.to_string());
+        }
+    }
+
+    fn write_into(&self, obj: &mut Map<String, Value>) {
+        obj.insert("detail".to_string(), json!(self.served.label()));
+        obj.insert(
+            "detail_requested".to_string(),
+            json!(self.requested.label()),
+        );
+        if let Some(mask) = self.mask {
+            obj.insert("field_mask".to_string(), json!(mask));
+            obj.insert("cost_tier".to_string(), json!(self.served.cost_tier()));
+        }
+        if let Some(reason) = &self.fallback_reason {
+            obj.insert("detail_fallback_reason".to_string(), json!(reason));
+        }
+    }
+}
+
+/// What a `places_search` that found nothing says about why, when the reason is knowable.
+///
+/// **This costs nothing and is computed entirely on this side**, which is the point: the
+/// query named no category, so nothing narrowed what was fetched, so a bare business name had
+/// no chance of selecting the shop it names. That is a fact about the request, available
+/// before any source is asked, and a caller told it can fix the query in one move instead of
+/// concluding the place does not exist.
+///
+/// It fires only when the category table matched NOTHING and the result set is empty. With a
+/// category matched, an empty result is a real answer — there is no bakery within 300 m — and
+/// explaining it would be noise.
+pub const EMPTY_FALLBACK_EXPLANATION: &str =
+    "This query matched no category word, so nothing narrowed what was fetched and the words \
+     in it were only used to filter what came back. A bare business name selects nothing: the \
+     name is not what is searched for, it is what the results are sieved through. Add a \
+     category word and search again — \"clothing store Anderson\" rather than \"Anderson\", \
+     \"pharmacy Boots\" rather than \"Boots\" — which both narrows the fetch to that kind of \
+     place and reaches further from the centre, because the same result ceiling is then spent \
+     on that category instead of on whatever happens to be nearest.";
 
 /// One source's answer to `places_search`, before the envelope is put round it.
 pub struct SearchHits {
@@ -2148,7 +2389,15 @@ impl PlacesTool {
                  `with_rating` and `without_rating`. If the query contains a place or street \
                  name that matches no venue name, the name filter is dropped and \
                  `name_filter_relaxed` is true — the results are then everything in the \
-                 category within the radius."
+                 category within the radius. A QUERY WITH NO CATEGORY WORD IN IT selects \
+                 nothing to fetch and normally returns nothing at all; when that happens the \
+                 response says so in `no_results_explanation` rather than leaving an empty \
+                 list to be read as \"there is no such place\". Set `detail` to \"rich\" to \
+                 also get review text and an editorial summary, at a materially higher cost \
+                 per call and against a separate, much smaller allowance; every response says \
+                 which level it served in `detail`, which level was asked for in \
+                 `detail_requested`, and — when a billed source answered — the exact field \
+                 set it paid for in `field_mask` and its price tier in `cost_tier`."
             }
             PlacesTool::Details => {
                 "Get the fullest record for one place, by the `id` of a `places_search` \
@@ -2161,7 +2410,17 @@ impl PlacesTool {
                  with a reason and `open_now` is null — the raw value is still returned. If \
                  the source an id names is unavailable this call fails rather than answering \
                  from the other one, because the other one has no record under that id: run \
-                 `places_search` again to get a usable id."
+                 `places_search` again to get a usable id. \
+                 FOR A RECORD FROM SOME SOURCES A `standard` CALL HERE ADDS NOTHING: the \
+                 source that carries ratings answers this tool with the same field set it \
+                 answered the search with, so calling it at the default level spends a \
+                 billed request and returns values the caller already has — the response \
+                 says so in `detail_adds_nothing_here` when it happens. What that source \
+                 does have to add is `detail: \"rich\"`, which returns review text and an \
+                 editorial summary for ONE place without re-running, and re-paying for, the \
+                 whole search at the dearer field set. Reviews arrive with their author and \
+                 a `source_url`, and both must travel with any of that text that is \
+                 repeated to a person."
             }
         }
     }
@@ -2174,7 +2433,7 @@ impl PlacesTool {
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "What to look for: a category word (\"cafe\", \"pharmacy\", \"supermarket\") and/or part of a name. Category words select what is fetched; the rest filters by name."
+                        "description": "What to look for. ALWAYS INCLUDE A CATEGORY WORD (\"cafe\", \"pharmacy\", \"supermarket\", \"clothing store\"); a name may follow it. Only the category word selects what is fetched — a bare business name selects NOTHING and reliably returns an empty result, because the name is not searched for, it is only used to sieve what came back. \"clothing store Anderson\" works where \"Anderson\" finds nothing, and reaches further from the centre as well."
                     },
                     "latitude": {"type": "number", "description": "Centre of the search, -90 to 90."},
                     "longitude": {"type": "number", "description": "Centre of the search, -180 to 180."},
@@ -2183,6 +2442,12 @@ impl PlacesTool {
                         "description": "Search radius in metres. Default 1000, maximum 20000."
                     },
                     "limit": {"type": "number", "description": "Maximum places to return. Default 15, maximum 50."},
+                    "detail": {
+                        "type": "string",
+                        "enum": ["standard", "rich"],
+                        "default": "standard",
+                        "description": "How much to fetch per place. \"standard\" (the default) returns the fields listed above. \"rich\" also returns review text and, where one exists, an editorial summary — and COSTS MATERIALLY MORE PER CALL, against a separate and much smaller daily allowance that is reported as `rich_budget`. Ask for it only when the question needs what people said rather than how they scored it, and pair it with a small `limit`: it returns up to five reviews for EVERY result, so a rich search over fifteen places is a great deal of prose. Reviews carry display obligations — each one arrives with its author and a `source_url`, and those must travel with any of the text that is repeated to a person."
+                    },
                     "timezone": {
                         "type": "string",
                         "description": "IANA timezone name to evaluate `open_now` in, e.g. \"Europe/London\". Defaults to the host's zone; whichever is used is named in the response."
@@ -2197,6 +2462,12 @@ impl PlacesTool {
                     "id": {
                         "type": "string",
                         "description": "The `id` of a `places_search` result, passed back verbatim. Ids are opaque: do not construct, edit or guess one."
+                    },
+                    "detail": {
+                        "type": "string",
+                        "enum": ["standard", "rich"],
+                        "default": "standard",
+                        "description": "How much to fetch. \"standard\" (the default) is the field set search already returned — see the tool description before spending a call on it. \"rich\" adds review text and, where one exists, an editorial summary; it costs materially more per call, against the separate allowance reported as `rich_budget`, and is the reason to call this tool at all for a place search has already returned."
                     },
                     "timezone": {
                         "type": "string",
@@ -2715,6 +2986,171 @@ mod tests {
         }
         assert_eq!(PlacesTool::parse("places_delete"), None);
         assert_eq!(PlacesTool::parse(""), None);
+    }
+
+    // ---- the detail level ----------------------------------------------------------
+
+    /// **THE TOOL SET IS STILL EXACTLY TWO NAMES.** The richer field set arrived as an
+    /// argument precisely so that it would not be a third and fourth tool: `capability_args`
+    /// carries tool NAMES and never schemas, so a new property moves no argv, so the
+    /// committed containment record still speaks for the deployment and this change costs no
+    /// live battery. A third name would have cost one.
+    #[test]
+    fn the_richer_field_set_added_no_tool_name() {
+        assert_eq!(PlacesTool::ALL.len(), 2);
+        let names: Vec<&str> = PlacesTool::ALL.iter().map(|t| t.tool_name()).collect();
+        assert_eq!(names, vec!["places_search", "place_details"]);
+        for invented in [
+            "places_search_rich",
+            "place_details_rich",
+            "places_reviews",
+            "place_reviews",
+        ] {
+            assert_eq!(
+                PlacesTool::parse(invented),
+                None,
+                "{invented} must not exist: a third tool name is a containment battery"
+            );
+        }
+        // And it IS on both of the two that do exist.
+        for t in PlacesTool::ALL {
+            let schema = t.input_schema();
+            let detail = &schema["properties"]["detail"];
+            assert_eq!(detail["type"], json!("string"), "{}", t.tool_name());
+            assert_eq!(detail["enum"], json!(["standard", "rich"]));
+            assert_eq!(
+                detail["default"],
+                json!("standard"),
+                "the default must be the cheap answer on both tools"
+            );
+            assert!(
+                !schema["required"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!("detail")),
+                "an optional parameter, or every existing caller breaks"
+            );
+        }
+    }
+
+    /// The default is the cheap answer, and an unrecognised value is an ERROR rather than a
+    /// silent downgrade — a caller that believes it paid for reviews must not be quietly
+    /// handed the standard record.
+    #[test]
+    fn the_detail_argument_defaults_to_standard_and_refuses_nonsense() {
+        assert_eq!(
+            DetailLevel::parse_arg(&json!({})).unwrap(),
+            DetailLevel::Standard,
+            "absent means standard"
+        );
+        assert_eq!(
+            DetailLevel::parse_arg(&json!({"detail": null})).unwrap(),
+            DetailLevel::Standard
+        );
+        assert_eq!(
+            DetailLevel::parse_arg(&json!({"detail": "standard"})).unwrap(),
+            DetailLevel::Standard
+        );
+        assert_eq!(
+            DetailLevel::parse_arg(&json!({"detail": "rich"})).unwrap(),
+            DetailLevel::Rich
+        );
+        // Case and surrounding space are forgiven; anything else is refused.
+        assert_eq!(
+            DetailLevel::parse_arg(&json!({"detail": "  RICH "})).unwrap(),
+            DetailLevel::Rich
+        );
+        for bad in [
+            json!("full"),
+            json!("everything"),
+            json!(""),
+            json!(true),
+            json!(2),
+        ] {
+            let err = DetailLevel::parse_arg(&json!({"detail": bad}))
+                .expect_err("an unrecognised detail level must not be answered cheaply");
+            assert!(err.contains("standard") && err.contains("rich"), "{err}");
+        }
+        assert_eq!(DetailLevel::default(), DetailLevel::Standard);
+        assert_eq!(DetailLevel::Standard.cost_tier(), "enterprise");
+        assert_eq!(DetailLevel::Rich.cost_tier(), "enterprise_atmosphere");
+        assert!(!DetailLevel::Standard.is_rich());
+        assert!(DetailLevel::Rich.is_rich());
+    }
+
+    /// **A caller must be able to tell "I did not ask for reviews" from "I asked and there
+    /// are none".** One field cannot say both, so the report carries what was asked for AND
+    /// what was served, even when they are the same.
+    #[test]
+    fn the_response_says_what_was_asked_for_as_well_as_what_it_served() {
+        let mut obj = Map::new();
+        DetailReport::new(DetailLevel::Standard).write_into(&mut obj);
+        assert_eq!(obj["detail"], json!("standard"));
+        assert_eq!(obj["detail_requested"], json!("standard"));
+        assert!(
+            !obj.contains_key("field_mask") && !obj.contains_key("cost_tier"),
+            "no billed call was made, so there is no mask and no price to report"
+        );
+        assert!(!obj.contains_key("detail_fallback_reason"));
+
+        // Served rich by the billed source: the exact mask and its tier are on the response,
+        // so "what did I pay for" is answerable without reading the source.
+        let mut obj = Map::new();
+        let mut r = DetailReport::new(DetailLevel::Rich);
+        r.mask = Some(crate::places_google::GOOGLE_SEARCH_FIELD_MASK_RICH);
+        r.write_into(&mut obj);
+        assert_eq!(obj["detail"], json!("rich"));
+        assert_eq!(obj["detail_requested"], json!("rich"));
+        assert_eq!(obj["cost_tier"], json!("enterprise_atmosphere"));
+        assert!(obj["field_mask"]
+            .as_str()
+            .unwrap()
+            .contains("places.reviews"));
+
+        // A rich request the free source served: downgraded, and SAID SO in the same voice a
+        // provider fallback uses.
+        let mut obj = Map::new();
+        let mut r = DetailReport::new(DetailLevel::Rich);
+        r.served_by_free_source();
+        r.write_into(&mut obj);
+        assert_eq!(obj["detail"], json!("standard"), "what it actually served");
+        assert_eq!(obj["detail_requested"], json!("rich"), "what was asked for");
+        assert_eq!(
+            obj["detail_fallback_reason"],
+            json!(NO_RICH_FROM_THIS_SOURCE)
+        );
+        assert!(!obj.contains_key("cost_tier"), "nothing was billed");
+
+        // A STANDARD request the free source served falls back on nothing, so it explains
+        // nothing — the caller got exactly what it asked for.
+        let mut obj = Map::new();
+        let mut r = DetailReport::new(DetailLevel::Standard);
+        r.served_by_free_source();
+        r.write_into(&mut obj);
+        assert!(!obj.contains_key("detail_fallback_reason"));
+    }
+
+    /// The explanation names the fix in words a caller can act on without reading this file:
+    /// that a category word is what selects, and that a bare name selects nothing.
+    #[test]
+    fn the_empty_result_explanation_says_what_to_do_instead() {
+        let e = EMPTY_FALLBACK_EXPLANATION;
+        assert!(e.contains("category word"), "{e}");
+        assert!(e.contains("bare business name"), "{e}");
+        assert!(
+            e.contains("clothing store Anderson"),
+            "an example beats a rule: {e}"
+        );
+        // And the schema says it too, so a caller never has to make the failing call first.
+        let q = PlacesTool::Search.input_schema()["properties"]["query"]["description"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(q.contains("CATEGORY WORD"), "{q}");
+        assert!(
+            q.contains("selects NOTHING"),
+            "the schema must say it outright: {q}"
+        );
     }
 
     // ---- query handling -----------------------------------------------------------

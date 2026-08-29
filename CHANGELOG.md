@@ -13,6 +13,77 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [bridge 0.105.0] - 2026-08-29
+
+### Added
+
+- **`places` can be asked for more, and is only ever asked for more deliberately.** Both
+  tools take an optional `detail` parameter — `"standard"` (the default) or `"rich"`. The
+  default is byte-for-byte what 0.104.0 sent and returned; `rich` raises the field mask to
+  add **review text** and, where one exists, an editorial summary. Review text was the thing
+  that was actually missing: a rating says a place is well liked and cannot say why.
+
+  **No tool was added or renamed.** `DEFAULT_ALLOWED_TOOLS` and `MAIN_CHILD_MCP_CONFIG` are
+  byte-identical to 0.104.0, so `toolset_args` did not move, so the committed containment
+  record still speaks for the deployment and this cost no live battery — verified against the
+  gate's own strict-equality comparison rather than asserted.
+
+- **Every response now says what it was asked for, what it served, and what that cost.**
+  `detail_requested` and `detail` are both reported even when equal, because a caller reading
+  a response with no reviews has to be able to tell *"I did not ask for them"* from *"I asked
+  and this place has none"*. A billed answer also carries `field_mask` — the literal mask that
+  left the host — and `cost_tier`.
+
+- **A second, much lower ceiling for the dearer calls**, `JESSE_PLACES_GOOGLE_MAX_RICH_CALLS`,
+  default **20** against the ordinary 200, counted over the same rolling window and reported
+  as `rich_budget`. A rich call counts against **both** ceilings — it is a dearer call, not a
+  second pool — so an accidental loop of them trips ten times sooner than the ordinary budget
+  would allow, while the ordinary budget still has nine tenths of its room. The ledger's tier
+  column records `enterprise_atmosphere` for such a call; a line written by 0.104.0 says
+  `enterprise` and correctly counts against neither rich ceiling, and a line whose tier column
+  is unreadable counts against **both**, on the same fail-closed rule the timestamp column
+  already had.
+
+- **Review text carries the obligations that come with it.** Google's Places policy requires
+  that the author be credited and that the source review remain reachable, so every returned
+  review carries its author's name, profile link and avatar URI and its own `source_url`, plus
+  the publish date, a report link and — for places in France, where it is required — the visit
+  date. A review arriving without an author or a source link is **withheld** rather than
+  returned unshowable, and the count of those is reported as `reviews_withheld`. Nothing is
+  reordered, filtered, edited or truncated, which is the only thing that makes the ordering
+  notice carried alongside a true statement.
+
+### Fixed
+
+- **A search that finds nothing now says why, at no cost.** `places_search` with a bare
+  business name — `"Anderson Kilts"` — matched no category, so nothing narrowed what was
+  fetched, so the name filter sieved a result set the shop was never in and the answer was an
+  unexplained empty list. The response now carries `no_results_explanation` whenever the
+  category table matched nothing and the result set is empty, saying that a category word is
+  what selects and that a bare name selects nothing, with a worked example. The `query` schema
+  description says it outright as well, so the failing call need not be made first.
+
+- **`place_details` no longer spends money silently for no new information.** For a record
+  from the source that carries ratings, the details field mask names the same fields as the
+  search mask, so a `standard` details call returned exactly what the search that produced the
+  id had already returned — measured, and true of every field but the timestamp `open_now` was
+  evaluated at. That call now returns `detail_adds_nothing_here` saying so, and both the tool
+  description and the `detail` schema say it before the call is made. `detail: "rich"` is what
+  gives the tool a reason to exist on that source: review text for one place, without
+  re-running and re-paying for a whole search at the dearer mask.
+
+### Unchanged, deliberately
+
+- **No caller-authored string reaches a remote service.** The richer field set buys FIELDS in
+  the response and never a channel out of the host: the request body is still a coordinate, a
+  radius, a count and place types drawn from the closed compile-time table, and Text Search
+  remains unused and unreachable. An opt-in text query was considered and **not built** — no
+  gate defensible against a child that reads attacker-authored message bodies could be
+  constructed for it. See the pull request.
+
+- **No caching position was relaxed.** Review text is Google Maps Content like any other and
+  none of it is cached; the five-minute response cache remains OpenStreetMap-only.
+
 ## [bridge 0.104.0] - 2026-08-29
 
 ### Added
