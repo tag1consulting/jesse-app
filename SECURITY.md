@@ -388,7 +388,7 @@ adding it to `DEPLOY_BINS` ships a config naming a command that is not installed
 bridge starts cleanly, answers `/health`, and registers zero tools for that server on every
 turn thereafter, with no error written anywhere.
 
-### Places (`places`, 2026-08-27; second provider 2026-08-29)
+### Places (`places`, 2026-08-27; second provider 2026-08-29; opt-in richer field set 2026-08-29)
 
 The child has had Apple Maps search since 0.99.0, and that tool returns **no opening hours and
 no ratings, ever** — a limit of its upstream data source, not of its configuration. "What is
@@ -414,6 +414,11 @@ all, exactly as it did before.**
 | --- | --- |
 | `mcp__places__places_search` | free-text query + latitude/longitude/radius → nearby places with hours |
 | `mcp__places__place_details` | one id from a search result → the fullest record for it |
+
+**Still exactly two, and that is the point.** 0.105.0 added an opt-in richer field set as an
+optional `detail` PARAMETER on both of them rather than as a third and fourth tool name, for
+the containment reason set out immediately below: `capability_args` carries tool names and
+never schemas, so an added property moves no argv.
 
 #### The tool names name no provider, and that is a containment decision
 
@@ -503,11 +508,22 @@ attacker-authored content. Four controls, all inside the server:
   a SKU tier and a running count. It is a file rather than a counter because
   `jesse-places-mcp` is spawned **per turn**, so an in-process counter would reset on every
   question and bound nothing across a day.
-* **Minimum field masks.** That API bills per request at the highest SKU tier any field in the
-  mask belongs to. `rating`, `userRatingCount` and `regularOpeningHours` are all Enterprise, so
-  Enterprise is the floor for this tool contract; the masks are pinned to that floor and a test
-  asserts the Enterprise + Atmosphere families (`reviews`, `photos`, `editorialSummary`, the
-  service/amenity block) are absent.
+* **Minimum field masks by default, and a dearer one only when asked for.** That API bills per
+  request at the highest SKU tier any field in the mask belongs to. `rating`,
+  `userRatingCount` and `regularOpeningHours` are all Enterprise, so Enterprise is the floor
+  for this tool contract; the default masks are pinned to that floor and a test asserts the
+  Enterprise + Atmosphere families are absent from them. Since 0.105.0 a caller may pass
+  `detail: "rich"`, which raises the mask by exactly `reviews` and `editorialSummary` and
+  therefore bills the whole call at Enterprise + Atmosphere. `photos` and the service/amenity
+  block are still excluded. **All four masks are pinned byte-for-byte by a test**, so adding
+  any field has to change a test whose failure message says what that field costs.
+* **A second, much lower ceiling for those dearer calls** (`JESSE_PLACES_GOOGLE_MAX_RICH_CALLS`,
+  default **20** against the ordinary 200), counted over the same rolling window. A rich call
+  counts against **both** ceilings — it is a dearer call, not a second pool — so an accidental
+  loop of them trips ten times sooner than the ordinary budget would allow, and the ordinary
+  budget still has nine tenths of its room when it does. A separate counter was chosen over a
+  weight on the shared one because a weight is arithmetic derived from a price ratio that
+  Google can change, and a shared pool lets the wrong kind of call spend the allowance.
 * **No caching of Google content at all** — see below. That is a refusal, not an omission.
 
 #### Google's terms permit almost no caching, and the design obeys that rather than working round it
@@ -532,6 +548,46 @@ Two further terms bind this use and are complied with: **§14.1** permits Places
 without a Google map and **§14.2** forbids it *with* a non-Google map — this server renders no
 map — and the attribution requirement, met by an `attribution` field on every Google-served
 record plus the provider's own `attributions` array passed through untouched.
+
+#### Review text (0.105.0) carries obligations a rating does not, and a larger untrusted surface
+
+`detail: "rich"` returns review text, and the Places API policy page attaches named
+requirements to displaying it that it does not attach to a rating: *"You must always credit
+the author when displaying photos or reviews. Each photo and review includes an author
+attribution (author's avatar image, name, and profile link)"*, and *"For each photo and
+review, end-users must always have access to view the individual source photo or review on
+Google Maps using the provided `googleMapsUri`."* It also requires *"a clear notice that
+describes how reviews are being ordered and filtered"*, and — for places in France and French
+territories — that the returned `visitDate` be *"displayed alongside the content"*.
+
+Those are met inside the server rather than left to the caller, because the caller is a
+language model that will summarise whatever it is handed. Every returned review carries its
+author's name, profile link and avatar URI, its own `source_url`, its publish date, a report
+link, and a visit date where one was sent; the array keeps the order it arrived in and nothing
+is filtered, edited or truncated, which is the only thing that makes the notice carried
+alongside it true. **A review arriving without an author or a source link is withheld rather
+than returned unshowable**, and the count of withheld reviews is reported.
+
+Nothing about the caching position changes: review text is Google Maps Content and none of it
+is cached. §3.2.3(a)(iii), which names *"copy and save business names, addresses, or user
+reviews"* as prohibited scraping, applies to what a **turn** does with the text afterwards —
+the same operator boundary already recorded above for names and addresses, with the stakes
+raised because a review is a named private individual's words.
+
+What is genuinely new on the security side is **inbound volume**, and it is bounded rather
+than merely noted. A review is text any member of the public can author, which makes it the
+same trust level as a fetched web page — but this API returns up to five reviews per place, so
+a rich search at `limit: 20` would put a hundred of them into the context of a child that also
+reads attacker-authored message bodies and can write to the vault. **The request budget does
+not bound this**: twenty such searches sit comfortably inside the rich ceiling, so the ceiling
+caps money and not injection surface.
+
+So **a search returns one review per place** (`SEARCH_REVIEWS_PER_PLACE`), which takes the
+worst case for one call from ~100 reviews to 20, and `place_details` — which names a single
+place — returns the full set. That is the honest division of labour rather than a compromise:
+a search asks which result to look at, for which the most relevant review is a sample. The cap
+is reported, never silent: `reviews_per_place_cap` on the envelope and `reviews_not_sent` on
+any record holding more back.
 
 One term is worth flagging as a limit this tool cannot enforce: **§3.2.3(c)(vii)** forbids
 using Google Maps Content *"to improve machine learning and artificial intelligence models,
@@ -560,7 +616,8 @@ above, and it is in the deploy binary set. Configuration is entirely by environm
 `JESSE_PLACES_MIN_INTERVAL_MS`, `JESSE_PLACES_CACHE_TTL_SECS`, `JESSE_PLACES_HTTP_TIMEOUT_SECS`,
 `JESSE_PLACES_TIMEZONE`, `JESSE_PLACES_PROVIDER`, `JESSE_PLACES_GOOGLE_API_KEY`,
 `JESSE_PLACES_GOOGLE_BASE_URL`, `JESSE_PLACES_GOOGLE_MAX_CALLS`,
-`JESSE_PLACES_GOOGLE_WINDOW_SECS`, `JESSE_PLACES_GOOGLE_LEDGER`) and never by argv —
+`JESSE_PLACES_GOOGLE_WINDOW_SECS`, `JESSE_PLACES_GOOGLE_MAX_RICH_CALLS`,
+`JESSE_PLACES_GOOGLE_LEDGER`) and never by argv —
 deliberately, so that repointing a backend when the public instance is unavailable does not
 change the argv the containment record commits by strict equality. None of these grant a tool;
 the startup gate says so itself.

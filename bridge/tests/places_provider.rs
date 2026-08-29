@@ -29,7 +29,8 @@ use axum::{
 };
 use jesse_bridge::{
     run_places_tool, ApiKey, GoogleConfig, PlacesClient, PlacesConfig, PlacesTool,
-    ProviderPreference, GOOGLE_DETAILS_FIELD_MASK, GOOGLE_SEARCH_FIELD_MASK,
+    ProviderPreference, GOOGLE_DETAILS_FIELD_MASK, GOOGLE_DETAILS_FIELD_MASK_RICH,
+    GOOGLE_SEARCH_FIELD_MASK, GOOGLE_SEARCH_FIELD_MASK_RICH,
 };
 use serde_json::{json, Value};
 
@@ -216,6 +217,7 @@ fn google_cfg(base: &str, sc: &Scratch, max_calls: u32) -> GoogleConfig {
         api_key: ApiKey::new("fixture-key"),
         base_url: format!("{base}/v1"),
         max_calls,
+        rich_max_calls: max_calls,
         window: Duration::from_secs(3600),
         ledger: Some(sc.ledger()),
     }
@@ -557,4 +559,504 @@ async fn the_paid_sources_responses_are_never_reused() {
         );
     }
     assert_eq!(seen.lock().unwrap().bodies.len(), 3);
+}
+
+// ---- the richer field set ------------------------------------------------------------------
+
+/// One paid-source record at the richer level: everything the standard fixture has, plus the
+/// two fields the dearer mask buys. The review is shaped exactly as a live response shapes
+/// one, author attribution and source link included, because those two are what the tool has
+/// to carry to be allowed to return the text at all.
+fn google_rich_body() -> Value {
+    let mut body = google_body();
+    body["places"][0]["editorialSummary"] =
+        json!({"text": "A long-established kiltmaker.", "languageCode": "en"});
+    body["places"][0]["reviews"] = json!([
+    {
+        "name": "places/ChIJFixture/reviews/Ci9DQUlR",
+        "relativePublishTimeDescription": "a month ago",
+        "rating": 5,
+        "text": {"text": "The fitting was unhurried and the staff were kind.", "languageCode": "en"},
+        "originalText": {"text": "The fitting was unhurried and the staff were kind.", "languageCode": "en"},
+        "authorAttribution": {
+            "displayName": "A Reviewer",
+            "uri": "https://www.google.com/maps/contrib/1/reviews",
+            "photoUri": "https://lh3.googleusercontent.com/a/x=s128",
+        },
+        "publishTime": "2026-07-04T13:57:43.708815105Z",
+        "flagContentUri": "https://www.google.com/local/content/rap/report?postId=x",
+        "googleMapsUri": "https://www.google.com/maps/reviews/data=!4m6",
+    },
+    // A SECOND ONE, so the search path's volume cap is observable end to end rather than
+    // only in a unit test.
+    {
+        "name": "places/ChIJFixture/reviews/Ci9DQUlS",
+        "relativePublishTimeDescription": "a year ago",
+        "rating": 4,
+        "text": {"text": "Good, but the queue was long.", "languageCode": "en"},
+        "authorAttribution": {
+            "displayName": "Another Reviewer",
+            "uri": "https://www.google.com/maps/contrib/2/reviews",
+            "photoUri": "https://lh3.googleusercontent.com/a/y=s128",
+        },
+        "publishTime": "2025-08-04T10:00:00Z",
+        "googleMapsUri": "https://www.google.com/maps/reviews/data=!4m7",
+    }]);
+    body
+}
+
+fn rich_search_args() -> Value {
+    let mut a = search_args();
+    a["detail"] = json!("rich");
+    a
+}
+
+/// **The default did not move, asserted against the bytes that left the host.** A search with
+/// no `detail` argument sends the mask 0.104.0 sent, and reports the standard tier — this is
+/// the regression that matters most, because everything else here is opt-in.
+#[tokio::test]
+async fn a_search_with_no_detail_argument_sends_exactly_the_old_mask() {
+    let sc = Scratch::new("detail-default");
+    let (overpass, _osm) = start_fake_overpass().await;
+    let (google, seen) = start_fake_google(Ok(google_body())).await;
+    let out = search(config(&overpass, Some(google_cfg(&google, &sc, 10)))).await;
+
+    assert_eq!(seen.lock().unwrap().masks, vec![GOOGLE_SEARCH_FIELD_MASK]);
+    assert_eq!(out["detail"], json!("standard"));
+    assert_eq!(out["detail_requested"], json!("standard"));
+    assert_eq!(out["cost_tier"], json!("enterprise"));
+    assert_eq!(out["field_mask"], json!(GOOGLE_SEARCH_FIELD_MASK));
+    assert!(
+        out.get("detail_fallback_reason").is_none(),
+        "nothing was downgraded"
+    );
+    // The record carries no review keys at all — not an empty array, which would read as
+    // "this place has no reviews".
+    for absent in ["reviews", "reviews_notice", "editorial_summary"] {
+        assert!(out["places"][0].get(absent).is_none(), "{absent}");
+    }
+    // And the ledger line is the one the old code wrote.
+    let ledger = std::fs::read_to_string(sc.ledger()).unwrap();
+    assert!(ledger.contains("\tenterprise\t1/10"), "{ledger}");
+    assert!(!ledger.contains("enterprise_atmosphere"), "{ledger}");
+}
+
+/// **`rich` sends the dearer mask and nothing dearer still** — and the egress property is
+/// untouched: the request body is the same coordinate, radius, count and table-supplied
+/// types, with no caller-authored string and no `textQuery`. The extra spend buys FIELDS in
+/// the response, never a new channel out of the host.
+#[tokio::test]
+async fn a_rich_search_sends_the_rich_mask_and_still_no_caller_string() {
+    let sc = Scratch::new("detail-rich");
+    let (overpass, osm_seen) = start_fake_overpass().await;
+    let (google, seen) = start_fake_google(Ok(google_rich_body())).await;
+    let client =
+        PlacesClient::new(config(&overpass, Some(google_cfg(&google, &sc, 10)))).expect("client");
+    let out = run_places_tool(&client, PlacesTool::Search, &rich_search_args())
+        .await
+        .expect("search must answer");
+
+    assert_eq!(out["provider"], json!("google_places"));
+    assert_eq!(out["detail"], json!("rich"));
+    assert_eq!(out["detail_requested"], json!("rich"));
+    assert_eq!(out["cost_tier"], json!("enterprise_atmosphere"));
+    assert_eq!(out["field_mask"], json!(GOOGLE_SEARCH_FIELD_MASK_RICH));
+
+    let s = seen.lock().unwrap();
+    assert_eq!(
+        s.masks,
+        vec![GOOGLE_SEARCH_FIELD_MASK_RICH.to_string()],
+        "the mask on the wire is the rich one, exactly"
+    );
+    // THE EGRESS PROPERTY IS UNCHANGED BY THE RICHER FIELD SET.
+    let body = &s.bodies[0];
+    let sent: Value = serde_json::from_str(body).expect("a JSON body");
+    assert_eq!(sent["includedTypes"], json!(["cafe", "coffee_shop"]));
+    assert!(
+        sent.get("textQuery").is_none(),
+        "the free-text endpoint is still not used and its parameter is still never sent"
+    );
+    assert!(
+        !body.contains("rich") && !body.contains("detail"),
+        "the detail level is a mask header and a budget decision, not a request field: {body}"
+    );
+    drop(s);
+    assert!(osm_seen.lock().unwrap().bodies.is_empty());
+
+    // What the extra spend actually bought, on the record.
+    let p = &out["places"][0];
+    assert_eq!(
+        p["editorial_summary"],
+        json!("A long-established kiltmaker.")
+    );
+    assert_eq!(
+        p["reviews"][0]["text"],
+        json!("The fitting was unhurried and the staff were kind.")
+    );
+    // AND THE OBLIGATIONS THAT COME WITH IT: an author, and a link to the review at source.
+    assert_eq!(p["reviews"][0]["author"]["name"], json!("A Reviewer"));
+    assert!(p["reviews"][0]["author"]["profile_url"].is_string());
+    assert!(p["reviews"][0]["author"]["avatar_url"].is_string());
+    assert!(p["reviews"][0]["source_url"].is_string());
+    assert!(
+        p["reviews_notice"]
+            .as_str()
+            .expect("the ordering notice travels with the reviews")
+            .contains("order the source returned them"),
+        "{p}"
+    );
+    // **THE VOLUME CAP.** The request budget bounds what a rich call costs, not what it
+    // carries; without this one search at `limit: 20` could return a hundred reviews of
+    // public-authored text into a turn's context. One per place, and both the cap and the
+    // remainder are stated rather than applied silently.
+    assert_eq!(
+        p["reviews"].as_array().map(Vec::len),
+        Some(1),
+        "a rich SEARCH sends one review per place"
+    );
+    assert_eq!(
+        p["reviews_not_sent"],
+        json!(1),
+        "and says how many it held back, which is what sends a caller to the other tool"
+    );
+    assert_eq!(
+        out["reviews_per_place_cap"],
+        json!(1),
+        "stated on the envelope too, so 'this place has one review' and 'search sends one \
+         review per place' are distinguishable"
+    );
+    // The standard fields are all still there — `rich` adds, it does not replace.
+    assert_eq!(p["rating"], json!(4.4));
+    assert_eq!(p["rating_count"], json!(2183));
+    assert_eq!(p["opening_hours"]["parsed"], json!(true));
+}
+
+/// **A rich call is accounted under its own key with its own ceiling, and the ordinary budget
+/// object is untouched.** A shared undifferentiated counter would let a loop of dear calls
+/// spend several times what the number in the response implies.
+#[tokio::test]
+async fn a_rich_call_is_accounted_separately_from_an_ordinary_one() {
+    let sc = Scratch::new("detail-ledger");
+    let (overpass, _osm) = start_fake_overpass().await;
+    let (google, _seen) = start_fake_google(Ok(google_rich_body())).await;
+    let client =
+        PlacesClient::new(config(&overpass, Some(google_cfg(&google, &sc, 10)))).expect("client");
+
+    let standard = run_places_tool(&client, PlacesTool::Search, &search_args())
+        .await
+        .expect("search");
+    assert_eq!(
+        standard["budget"],
+        json!({"used": 1, "limit": 10, "window_seconds": 3600}),
+        "the object 0.104.0 emitted, unchanged in keys and in values"
+    );
+    assert_eq!(
+        standard["rich_budget"],
+        json!({"used": 0, "limit": 10, "window_seconds": 3600}),
+        "an ordinary call spends none of the rich allowance"
+    );
+
+    let rich = run_places_tool(&client, PlacesTool::Search, &rich_search_args())
+        .await
+        .expect("search");
+    assert_eq!(
+        rich["budget"],
+        json!({"used": 2, "limit": 10, "window_seconds": 3600}),
+        "a rich call is still a call and counts against the ordinary ceiling too"
+    );
+    assert_eq!(
+        rich["rich_budget"],
+        json!({"used": 1, "limit": 10, "window_seconds": 3600})
+    );
+
+    // The ledger tells them apart by tier, which is what the second ceiling reads back.
+    let ledger = std::fs::read_to_string(sc.ledger()).unwrap();
+    let lines: Vec<&str> = ledger.lines().collect();
+    assert_eq!(lines.len(), 2, "{ledger}");
+    assert!(lines[0].contains("\tenterprise\t"), "{ledger}");
+    assert!(lines[1].contains("\tenterprise_atmosphere\t"), "{ledger}");
+    assert!(lines[1].contains("rich=1/10"), "{ledger}");
+}
+
+/// **The rich ceiling trips on its own, with the ordinary budget barely touched** — and the
+/// tool keeps answering, because a spent budget has always meant a fallback rather than a
+/// failure. The reason names the ceiling that stopped it.
+#[tokio::test]
+async fn a_spent_rich_ceiling_falls_back_while_the_ordinary_budget_still_has_room() {
+    let sc = Scratch::new("detail-rich-cap");
+    let (overpass, osm_seen) = start_fake_overpass().await;
+    let (google, seen) = start_fake_google(Ok(google_rich_body())).await;
+    let mut cfg = google_cfg(&google, &sc, 20);
+    cfg.rich_max_calls = 1;
+    let client = PlacesClient::new(config(&overpass, Some(cfg))).expect("client");
+
+    let first = run_places_tool(&client, PlacesTool::Search, &rich_search_args())
+        .await
+        .expect("search");
+    assert_eq!(first["provider"], json!("google_places"));
+    assert_eq!(first["detail"], json!("rich"));
+
+    let second = run_places_tool(&client, PlacesTool::Search, &rich_search_args())
+        .await
+        .expect("search must still answer");
+    assert_eq!(
+        second["provider"],
+        json!("openstreetmap"),
+        "a spent budget falls back rather than failing"
+    );
+    let why = second["provider_fallback_reason"]
+        .as_str()
+        .expect("a reason");
+    assert!(
+        why.contains("richer field set") && why.contains("1 of 1"),
+        "the reason names the ceiling that stopped it: {why}"
+    );
+    assert!(
+        why.contains("1 of 20"),
+        "and says the ordinary budget still has room: {why}"
+    );
+    assert_eq!(second["detail"], json!("standard"));
+    assert_eq!(second["detail_requested"], json!("rich"));
+    assert_eq!(
+        seen.lock().unwrap().bodies.len(),
+        1,
+        "the second call must not reach the paid source at all"
+    );
+    assert_eq!(osm_seen.lock().unwrap().bodies.len(), 1);
+
+    // AND THE CHEAP ANSWER IS STILL AVAILABLE FROM THE PAID SOURCE. The rich budget is spent;
+    // the ordinary one is not, so a standard call still gets ratings and hours.
+    let standard = run_places_tool(&client, PlacesTool::Search, &search_args())
+        .await
+        .expect("search");
+    assert_eq!(standard["provider"], json!("google_places"));
+    assert_eq!(standard["detail"], json!("standard"));
+}
+
+/// **A rich request the free source serves says so, in the same voice a provider fallback
+/// uses** — rather than silently returning a standard record that a caller would read as
+/// "this place has no reviews".
+#[tokio::test]
+async fn a_rich_request_served_by_the_free_source_announces_it() {
+    let (overpass, _osm) = start_fake_overpass().await;
+    let client = PlacesClient::new(config(&overpass, None)).expect("client");
+    let out = run_places_tool(&client, PlacesTool::Search, &rich_search_args())
+        .await
+        .expect("search must answer");
+
+    assert_eq!(out["provider"], json!("openstreetmap"));
+    assert_eq!(out["detail_requested"], json!("rich"), "what was asked for");
+    assert_eq!(out["detail"], json!("standard"), "what was served");
+    let why = out["detail_fallback_reason"]
+        .as_str()
+        .expect("a rich request the free source served must explain itself");
+    assert!(why.contains("no review text"), "{why}");
+    assert!(
+        !why.is_empty() && why.contains("bills per request"),
+        "it says where a richer answer would have to come from: {why}"
+    );
+    assert!(
+        out.get("cost_tier").is_none() && out.get("field_mask").is_none(),
+        "nothing was billed, so no price and no mask are reported"
+    );
+    // A real answer still came back — the downgrade is announced, not fatal.
+    assert_eq!(out["returned"], json!(1));
+}
+
+/// **The empty answer explains itself, at no cost.** A bare business name matches no category,
+/// so nothing narrows what is fetched and the name only sieves what came back — which is the
+/// whole reason this returns nothing, and is knowable before any source is asked.
+#[tokio::test]
+async fn a_bare_business_name_that_finds_nothing_says_why() {
+    let (overpass, _osm) = start_fake_overpass().await;
+    let client = PlacesClient::new(config(&overpass, None)).expect("client");
+    let out = run_places_tool(
+        &client,
+        PlacesTool::Search,
+        &json!({"query": "Anderson Kilts", "latitude": 55.0701, "longitude": -3.6053, "radius_m": 1500}),
+    )
+    .await
+    .expect("search must answer");
+
+    assert_eq!(out["returned"], json!(0));
+    assert_eq!(out["used_fallback_categories"], json!(true));
+    assert_eq!(out["matched_categories"], json!([]));
+    let why = out["no_results_explanation"]
+        .as_str()
+        .expect("an empty result from a category-less query must explain itself");
+    assert!(why.contains("category word"), "{why}");
+    assert!(why.contains("bare business name"), "{why}");
+
+    // AND IT DOES NOT FIRE WHEN A CATEGORY MATCHED. There an empty result is a real answer —
+    // no café within the radius — and explaining it would be noise.
+    let out = run_places_tool(
+        &client,
+        PlacesTool::Search,
+        &json!({"query": "bakery Nowhere", "latitude": 55.0701, "longitude": -3.6053}),
+    )
+    .await
+    .expect("search must answer");
+    assert_eq!(out["used_fallback_categories"], json!(false));
+    assert!(
+        out.get("no_results_explanation").is_none(),
+        "a category matched, so an empty result needs no explaining"
+    );
+}
+
+/// **`place_details` at the standard level on a paid-source id buys nothing, and now says
+/// so.** The details mask names the same field set the search mask does, so the call spends a
+/// billed request to return values the caller already had.
+#[tokio::test]
+async fn standard_details_on_a_paid_id_says_it_added_nothing() {
+    let sc = Scratch::new("detail-details-standard");
+    let (overpass, _osm) = start_fake_overpass().await;
+    let one = google_body()["places"][0].clone();
+    let (google, seen) = start_fake_google(Ok(one)).await;
+    let client =
+        PlacesClient::new(config(&overpass, Some(google_cfg(&google, &sc, 10)))).expect("client");
+    let out = run_places_tool(
+        &client,
+        PlacesTool::Details,
+        &json!({"id": "google/ChIJFixture", "timezone": "Europe/London"}),
+    )
+    .await
+    .expect("details must answer");
+
+    assert_eq!(out["detail"], json!("standard"));
+    assert_eq!(seen.lock().unwrap().masks, vec![GOOGLE_DETAILS_FIELD_MASK]);
+    let said = out["detail_adds_nothing_here"]
+        .as_str()
+        .expect("a call that spends money for no new information must say so");
+    assert!(said.contains("added no information"), "{said}");
+    assert!(
+        said.contains("rich"),
+        "and names the level that would have added some: {said}"
+    );
+    // The two masks really do name the same fields — the claim above, checked rather than
+    // asserted in prose.
+    let mut search_fields: Vec<&str> = GOOGLE_SEARCH_FIELD_MASK
+        .split(',')
+        .map(|f| f.trim_start_matches("places."))
+        .collect();
+    let mut details_fields: Vec<&str> = GOOGLE_DETAILS_FIELD_MASK.split(',').collect();
+    search_fields.sort_unstable();
+    details_fields.sort_unstable();
+    assert_eq!(
+        search_fields, details_fields,
+        "if these ever differ, the sentence above becomes a lie and must change with them"
+    );
+}
+
+/// **`rich` is what gives `place_details` a reason to exist on the paid source**: review text
+/// for one place, without re-running — and re-paying for — the whole search at the dearer mask.
+#[tokio::test]
+async fn rich_details_uses_the_rich_details_mask_and_returns_the_reviews() {
+    let sc = Scratch::new("detail-details-rich");
+    let (overpass, _osm) = start_fake_overpass().await;
+    let one = google_rich_body()["places"][0].clone();
+    let (google, seen) = start_fake_google(Ok(one)).await;
+    let client =
+        PlacesClient::new(config(&overpass, Some(google_cfg(&google, &sc, 10)))).expect("client");
+    let out = run_places_tool(
+        &client,
+        PlacesTool::Details,
+        &json!({"id": "google/ChIJFixture", "detail": "rich", "timezone": "Europe/London"}),
+    )
+    .await
+    .expect("details must answer");
+
+    let s = seen.lock().unwrap();
+    assert_eq!(
+        s.masks,
+        vec![GOOGLE_DETAILS_FIELD_MASK_RICH.to_string()],
+        "unprefixed, and the rich one"
+    );
+    assert!(
+        !GOOGLE_DETAILS_FIELD_MASK_RICH.contains("places."),
+        "a prefixed details mask is a 400 from the provider"
+    );
+    drop(s);
+
+    assert_eq!(out["detail"], json!("rich"));
+    assert_eq!(out["cost_tier"], json!("enterprise_atmosphere"));
+    assert_eq!(out["field_mask"], json!(GOOGLE_DETAILS_FIELD_MASK_RICH));
+    assert!(
+        out.get("detail_adds_nothing_here").is_none(),
+        "this call added something, so it must not claim otherwise"
+    );
+    assert_eq!(
+        out["reviews"][0]["text"],
+        json!("The fitting was unhurried and the staff were kind.")
+    );
+    assert_eq!(out["reviews"][0]["author"]["name"], json!("A Reviewer"));
+    assert!(out["reviews"][0]["source_url"].is_string());
+    assert!(out["reviews_notice"].is_string());
+    assert_eq!(out["rich_budget"]["used"], json!(1));
+    // **AND THIS TOOL RETURNS THEM ALL** — it names one place, which is the case the search
+    // path's cap exists to send here. That is what makes the second call worth making.
+    assert_eq!(
+        out["reviews"].as_array().map(Vec::len),
+        Some(2),
+        "no volume cap on a single-place lookup"
+    );
+    assert!(
+        out.get("reviews_not_sent").is_none(),
+        "nothing was held back"
+    );
+    assert!(
+        out.get("reviews_per_place_cap").is_none(),
+        "and there is no per-place cap to report on a one-place tool"
+    );
+}
+
+/// A rich request against an id from the FREE source is announced rather than answered as
+/// though it had been served — that source has no such fields at any price.
+#[tokio::test]
+async fn rich_details_on_a_free_source_id_announces_the_downgrade() {
+    let (overpass, _osm) = start_fake_overpass().await;
+    let client = PlacesClient::new(config(&overpass, None)).expect("client");
+    let out = run_places_tool(
+        &client,
+        PlacesTool::Details,
+        &json!({"id": "node/1375266472", "detail": "rich"}),
+    )
+    .await
+    .expect("details must answer");
+
+    assert_eq!(out["provider"], json!("openstreetmap"));
+    assert_eq!(out["detail_requested"], json!("rich"));
+    assert_eq!(out["detail"], json!("standard"));
+    assert!(out["detail_fallback_reason"]
+        .as_str()
+        .expect("announced")
+        .contains("no review text"));
+    assert!(out.get("reviews").is_none());
+}
+
+/// An unrecognised `detail` value is refused on both tools rather than answered cheaply — a
+/// caller that believes it asked for reviews must not be handed a standard record silently.
+#[tokio::test]
+async fn an_unrecognised_detail_level_is_refused_on_both_tools() {
+    let (overpass, osm_seen) = start_fake_overpass().await;
+    let client = PlacesClient::new(config(&overpass, None)).expect("client");
+
+    let mut args = search_args();
+    args["detail"] = json!("everything");
+    let err = run_places_tool(&client, PlacesTool::Search, &args)
+        .await
+        .expect_err("an unknown detail level must not be answered");
+    assert!(err.contains("standard") && err.contains("rich"), "{err}");
+
+    let err = run_places_tool(
+        &client,
+        PlacesTool::Details,
+        &json!({"id": "node/1", "detail": "everything"}),
+    )
+    .await
+    .expect_err("nor on the other tool");
+    assert!(err.contains("standard") && err.contains("rich"), "{err}");
+    assert!(
+        osm_seen.lock().unwrap().bodies.is_empty(),
+        "and neither one went and looked anything up first"
+    );
 }
