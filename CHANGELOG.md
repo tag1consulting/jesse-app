@@ -2,8 +2,9 @@
 
 All notable changes to this project are documented here.
 
-The **bridge** (Rust, `bridge/Cargo.toml`) and the **iOS app** (`Jesse/`) are
-**versioned independently** — each entry names the component and its version.
+The **bridge** (Rust, `bridge/Cargo.toml`), the **agent** (Rust,
+`agent/Cargo.toml`) and the **iOS app** (`Jesse/`) are **versioned independently** — each
+entry names the component and its version.
 The bridge follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html);
 the app uses `MARKETING_VERSION (CURRENT_PROJECT_VERSION)` (e.g. `1.0 (2)`),
 where the build number increments every release. The format is based on
@@ -328,6 +329,99 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
   as text. Google's error **body** is never echoed into a tool result either: its envelope
   repeats request parameters back. Only the fixed status enum (`PERMISSION_DENIED`, …) is
   passed through, and only when it matches that shape.
+
+## [agent 0.1.0] - 2026-08-29
+
+The first component in this changelog that is neither the bridge nor the app: a new
+`agent/` crate, `jesse-agent`, joined to the root workspace alongside `eval/`. Library
+only — the agent loop is the next step, not this one. Nothing in the bridge changed, and
+the bridge's version is deliberately not bumped.
+
+### Added
+
+- **A provider-neutral request/response model, and two adapters that speak it.** The
+  bridge talks to model endpoints today by writing Anthropic-shaped JSON and parsing the
+  answer with an OpenAI-shaped fallback (`bridge/src/vision.rs`). That is the right size
+  for a one-shot helper call whose whole result is a string, and it does not survive tool
+  use: the moment a loop has to read tool calls back out, decide, and send results in,
+  "Anthropic shape plus a fallback" is two loops wearing one name. So the translation cost
+  is paid once, in two adapters, instead of at every branch of a loop that does not exist
+  yet.
+
+  A caller builds a `Request` — system prefix as ordered blocks with a `cacheable` flag,
+  messages, a tool manifest, sampling, a provider-neutral `thinking` level — and reads a
+  stream of `Event`. It cannot tell which wire served it except by asking. **No
+  adapter-specific type or string appears outside `agent/src/provider/`**, which is what
+  makes a third wire a new file rather than a new branch everywhere.
+
+  - `AnthropicMessages` — `POST {base}/v1/messages`, `anthropic-version` pinned to the
+    value `bridge/src/health.rs` sends today, `cache_control` on flagged system blocks and
+    on the last tool, `thinking` mapped to a documented per-level token budget and clamped
+    below `max_tokens` as the API requires.
+  - `OpenAiChat` — `POST {base}/chat/completions` with `stream_options.include_usage`
+    (without which a streamed call reports **no tokens at all**, silently), system blocks
+    concatenated into one leading message, tool results as `role: "tool"` messages, images
+    as `data:` URLs.
+
+- **One documented usage invariant, enforced on both wires.** `input_tokens` EXCLUDES
+  cache reads; the prompt total is `input + cache_read + cache_write`. This is what
+  `bridge/src/shadow.rs` already documents for `ShadowUsage`, and only the Anthropic wire
+  reports it that way for free — the OpenAI wire reports `prompt_tokens` *inclusive* of its
+  cached count, so the adapter subtracts. Without that subtraction every cached turn is
+  billed twice, once at the input rate and once at the cache-read rate, and the error reads
+  as "caching made things more expensive". `TokenUsage` is shaped exactly like
+  `ShadowUsage`'s four fields so the bridge can adopt it as a type alias rather than
+  defining the shape a second time.
+
+- **A shared HTTP layer, so the two adapters cannot drift.** One `reqwest` client per
+  provider; retries with jittered exponential backoff that honour `retry-after` and fire
+  only on `RateLimited`/`Overloaded`/`Transport`/`Timeout`, never on `Auth`/`NotFound`/
+  `BadRequest`/`Protocol`; a redaction pass over every provider-supplied string before it
+  enters an error; and a content-free stderr audit line per call (wire, model, latency,
+  tokens, stop reason, attempt) in the shape `bridge/src/vision.rs`'s audit records use.
+
+  **A retry may only happen before the caller has seen an event.** Every attempt lives
+  inside the future that returns the stream; a failure after that surfaces as an error
+  event with the partial answer in hand. Replaying a stream whose prefix the caller already
+  consumed would hand it a duplicate it cannot identify.
+
+  The error classification deliberately mirrors `bridge/src/health.rs`'s
+  `classify_probe_status` — a status the prober calls fatal and a real call calls retryable
+  would make a green health light meaningless — and diverges only on the non-429 4xx range,
+  which the prober tolerates because it asks "is this endpoint alive" and this layer does
+  not because it asks "did this call produce tokens".
+
+- **Tool arguments are validated, never silently empty.** Fragments accumulate per block
+  and are parsed when the block closes; one that does not parse is a protocol error
+  *naming the tool*, not a tool call with `{}` — which for most tools is a
+  plausible-looking call that does the wrong thing.
+
+- **A conformance suite that runs one table of cases against both adapters through
+  `&dyn Provider`.** Thirteen cases — text, a tool call arriving in three fragments,
+  parallel tool calls, a `max_tokens` stop, 429-then-200 with `retry-after` honoured, a
+  fatal 401, a truncated stream, mid-stream cancellation proven by the mock observing the
+  connection close, the usage arithmetic on both wires, caching, images, and `thinking` on
+  and off the quirk — each asserted on the exact request body the mock received as well as
+  on the parsed events. A behaviour that differs between the adapters fails the suite
+  instead of being papered over per adapter. No network: real loopback sockets, as
+  `bridge/tests/integration.rs` already does.
+
+- **`Wire::Responses` declared and unimplemented.** `codex-cli` speaks only that wire, so
+  the third arm exists now to force every match to account for it; constructing a provider
+  for it is a typed error, never a panic and never a silent fallback to the Chat wire.
+
+- **`agent/README.md`**, including the checklist a third adapter follows — written now so
+  that step checks a list rather than guessing.
+
+### Changed
+
+- **`.github/workflows/ci.yml` gains an `agent` job.** Build, test, clippy and fmt, scoped
+  to `-p jesse-agent`. The `bridge` job is untouched: the bridge is excluded from the root
+  workspace and builds from `working-directory: bridge` with its own `Cargo.lock`, so one
+  `cargo` invocation cannot cover both. The scope is `-p jesse-agent` rather than the whole
+  workspace because the other member, `eval/`, has never been in CI and does not pass
+  `cargo clippy -- -D warnings` today; an unscoped job would fail on code this change does
+  not touch.
 
 ## [bridge 0.103.0] - 2026-08-28
 

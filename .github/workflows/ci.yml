@@ -30,6 +30,50 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
+  # THE ROOT WORKSPACE'S `agent/` CRATE. A separate job from `bridge` on purpose: the
+  # bridge is EXCLUDED from the root workspace (see the root Cargo.toml) and builds from
+  # `working-directory: bridge` with its own Cargo.lock, so one `cargo` invocation cannot
+  # cover both and nothing here changes how the bridge is built.
+  #
+  # SCOPED TO `-p jesse-agent`, NOT THE WHOLE WORKSPACE, and that is deliberate. The other
+  # member, `eval/`, has never been in CI and does not pass `cargo clippy -- -D warnings`
+  # today (6 x doc_overindented_list_items) — the `Format check` step in the bridge job
+  # below records exactly that. An unscoped job here would therefore fail on code this
+  # change does not touch, and fixing `eval` to make an unrelated crate's CI green is not
+  # this job's business. When `eval` is cleaned up it joins by widening these `-p` flags.
+  agent:
+    name: agent (build, test, clippy, fmt)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        run: rustup component add clippy rustfmt
+
+      - name: Cache cargo
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-agent-${{ hashFiles('Cargo.lock') }}
+
+      - name: Build
+        run: cargo build -p jesse-agent
+
+      # `--all-targets` so the conformance suite AND `examples/smoke.rs` are compiled. The
+      # smoke is an example rather than a test precisely so this compiles it and never
+      # RUNS it: it needs a live endpoint and a credential, neither of which belongs in CI.
+      - name: Test
+        run: cargo test -p jesse-agent --all-targets
+
+      - name: Clippy
+        run: cargo clippy -p jesse-agent --all-targets -- -D warnings
+
+      - name: Format check
+        run: cargo fmt -p jesse-agent --check
+
   bridge:
     name: bridge (build, test, clippy, guards, audit, coverage)
     runs-on: ubuntu-latest
