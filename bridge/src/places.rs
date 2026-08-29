@@ -10,18 +10,31 @@
 //! was worth doing. This module supplies the missing half: hours, and enough structure to
 //! decide *open at 07:00 on a Thursday* without re-reading prose.
 //!
-//! # The naming rule, which is not negotiable
+//! # The naming rule, which is not negotiable — and the one thing it never covered
 //!
-//! **Nothing a caller can see names a provider.** Not the tool names, not the descriptions,
-//! not a field in the output. The backend here is OpenStreetMap — Overpass for nearby search
-//! and Nominatim for the address of a specific object — and a second provider is expected
-//! behind exactly these names, carrying the ratings OSM does not have. The whole point of the
-//! design is that when it lands, `DEFAULT_ALLOWED_TOOLS` and the containment record's
-//! `toolset_args` DO NOT CHANGE: adding a provider must not cost a live battery re-run. A
-//! provider name leaking into `places_search`'s output shape would make that impossible,
-//! because the caller would have learned to depend on it.
+//! **Nothing in the ADVERTISED SURFACE names a provider.** Not the tool names, not the
+//! descriptions, not the schemas, not an output field NAME. This module speaks
+//! OpenStreetMap — Overpass for nearby search, Nominatim for the address of a specific
+//! object — and [`crate::places_google`] speaks Google Places, and both answer to exactly
+//! these two tool names. The whole point of the design is that when a second provider lands,
+//! `DEFAULT_ALLOWED_TOOLS` and the containment record's `toolset_args` DO NOT CHANGE: adding
+//! a provider must not cost a live battery re-run. That held; the second provider changed
+//! neither.
 //!
-//! The `provider` field in a result is therefore a deliberate omission, not an oversight.
+//! What the rule never covered, and must not, is the **value** of a field saying which source
+//! answered. `place_json` emits a `provider` key whose value is `"openstreetmap"`, and the
+//! Google builder emits `"google_places"`. That is data, not surface: the field NAME is
+//! `provider` on both paths, so nothing about the tool contract moves when a third source
+//! appears, and no argv anywhere contains either string.
+//!
+//! It is load-bearing rather than decorative. This source carries no ratings and thin hours
+//! coverage; the other carries both. Without the field, a caller seeing no rating cannot tell
+//! *"this place has no rating"* from *"this answer came from the source that has none"* — and
+//! those two call for different next moves. Same for a missing `opening_hours_raw`.
+//!
+//! **A result is never blended.** Every field in one place record comes from the one source
+//! that record names. Merging a Google rating onto an OSM record would produce an object no
+//! provider ever said, whose `provider` field would then be a lie.
 //!
 //! # No free text ever leaves the host
 //!
@@ -43,13 +56,27 @@
 //! naming no known category falls back to a broad POI tag set, and name matching is a
 //! client-side substring test over whatever that returned. See [`categories_for_query`].
 //!
-//! # There are no ratings here
+//! # There are no ratings in THIS source
 //!
-//! OSM carries none, no proxy for one exists in the data, and this module does not emit a
+//! OSM carries none, no proxy for one exists in the data, and [`place_json`] does not emit a
 //! `rating` key — not even null. A null rating is worse than a missing one: a caller that sees
 //! the key learns the concept exists and may render "0" or "unrated" for a place that is
-//! simply outside this provider's coverage. Ratings arrive with the second provider or they do
-//! not arrive.
+//! simply outside this provider's coverage.
+//!
+//! Ratings now arrive from [`crate::places_google`], which emits `rating` and `rating_count`
+//! **together or not at all** — a bare rating with no count is not usable information, because
+//! 5.0 from one person and 4.6 from eleven thousand are not the same claim. Which source a
+//! record came from is on the record.
+//!
+//! # Which source answers, and what happens when it cannot
+//!
+//! Google Places is preferred whenever a key is configured, because its hours coverage and
+//! its ratings are the entire reason it was added. OpenStreetMap serves the request instead
+//! when there is no key, when the deployment pins this source with `JESSE_PLACES_PROVIDER`,
+//! when the query names a category Google has no type for, when the per-window request budget
+//! is spent, or when the Google call fails. **The server works with no key at all, exactly as
+//! it did before**, and every response says which source served it and — when it was not the
+//! preferred one — why.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -58,6 +85,60 @@ use std::time::{Duration, Instant};
 use chrono::{Datelike, Timelike, Utc};
 use serde_json::{json, Map, Value};
 use tokio::sync::Mutex;
+
+use crate::places_google::{
+    google_distance, google_name_hit, google_place_json, BudgetState, GoogleConfig, GoogleProvider,
+    GOOGLE_ATTRIBUTION, GOOGLE_MAX_RESULTS,
+};
+
+// ---------------------------------------------------------------------------------------
+// Which source answered
+// ---------------------------------------------------------------------------------------
+
+/// The two sources this server can answer from.
+///
+/// The LABELS are values, never field names and never argv — see the module docs on why that
+/// distinction is the whole reason a second provider costs no containment battery.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Provider {
+    OpenStreetMap,
+    GooglePlaces,
+}
+
+impl Provider {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Provider::OpenStreetMap => "openstreetmap",
+            Provider::GooglePlaces => "google_places",
+        }
+    }
+}
+
+/// Which source a deployment wants, from `JESSE_PLACES_PROVIDER`.
+///
+/// **There is deliberately no "Google only".** The OpenStreetMap fallback cannot be switched
+/// off, because the property that makes this server safe to depend on is that it keeps
+/// answering — with no key, with a spent budget, with the paid backend down. A mode that could
+/// turn a working tool into a failing one in exchange for nothing is a mode not worth having.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProviderPreference {
+    /// Google Places when a key is configured, OpenStreetMap otherwise. The default.
+    Auto,
+    /// OpenStreetMap only. Google is not called even when a key is present — which is what
+    /// makes a like-for-like comparison of the two sources possible from one deployment.
+    OpenStreetMapOnly,
+}
+
+impl ProviderPreference {
+    /// Anything unrecognised is `Auto`, on the same terms as every other value here: a
+    /// mistyped environment variable must not take the capability out for the conversation.
+    pub fn parse(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "openstreetmap" | "osm" => ProviderPreference::OpenStreetMapOnly,
+            _ => ProviderPreference::Auto,
+        }
+    }
+}
 
 /// The public Overpass instance, used when `JESSE_PLACES_OVERPASS_URL` is unset.
 pub const DEFAULT_OVERPASS_URL: &str = "https://overpass-api.de/api/interpreter";
@@ -135,6 +216,11 @@ pub struct PlacesConfig {
     /// The zone `open_now` is computed against when a call does not name one, as an IANA
     /// name. Unset means the host's own zone.
     pub default_timezone: Option<String>,
+    /// Which source this deployment wants. See [`ProviderPreference`].
+    pub provider_preference: ProviderPreference,
+    /// The paid provider's configuration, or `None` when no key is set — which is what
+    /// "there is no second provider on this deployment" means, everywhere in this module.
+    pub google: Option<GoogleConfig>,
 }
 
 impl Default for PlacesConfig {
@@ -147,6 +233,11 @@ impl Default for PlacesConfig {
             cache_ttl: Duration::from_secs(DEFAULT_CACHE_TTL_SECS),
             http_timeout: Duration::from_secs(45),
             default_timezone: None,
+            provider_preference: ProviderPreference::Auto,
+            // NOT read from the environment here. `Default` is what tests and callers get
+            // when they build a config by hand, and a default that quietly picked up a real
+            // API key from the ambient environment would let a unit test spend money.
+            google: None,
         }
     }
 }
@@ -177,6 +268,10 @@ impl PlacesConfig {
                 .map(Duration::from_secs)
                 .unwrap_or(d.http_timeout),
             default_timezone: non_empty("JESSE_PLACES_TIMEZONE"),
+            provider_preference: non_empty("JESSE_PLACES_PROVIDER")
+                .map(|s| ProviderPreference::parse(&s))
+                .unwrap_or(ProviderPreference::Auto),
+            google: GoogleConfig::from_env(),
         }
     }
 }
@@ -236,7 +331,12 @@ impl TagFilter {
     }
 }
 
-/// A named category: the words a person might use for it, and the tags it lives under.
+/// A named category: the words a person might use for it, and how each source expresses it.
+///
+/// **One table, both providers.** `filters` are OSM tag predicates and `google_types` are
+/// Google Places "Table A" types, and they sit on the same row precisely so that the closed
+/// compile-time table which keeps free text off the OSM wire keeps it off the Google wire too.
+/// A second table would have been a second place for a caller's string to leak into a request.
 #[derive(Clone, Copy, Debug)]
 pub struct Category {
     /// The category's own name, echoed to the caller as `category`.
@@ -244,6 +344,25 @@ pub struct Category {
     /// Words that select this category. Matched as whole words against the lowercased query.
     pub keywords: &'static [&'static str],
     pub filters: &'static [TagFilter],
+    /// The Google Places types this category maps to, from that API's Table A.
+    ///
+    /// **Empty means "this source cannot express this category"**, not "match anything". Three
+    /// rows are empty because Google's type table genuinely has no equivalent — there is no
+    /// optician, no newsagent and no greengrocer in it — and a query that lands on one of them
+    /// is served by OpenStreetMap with that stated as the reason. Substituting a broader type
+    /// (`store`, `convenience_store`) would answer a different question while looking like it
+    /// had answered this one.
+    ///
+    /// Every value here was checked against the published Table A on 2026-08-29. A test
+    /// asserts the SHAPE (lowercase, `[a-z0-9_]`, no duplicates within a row) because that is
+    /// all a test can assert without vendoring a 478-row table that would go stale silently.
+    ///
+    /// What keeps a typo from being serious is the fallback rather than the check: that API
+    /// answers an unknown type with a 400 for the WHOLE request, and a failed call here falls
+    /// through to OpenStreetMap with the failure stated in `provider_fallback_reason`. A
+    /// mistyped type therefore degrades one category to the free source loudly; it does not
+    /// take the tool out.
+    pub google_types: &'static [&'static str],
 }
 
 /// The closed keyword table.
@@ -256,11 +375,13 @@ pub const CATEGORIES: &[Category] = &[
         name: "cafe",
         keywords: &["cafe", "café", "coffee", "coffeeshop", "espresso"],
         filters: &[TagFilter::eq("amenity", "cafe")],
+        google_types: &["cafe", "coffee_shop"],
     },
     Category {
         name: "restaurant",
         keywords: &["restaurant", "dinner", "lunch", "bistro", "trattoria"],
         filters: &[TagFilter::eq("amenity", "restaurant")],
+        google_types: &["restaurant"],
     },
     Category {
         name: "fast_food",
@@ -268,141 +389,169 @@ pub const CATEGORIES: &[Category] = &[
             "takeaway", "takeout", "fastfood", "burger", "kebab", "chippy",
         ],
         filters: &[TagFilter::eq("amenity", "fast_food")],
+        google_types: &["fast_food_restaurant"],
     },
     Category {
         name: "pub",
         keywords: &["pub", "tavern", "alehouse"],
         filters: &[TagFilter::eq("amenity", "pub")],
+        google_types: &["pub"],
     },
     Category {
         name: "bar",
         keywords: &["bar", "cocktails", "wine bar"],
         filters: &[TagFilter::eq("amenity", "bar")],
+        google_types: &["bar"],
     },
     Category {
         name: "nightclub",
         keywords: &["nightclub", "club"],
         filters: &[TagFilter::eq("amenity", "nightclub")],
+        google_types: &["night_club"],
     },
     Category {
         name: "ice_cream",
         keywords: &["gelato", "icecream"],
         filters: &[TagFilter::eq("amenity", "ice_cream")],
+        google_types: &["ice_cream_shop"],
     },
     Category {
         name: "bakery",
         keywords: &["bakery", "baker", "bread", "patisserie"],
         filters: &[TagFilter::eq("shop", "bakery")],
+        google_types: &["bakery"],
     },
     Category {
         name: "supermarket",
         keywords: &["supermarket", "grocery", "groceries", "grocer"],
         filters: &[TagFilter::eq("shop", "supermarket")],
+        google_types: &["supermarket", "grocery_store"],
     },
     Category {
         name: "convenience",
         keywords: &["convenience", "cornershop"],
         filters: &[TagFilter::eq("shop", "convenience")],
+        google_types: &["convenience_store"],
     },
     Category {
         name: "deli",
         keywords: &["deli", "delicatessen"],
         filters: &[TagFilter::eq("shop", "deli")],
+        google_types: &["deli"],
     },
     Category {
         name: "butcher",
         keywords: &["butcher", "butchers"],
         filters: &[TagFilter::eq("shop", "butcher")],
+        google_types: &["butcher_shop"],
     },
     Category {
         name: "greengrocer",
         keywords: &["greengrocer", "fruit", "vegetables"],
         filters: &[TagFilter::eq("shop", "greengrocer")],
+        google_types: &[],
     },
     Category {
         name: "alcohol",
         keywords: &["offlicence", "liquor", "wine shop", "whisky", "bottleshop"],
         filters: &[TagFilter::eq("shop", "alcohol")],
+        google_types: &["liquor_store"],
     },
     Category {
         name: "pharmacy",
         keywords: &["pharmacy", "chemist", "drugstore", "apotheke", "farmacia"],
         filters: &[TagFilter::eq("amenity", "pharmacy")],
+        google_types: &["pharmacy", "drugstore"],
     },
     Category {
         name: "doctors",
         keywords: &["doctor", "doctors", "gp", "surgery", "clinic"],
         filters: &[TagFilter::eq("amenity", "doctors")],
+        google_types: &["doctor"],
     },
     Category {
         name: "dentist",
         keywords: &["dentist", "dental"],
         filters: &[TagFilter::eq("amenity", "dentist")],
+        google_types: &["dentist"],
     },
     Category {
         name: "hospital",
         keywords: &["hospital", "a&e", "emergency room"],
         filters: &[TagFilter::eq("amenity", "hospital")],
+        google_types: &["hospital"],
     },
     Category {
         name: "veterinary",
         keywords: &["vet", "vets", "veterinary"],
         filters: &[TagFilter::eq("amenity", "veterinary")],
+        google_types: &["veterinary_care"],
     },
     Category {
         name: "bank",
         keywords: &["bank"],
         filters: &[TagFilter::eq("amenity", "bank")],
+        google_types: &["bank"],
     },
     Category {
         name: "atm",
         keywords: &["atm", "cashpoint", "cash machine"],
         filters: &[TagFilter::eq("amenity", "atm")],
+        google_types: &["atm"],
     },
     Category {
         name: "post_office",
         keywords: &["post office", "postoffice", "post"],
         filters: &[TagFilter::eq("amenity", "post_office")],
+        google_types: &["post_office"],
     },
     Category {
         name: "library",
         keywords: &["library"],
         filters: &[TagFilter::eq("amenity", "library")],
+        google_types: &["library"],
     },
     Category {
         name: "fuel",
         keywords: &["petrol", "fuel", "gas station", "diesel", "filling station"],
         filters: &[TagFilter::eq("amenity", "fuel")],
+        google_types: &["gas_station"],
     },
     Category {
         name: "parking",
         keywords: &["parking", "car park", "carpark"],
         filters: &[TagFilter::eq("amenity", "parking")],
+        google_types: &["parking"],
     },
     Category {
         name: "toilets",
         keywords: &["toilet", "toilets", "loo", "restroom", "wc"],
         filters: &[TagFilter::eq("amenity", "toilets")],
+        google_types: &["public_bathroom"],
     },
     Category {
         name: "cinema",
         keywords: &["cinema", "movies", "movie theater"],
         filters: &[TagFilter::eq("amenity", "cinema")],
+        google_types: &["movie_theater"],
     },
     Category {
         name: "theatre",
         keywords: &["theatre", "theater"],
         filters: &[TagFilter::eq("amenity", "theatre")],
+        google_types: &["performing_arts_theater"],
     },
     Category {
         name: "place_of_worship",
         keywords: &["church", "mosque", "synagogue", "temple"],
         filters: &[TagFilter::eq("amenity", "place_of_worship")],
+        google_types: &["church", "mosque", "synagogue", "hindu_temple"],
     },
     Category {
         name: "museum",
         keywords: &["museum", "gallery"],
         filters: &[TagFilter::eq("tourism", "museum")],
+        google_types: &["museum", "art_gallery"],
     },
     Category {
         name: "hotel",
@@ -411,6 +560,13 @@ pub const CATEGORIES: &[Category] = &[
             "tourism",
             "^(hotel|hostel|guest_house|motel)$",
         )],
+        google_types: &[
+            "hotel",
+            "motel",
+            "hostel",
+            "guest_house",
+            "bed_and_breakfast",
+        ],
     },
     Category {
         name: "attraction",
@@ -419,6 +575,7 @@ pub const CATEGORIES: &[Category] = &[
             "tourism",
             "^(attraction|viewpoint|artwork)$",
         )],
+        google_types: &["tourist_attraction"],
     },
     Category {
         name: "fitness_centre",
@@ -427,6 +584,7 @@ pub const CATEGORIES: &[Category] = &[
             "leisure",
             "^(fitness_centre|sports_centre|climbing)$",
         )],
+        google_types: &["gym", "fitness_center", "sports_complex"],
     },
     Category {
         name: "swimming_pool",
@@ -435,26 +593,31 @@ pub const CATEGORIES: &[Category] = &[
             "leisure",
             "^(swimming_pool|water_park)$",
         )],
+        google_types: &["swimming_pool", "water_park"],
     },
     Category {
         name: "park",
         keywords: &["park", "garden", "green space"],
         filters: &[TagFilter::matching("leisure", "^(park|garden)$")],
+        google_types: &["park", "garden"],
     },
     Category {
         name: "playground",
         keywords: &["playground", "play park"],
         filters: &[TagFilter::eq("leisure", "playground")],
+        google_types: &["playground"],
     },
     Category {
         name: "hairdresser",
         keywords: &["hairdresser", "barber", "haircut", "salon"],
         filters: &[TagFilter::eq("shop", "hairdresser")],
+        google_types: &["hair_salon", "barber_shop"],
     },
     Category {
         name: "laundry",
         keywords: &["laundry", "launderette", "laundrette", "dry cleaner"],
         filters: &[TagFilter::matching("shop", "^(laundry|dry_cleaning)$")],
+        google_types: &["laundry"],
     },
     Category {
         name: "doityourself",
@@ -463,16 +626,19 @@ pub const CATEGORIES: &[Category] = &[
             "shop",
             "^(doityourself|hardware|trade)$",
         )],
+        google_types: &["hardware_store", "home_improvement_store"],
     },
     Category {
         name: "books",
         keywords: &["bookshop", "bookstore", "books", "bookseller"],
         filters: &[TagFilter::eq("shop", "books")],
+        google_types: &["book_store"],
     },
     Category {
         name: "clothes",
         keywords: &["clothes", "clothing", "fashion", "shoes"],
         filters: &[TagFilter::matching("shop", "^(clothes|shoes|boutique)$")],
+        google_types: &["clothing_store", "shoe_store"],
     },
     Category {
         name: "electronics",
@@ -481,31 +647,37 @@ pub const CATEGORIES: &[Category] = &[
             "shop",
             "^(electronics|computer|mobile_phone)$",
         )],
+        google_types: &["electronics_store", "cell_phone_store"],
     },
     Category {
         name: "optician",
         keywords: &["optician", "optometrist", "glasses"],
         filters: &[TagFilter::eq("shop", "optician")],
+        google_types: &[],
     },
     Category {
         name: "florist",
         keywords: &["florist", "flowers"],
         filters: &[TagFilter::eq("shop", "florist")],
+        google_types: &["florist"],
     },
     Category {
         name: "newsagent",
         keywords: &["newsagent", "newspaper"],
         filters: &[TagFilter::eq("shop", "newsagent")],
+        google_types: &[],
     },
     Category {
         name: "school",
         keywords: &["school"],
         filters: &[TagFilter::eq("amenity", "school")],
+        google_types: &["school", "primary_school", "secondary_school"],
     },
     Category {
         name: "university",
         keywords: &["university", "campus", "college"],
         filters: &[TagFilter::matching("amenity", "^(university|college)$")],
+        google_types: &["university"],
     },
 ];
 
@@ -581,6 +753,46 @@ fn filters_for_query(query: &str) -> (Vec<TagFilter>, Vec<&'static str>, bool) {
 ///
 /// "open cafe near Fountainbridge" should not filter names by "cafe": the category already
 /// did that, and no café is called "cafe". Stop words are dropped for the same reason.
+/// What the preferred provider can be asked for, for one query.
+///
+/// Three outcomes rather than "a list of types", because the empty list is ambiguous on that
+/// API and the ambiguity would cost money in the wrong direction: sending no `includedTypes`
+/// means "every type", which is the right answer for a query naming no category and the WRONG
+/// answer for a category the provider cannot express.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GoogleTypes {
+    /// The query named no known category. Ask for everything nearby and filter by name on
+    /// this side — the counterpart of [`FALLBACK_FILTERS`].
+    Everything,
+    /// The query named categories this provider expresses.
+    These(Vec<&'static str>),
+    /// The query named categories and this provider expresses NONE of them. Not a failure —
+    /// the other source answers, and the response says why.
+    Unsupported,
+}
+
+/// Which provider types a free-text query selects, from the same closed table
+/// [`filters_for_query`] reads.
+pub fn google_types_for_query(query: &str) -> GoogleTypes {
+    let matched = categories_for_query(query);
+    if matched.is_empty() {
+        return GoogleTypes::Everything;
+    }
+    let mut types: Vec<&'static str> = Vec::new();
+    for c in matched {
+        for t in c.google_types {
+            if !types.contains(t) {
+                types.push(t);
+            }
+        }
+    }
+    if types.is_empty() {
+        GoogleTypes::Unsupported
+    } else {
+        GoogleTypes::These(types)
+    }
+}
+
 fn name_terms(query: &str) -> Vec<String> {
     const STOP: &[&str] = &[
         "a", "an", "the", "near", "nearby", "around", "close", "by", "in", "at", "to", "me",
@@ -613,7 +825,7 @@ fn name_terms(query: &str) -> Vec<String> {
 ///
 /// This is a comparison key only. The name returned to the caller is always the source
 /// spelling, apostrophe and all.
-fn fold_name(s: &str) -> String {
+pub(crate) fn fold_name(s: &str) -> String {
     s.to_lowercase()
         .chars()
         .filter(|c| *c != '\'' && *c != '\u{2019}')
@@ -928,10 +1140,13 @@ fn parse_clock(s: &str) -> Option<u16> {
 }
 
 /// The resolved evaluation zone, and where it came from.
-struct Zone {
-    tz: chrono_tz::Tz,
-    name: String,
-    source: &'static str,
+///
+/// `pub(crate)` because [`crate::places_google`] renders hours through the same function this
+/// module does — see [`hours_json_from`] — and cannot do that without naming the zone type.
+pub(crate) struct Zone {
+    pub(crate) tz: chrono_tz::Tz,
+    pub(crate) name: String,
+    pub(crate) source: &'static str,
 }
 
 fn resolve_zone(requested: Option<&str>, cfg: &PlacesConfig) -> Zone {
@@ -984,11 +1199,29 @@ fn resolve_zone(requested: Option<&str>, cfg: &PlacesConfig) -> Zone {
 /// as shut because a string was unreadable is the specific wrong answer this whole design is
 /// built to avoid.
 fn hours_json(raw: &str, zone: &Zone) -> Value {
+    hours_json_from(parse_opening_hours(raw), zone)
+}
+
+/// Render an ALREADY-PARSED hours result — **the one renderer both providers go through.**
+///
+/// This split is not tidiness. The two sources describe hours in two completely different
+/// ways: OSM sends a string in its own grammar, Google sends a list of open/close instants.
+/// If each had rendered its own answer, the two would have drifted into two output shapes on
+/// the first change to either — and a caller would then have had to branch on `provider` to
+/// read hours, which is exactly the coupling the provider-agnostic tool names exist to
+/// prevent. Each source's job ends at producing an [`OpeningHours`] (or a reason it could
+/// not); from here the shape is decided in one place, for both, by construction.
+///
+/// `open_now` is recomputed HERE for both sources rather than taken from a provider that
+/// offers one. Google returns its own `openNow`, evaluated in the place's local zone; using it
+/// would mean `open_now` answered a different question depending on who replied, and the
+/// timezone this response names would not be the timezone the boolean was computed in.
+pub(crate) fn hours_json_from(parsed: Result<OpeningHours, String>, zone: &Zone) -> Value {
     let now = Utc::now().with_timezone(&zone.tz);
     let weekday = now.weekday().num_days_from_monday() as usize;
     let minute = (now.hour() * 60 + now.minute()) as u16;
 
-    match parse_opening_hours(raw) {
+    match parsed {
         Ok(h) => {
             let mut days = Map::new();
             for (i, name) in WEEKDAY_NAMES.iter().enumerate() {
@@ -1034,11 +1267,22 @@ struct CacheEntry {
 pub struct PlacesClient {
     cfg: PlacesConfig,
     http: reqwest::Client,
-    /// Serialises ALL outbound requests and holds the time of the last one. One gate covers
-    /// both endpoints deliberately — the policy is about the client, and two independent
-    /// limiters would let a search and a lookup fire in the same tick.
+    /// Serialises ALL outbound OpenStreetMap requests and holds the time of the last one. One
+    /// gate covers both of that source's endpoints deliberately — the policy is about the
+    /// client, and two independent limiters would let a search and a lookup fire in the same
+    /// tick.
+    ///
+    /// **The paid provider does not go through it.** This gate implements Nominatim's
+    /// one-request-per-second client policy, which says nothing about any other service, and
+    /// making a Google call wait a second before a fallback could then wait another is a cost
+    /// with no corresponding rule behind it. What bounds the paid path is the request budget.
     gate: Mutex<Option<Instant>>,
+    /// The five-minute response cache — **OpenStreetMap only.** Google's terms permit caching
+    /// place ids and coordinates and nothing else (see [`crate::places_google`]), so no Google
+    /// response ever reaches this map.
     cache: Mutex<HashMap<String, CacheEntry>>,
+    /// The preferred source, present exactly when a key is configured.
+    google: Option<GoogleProvider>,
 }
 
 impl PlacesClient {
@@ -1048,12 +1292,38 @@ impl PlacesClient {
             .timeout(cfg.http_timeout)
             .build()
             .map_err(|e| format!("http client: {e}"))?;
+        let google = cfg.google.clone().map(GoogleProvider::new);
         Ok(Arc::new(Self {
             cfg,
             http,
             gate: Mutex::new(None),
             cache: Mutex::new(HashMap::new()),
+            google,
         }))
+    }
+
+    /// The preferred source, or the sentence saying why this request will not use it.
+    ///
+    /// Both halves are returned together so that no call site can take the provider without
+    /// also having somewhere to put the reason. Every response served by the fallback carries
+    /// one of these strings, including the ordinary "no key configured" case: a caller that
+    /// sees no ratings is owed the difference between "there are none for this place" and
+    /// "this deployment has no key for the source that has them".
+    ///
+    /// The `Err` is a CAUSE and not a whole sentence — no trailing "so the free source
+    /// answered". `places_search` composes that on ([`FELL_BACK`]) and `place_details`
+    /// composes something different, because there the free source did NOT answer.
+    fn preferred(&self) -> Result<&GoogleProvider, String> {
+        if self.cfg.provider_preference == ProviderPreference::OpenStreetMapOnly {
+            return Err(
+                "this deployment is pinned to the free source by JESSE_PLACES_PROVIDER".to_string(),
+            );
+        }
+        self.google.as_ref().ok_or_else(|| {
+            "no API key is configured for the source that carries ratings and fuller \
+             opening-hours coverage"
+                .to_string()
+        })
     }
 
     /// One outbound request: cache lookup, then rate gate, then fetch, then cache store.
@@ -1137,8 +1407,16 @@ impl PlacesClient {
         );
         Ok(text)
     }
-
-    /// `places_search`.
+    /// `places_search`, on whichever source this deployment can use for it.
+    ///
+    /// The arguments are validated ONCE, up front, for both sources: a radius that is out of
+    /// range is out of range whoever would have answered, and validating per branch is how the
+    /// two paths start disagreeing about what a legal request is.
+    ///
+    /// The order is: preferred source, then the free one. Every way the preferred source can
+    /// fail to answer — no key, pinned off, a category it has no type for, a spent budget, a
+    /// failed call — produces a SENTENCE, not a silent switch, and that sentence is in the
+    /// response.
     pub async fn search(&self, args: &Value) -> Result<Value, String> {
         let query = args
             .get("query")
@@ -1159,11 +1437,166 @@ impl PlacesClient {
         let limit = num(args, "limit").unwrap_or(15.0).round().clamp(1.0, 50.0) as usize;
         let zone = resolve_zone(args.get("timezone").and_then(Value::as_str), &self.cfg);
 
-        let (filters, categories, fallback) = filters_for_query(&query);
+        let (filters, categories, category_fallback) = filters_for_query(&query);
         let terms = name_terms(&query);
 
+        let mut budget: Option<BudgetState> = None;
+        let mut fallback_reason: Option<String> = None;
+        let mut answer: Option<(Provider, SearchHits)> = None;
+
+        match self.preferred() {
+            Err(reason) => fallback_reason = Some(reason),
+            Ok(g) => match google_types_for_query(&query) {
+                // A category the preferred source has no type for is NOT an error and NOT a
+                // reason to send it a broader question it can bill for. The free source has
+                // the tag, so the free source answers and the response says so.
+                GoogleTypes::Unsupported => {
+                    fallback_reason = Some(format!(
+                        "the source that carries ratings has no place type for {}",
+                        categories.join(" / ")
+                    ))
+                }
+                types => {
+                    let list: &[&'static str] = match &types {
+                        GoogleTypes::These(v) => v,
+                        _ => &[],
+                    };
+                    match g
+                        .search_nearby(&self.http, list, lat, lon, radius, limit)
+                        .await
+                    {
+                        Ok((body, b)) => {
+                            budget = Some(b);
+                            answer = Some((
+                                Provider::GooglePlaces,
+                                google_hits(
+                                    &body,
+                                    lat,
+                                    lon,
+                                    limit,
+                                    &terms,
+                                    matches!(types, GoogleTypes::Everything),
+                                    &zone,
+                                ),
+                            ));
+                        }
+                        Err(e) => fallback_reason = Some(e),
+                    }
+                }
+            },
+        }
+
+        if answer.is_none() {
+            if budget.is_none() {
+                if let Some(g) = self.google.as_ref() {
+                    budget = g.ledger.peek().await;
+                }
+            }
+            answer = Some((
+                Provider::OpenStreetMap,
+                self.osm_hits(
+                    lat,
+                    lon,
+                    radius,
+                    limit,
+                    &filters,
+                    &terms,
+                    category_fallback,
+                    &zone,
+                )
+                .await?,
+            ));
+        }
+        let (provider, hits) = answer.expect("one of the two branches sets an answer");
+
+        // COVERAGE IS REPORTED, NOT IMPLIED, and now for ratings as well as hours. A caller
+        // that cannot see how many results carried a field has no way to tell "nothing is
+        // open" from "nobody has recorded this street" — and, since the second source landed,
+        // no way to tell an unrated place from a source with no ratings in it.
+        let with_hours = hits
+            .places
+            .iter()
+            .filter(|p| p.get("opening_hours_raw").is_some())
+            .count();
+        let with_rating = hits
+            .places
+            .iter()
+            .filter(|p| p.get("rating").is_some())
+            .count();
+
+        let mut out = json!({
+            "query": query,
+            "center": {"latitude": lat, "longitude": lon},
+            "radius_m": radius,
+            "provider": provider.label(),
+            "matched_categories": categories,
+            "used_fallback_categories": category_fallback,
+            "name_filter_terms": terms,
+            "name_filter_relaxed": hits.relaxed,
+            "timezone": zone.name,
+            "timezone_source": zone.source,
+            "total_matches": hits.total,
+            "returned": hits.places.len(),
+            "with_opening_hours": with_hours,
+            "without_opening_hours": hits.places.len().saturating_sub(with_hours),
+            "with_rating": with_rating,
+            "without_rating": hits.places.len().saturating_sub(with_rating),
+            "places": hits.places,
+        });
+        // NO SILENT CAP. The preferred source will not return more than
+        // [`GOOGLE_MAX_RESULTS`] per call whatever `limit` says, and a caller that asked for
+        // 50 and got 20 is owed the difference between "that is all there is" and "that is
+        // all this source will send".
+        if provider == Provider::GooglePlaces && limit > GOOGLE_MAX_RESULTS {
+            out["limit_capped_by_provider"] = json!(GOOGLE_MAX_RESULTS);
+        }
+        self.annotate(
+            &mut out,
+            provider,
+            fallback_reason.map(|cause| format!("{cause}{FELL_BACK}")),
+            budget,
+        );
+        Ok(out)
+    }
+
+    /// The fields every response carries about WHERE it came from and WHAT IT COST.
+    ///
+    /// One function so the two tools cannot disagree about them, and so a third tool could not
+    /// be added without them.
+    fn annotate(
+        &self,
+        out: &mut Value,
+        provider: Provider,
+        fallback_reason: Option<String>,
+        budget: Option<BudgetState>,
+    ) {
+        let obj = out.as_object_mut().expect("responses are objects");
+        if let Some(reason) = fallback_reason {
+            obj.insert("provider_fallback_reason".to_string(), json!(reason));
+        }
+        if let Some(b) = budget {
+            obj.insert("budget".to_string(), b.as_json());
+        }
+        if provider == Provider::GooglePlaces {
+            obj.insert("attribution".to_string(), json!(GOOGLE_ATTRIBUTION));
+        }
+    }
+
+    /// The OpenStreetMap half of `places_search`: build the query, fetch, filter, rank.
+    #[allow(clippy::too_many_arguments)]
+    async fn osm_hits(
+        &self,
+        lat: f64,
+        lon: f64,
+        radius: u32,
+        limit: usize,
+        filters: &[TagFilter],
+        terms: &[String],
+        category_fallback: bool,
+        zone: &Zone,
+    ) -> Result<SearchHits, String> {
         let mut clauses = String::new();
-        for f in &filters {
+        for f in filters {
             clauses.push_str(&format!(
                 "  nwr{}(around:{radius},{lat},{lon});\n",
                 f.render()
@@ -1227,68 +1660,73 @@ impl PlacesClient {
             in_range.push((dist, name_hit, el, elat, elon));
         }
 
-        // THE NAME FILTER IS RELAXED RATHER THAN ALLOWED TO RETURN NOTHING, when a category
-        // matched and no name did.
-        //
-        // This is not a convenience: without it the most natural phrasing of the question
-        // breaks. "cafe near Fountainbridge" leaves `fountainbridge` as a name term — it is
-        // not a category word and not a stop word — and no café is CALLED Fountainbridge, so
-        // a strict filter answers "there are no cafés near you" for a street with a dozen.
-        // The place name in such a query is already expressed by the coordinate the caller
-        // passed; insisting it also appear in a venue's name is asking the same question
-        // twice and rejecting on the second.
-        //
-        // It is relaxed ONLY when a category matched. With no category the tag set is the
-        // broad POI fallback, and dropping the name filter there would return every shop in
-        // the radius — a worse answer than an empty one, because it looks like a result.
-        // Either way the response SAYS which happened.
         let name_hits = in_range.iter().filter(|r| r.1).count();
-        let relaxed = !terms.is_empty() && name_hits == 0 && !fallback;
+        let relaxed = relax_name_filter(terms, name_hits, category_fallback);
         let mut results: Vec<(f64, Value)> = in_range
             .into_iter()
             .filter(|(_, hit, _, _, _)| relaxed || *hit)
-            .map(|(dist, _, el, elat, elon)| (dist, place_json(el, elat, elon, dist, &zone)))
+            .map(|(dist, _, el, elat, elon)| (dist, place_json(el, elat, elon, dist, zone)))
             .collect();
         results.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
         let total = results.len();
-        let places: Vec<Value> = results.into_iter().take(limit).map(|(_, v)| v).collect();
-
-        // COVERAGE IS REPORTED, NOT IMPLIED. `opening_hours` is present on some cafés and
-        // absent on others, and a caller that cannot see how many of its results carried the
-        // field has no way to tell "nothing is open" from "nobody has tagged this street".
-        let with_hours = places
-            .iter()
-            .filter(|p| p.get("opening_hours_raw").is_some())
-            .count();
-
-        Ok(json!({
-            "query": query,
-            "center": {"latitude": lat, "longitude": lon},
-            "radius_m": radius,
-            "matched_categories": categories,
-            "used_fallback_categories": fallback,
-            "name_filter_terms": terms,
-            "name_filter_relaxed": relaxed,
-            "timezone": zone.name,
-            "timezone_source": zone.source,
-            "total_matches": total,
-            "returned": places.len(),
-            "with_opening_hours": with_hours,
-            "without_opening_hours": places.len().saturating_sub(with_hours),
-            "places": places,
-        }))
+        Ok(SearchHits {
+            places: results.into_iter().take(limit).map(|(_, v)| v).collect(),
+            total,
+            relaxed,
+        })
     }
 
-    /// `place_details`.
+    /// `place_details`, routed by the id.
+    ///
+    /// **An id names a source, so there is no provider preference to apply here and no
+    /// fallback to make.** An id from one source means nothing to the other: there is no
+    /// lookup that turns `node/1375266472` into a record from the paid provider, and none that
+    /// turns an opaque paid-provider id into an OSM object. So this dispatches on the id's
+    /// form, and when the source an id names is unavailable it says so and stops. Quietly
+    /// answering from the other source would return a DIFFERENT PLACE under the id the caller
+    /// asked about, which is worse than an error by a wide margin.
     pub async fn details(&self, args: &Value) -> Result<Value, String> {
         let id = args
             .get("id")
             .and_then(Value::as_str)
             .ok_or("id is required; use the `id` of a `places_search` result")?
             .trim();
-        let (kind, num_id) = parse_place_id(id)?;
         let zone = resolve_zone(args.get("timezone").and_then(Value::as_str), &self.cfg);
+        match PlaceRef::parse(id)? {
+            PlaceRef::Google(pid) => self.google_details(id, pid, &zone).await,
+            PlaceRef::OpenStreetMap { kind, id: num_id } => {
+                self.osm_details(id, kind, num_id, &zone).await
+            }
+        }
+    }
 
+    /// `place_details` against the paid provider.
+    async fn google_details(&self, id: &str, place_id: &str, zone: &Zone) -> Result<Value, String> {
+        let g = self.preferred().map_err(|cause| {
+            format!(
+                "{id:?} names the source that carries ratings, and this call cannot reach \
+                 it: {cause}. Run `places_search` again to get an id from whichever source \
+                 is available"
+            )
+        })?;
+        let (body, budget) = g
+            .details(&self.http, place_id)
+            .await
+            .map_err(|e| format!("{e}. Run `places_search` again to get a usable id"))?;
+        // NAN for the distance, for the reason the OpenStreetMap path states below.
+        let mut out = google_place_json(&body, f64::NAN, zone);
+        self.annotate(&mut out, Provider::GooglePlaces, None, Some(budget));
+        Ok(out)
+    }
+
+    /// `place_details` against OpenStreetMap.
+    async fn osm_details(
+        &self,
+        id: &str,
+        kind: &'static str,
+        num_id: u64,
+        zone: &Zone,
+    ) -> Result<Value, String> {
         let overpass = format!("[out:json][timeout:25];\n{kind}({num_id});\nout center;\n");
         let body = self.fetch(&self.cfg.overpass_url, Some(overpass)).await?;
         let parsed: Value = serde_json::from_str(&body)
@@ -1305,7 +1743,7 @@ impl PlacesClient {
         // NAN for the distance: `place_json` emits `distance_m` only when it is finite, and
         // "distance from where?" has no answer here — `place_details` names a place, not a
         // search centre. Emitting 0 would read as "you are standing on it".
-        let mut out = place_json(&el, elat, elon, f64::NAN, &zone);
+        let mut out = place_json(&el, elat, elon, f64::NAN, zone);
         let obj = out.as_object_mut().expect("place_json returns an object");
 
         // The structured address, when the object's own `addr:*` tags do not carry one. This
@@ -1340,6 +1778,14 @@ impl PlacesClient {
         if let Some(tags) = el.get("tags") {
             obj.insert("all_tags".to_string(), tags.clone());
         }
+        // The free source served this because the id named it, not because anything fell
+        // back — so no `provider_fallback_reason`. The budget is reported anyway when a key
+        // is configured, so a reader can see the running count from either tool.
+        let budget = match self.google.as_ref() {
+            Some(g) => g.ledger.peek().await,
+            None => None,
+        };
+        self.annotate(&mut out, Provider::OpenStreetMap, None, budget);
         Ok(out)
     }
 }
@@ -1394,6 +1840,113 @@ fn parse_place_id(id: &str) -> Result<(&'static str, u64), String> {
     Ok((kind, n))
 }
 
+/// Which source an id names, decided before anything is looked up.
+///
+/// The two forms are disjoint by construction and both are CLOSED grammars: an
+/// OpenStreetMap object is `node|way|relation/<digits>`, and a paid-provider place is
+/// `google/<opaque>`. The prefix is a routing key rather than a label — `place_details` must
+/// know which service to ask before it can ask anything, and an opaque token carries nothing
+/// that says. OSM ids are unchanged from before the second provider existed, so every id a
+/// caller already holds still resolves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlaceRef<'a> {
+    OpenStreetMap { kind: &'static str, id: u64 },
+    Google(&'a str),
+}
+
+impl<'a> PlaceRef<'a> {
+    pub fn parse(id: &'a str) -> Result<Self, String> {
+        let id = id.trim();
+        if let Some(rest) = id.strip_prefix("google/") {
+            return crate::places_google::validate_google_place_id(rest).map(PlaceRef::Google);
+        }
+        let (kind, num) = parse_place_id(id)?;
+        Ok(PlaceRef::OpenStreetMap { kind, id: num })
+    }
+}
+
+/// The sentence `places_search` puts after a fallback CAUSE, so that every reason reads the
+/// same way and no cause has to know it will be used there. `place_details` deliberately does
+/// not use it: there the free source does not answer, it errors.
+pub const FELL_BACK: &str = ". This answer came from the free source instead";
+
+/// One source's answer to `places_search`, before the envelope is put round it.
+pub struct SearchHits {
+    pub places: Vec<Value>,
+    /// How many passed the filters, which can exceed `places.len()` when `limit` cut it.
+    pub total: usize,
+    pub relaxed: bool,
+}
+
+/// **THE NAME FILTER IS RELAXED RATHER THAN ALLOWED TO RETURN NOTHING**, when a category
+/// matched and no name did. Shared by both sources so the rule cannot drift into two rules.
+///
+/// This is not a convenience: without it the most natural phrasing of the question breaks.
+/// "cafe near Fountainbridge" leaves `fountainbridge` as a name term — it is not a category
+/// word and not a stop word — and no café is CALLED Fountainbridge, so a strict filter answers
+/// "there are no cafés near you" for a street with a dozen. The place name in such a query is
+/// already expressed by the coordinate the caller passed; insisting it also appear in a venue's
+/// name is asking the same question twice and rejecting on the second.
+///
+/// It is relaxed ONLY when a category matched. With no category the request was for every
+/// nearby place, and dropping the name filter there would return all of them — a worse answer
+/// than an empty one, because it looks like a result. Either way the response SAYS which
+/// happened, in `name_filter_relaxed`.
+pub fn relax_name_filter(terms: &[String], name_hits: usize, category_fallback: bool) -> bool {
+    !terms.is_empty() && name_hits == 0 && !category_fallback
+}
+
+/// The paid provider's half of `places_search`: filter by name on THIS side, rank by distance.
+///
+/// The provider already restricted the result set to the circle, so there is no radius test
+/// here — but the distance is still computed, because that API does not return one and
+/// `distance_m` is part of this server's contract on both paths.
+pub(crate) fn google_hits(
+    body: &Value,
+    lat: f64,
+    lon: f64,
+    limit: usize,
+    terms: &[String],
+    category_fallback: bool,
+    zone: &Zone,
+) -> SearchHits {
+    let places = body
+        .get("places")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let scored: Vec<(f64, bool, &Value)> = places
+        .iter()
+        .filter(|p| {
+            p.get("displayName")
+                .and_then(|d| d.get("text"))
+                .and_then(Value::as_str)
+                .is_some_and(|n| !n.is_empty())
+        })
+        .map(|p| {
+            (
+                google_distance(p, lat, lon).unwrap_or(f64::NAN),
+                google_name_hit(p, terms),
+                p,
+            )
+        })
+        .collect();
+    let name_hits = scored.iter().filter(|r| r.1).count();
+    let relaxed = relax_name_filter(terms, name_hits, category_fallback);
+    let mut kept: Vec<(f64, Value)> = scored
+        .into_iter()
+        .filter(|(_, hit, _)| relaxed || *hit)
+        .map(|(dist, _, p)| (dist, google_place_json(p, dist, zone)))
+        .collect();
+    kept.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    let total = kept.len();
+    SearchHits {
+        places: kept.into_iter().take(limit).map(|(_, v)| v).collect(),
+        total,
+        relaxed,
+    }
+}
+
 fn num(args: &Value, key: &str) -> Option<f64> {
     match args.get(key) {
         Some(Value::Number(n)) => n.as_f64(),
@@ -1443,8 +1996,17 @@ fn place_json(el: &Value, lat: f64, lon: f64, dist_m: f64, zone: &Zone) -> Value
     };
 
     let mut out = Map::new();
-    // A STABLE ID ACROSS BOTH TOOLS: `place_details` takes exactly this string back.
+    // A STABLE ID ACROSS BOTH TOOLS: `place_details` takes exactly this string back. The
+    // `node|way|relation/<n>` form is ALSO what routes the id back to this source — see
+    // [`PlaceRef::parse`] — so it is unchanged by the arrival of a second provider.
     out.insert("id".to_string(), json!(format!("{kind}/{id}")));
+    // WHICH SOURCE SAID THIS. Not a provider name in the tool surface (the KEY is `provider`
+    // on every path); a value, so that a caller seeing no `rating` here can tell "no rating
+    // exists" from "this source has none". See the module docs.
+    out.insert(
+        "provider".to_string(),
+        json!(Provider::OpenStreetMap.label()),
+    );
     out.insert("name".to_string(), json!(t("name").unwrap_or("")));
     out.insert(
         "coordinates".to_string(),
@@ -1516,13 +2078,14 @@ fn place_json(el: &Value, lat: f64, lon: f64, dist_m: f64, zone: &Zone) -> Value
         out.insert("opening_hours_raw".to_string(), json!(raw));
         out.insert("opening_hours".to_string(), hours_json(raw, zone));
     }
-    // NOTE what is not here: no `rating`, no `review_count`, not even set to null. See the
-    // module docs.
+    // NOTE what is not here: no `rating`, no `rating_count`, not even set to null. This
+    // source has none and never will; the record says which source it is, so the absence is
+    // readable rather than ambiguous. See the module docs.
     Value::Object(out)
 }
 
 /// Great-circle distance in metres.
-fn haversine_m(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
+pub(crate) fn haversine_m(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
     const R: f64 = 6_371_000.0;
     let (p1, p2) = (lat1.to_radians(), lat2.to_radians());
     let dp = (lat2 - lat1).to_radians();
@@ -1567,27 +2130,38 @@ impl PlacesTool {
     pub fn description(&self) -> &'static str {
         match self {
             PlacesTool::Search => {
-                "Find places near a coordinate and report their opening hours. Takes a free-text \
-                 query (\"cafe\", \"pharmacy\", \"Söderberg bakery\"), a latitude, a longitude \
-                 and a radius in metres. Returns each place's stable id, name, address, \
-                 coordinates, distance, and whatever of phone, website, category and opening \
-                 hours is recorded for it. Opening hours come back in two fields: \
-                 `opening_hours_raw` (the source string) and `opening_hours` (per-weekday \
-                 intervals plus an `open_now` boolean evaluated in a named timezone). Coverage \
-                 is uneven and the response says so: `with_opening_hours` and \
-                 `without_opening_hours` count how many results carried the field. If the \
-                 query contains a place or street name that matches no venue name, the name \
-                 filter is dropped and `name_filter_relaxed` is true — the results are then \
-                 everything in the category within the radius. No ratings are available from \
-                 this source."
+                "Find places near a coordinate and report their opening hours and ratings. \
+                 Takes a free-text query (\"cafe\", \"pharmacy\", \"Söderberg bakery\"), a \
+                 latitude, a longitude and a radius in metres. Returns each place's stable id, \
+                 name, address, coordinates, distance, and whatever of phone, website, \
+                 category, rating and opening hours is recorded for it. Opening hours come \
+                 back in two fields: `opening_hours_raw` (the source string) and \
+                 `opening_hours` (per-weekday intervals plus an `open_now` boolean evaluated \
+                 in a named timezone). A rating comes back as `rating` and `rating_count` \
+                 together or not at all. Results are served from one of two data sources and \
+                 EVERY result names its own in a `provider` field: they differ in coverage — \
+                 one has no ratings at all and thinner opening hours — so a missing `rating` \
+                 means \"not available from the source that answered\", which is not the same \
+                 claim as \"this place is unrated\". When the answer did not come from the \
+                 preferred source, `provider_fallback_reason` says why in a sentence. Coverage \
+                 is counted on every response: `with_opening_hours`, `without_opening_hours`, \
+                 `with_rating` and `without_rating`. If the query contains a place or street \
+                 name that matches no venue name, the name filter is dropped and \
+                 `name_filter_relaxed` is true — the results are then everything in the \
+                 category within the radius."
             }
             PlacesTool::Details => {
-                "Get the fullest record for one place, by the `id` of a `places_search` result \
-                 (for example \"node/1234567\"). Returns everything search returns, plus a \
-                 looked-up postal address when the place has no address tags of its own, and \
-                 every raw tag recorded for it. Opening hours come back in both the raw and \
-                 parsed forms; when the raw string cannot be parsed, `opening_hours.parsed` is \
-                 false with a reason and `open_now` is null — the raw string is still returned."
+                "Get the fullest record for one place, by the `id` of a `places_search` \
+                 result — pass the id back EXACTLY as it was given, since it also says which \
+                 data source the record came from and that source is the only one that can \
+                 resolve it. Returns everything search returns, and for some sources a \
+                 looked-up postal address when the place carries none of its own plus every \
+                 raw tag recorded for it. Opening hours come back in both the raw and parsed \
+                 forms; when the raw value cannot be parsed, `opening_hours.parsed` is false \
+                 with a reason and `open_now` is null — the raw value is still returned. If \
+                 the source an id names is unavailable this call fails rather than answering \
+                 from the other one, because the other one has no record under that id: run \
+                 `places_search` again to get a usable id."
             }
         }
     }
@@ -1622,7 +2196,7 @@ impl PlacesTool {
                 "properties": {
                     "id": {
                         "type": "string",
-                        "description": "The `id` of a `places_search` result, e.g. \"node/1234567\"."
+                        "description": "The `id` of a `places_search` result, passed back verbatim. Ids are opaque: do not construct, edit or guess one."
                     },
                     "timezone": {
                         "type": "string",
@@ -1916,6 +2490,222 @@ mod tests {
                 "the advertised surface must not name a provider, found {banned:?} in: {blob}"
             );
         }
+    }
+
+    // ---- the second source, seen from this side ------------------------------------
+
+    /// The shipped record must SAY which source it came from. Without it a caller seeing no
+    /// `rating` cannot tell "this place is unrated" from "the source that answered has no
+    /// ratings in it", and those call for different next moves.
+    #[test]
+    fn every_record_names_the_source_that_produced_it() {
+        let zone = Zone {
+            tz: chrono_tz::UTC,
+            name: "UTC".to_string(),
+            source: "test",
+        };
+        let el = json!({
+            "type": "node", "id": 42, "lat": 1.0, "lon": 1.0,
+            "tags": {"name": "X", "amenity": "cafe"}
+        });
+        assert_eq!(
+            place_json(&el, 1.0, 1.0, 1.0, &zone)["provider"],
+            json!("openstreetmap")
+        );
+        assert_eq!(Provider::OpenStreetMap.label(), "openstreetmap");
+        assert_eq!(Provider::GooglePlaces.label(), "google_places");
+    }
+
+    /// The `provider` field is a VALUE, not a name in the tool surface. That distinction is
+    /// the whole reason a second source costs no containment battery, so it is asserted
+    /// rather than left to the sibling test's phrasing: the KEY is the same string on both
+    /// paths, and neither label appears in any tool name, description or schema.
+    #[test]
+    fn the_provider_is_a_value_and_never_part_of_the_surface() {
+        let mut surface = String::new();
+        for t in PlacesTool::ALL {
+            surface.push_str(t.tool_name());
+            surface.push(' ');
+            surface.push_str(t.description());
+            surface.push(' ');
+            surface.push_str(&t.input_schema().to_string());
+            surface.push(' ');
+        }
+        let lower = surface.to_lowercase();
+        for label in [
+            Provider::OpenStreetMap.label(),
+            Provider::GooglePlaces.label(),
+            "google",
+        ] {
+            assert!(
+                !lower.contains(label),
+                "the advertised surface must not name a source, found {label:?}"
+            );
+        }
+    }
+
+    /// One table, both sources: adding a category has to serve both or say it cannot.
+    #[test]
+    fn the_category_table_carries_well_formed_types_for_the_second_source() {
+        let mut expressible = 0;
+        for c in CATEGORIES {
+            let mut seen: Vec<&str> = Vec::new();
+            for t in c.google_types {
+                assert!(
+                    !t.is_empty()
+                        && t.bytes()
+                            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'),
+                    "{}: {t:?} is not a well-formed place type",
+                    c.name
+                );
+                assert!(!seen.contains(t), "{}: {t:?} listed twice", c.name);
+                seen.push(t);
+            }
+            if !c.google_types.is_empty() {
+                expressible += 1;
+            }
+        }
+        // The three that genuinely have no equivalent are optician, newsagent and
+        // greengrocer. If that count moves, the doc comment on `google_types` moves with it.
+        assert_eq!(
+            CATEGORIES.len() - expressible,
+            3,
+            "exactly three categories are known to be inexpressible for the second source"
+        );
+    }
+
+    #[test]
+    fn a_query_selects_types_from_the_same_closed_table_as_the_tag_filters() {
+        assert_eq!(
+            google_types_for_query("coffee"),
+            GoogleTypes::These(vec!["cafe", "coffee_shop"])
+        );
+        // Two categories in one query union their types, in table order, without duplicates.
+        assert_eq!(
+            google_types_for_query("pharmacy or chemist supermarket"),
+            GoogleTypes::These(vec![
+                "supermarket",
+                "grocery_store",
+                "pharmacy",
+                "drugstore"
+            ])
+        );
+        // No category at all: ask for everything nearby, exactly as the tag side falls back.
+        assert_eq!(google_types_for_query("Söderberg"), GoogleTypes::Everything);
+        // A category this source has no type for is neither an error nor a broader question.
+        assert_eq!(google_types_for_query("optician"), GoogleTypes::Unsupported);
+        assert_eq!(
+            google_types_for_query("newsagent"),
+            GoogleTypes::Unsupported
+        );
+    }
+
+    /// A hostile query must not reach the second source's request either. The types are all
+    /// `'static` and come from the table; nothing a caller writes can become one.
+    #[test]
+    fn a_hostile_query_cannot_reach_the_selected_types() {
+        let hostile = "cafe\"]);out:json;/*evil*/ {\"includedTypes\":[\"restaurant\"]}";
+        assert_eq!(
+            google_types_for_query(hostile),
+            GoogleTypes::These(vec!["cafe", "coffee_shop", "restaurant"]),
+            "only table values survive; the punctuation is not in the result at all"
+        );
+    }
+
+    /// An id says which source can resolve it, and the ids this server has always emitted
+    /// still resolve to the source that emitted them.
+    #[test]
+    fn an_id_routes_to_the_source_that_can_resolve_it() {
+        assert_eq!(
+            PlaceRef::parse("node/1375266472"),
+            Ok(PlaceRef::OpenStreetMap {
+                kind: "node",
+                id: 1375266472
+            })
+        );
+        assert_eq!(
+            PlaceRef::parse("way/7"),
+            Ok(PlaceRef::OpenStreetMap { kind: "way", id: 7 })
+        );
+        assert_eq!(
+            PlaceRef::parse("google/ChIJexample_1-2"),
+            Ok(PlaceRef::Google("ChIJexample_1-2"))
+        );
+        for bad in [
+            "google/",
+            "google/../../etc/passwd",
+            "google/a?fields=*",
+            "elephant/1",
+            "1375266472",
+            "",
+        ] {
+            assert!(
+                PlaceRef::parse(bad).is_err(),
+                "{bad:?} must not route anywhere"
+            );
+        }
+    }
+
+    /// The relax rule is shared, so the two sources cannot answer the same query differently.
+    #[test]
+    fn the_name_filter_relaxes_on_the_same_rule_for_both_sources() {
+        let terms = vec!["fountainbridge".to_string()];
+        assert!(
+            relax_name_filter(&terms, 0, false),
+            "a matched category with no name hit relaxes"
+        );
+        assert!(
+            !relax_name_filter(&terms, 0, true),
+            "a query with NO category must not relax into every nearby place"
+        );
+        assert!(
+            !relax_name_filter(&terms, 3, false),
+            "name hits mean no relaxing"
+        );
+        assert!(
+            !relax_name_filter(&[], 0, false),
+            "no terms, nothing to relax"
+        );
+    }
+
+    /// The second source's result list goes through the same filtering, ranking and limiting
+    /// as the first — the caller must not be able to tell which one ran from the envelope's
+    /// shape, only from `provider`.
+    #[test]
+    fn the_second_sources_results_are_filtered_and_ranked_the_same_way() {
+        let zone = Zone {
+            tz: chrono_tz::UTC,
+            name: "UTC".to_string(),
+            source: "test",
+        };
+        let body = json!({"places": [
+            {"id": "far", "displayName": {"text": "Far Cafe"},
+             "location": {"latitude": 55.9500, "longitude": -3.2081}},
+            {"id": "near", "displayName": {"text": "Near Cafe"},
+             "location": {"latitude": 55.9436, "longitude": -3.2081}},
+            {"id": "nameless", "displayName": {"text": ""},
+             "location": {"latitude": 55.9435, "longitude": -3.2081}},
+        ]});
+        let hits = google_hits(&body, 55.9435, -3.2081, 10, &[], false, &zone);
+        assert_eq!(
+            hits.total, 2,
+            "an unnamed place is dropped, as on the other path"
+        );
+        assert_eq!(hits.places[0]["name"], json!("Near Cafe"), "nearest first");
+        assert_eq!(hits.places[1]["name"], json!("Far Cafe"));
+        assert!(hits.places[0]["distance_m"].as_i64().unwrap() < 20);
+        assert!(!hits.relaxed);
+
+        // `limit` truncates the returned list but `total` still says how many matched.
+        let hits = google_hits(&body, 55.9435, -3.2081, 1, &[], false, &zone);
+        assert_eq!(hits.places.len(), 1);
+        assert_eq!(hits.total, 2);
+
+        // A name term that matches nothing, with a category matched, relaxes — same rule.
+        let terms = vec!["fountainbridge".to_string()];
+        let hits = google_hits(&body, 55.9435, -3.2081, 10, &terms, false, &zone);
+        assert!(hits.relaxed);
+        assert_eq!(hits.places.len(), 2);
     }
 
     #[test]

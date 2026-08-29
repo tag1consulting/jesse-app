@@ -13,6 +13,79 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [bridge 0.104.0] - 2026-08-29
+
+### Added
+
+- **`places` answers from a second source, behind the same two tool names.** OpenStreetMap
+  gives opening hours where a mapper has recorded them — 6 of 15 cafés on Fountainbridge — and
+  gives ratings never, because the data model has no field for one. Google Places API (New)
+  gives both. It is now the preferred source whenever `JESSE_PLACES_GOOGLE_API_KEY` is set,
+  with OpenStreetMap serving the request when there is no key, when the deployment pins itself
+  with `JESSE_PLACES_PROVIDER=openstreetmap`, when the query names a category Google has no
+  place type for, when the request budget is spent, or when the Google call fails. **The
+  server works with no key at all, exactly as it did before.**
+
+  `places_search` and `place_details` are unchanged and no tool was added, which was the whole
+  point: `DEFAULT_ALLOWED_TOOLS` and `MAIN_CHILD_MCP_CONFIG` did not move, so `toolset_args`
+  did not move, so **this cost no live containment battery**. Verified rather than assumed —
+  every input to `Harness::capability_args` is byte-identical to the previous release.
+
+- **Every result names the source that produced it**, in a `provider` field. The two sources
+  differ in coverage, so without it a caller seeing no `rating` cannot tell "this place is
+  unrated" from "the source that answered has no ratings at all". Results are never blended:
+  every field of a record comes from the one source that record names. When the answer did not
+  come from the preferred source, `provider_fallback_reason` says why in a sentence, and
+  `with_rating` / `without_rating` join the existing hours-coverage counts.
+
+- **A request budget, a ledger, and minimum field masks**, because this is the first bridge
+  capability that spends money per call. Default 200 calls per rolling 24 hours
+  (`JESSE_PLACES_GOOGLE_MAX_CALLS`, `JESSE_PLACES_GOOGLE_WINDOW_SECS`), enforced server-side
+  and **failing closed**: the reservation is taken before the request goes out, and a ledger
+  that cannot be read or written refuses the paid source rather than spending unmetered. When
+  it trips, the free source answers and the response says so. The ledger is plain text, one
+  line per billed call, at `$JESSE_STATE_DIR/places-google-calls.log` — the budget's storage
+  and the audit trail in one file, so a runaway loop is visible the same day. It is a file
+  rather than a counter because `jesse-places-mcp` is spawned per turn.
+
+  The API bills at the highest SKU tier in the field mask; `rating`, `userRatingCount` and
+  `regularOpeningHours` are all Enterprise, so Enterprise is this contract's floor and the
+  masks are pinned to it. A test asserts the Enterprise + Atmosphere families are absent.
+
+- **No Google response is cached, at all.** Its terms permit caching only latitude/longitude
+  (30 days, Service Specific Terms §14.3) and `place_id` (§3) — not names, addresses, ratings
+  or opening hours. The five-minute response cache the OpenStreetMap path uses is not on the
+  Google path, and the two things the terms do permit would save nothing here. See SECURITY.md
+  for the clauses and what they bind.
+
+### Changed
+
+- Google's structured `periods` are mapped onto the **same** internal hours representation the
+  OpenStreetMap string parser produces, and both are rendered by one function — so an overnight
+  Friday close at 02:00 is one interval flagged `crosses_midnight` on both paths, and a caller
+  never branches on the source to read hours. `open_now` is recomputed locally for both rather
+  than taken from Google's own `openNow`, which is evaluated in the place's local zone.
+
+- Ids now say which source can resolve them: OpenStreetMap ids keep their existing
+  `node|way|relation/<n>` form and Google's are `google/<place id>`. `place_details` routes on
+  that, and when the source an id names is unavailable it **fails rather than answering from
+  the other one** — which would return a different place under the id the caller asked about.
+
+### Security
+
+- No caller-authored string reaches Google either. Its obvious entry point is Text Search,
+  which takes a `textQuery` — precisely the egress channel this server exists not to have.
+  It is not used and is not reachable. Nearby Search is, and its whole request body is a
+  coordinate, a radius, a count and place types drawn from the same closed compile-time
+  category table that already chooses the OpenStreetMap tag filters. The one caller-supplied
+  string that reaches it is a place id, validated against `^[A-Za-z0-9_-]{1,255}$` first.
+
+- The API key is read from the environment and nowhere else, and is wrapped in a newtype whose
+  `Debug` is redacted — `PlacesConfig` derives `Debug` and tool failures are returned to a turn
+  as text. Google's error **body** is never echoed into a tool result either: its envelope
+  repeats request parameters back. Only the fixed status enum (`PERMISSION_DENIED`, …) is
+  passed through, and only when it matches that shape.
+
 ## [bridge 0.103.0] - 2026-08-28
 
 ### Fixed

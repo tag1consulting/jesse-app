@@ -680,12 +680,25 @@ pub const DEFAULT_MAX_ATTACHMENTS_TOTAL_BYTES: usize = 20 * 1024 * 1024;
 // exactly that half: hours, raw and parsed, with an `open_now` evaluated in a named timezone.
 //
 // THE NAMES ARE PROVIDER-AGNOSTIC AND THAT IS WHY THEY ARE CHEAP TO KEEP. Nothing here names
-// a backend, and nothing the tools return does either. This pass is backed by OpenStreetMap;
-// a second provider carrying the ratings OSM does not have is expected behind these SAME two
-// names. Because the names do not move, that provider changes neither this const nor
-// `MAIN_CHILD_MCP_CONFIG` — so it changes no `toolset_args`, so it costs NO LIVE BATTERY
-// RE-RUN. Naming a provider in a tool would have made every backend swap a $20 re-record.
-// Do not "clarify" these names by adding one.
+// a backend, and no tool name, description or output field NAME does either. The second
+// provider — Google Places, carrying the ratings OpenStreetMap does not have — landed in
+// 0.104.0 BEHIND THESE SAME TWO NAMES, and the bet paid: it changed neither this const nor
+// `MAIN_CHILD_MCP_CONFIG`, so it changed no `toolset_args`, so it cost NO LIVE BATTERY
+// RE-RUN. Naming a provider in a tool would have made that swap a $20 re-record. Do not
+// "clarify" these names by adding one, and do not add a third tool for a third source.
+//
+// What a result DOES carry is a `provider` field whose VALUE names the source that answered.
+// That is data rather than surface — the key is `provider` on every path — and it is
+// load-bearing: the two sources differ in coverage, so without it a caller seeing no rating
+// cannot tell "this place is unrated" from "the source that answered has no ratings at all".
+//
+// PLACES NOW SPENDS MONEY, WHICH NOTHING ELSE IN THIS LIST DOES. The preferred source bills
+// per request, out of a child that reads attacker-authored message bodies, and its terms
+// forbid caching the fields this tool exists to return. The controls are inside the server,
+// not in this list: a rolling-window request budget that fails closed and falls back to the
+// free source, minimum field masks, and a plain-text ledger with one line per billed call.
+// See `crate::places_google`. Granting these tools is therefore also a decision to accept a
+// bounded per-day spend; the bound is `JESSE_PLACES_GOOGLE_MAX_CALLS`.
 //
 // WHAT THEY COST, STATED AGAINST THE MAPS GRANT DIRECTLY ABOVE. `maps_search` sends a
 // caller-authored QUERY STRING to Apple out of a child that reads attacker-authored message
@@ -696,11 +709,20 @@ pub const DEFAULT_MAX_ATTACHMENTS_TOTAL_BYTES: usize = 20 * 1024 * 1024;
 // `^(node|way|relation)/[0-9]+$` first. What goes out is a coordinate, a radius and
 // constants. There is no string a turn can author that reaches a remote service.
 //
+// THAT STILL HOLDS WITH THE SECOND SOURCE. Its obvious entry point is Text Search, which
+// takes a `textQuery` — precisely the egress channel this server exists not to have. It is
+// not used and is not reachable. Nearby Search is, and its whole request body is a
+// coordinate, a radius, a count and place types drawn from the same closed compile-time
+// table; the one caller-supplied string that reaches it is a place id validated as
+// `^[A-Za-z0-9_-]{1,255}$` first.
+//
 // WHAT IS GENUINELY NEW is inbound: OSM is a public wiki, so a place name or an
 // `opening_hours` value is untrusted text arriving in a turn's context. That is the same
 // trust level as any page the browser server fetches, which this list has carried since
 // 0.66.0, and it is why the hours parser refuses a string it cannot read instead of guessing
 // — a confident wrong answer from attacker-editable data is the failure mode worth avoiding.
+// The second source's records are third-party business content rather than wiki text, which
+// is a different provenance but not a more trusted one.
 pub const DEFAULT_ALLOWED_TOOLS: &str = "\
 Read(//${WORKSPACE}/**),Edit(//${WORKSPACE}/**),\
 Grep(//${WORKSPACE}/**),Glob(//${WORKSPACE}/**),\

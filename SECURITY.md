@@ -388,7 +388,7 @@ adding it to `DEPLOY_BINS` ships a config naming a command that is not installed
 bridge starts cleanly, answers `/health`, and registers zero tools for that server on every
 turn thereafter, with no error written anywhere.
 
-### Places (`places`, 2026-08-27)
+### Places (`places`, 2026-08-27; second provider 2026-08-29)
 
 The child has had Apple Maps search since 0.99.0, and that tool returns **no opening hours and
 no ratings, ever** — a limit of its upstream data source, not of its configuration. "What is
@@ -399,10 +399,16 @@ half.
 
 Two MCP tools, served by `jesse-places-mcp` (this repository's own binary, `bridge/src/bin/`),
 over the same inline `--mcp-config` + `--strict-mcp-config` channel every other server uses.
-The logic is Rust in the bridge crate (`bridge/src/places.rs`); the binary is transport. Both
-tools are granted; there is no third tool to withhold and no write verb anywhere in the
-server. This pass is backed by OpenStreetMap (Overpass for nearby search, Nominatim for the
-address of a specific object); neither needs an API key.
+The logic is Rust in the bridge crate (`bridge/src/places.rs`, `bridge/src/places_google.rs`);
+the binary is transport. Both tools are granted; there is no third tool to withhold and no
+write verb anywhere in the server.
+
+**Two data sources sit behind those same two tools.** OpenStreetMap (Overpass for nearby
+search, Nominatim for the address of a specific object), which needs no key; and Google Places
+API (New), which needs an API key and bills per request. Google is preferred when a key is
+configured — it is the only one with ratings, and its opening-hours coverage is materially
+better — and OpenStreetMap serves the request otherwise. **The server works with no key at
+all, exactly as it did before.**
 
 | Tool | What it does |
 | --- | --- |
@@ -411,11 +417,25 @@ address of a specific object); neither needs an API key.
 
 #### The tool names name no provider, and that is a containment decision
 
-A second provider is expected behind these same two names, carrying the ratings OSM does not
-have. Because the names do not move, that provider changes neither `DEFAULT_ALLOWED_TOOLS` nor
-`MAIN_CHILD_MCP_CONFIG` — so it changes no `toolset_args`, and therefore **costs no live
-battery re-run**. A provider baked into a tool name would have made every backend swap a
-$20 re-record.
+The second provider landed behind these same two names and the bet paid: it changed neither
+`DEFAULT_ALLOWED_TOOLS` nor `MAIN_CHILD_MCP_CONFIG`, so it changed no `toolset_args`, and it
+therefore **cost no live battery re-run**. A provider baked into a tool name would have made
+every backend swap a $20 re-record. Verified rather than assumed — every input to
+`Harness::capability_args` is byte-identical to `main`, and all four rows of
+`bridge/containment.toml` still compare equal under `validate_toolset_argv`.
+
+Nothing at boot reads the server list or a per-server tool count. The startup gate compares
+`capability_args` (an allowlist argv, with no `--mcp-config` in it) against the record by
+strict equality; the one thing that does look at the MCP config —
+`detect_unresolved_mcp_servers` — checks that each stdio command resolves on the child's
+`PATH` and is explicitly advisory, never fatal.
+
+What a result *does* carry is a `provider` field whose **value** names the source that
+answered. That is data, not surface: the key is `provider` on both paths, no tool name or
+description or schema names a source, and no argv contains either label. It is load-bearing —
+the two sources differ in coverage, so without it a caller seeing no `rating` cannot tell
+"this place is unrated" from "the source that answered has no ratings at all". Results are
+never blended: every field of a record comes from the one source that record names.
 
 #### Egress: this does not widen the channel `maps_search` opened
 
@@ -451,9 +471,75 @@ failed parse `open_now` is `null`, not `false` — a `false` there would be indi
 from "closed right now", and reporting a venue as shut because a string was unreadable is
 precisely the wrong answer this design exists to avoid.
 
-There are **no ratings** in this data source and no `rating` key is emitted, not even as null:
-a null would teach a caller the concept exists and invite it to render "0" or "unrated" for a
-place that is simply outside the provider's coverage.
+There are **no ratings** in the OpenStreetMap data and no `rating` key is emitted on that
+path, not even as null: a null would teach a caller the concept exists and invite it to render
+"0" or "unrated" for a place that is simply outside the provider's coverage. On the Google
+path `rating` and `rating_count` are emitted **together or not at all** — a bare rating with
+no count is not usable information, because 5.0 from one person and 4.6 from eleven thousand
+are not the same claim.
+
+Google's structured hours are mapped onto the *same* internal representation the OSM string
+parser produces, and both are rendered by one function, so the two cannot drift into two
+output shapes. `open_now` is recomputed locally for both rather than taken from Google's own
+`openNow`, which is evaluated in the place's local zone: otherwise the boolean would answer a
+different question depending on who replied, and the timezone the response names would not be
+the one it was computed in.
+
+#### Cost and abuse control, which is not optional for a per-request-billed source
+
+This is the first bridge capability that spends money per call, from a child that reads
+attacker-authored content. Four controls, all inside the server:
+
+* **A rolling-window request budget**, default 200 calls per 24 hours
+  (`JESSE_PLACES_GOOGLE_MAX_CALLS`, `JESSE_PLACES_GOOGLE_WINDOW_SECS`). It **fails closed**:
+  a reservation is taken *before* the request goes out (a call that reaches Google and returns
+  4xx may still have been billed), and if the ledger cannot be read or written the paid source
+  is refused rather than used unmetered. When it trips, the free source answers and the
+  response says so — the tool never fails for want of budget.
+* **A plain-text ledger**, one line per billed call, at
+  `$JESSE_STATE_DIR/places-google-calls.log` (`JESSE_PLACES_GOOGLE_LEDGER` overrides). It is
+  both the budget's storage and the audit trail — `wc -l` answers "is something looping?" the
+  same day rather than on a bill. It stores **no response content**: a timestamp, a tool name,
+  a SKU tier and a running count. It is a file rather than a counter because
+  `jesse-places-mcp` is spawned **per turn**, so an in-process counter would reset on every
+  question and bound nothing across a day.
+* **Minimum field masks.** That API bills per request at the highest SKU tier any field in the
+  mask belongs to. `rating`, `userRatingCount` and `regularOpeningHours` are all Enterprise, so
+  Enterprise is the floor for this tool contract; the masks are pinned to that floor and a test
+  asserts the Enterprise + Atmosphere families (`reviews`, `photos`, `editorialSummary`, the
+  service/amenity block) are absent.
+* **No caching of Google content at all** — see below. That is a refusal, not an omission.
+
+#### Google's terms permit almost no caching, and the design obeys that rather than working round it
+
+Google Maps Platform Terms of Service **§3.2.3(b) (No Caching)**: *"Customer will not cache
+Google Maps Content except as expressly permitted under the Maps Service Specific Terms."* The
+Service Specific Terms then permit, for this API, exactly two things: **§14.3** — *"Customer
+may temporarily cache latitude and longitude values from the Places API for up to 30
+consecutive calendar days"* — and **§3 (ID Caching)**, which allows storing `place_id`
+indefinitely. Nothing else. Not names, not addresses, not ratings, and **not opening hours** —
+the two fields this source was added for. §3.2.3(a)(iii) closes it from the other side by
+naming *"copy and save business names, addresses, or user reviews"* as prohibited scraping.
+
+So the five-minute response cache the OpenStreetMap path uses is **not on the Google path at
+all**, and every Google-served tool call is a billed call. The two things the terms *do*
+permit are the two whose reuse would save nothing here: a cached id still needs a billed Place
+Details call to become hours and a rating, which costs more than the search that produced it.
+The request budget is therefore the only cost control, which is why it defaults low and fails
+closed.
+
+Two further terms bind this use and are complied with: **§14.1** permits Places content
+without a Google map and **§14.2** forbids it *with* a non-Google map — this server renders no
+map — and the attribution requirement, met by an `attribution` field on every Google-served
+record plus the provider's own `attributions` array passed through untouched.
+
+One term is worth flagging as a limit this tool cannot enforce: **§3.2.3(c)(vii)** forbids
+using Google Maps Content *"to improve machine learning and artificial intelligence models,
+including to train, test, validate or fine-tune the models"*. Answering a question from a tool
+result is inference, not model improvement, so ordinary use is inside the term. What the server
+cannot control is what a turn subsequently does with the text — writing a Google-sourced
+business name into a vault note would be storage the terms do not permit. That is a usage
+boundary for the operator, recorded here rather than silently assumed away.
 
 #### Rate limiting is enforced in the server, not asked of the caller
 
@@ -469,12 +555,26 @@ repository, and `JESSE_PLACES_USER_AGENT` overrides it.
 #### Deployment
 
 `jesse-places-mcp` must be on the bridge's `PATH`, on the same terms as `jesse-build-mcp`
-above, and it is in `DEPLOY_BINS`. Configuration is entirely by environment
+above, and it is in the deploy binary set. Configuration is entirely by environment
 (`JESSE_PLACES_OVERPASS_URL`, `JESSE_PLACES_NOMINATIM_URL`, `JESSE_PLACES_USER_AGENT`,
 `JESSE_PLACES_MIN_INTERVAL_MS`, `JESSE_PLACES_CACHE_TTL_SECS`, `JESSE_PLACES_HTTP_TIMEOUT_SECS`,
-`JESSE_PLACES_TIMEZONE`) and never by argv — deliberately, so that repointing a backend when
-the public instance is unavailable does not change the argv the containment record commits by
-strict equality. None of these grant a tool; the startup gate says so itself.
+`JESSE_PLACES_TIMEZONE`, `JESSE_PLACES_PROVIDER`, `JESSE_PLACES_GOOGLE_API_KEY`,
+`JESSE_PLACES_GOOGLE_BASE_URL`, `JESSE_PLACES_GOOGLE_MAX_CALLS`,
+`JESSE_PLACES_GOOGLE_WINDOW_SECS`, `JESSE_PLACES_GOOGLE_LEDGER`) and never by argv —
+deliberately, so that repointing a backend when the public instance is unavailable does not
+change the argv the containment record commits by strict equality. None of these grant a tool;
+the startup gate says so itself.
+
+The API key lives in the bridge's launchd plist `EnvironmentVariables`, the same way
+`HA_MCP_TOKEN` does, and is read from the environment and nowhere else — not from a config
+file in the vault (which the child can write), not from a tool argument, and not from argv
+(which the containment record commits verbatim). It is wrapped in a newtype whose `Debug` is
+redacted, because `PlacesConfig` derives `Debug` and tool failures are returned to a turn as
+text. **The key must be restricted in the Google console to the Places API only.** That is the
+one mitigation available for a key that lives in a plist on a machine that runs agent turns:
+if it leaks, the blast radius is this API's bill rather than every API on the project. A plist
+environment change does not survive a plain `launchctl kickstart` — it needs `bootout` then
+`bootstrap`.
 
 ### Web access (`WebSearch` and `WebFetch`, 2026-08-05)
 
