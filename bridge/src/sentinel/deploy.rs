@@ -1818,8 +1818,20 @@ async fn origin_main_view(sen: &Arc<Sentinel>) -> Value {
     let cached = sen.state.lock_ok().origin_main.clone();
     let now = now_ms();
     if let Some(c) = &cached {
-        if now.saturating_sub(c.checked_ms) < ORIGIN_MAIN_TTL_MS {
-            return json!(c);
+        let age = now.saturating_sub(c.checked_ms);
+        // **A `pending` VERDICT IS NEVER SERVED FROM CACHE**, and it is the only one excluded.
+        //
+        // Every other state is an answer that will still be true in a minute. `pending` is
+        // the one that is KNOWN to be about to change — it means a run is in flight right
+        // now — so caching it for five minutes shows "CI has not finished" for up to five
+        // minutes after it finished, which reads as "the deploy is still blocked" when it is
+        // not. That is a card actively misinforming someone who is waiting on it, and the
+        // refresh it costs is one `git fetch` and a couple of API calls at the one moment
+        // somebody actually wants the current answer. The card is only refreshed on appear
+        // and on pull-to-refresh (the three-second poll runs during a deploy, and a deploy
+        // short-circuits below), so this is not a hot loop.
+        if age < ORIGIN_MAIN_TTL_MS && c.ci != "pending" {
+            return cached_view(c, age);
         }
     }
     // A deploy owns the clone while it runs — it leaves a detached head in it and a `cargo`
@@ -1844,6 +1856,44 @@ async fn origin_main_view(sen: &Arc<Sentinel>) -> Value {
             json!(fresh)
         }
         Err(e) => stale_view(cached, &e),
+    }
+}
+
+/// A cache hit inside the TTL, marked with its own age.
+///
+/// **This is the other half of what [`stale_view`] promises, and it was missing.** That
+/// function's contract is that the card is NEVER shown a silently old value — but it only ran
+/// when a refresh was attempted and failed, so a value served straight out of the TTL came
+/// back unmarked and the app, which documents `stale` as "present only when the view could
+/// not be refreshed", rendered a five-minute-old answer as current. That is benign in one
+/// direction (a stale `pending` costs somebody a wait) and not in the other: a stale `green`
+/// enables the Deploy button for a commit whose CI may since have gone red. The verb re-checks
+/// CI for real before it builds anything, so the button lies rather than the deploy breaking —
+/// but a button that lies is the thing this card exists not to be.
+///
+/// The age is in the reason rather than in a new field on purpose: the shipped app already
+/// renders `stale_reason` verbatim, so this reaches a phone with no app change and no
+/// TestFlight build.
+fn cached_view(c: &OriginMain, age_ms: u64) -> Value {
+    let mut v = json!(c);
+    v["stale"] = json!(true);
+    v["stale_reason"] = json!(format!(
+        "read {}, and re-read at most every {}s — pull to refresh for the current answer",
+        approx_age(age_ms),
+        ORIGIN_MAIN_TTL_MS / 1000,
+    ));
+    v
+}
+
+/// An age a person reads, not a number they convert. Used in the one place a card says how
+/// old its answer is.
+fn approx_age(ms: u64) -> String {
+    let secs = ms / 1000;
+    match secs {
+        0..=9 => "just now".to_string(),
+        s if s < 60 => format!("{s}s ago"),
+        s if s < 120 => "a minute ago".to_string(),
+        s => format!("{}m ago", s / 60),
     }
 }
 
@@ -1914,6 +1964,81 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, b"#!/bin/sh\n").unwrap();
         set_executable(path).unwrap();
+    }
+
+    // ---- the card's own freshness ---------------------------------------------------
+
+    /// **A value served from the TTL says how old it is.** The app documents `stale` as
+    /// "present only when the view could not be refreshed", so an unmarked cache hit is
+    /// rendered as current — which is how a card showing "CI is pending" survived four
+    /// minutes past CI going green, and how a `green` card could outlive the CI that vouched
+    /// for it and offer a Deploy button for a commit that has since gone red.
+    #[test]
+    fn a_cache_hit_is_marked_with_its_age_rather_than_passing_as_current() {
+        let c = OriginMain {
+            sha: Some("a".repeat(40)),
+            version: Some("0.105.0".to_string()),
+            ci: "green".to_string(),
+            ci_detail: Some("run 1 (CI) passed the \"bridge\" job".to_string()),
+            checked_ms: 0,
+        };
+        let v = cached_view(&c, 4 * 60 * 1000);
+        assert_eq!(v["stale"], json!(true), "a cache hit is not a fresh read");
+        let why = v["stale_reason"].as_str().expect("it says why");
+        assert!(why.contains("4m ago"), "and how old it is: {why}");
+        assert!(
+            why.contains("pull to refresh"),
+            "and what to do about it: {why}"
+        );
+        // The verdict itself is passed through untouched — this marks the answer, it does not
+        // change it.
+        assert_eq!(v["ci"], json!("green"));
+        assert_eq!(v["version"], json!("0.105.0"));
+        assert_eq!(v["sha"], json!("a".repeat(40)));
+    }
+
+    /// The age reads as a person would say it, because it is rendered verbatim on a phone.
+    #[test]
+    fn the_age_is_written_the_way_someone_reads_it() {
+        assert_eq!(approx_age(0), "just now");
+        assert_eq!(approx_age(9_000), "just now");
+        assert_eq!(approx_age(30_000), "30s ago");
+        assert_eq!(approx_age(90_000), "a minute ago");
+        assert_eq!(approx_age(4 * 60 * 1000), "4m ago");
+        assert_eq!(approx_age(ORIGIN_MAIN_TTL_MS), "5m ago");
+    }
+
+    /// **`pending` is the one verdict never served from cache.** It means a run is in flight
+    /// *right now*, so a five-minute cache of it shows "CI has not finished" for up to five
+    /// minutes after it did — a card actively telling someone waiting on it that they are
+    /// still blocked when they are not. Every other state is an answer that is still true a
+    /// minute later.
+    #[test]
+    fn a_pending_verdict_is_never_served_from_the_cache() {
+        let fresh_enough = ORIGIN_MAIN_TTL_MS / 2;
+        for (ci, cacheable) in [
+            ("green", true),
+            ("red", true),
+            ("none", true),
+            ("pending", false),
+        ] {
+            let c = OriginMain {
+                sha: Some("b".repeat(40)),
+                version: None,
+                ci: ci.to_string(),
+                ci_detail: None,
+                checked_ms: 0,
+            };
+            // The predicate `origin_main_view` applies, stated here so the reason a
+            // `pending` card refreshes cannot be edited away without a failing test.
+            let served_from_cache = fresh_enough < ORIGIN_MAIN_TTL_MS && c.ci != "pending";
+            assert_eq!(
+                served_from_cache,
+                cacheable,
+                "{ci} should {} be served from a within-TTL cache",
+                if cacheable { "" } else { "NOT" }
+            );
+        }
     }
 
     #[test]

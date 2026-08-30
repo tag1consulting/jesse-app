@@ -13,6 +13,38 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [bridge 0.106.0] - 2026-08-30
+
+### Fixed
+
+- **The deploy card no longer shows a cached answer as a current one.** `GET
+  /sentinel/deploy/status` serves its view of `origin/main` from a five-minute cache, and the
+  TTL path returned that value unmarked — while the app documents `stale` as "present only
+  when the view could not be refreshed", so an unmarked cache hit renders as freshly read.
+  `stale`/`stale_reason` were set only when a refresh was *attempted and failed*, so the
+  guarantee `stale_view` states in its own doc comment — that the card can always tell "green
+  five minutes ago" from "green, checked just now" — did not hold on the ordinary path.
+
+  A cache hit is now marked with its own age ("read 4m ago, and re-read at most every 300s —
+  pull to refresh for the current answer"). The age goes in `stale_reason` rather than in a
+  new field deliberately: the shipped app renders that string verbatim, so the fix reaches a
+  phone with no app change and no TestFlight build.
+
+  Observed benignly — a card showing "CI is pending" four minutes after CI went green, which
+  reads as "the deploy is still blocked" when it is not. The same bug inverted is not benign:
+  a cached `green` enables the Deploy button for a commit whose CI may since have gone red.
+  The verb re-checks CI for real before it builds anything, so what breaks is the button's
+  promise rather than the deployment — but a button that lies is what this card exists not to
+  be.
+
+- **A `pending` CI verdict is never served from the cache.** It is the one state that is known
+  to be about to change — it means a run is in flight right now — so caching it for five
+  minutes is precisely wrong. Every other verdict is still true a minute later and is still
+  cached. The refresh costs one `git fetch` and a couple of API calls, at the one moment
+  somebody actually wants the current answer; the card is refreshed only on appear and on
+  pull-to-refresh, and the three-second poll runs during a deploy, which short-circuits the
+  read anyway.
+
 ## [bridge 0.105.0] - 2026-08-29
 
 ### Added
