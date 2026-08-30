@@ -90,6 +90,19 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
   ceilings — as one table rather than per-model keys, because it describes the VAULT and
   per-model copies would be a way for two models to disagree about which documents exist.
 
+### Fixed
+
+- **The startup binary check no longer refuses to boot over a harness that has no binary.**
+  It exited when a harness in use named neither an env var nor a default binary, which was
+  right while that could only be true of an id nobody could construct. It is now also true of
+  `direct`, which answers turns in this process — so a correctly configured deployment would
+  have failed to start. The check asks `runner()` rather than inferring from a missing name,
+  and stays strict for a SPAWNED harness with no binary, which is still a build that
+  registered a harness it cannot run.
+
+  Found by running the bridge, not by a test: the first scratch start with a direct model
+  configured exited on this line.
+
 ### Changed
 
 - **The write lock is taken through the broker directly.** `BrokerGuard` implements the agent

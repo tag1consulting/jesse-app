@@ -11,8 +11,8 @@ use jesse_bridge::{
     manual_pairing_lines, pairing_payload, prune_direct_state, qr_env_tristate, sentinel_advert,
     serve_broker, settings_permission_drift, show_qr_opt_in, show_token_opt_in,
     spawn_eviction_task, spawn_scheduler, spawn_session_gc_task, start_health_prober,
-    validate_model_config, AppState, Config, ConfigError, QrArt, TokenVisibility, BINARY_DRIFT,
-    CONTAINMENT_RECORDS, SETTINGS_DRIFT, UNRESOLVED_MCP,
+    validate_model_config, AppState, Config, ConfigError, QrArt, Runner, TokenVisibility,
+    BINARY_DRIFT, CONTAINMENT_RECORDS, SETTINGS_DRIFT, UNRESOLVED_MCP,
 };
 
 #[tokio::main]
@@ -162,7 +162,26 @@ async fn main() {
     // One binary check per harness some configured model actually references. A config full
     // of Codex models must not demand a Claude binary for the models it does not have — and
     // the ambient default keeps `claude-code` in the list regardless.
+    //
+    // A HARNESS THAT SPAWNS NOTHING IS SKIPPED, and the skip is asked of `runner()` rather
+    // than inferred from a missing binary name. Those are two different facts and only one of
+    // them is safe to act on: "this harness names no binary" was, until the third harness,
+    // only ever true of an id nobody could construct, so exiting was right. It is now also
+    // true of `direct`, which answers turns in this process and has nothing on `PATH` whose
+    // absence could matter. Refusing to boot over it would take the bridge down for a
+    // correctly configured deployment.
+    //
+    // The check is kept STRICT for a spawned harness with no binary name: that is still a
+    // build that registered a harness it cannot run, and starting would mean failing every
+    // turn on it instead.
     for id in harnesses_in_use(&cfg) {
+        if cfg
+            .harnesses
+            .get(&id)
+            .is_some_and(|h| matches!(h.runner(), Runner::InProcess(_)))
+        {
+            continue;
+        }
         let bin = harness_bin_env(&id)
             .and_then(env_string)
             .or_else(|| harness_default_bin(&id).map(str::to_string));
@@ -176,7 +195,10 @@ async fn main() {
                 std::process::exit(1);
             }
             None => {
-                eprintln!("jesse-bridge: harness '{id}' has no known binary path.");
+                eprintln!(
+                    "jesse-bridge: harness '{id}' spawns a child but names no binary — this \
+                     build registered a harness it cannot run."
+                );
                 std::process::exit(1);
             }
         }
