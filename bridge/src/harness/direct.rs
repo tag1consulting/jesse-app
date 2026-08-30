@@ -1088,3 +1088,137 @@ fn attachment_image_blocks(dir: Option<&Path>) -> Vec<ContentBlock> {
         })
         .collect()
 }
+
+// ---- Startup housekeeping ---------------------------------------------------
+
+/// Prune the direct harness's two on-disk ledgers, once, at startup.
+///
+/// **BOTH ARE BOUNDED BY SOMETHING OTHER THAN "forever", and neither is bounded by the same
+/// thing.** The usage log is a time series and is pruned by AGE; the thread store is a set of
+/// conversations and is pruned by REACHABILITY. Using one rule for both would be wrong in
+/// both directions: a thread the user is still in must not age out, and a usage record for a
+/// deleted conversation is still part of the bill.
+///
+/// Best-effort throughout. A failure logs and the bridge starts — housekeeping that can stop
+/// a boot is worse than housekeeping that does not run.
+pub fn prune_direct_state(cfg: &Config, conversations: &ConversationStore) {
+    let Some(state) = cfg.state_dir.as_deref().map(PathBuf::from) else {
+        return;
+    };
+    prune_usage_log(&state.join(USAGE_FILE), SystemTime::now());
+    prune_direct_threads(&state.join(DIRECT_THREADS_DIR), conversations);
+}
+
+/// Drop usage records older than [`USAGE_RETENTION_DAYS`].
+///
+/// The same shape as the turn-timing prune next to it, and for the same reason: the records
+/// are RFC-3339 UTC at fixed width, so "older than the cutoff" is a STRING comparison rather
+/// than a date parse, and the rewrite is temp-file-plus-rename so a crash mid-prune leaves
+/// either the whole old file or the whole new one.
+///
+/// Ninety days rather than the timing log's seven because the two answer different questions.
+/// A timing record answers "why was that turn slow", which nobody asks about last month. A
+/// usage record answers "what did this cost", which is a question asked per billing period —
+/// and a ledger that could not cover a quarter would be a ledger nobody could reconcile.
+fn prune_usage_log(path: &Path, now: SystemTime) {
+    if !path.exists() {
+        return;
+    }
+    let cutoff = rfc3339_utc(now - Duration::from_secs(USAGE_RETENTION_DAYS * 86_400));
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return;
+    };
+    let kept: Vec<&str> = text
+        .lines()
+        .filter(|line| {
+            let t = line.trim();
+            if t.is_empty() {
+                return false;
+            }
+            // A line whose timestamp cannot be read is KEPT. Dropping what we cannot parse
+            // would make a format change silently delete the ledger.
+            match serde_json::from_str::<Value>(t) {
+                Ok(v) => v
+                    .get("ts")
+                    .and_then(|x| x.as_str())
+                    .map(|ts| ts >= cutoff.as_str())
+                    .unwrap_or(true),
+                Err(_) => true,
+            }
+        })
+        .collect();
+    if kept.len() == text.lines().filter(|l| !l.trim().is_empty()).count() {
+        return; // nothing to drop; do not rewrite a file for no reason
+    }
+    let tmp = path.with_extension("jsonl.tmp");
+    let body = kept.join("\n") + if kept.is_empty() { "" } else { "\n" };
+    if std::fs::write(&tmp, body).is_ok() {
+        if let Err(e) = std::fs::rename(&tmp, path) {
+            eprintln!("jesse-bridge: usage-log prune failed: {e} — continuing");
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
+}
+
+/// Remove thread files no conversation references.
+///
+/// **REACHABILITY, NOT AGE.** A direct thread is reachable exactly when some conversation
+/// record lists its id, and the conversation registry is the bridge's own durable notion of
+/// a thread — so a thread whose conversation was deleted is unreachable forever and a thread
+/// the user has not touched in a year is still theirs.
+///
+/// This is the direct harness's equivalent of the session GC sweep, which reclaims orphaned
+/// transcript files for the harnesses that keep them. It is deliberately NOT that sweep:
+/// `Harness::transcript_dir` returns `None` here, so the sweep skips this harness entirely,
+/// and a prune that hooked into it would have to be told about a directory the sweep is
+/// documented not to look at.
+///
+/// SIZE-BOUNDED: at most [`DIRECT_PRUNE_MAX_REMOVALS`] files per startup. A store that has
+/// somehow accumulated tens of thousands of orphans should not turn a boot into a long series
+/// of unlinks; the next start continues where this one stopped.
+fn prune_direct_threads(dir: &Path, conversations: &ConversationStore) {
+    if !dir.is_dir() {
+        return;
+    }
+    let referenced: std::collections::HashSet<String> = conversations
+        .all()
+        .into_iter()
+        .flat_map(|r| r.session_ids)
+        .collect();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut removed = 0usize;
+    for e in entries.flatten() {
+        if removed >= DIRECT_PRUNE_MAX_REMOVALS {
+            eprintln!(
+                "jesse-bridge: direct-thread prune stopped at {DIRECT_PRUNE_MAX_REMOVALS} \
+                 removals; the rest are left for the next start."
+            );
+            break;
+        }
+        let path = e.path();
+        // `<id>.jsonl` and `<id>.meta.json` are the store's two files per thread; the stem
+        // before the FIRST dot is the id in both cases.
+        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        let Some(stem) = name.split('.').next() else {
+            continue;
+        };
+        // Only ever touches something that PARSES as a thread id: an unrelated file that
+        // found its way into this directory is left alone rather than deleted on a guess.
+        if ThreadId::parse(stem).is_err() || referenced.contains(stem) {
+            continue;
+        }
+        if std::fs::remove_file(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    if removed > 0 {
+        eprintln!("jesse-bridge: pruned {removed} unreferenced direct-thread file(s)");
+    }
+}
+
+/// The most thread files one startup prune will remove. See [`prune_direct_threads`].
+pub const DIRECT_PRUNE_MAX_REMOVALS: usize = 500;

@@ -1985,7 +1985,12 @@ pub async fn jesse_result(
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
     check_auth(&headers, &st.cfg.token)?;
-    let timing = timing_to_value(st.timings.get(&job_id).as_ref());
+    let rec = st.timings.get(&job_id);
+    let timing = timing_to_value(rec.as_ref());
+    // BESIDE `timing`, not inside it: a client that wants the bill should not have to know
+    // the timing record's shape. `null` for every turn whose harness reported no counts,
+    // which is every claude-code and codex turn — see [`TurnTiming::usage`].
+    let usage = usage_to_value(rec.as_ref());
     // get_retrieving (not get) so a terminal result's first fetch starts the
     // short post-fetch grace; until then it's held the full TTL.
     match st.jobs.get_retrieving(&job_id) {
@@ -2007,14 +2012,18 @@ pub async fn jesse_result(
             // returns nothing. The bytes come from `GET /jesse/artifact/{id}`.
             "artifacts": artifacts_to_value(&artifacts),
             "timing": timing,
+            "usage": usage,
         }))),
         Some(JobState::Failed { error, partial }) => Ok(Json(json!({
             "status": "failed",
             "error": error,
             "partial": partial_to_value(partial.as_deref()),
             "timing": timing,
+            "usage": usage,
         }))),
-        Some(JobState::Cancelled) => Ok(Json(json!({ "status": "cancelled", "timing": timing }))),
+        Some(JobState::Cancelled) => Ok(Json(
+            json!({ "status": "cancelled", "timing": timing, "usage": usage }),
+        )),
         None => Err((
             StatusCode::NOT_FOUND,
             "unknown or expired job id".to_string(),

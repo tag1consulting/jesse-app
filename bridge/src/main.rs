@@ -8,11 +8,11 @@ use jesse_bridge::{
     app, binary_exists, bind_broker, build_apns, detect_binary_drift,
     detect_unresolved_mcp_servers, env_string, env_truthy, export_mcp_server_env, harness_bin_env,
     harness_default_bin, harnesses_in_use, is_bind_allowed, load_local_models,
-    manual_pairing_lines, pairing_payload, qr_env_tristate, sentinel_advert, serve_broker,
-    settings_permission_drift, show_qr_opt_in, show_token_opt_in, spawn_eviction_task,
-    spawn_scheduler, spawn_session_gc_task, start_health_prober, validate_model_config, AppState,
-    Config, ConfigError, QrArt, TokenVisibility, BINARY_DRIFT, CONTAINMENT_RECORDS, SETTINGS_DRIFT,
-    UNRESOLVED_MCP,
+    manual_pairing_lines, pairing_payload, prune_direct_state, qr_env_tristate, sentinel_advert,
+    serve_broker, settings_permission_drift, show_qr_opt_in, show_token_opt_in,
+    spawn_eviction_task, spawn_scheduler, spawn_session_gc_task, start_health_prober,
+    validate_model_config, AppState, Config, ConfigError, QrArt, TokenVisibility, BINARY_DRIFT,
+    CONTAINMENT_RECORDS, SETTINGS_DRIFT, UNRESOLVED_MCP,
 };
 
 #[tokio::main]
@@ -319,6 +319,12 @@ async fn main() {
     // Evict expired jobs on a periodic background task rather than on the request
     // hot path (H3), so a sweep's file unlinks never delay a turn.
     spawn_eviction_task(state.jobs.clone(), state.artifacts.clone());
+    // THE DIRECT HARNESS'S TWO ON-DISK LEDGERS, pruned once at startup, beside the turn-timing
+    // prune that already runs there. Both are no-ops on a deployment with no direct model —
+    // the files do not exist — and both are best-effort: a prune that fails logs and the
+    // bridge starts, because a bridge that will not boot over housekeeping is worse than one
+    // holding a month of extra records.
+    prune_direct_state(&state.cfg, &state.conversations);
     // Reclaim orphaned vault-project Claude Code sessions older than
     // JESSE_SESSION_TTL_DAYS on a background sweep (one run at startup, then
     // periodic). Scoped to the vault project only; an actively-resumed session
