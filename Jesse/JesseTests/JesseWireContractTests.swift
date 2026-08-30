@@ -243,6 +243,43 @@ final class JesseWireContractTests: XCTestCase {
             #"{"location_context_unavailable":true,"mode":"ask","text":"coffee near me?"}"#)
     }
 
+    /// The reason rides WITH the flag, under its own key. It is what lets the bridge
+    /// render one cause instead of listing four, and it carries no place data — a
+    /// token, never a coordinate, an accuracy or a place name.
+    func testLocationUnavailableReasonEncodesAlongsideTheFlag() throws {
+        let r = JesseClient.makeRequest(
+            mode: .ask, text: "coffee near me?", sessionId: nil,
+            conversationId: nil, voice: false, instructions: nil,
+            floorOverride: nil, attachments: [],
+            locationContextUnavailable: true,
+            locationContextUnavailableReason: LocationUnavailableReason.timedOut.rawValue)
+        XCTAssertEqual(
+            try body(r),
+            #"{"location_context_unavailable":true,"location_context_unavailable_reason":"timed_out","mode":"ask","text":"coffee near me?"}"#)
+    }
+
+    /// A reason WITHOUT the flag it explains would be a contradiction on the wire, so
+    /// it drops. So does a blank one.
+    func testALoneReasonWithoutTheFlagIsDropped() throws {
+        for reason in ["timed_out", "   "] {
+            let r = JesseClient.makeRequest(
+                mode: .ask, text: "hi", sessionId: nil, conversationId: nil,
+                voice: false, instructions: nil, floorOverride: nil, attachments: [],
+                locationContextUnavailable: nil,
+                locationContextUnavailableReason: reason)
+            XCTAssertEqual(try body(r), #"{"mode":"ask","text":"hi"}"#,
+                           "a reason with nothing to explain must not go on the wire")
+        }
+        // …and a blank reason alongside a real flag leaves the flag alone.
+        let flagged = JesseClient.makeRequest(
+            mode: .ask, text: "hi", sessionId: nil, conversationId: nil,
+            voice: false, instructions: nil, floorOverride: nil, attachments: [],
+            locationContextUnavailable: true,
+            locationContextUnavailableReason: "  ")
+        XCTAssertEqual(try body(flagged),
+                       #"{"location_context_unavailable":true,"mode":"ask","text":"hi"}"#)
+    }
+
     /// A blank block and `false` flags all drop out, so a build that sets them to
     /// their defaults is byte-for-byte one that predates the channel.
     func testLocationDefaultsAreOmittedEntirely() throws {

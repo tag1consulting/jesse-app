@@ -9,6 +9,12 @@ import Foundation
 // file is deliberately thin so the untestable CoreLocation surface is as small as
 // possible.
 //
+// The fix-ACQUISITION policy — which arrivals count, which one wins, when to stop
+// waiting, what to report when nothing usable came — used to live in here too, behind
+// the seam rather than in front of it, which is why the defect it contained could not be
+// tested for. It now lives in `LocationFixPolicy.swift` over plain values, and what is
+// left in this file is `CLFixSource`: start, stop, two callbacks.
+//
 // WHAT IT DELIBERATELY DOES NOT DO, and this is the security posture rather than a
 // to-do list:
 //
@@ -18,17 +24,21 @@ import Foundation
 //     NO visit monitoring, NO heading. The app declares no location background mode,
 //     so none of it would run anyway — but the absence is also structural: this file
 //     starts and stops updates inside one awaited call and holds no manager between
-//     turns.
+//     turns. `startUpdatingLocation` is now used in place of `requestLocation`, which
+//     makes STOPPING it on every exit path load-bearing rather than tidy — see
+//     `CLFixSource.stopUpdating` and `FixAcquisition.finish`.
 //   * NO persistence. A reading is returned, rendered into one request, and dropped.
 //     Nothing is written to the vault, to SwiftData, or to UserDefaults, and the only
-//     thing kept in memory is the single cached fix below.
-//   * NO logging of coordinates. The log lines here name failures and statuses, never
-//     a latitude.
+//     things kept in memory are the single cached fix below and the last-attempt
+//     diagnostic, which holds no place data at all.
+//   * NO logging of coordinates. The log lines here name statuses, failures, elapsed
+//     times and accuracy radii — never a latitude and never a place name.
 
 /// Reads one location fix (and optionally its placemark) for the `location_context`
 /// block. Read-only, when-in-use only, and bounded: every degrade path — services off,
 /// unauthorized, denied, restricted, timed out, no fix available, a simulator with no
-/// location set — yields `.empty`, so a turn is never blocked or broken by location.
+/// location set — yields an empty reading AND the reason it was empty, so a turn is
+/// never blocked or broken by location and the agent is told what actually happened.
 ///
 /// `@unchecked Sendable`: the type holds only immutable configuration plus a lock-
 /// guarded cache box; `CLLocationManager` is created and destroyed inside a single call
@@ -44,36 +54,51 @@ import Foundation
 /// `Sendable` value that must be usable from any context; saying so here is both the
 /// fix and the accurate description. Same for the delegate and cache classes below.
 nonisolated final class LocationContextProvider: LocationContextProviding, @unchecked Sendable {
-    /// Hard bound on one fix. The send path waits at most this long, then proceeds with
-    /// no block. Two seconds is generous for a warm fix and short enough that a cold
-    /// one (indoors, airplane mode) does not visibly delay the turn — it degrades to
-    /// the unavailable path instead, which still produces an answer.
-    private let fixTimeout: Duration
-    /// Hard bound on the reverse geocode, which is a network round trip. Separate from
-    /// the fix bound because a device can have a perfectly good fix and no network, and
-    /// in that case the coordinates should still ride out.
-    private let geocodeTimeout: Duration
     /// The last fix, kept in memory ONLY, so a `max_age_seconds` the directive is happy
     /// with can be served without waking the GPS. Dropped on process exit like anything
     /// else in memory; never written anywhere.
+    ///
+    /// A channel that ALWAYS FAILS never populates this at all, which is why repeated
+    /// attempts never got easier: three failed precise requests left the cache exactly as
+    /// empty as they found it, so the fourth started from cold too. Taking interim fixes
+    /// is what makes the cache start doing its job.
     private let cache = CachedFix()
+    /// Where the last attempt is recorded for the Settings diagnostic. Injected so the
+    /// tests do not write to the shared one.
+    private let attempts: LocationAttemptLog
+    /// The source of each acquisition. A factory rather than a stored instance: a
+    /// `CLLocationManager` is created and destroyed inside one call and never held
+    /// between turns.
+    private let makeSource: @Sendable () -> any FixSourcing
+    /// How the live authorization state is read. Injected for the same reason
+    /// `makeSource` is: the cache, the degrade paths and the achieved-precision
+    /// bookkeeping are policy, and a simulator is permanently unauthorized, so without
+    /// this seam every one of them would be untestable behind a `guard` that always
+    /// fails.
+    private let authorization: @Sendable () -> LocationAuthorizationState
 
-    init(fixTimeout: Duration = .seconds(2), geocodeTimeout: Duration = .milliseconds(1500)) {
-        self.fixTimeout = fixTimeout
-        self.geocodeTimeout = geocodeTimeout
+    init(attempts: LocationAttemptLog = .shared,
+         makeSource: @escaping @Sendable () -> any FixSourcing = { CLFixSource() },
+         authorization: @escaping @Sendable () -> LocationAuthorizationState = {
+             LocationPermissionStatus.state()
+         }) {
+        self.attempts = attempts
+        self.makeSource = makeSource
+        self.authorization = authorization
     }
 
     // MARK: - Authorization
 
-    /// The live status, read fresh. True ONLY for `.authorizedWhenInUse`.
+    /// The live state, read fresh, split three ways so "off for the whole device" and
+    /// "off for this app" are different answers — they need different things from the
+    /// owner, and telling him the wrong one is what cost an hour.
     ///
-    /// `.notDetermined` is false on purpose: the app has never asked, and asking here —
-    /// inside a turn, because of a message he typed — is exactly the mid-turn ambush
-    /// the gate exists to prevent. The first ask happens from the Settings row, where
-    /// he chose it.
-    func isAuthorized() async -> Bool {
-        guard CLLocationManager.locationServicesEnabled() else { return false }
-        return CLLocationManager().authorizationStatus == .authorizedWhenInUse
+    /// `.notDetermined` reports `.unauthorized` on purpose: the app has never asked, and
+    /// asking here — inside a turn, because of a message he typed — is exactly the
+    /// mid-turn ambush the gate exists to prevent. The first ask happens from the
+    /// Settings row, where he chose it.
+    func authorizationState() async -> LocationAuthorizationState {
+        authorization()
     }
 
     /// Ask for when-in-use authorization. Called from the Settings row and from
@@ -104,77 +129,187 @@ nonisolated final class LocationContextProvider: LocationContextProviding, @unch
 
     func reading(precision: LocationPrecision,
                  maxAgeSeconds: Int,
-                 wantsPlacemark: Bool) async -> LocationReading {
-        guard await isAuthorized() else { return .empty }
-
-        // A cached fix young enough for what was asked, and precise enough. A fix taken
-        // at reduced accuracy cannot answer a `precise` request, so precision is part
-        // of the cache key rather than only the age.
-        let location: CLLocation
-        if let cached = cache.load(maxAge: TimeInterval(maxAgeSeconds), precision: precision) {
-            location = cached
-        } else if let fresh = await bounded(fixTimeout, { await self.oneFix(precision: precision) }) {
-            cache.store(fresh, precision: precision)
-            location = fresh
-        } else {
-            return .empty
+                 wantsPlacemark: Bool,
+                 budget: LocationFixBudget) async -> LocationReadingResult {
+        let state = await authorizationState()
+        guard state == .authorized else {
+            let reason = state.unavailableReason ?? .unauthorized
+            record(requested: precision, achieved: nil, accuracy: nil,
+                   elapsed: 0, reason: reason, fromCache: false)
+            return .unavailable(reason)
         }
+
+        let fix: FixCandidate
+        // The precision the fix ACHIEVED, which is what it is cached and rendered under
+        // — never the precision that was asked for.
+        let achieved: LocationPrecision
+        var cachedPlace: String?
+        var servedFromCache = false
+        var elapsed: TimeInterval = 0
+
+        if let hit = cache.load(maxAge: TimeInterval(maxAgeSeconds), precision: precision) {
+            fix = hit.fix
+            achieved = hit.precision
+            cachedPlace = hit.placemark
+            servedFromCache = true
+        } else {
+            let attempt = await oneFix(precision: precision,
+                                       maxAgeSeconds: maxAgeSeconds,
+                                       budget: budget)
+            elapsed = attempt.elapsed
+            guard let got = attempt.fix else {
+                let reason = attempt.reason ?? .timedOut
+                Log.location.notice(
+                    "location: fix failed (reason=\(reason.rawValue) "
+                    + "requested=\(precision.rawValue) elapsed_ms=\(Self.ms(elapsed)))")
+                record(requested: precision, achieved: nil, accuracy: nil,
+                       elapsed: elapsed, reason: reason, fromCache: false)
+                return .unavailable(reason)
+            }
+            fix = got
+            achieved = Self.achievedPrecision(of: got)
+            cache.store(got, precision: achieved)
+            // A placemark already resolved for a fix close enough to share it. A repeat
+            // request inside the cache window used to pay the geocode round trip again
+            // for an answer that cannot have changed.
+            cachedPlace = cache.placemark(near: got)
+        }
+
+        Log.location.notice(
+            "location: fix ok (requested=\(precision.rawValue) achieved=\(achieved.rawValue) "
+            + "accuracy_m=\(Int(fix.horizontalAccuracy.rounded())) "
+            + "elapsed_ms=\(Self.ms(elapsed)) cached=\(servedFromCache))")
+        record(requested: precision, achieved: achieved, accuracy: fix.horizontalAccuracy,
+               elapsed: elapsed, reason: nil, fromCache: servedFromCache)
 
         var out = LocationReading(
-            latitude: location.coordinate.latitude,
-            longitude: location.coordinate.longitude,
-            accuracyMeters: location.horizontalAccuracy >= 0 ? location.horizontalAccuracy : nil,
+            latitude: fix.latitude,
+            longitude: fix.longitude,
+            accuracyMeters: fix.horizontalAccuracy > 0 ? fix.horizontalAccuracy : nil,
             placemark: nil,
-            timestamp: location.timestamp)
+            timestamp: fix.timestamp)
         if wantsPlacemark {
-            out.placemark = await bounded(geocodeTimeout, { await Self.placemark(for: location) })
-                .flatMap { $0 }
+            if let cachedPlace {
+                out.placemark = cachedPlace
+            } else if let resolved = await bounded(budget.geocodeTimeout, {
+                await Self.placemark(for: fix)
+            }).flatMap({ $0 }) {
+                out.placemark = resolved
+                cache.storePlacemark(resolved, for: fix)
+            }
         }
-        return out
+        return .got(out)
     }
 
-    /// One fix, via a manager that lives only for the duration of this call.
+    /// One fix, through a source that lives only for the duration of this call.
     ///
     /// `precision == .coarse` never touches `requestTemporaryFullAccuracyAuthorization`,
     /// so a coarse request cannot produce a prompt. A `precise` request on a device that
     /// granted reduced accuracy asks for temporary full accuracy — the one prompt this
-    /// channel can raise, and only because the model explicitly stated `"precise"`.
+    /// channel can raise, and only because the model explicitly stated `"precise"` — and
+    /// **waits for the answer before the deadline clock starts**, which the old code did
+    /// not. It fired the prompt and started the fix in the same breath, so the budget
+    /// burned down while the sheet was still on screen.
     ///
-    /// TWO THINGS HERE ARE LOAD-BEARING, and the first was the bug.
+    /// THREE THINGS HERE ARE LOAD-BEARING.
     ///
-    /// **The waiter is a `let` in THIS frame.** `CLLocationManager.delegate` is a WEAK
-    /// reference, so the waiter's only strong owner is whoever holds it — and the
-    /// manager's only strong owner is the waiter. When both were locals inside the inner
+    /// **The acquisition is a `let` in THIS frame.** `CLLocationManager.delegate` is a
+    /// WEAK reference, so the source's only strong owner is whoever holds it — and the
+    /// manager's only strong owner is the source. When both were locals inside the inner
     /// `Task { @MainActor in … }`, they died the instant that Task body finished, which
-    /// is immediately after `requestLocation()` returns. A deallocated manager delivers
-    /// neither `didUpdateLocations` nor `didFailWithError`, so the continuation was
-    /// never resumed at all. Declared out here, the async frame keeps the waiter alive
-    /// for the whole suspension, and the waiter keeps the manager alive with it.
+    /// is immediately after the request was started. A deallocated manager delivers
+    /// neither `didUpdateLocations` nor `didFailWithError`, so the continuation was never
+    /// resumed at all. Declared out here, the async frame keeps it alive for the whole
+    /// suspension.
     ///
-    /// **The cancellation handler is what makes the caller's timeout real.** `bounded`
-    /// races this against a sleep inside a `withTaskGroup`, and a task group cannot
-    /// return until every child finishes — `cancelAll()` only *requests* cancellation. A
-    /// plain non-throwing `withCheckedContinuation` ignores that request entirely, so a
-    /// fix that never arrives (airplane mode, no GPS, a simulator with no location set)
-    /// left the group unable to return and hung the whole turn rather than degrading to
-    /// `.empty`. Resuming with `nil` on cancel is what lets the group close.
-    private func oneFix(precision: LocationPrecision) async -> CLLocation? {
+    /// **The cancellation handler is what lets the caller's task group close.**
+    /// `bounded` races this against a sleep inside a `withTaskGroup`, and a task group
+    /// cannot return until every child finishes — `cancelAll()` only *requests*
+    /// cancellation. A plain non-throwing `withCheckedContinuation` ignores that request
+    /// entirely, so a fix that never arrives left the group unable to return and hung the
+    /// whole turn. Resuming on cancel is what makes the bound real.
+    ///
+    /// **The outer bound is NOT the fix deadline.** `FixAcquisition` owns the deadline
+    /// itself, and starts it only after the accuracy prompt settles. The bound here is
+    /// that deadline plus `authorizationGrace`, and exists for exactly one case: a prompt
+    /// nobody ever answers. Making it the fix bound would put the prompt-reading seconds
+    /// back on the budget, which is the bug.
+    private func oneFix(precision: LocationPrecision,
+                        maxAgeSeconds: Int,
+                        budget: LocationFixBudget) async -> LocationFixAttempt {
         // Owned by this frame, NOT by the Task below — see above.
-        let waiter = FixWaiter()
-        return await withTaskCancellationHandler {
-            await withCheckedContinuation { (cont: CheckedContinuation<CLLocation?, Never>) in
-                Task { @MainActor in
-                    waiter.begin(precision: precision) { cont.resume(returning: $0) }
+        let acquisition = FixAcquisition(source: makeSource(),
+                                         precision: precision,
+                                         budget: budget,
+                                         maxAgeSeconds: maxAgeSeconds)
+        let interval = Log.locationFix.begin("location-fix")
+        let attempt = await bounded(budget.deadline + LocationFixBudget.authorizationGrace, {
+            () -> LocationFixAttempt? in
+            await withTaskCancellationHandler {
+                await withCheckedContinuation {
+                    (cont: CheckedContinuation<LocationFixAttempt, Never>) in
+                    Task { @MainActor in
+                        await acquisition.begin { cont.resume(returning: $0) }
+                    }
                 }
+            } onCancel: {
+                // Hop to the main actor rather than isolating the acquisition to it:
+                // this type is held by `JesseClient` and released off the main actor,
+                // and a main-actor class gets an isolated deinit that aborts the process
+                // on such a release. The hop keeps every resume/teardown on the actor
+                // the manager delivers on, which is what makes the single-resume guard
+                // sufficient against this race.
+                Task { @MainActor in acquisition.cancel() }
             }
-        } onCancel: {
-            // Hop to the main actor rather than isolating the waiter to it: this type is
-            // held by `JesseClient` and released off the main actor, and a main-actor
-            // class gets an isolated deinit that aborts the process on such a release.
-            // The hop keeps every resume/teardown on the actor the manager delivers on,
-            // which is what makes the single-resume guard sufficient against this race.
-            Task { @MainActor in waiter.cancel() }
+        })
+        // The prompt was never answered: the outer net fired and there is no attempt to
+        // report. Charged as a timeout, which is what it is.
+        let result = attempt ?? .failure(.timedOut, elapsed: 0)
+        // Instrumentation, and the reason the deadlines in `LocationFixBudget` can be
+        // chosen from measurement rather than guessed the way the old 2 seconds was.
+        // Elapsed, achieved accuracy, outcome — and NO coordinate and NO place name.
+        Log.locationFix.end("location-fix", interval,
+                            Self.signpostSummary(result, precision: precision))
+        return result
+    }
+
+    /// The one-line summary of an attempt, for the signpost and nothing else. Carries
+    /// numbers about the fix, never the fix.
+    private static func signpostSummary(_ attempt: LocationFixAttempt,
+                                        precision: LocationPrecision) -> String {
+        let elapsed = "elapsed_ms=\(ms(attempt.elapsed))"
+        guard let fix = attempt.fix else {
+            return "requested=\(precision.rawValue) outcome=\(attempt.reason?.rawValue ?? "none") "
+                + elapsed
         }
+        return "requested=\(precision.rawValue) outcome=fix "
+            + "accuracy_m=\(Int(fix.horizontalAccuracy.rounded())) "
+            + "met_target=\(attempt.metTarget) " + elapsed
+    }
+
+    private static func ms(_ seconds: TimeInterval) -> Int {
+        Int((seconds * 1000).rounded())
+    }
+
+    /// What a fix actually achieved, which is what it is cached and rendered under. The
+    /// same ceiling the block rendering uses, so a fix cached as `precise` is exactly a
+    /// fix that would print five decimal places.
+    private static func achievedPrecision(of fix: FixCandidate) -> LocationPrecision {
+        fix.horizontalAccuracy > 0
+            && fix.horizontalAccuracy <= LocationRequestFulfiller.preciseRenderingCeilingMeters
+            ? .precise : .coarse
+    }
+
+    private func record(requested: LocationPrecision,
+                        achieved: LocationPrecision?,
+                        accuracy: Double?,
+                        elapsed: TimeInterval,
+                        reason: LocationUnavailableReason?,
+                        fromCache: Bool) {
+        attempts.record(LocationAttemptRecord(
+            requested: requested, achieved: achieved,
+            accuracyMeters: accuracy.flatMap { $0 > 0 ? $0 : nil },
+            elapsed: elapsed, reason: reason, servedFromCache: fromCache, at: Date()))
     }
 
     /// Reverse-geocode one fix into a human place line, or nil. Network-bound and
@@ -189,13 +324,14 @@ nonisolated final class LocationContextProvider: LocationContextProviding, @unch
     /// out and the results back across an isolation boundary, which does not compile.
     /// Keeping the whole geocode off the actor means no MapKit value crosses anything —
     /// only the assembled `String` leaves, and a String may.
-    private nonisolated static func placemark(for location: CLLocation) async -> String? {
+    private nonisolated static func placemark(for fix: FixCandidate) async -> String? {
+        let location = CLLocation(latitude: fix.latitude, longitude: fix.longitude)
         // Run in a DETACHED task, not merely a nonisolated function. A nonisolated async
         // function inherits its caller's isolation, so awaiting `mapItems` from it still
         // counts as sending a non-Sendable MapKit value across a boundary. A detached
         // task has an isolation of its own: the request is built, awaited and consumed
         // entirely inside it, and the only thing that comes back out is the `String?`.
-        await Task.detached { () -> String? in
+        return await Task.detached { () -> String? in
             guard let request = MKReverseGeocodingRequest(location: location),
                   let items = try? await request.mapItems,
                   let item = items.first else {
@@ -248,11 +384,19 @@ nonisolated final class LocationContextProvider: LocationContextProviding, @unch
     }
 }
 
-/// The queryable side of the permission, for the Settings row. Unlike HealthKit's read
-/// status — which Apple hides by design, so a denial is invisible — CoreLocation reports
-/// its status honestly, so the row can say "this is off in Settings" instead of leaving
-/// a toggle on that can never attach anything.
+/// The queryable side of the permission, for the Settings row and the gate. Unlike
+/// HealthKit's read status — which Apple hides by design, so a denial is invisible —
+/// CoreLocation reports its status honestly, so the row can say "this is off in
+/// Settings" instead of leaving a toggle on that can never attach anything.
 nonisolated enum LocationPermissionStatus {
+    /// The live three-way state. `.notDetermined` is `.unauthorized`: nobody has been
+    /// asked yet, which is a different row but the same answer to "can this read now".
+    static func state() -> LocationAuthorizationState {
+        guard CLLocationManager.locationServicesEnabled() else { return .servicesOff }
+        return CLLocationManager().authorizationStatus == .authorizedWhenInUse
+            ? .authorized : .unauthorized
+    }
+
     /// The owner has said no, or the device is restricted (Screen Time, MDM). NOT true
     /// for `.notDetermined`: nobody has been asked yet, which is a different row.
     static func isDenied() -> Bool {
@@ -262,94 +406,134 @@ nonisolated enum LocationPermissionStatus {
         default: return false
         }
     }
+
+    /// Whether FULL accuracy is granted, as distinct from when-in-use authorization.
+    /// A device can be authorized and still only ever hand back a 1–3 km circle, which
+    /// is the single most confusing state this channel has and is why the Settings row
+    /// now says it out loud.
+    static func isFullAccuracyGranted() -> Bool {
+        guard CLLocationManager.locationServicesEnabled() else { return false }
+        return CLLocationManager().accuracyAuthorization == .fullAccuracy
+    }
+
+    /// The authorization status as one short owner-facing phrase.
+    static func statusText() -> String {
+        guard CLLocationManager.locationServicesEnabled() else {
+            return "Location Services off (device-wide)"
+        }
+        switch CLLocationManager().authorizationStatus {
+        case .authorizedWhenInUse: return "While Using the App"
+        case .authorizedAlways: return "Always (this app never asks for this)"
+        case .denied: return "Denied"
+        case .restricted: return "Restricted"
+        case .notDetermined: return "Not asked yet"
+        @unknown default: return "Unknown"
+        }
+    }
 }
 
-// MARK: - Delegates (the only stateful CoreLocation surface)
+// MARK: - The CoreLocation source (the only stateful CoreLocation surface)
 
-/// Owns one location request end to end: it creates the `CLLocationManager`, holds the
-/// only strong reference to it (`delegate` is weak, so nothing else does), and resumes
-/// its caller EXACTLY ONCE — with the first fix, with nil on failure, or with nil on
-/// cancellation.
+/// `FixSourcing` over a real `CLLocationManager`. Owns the manager — the ONLY strong
+/// reference to it, because `delegate` is weak and a manager with no owner deallocates
+/// and never calls back — and forwards arrivals and failures as plain values.
 ///
-/// One-shot by design, and the guard in `finish` is what enforces it. Three things can
-/// race to finish a request: `didUpdateLocations`, `didFailWithError` (iOS can deliver
-/// both for one request), and the caller's timeout cancelling. Resuming a
-/// `CheckedContinuation` twice traps, so a second arrival must be a silent no-op rather
-/// than a second resume.
+/// **`startUpdatingLocation`, not `requestLocation`, and that is the whole fix.**
+/// `requestLocation()` delivers exactly one callback and only once CoreLocation is
+/// satisfied it has met `desiredAccuracy`; at `kCLLocationAccuracyBest`, taken cold or
+/// indoors, that regularly takes longer than any budget this channel can afford, and
+/// every progressively-improving interim fix computed on the way was thrown away
+/// unseen. Updates deliver those interim fixes, and `FixAcquisition` keeps the best one.
 ///
-/// `begin`, `cancel` and both delegate callbacks all run on the main actor — the manager
-/// is created there and delivers there, and `cancel` hops there — so the guard is
-/// checked and cleared on one actor and needs no further locking.
+/// The cost of that change is that stopping is now mandatory: a `startUpdatingLocation`
+/// left running holds the GPS on and drains the battery in the background, which is a
+/// worse bug than the one being fixed. `stopUpdating` is called on every exit path
+/// including cancellation and error, and there is a test that proves it.
 ///
 /// `nonisolated`/`@unchecked Sendable` deliberately: an instance is reachable from
 /// `LocationContextProvider`, which `JesseClient` holds and releases off the main actor.
 /// A main-actor-isolated class gets an isolated deinit and aborts the process on such a
 /// release, which is a crash this file has already had once.
-private nonisolated final class FixWaiter: NSObject, CLLocationManagerDelegate, @unchecked Sendable {
-    private var resume: ((CLLocation?) -> Void)?
+nonisolated final class CLFixSource: NSObject, CLLocationManagerDelegate, FixSourcing,
+                                     @unchecked Sendable {
     private var manager: CLLocationManager?
+    private var onUpdate: ((FixCandidate) -> Void)?
+    private var onFailure: ((LocationFixFailure) -> Void)?
 
-    /// Arm the request: configure accuracy for `precision`, take the one strong
-    /// reference to the manager, and ask for a single fix. `requestLocation()` delivers
-    /// exactly one callback, so the `resume` stored here is called once and then cleared.
+    /// Settle the temporary-full-accuracy prompt BEFORE the caller starts its clock.
     ///
-    /// `precision == .coarse` never touches full accuracy, so a coarse request cannot
-    /// raise a prompt.
+    /// A coarse request never reaches the prompt at all — that is what "a coarse request
+    /// cannot raise any prompt" means structurally rather than by convention. A precise
+    /// request on a device that already granted full accuracy does not reach it either.
+    ///
+    /// The completion handler is awaited, which the old code did not do: it fired the
+    /// prompt and started the fix immediately, so on a reduced-accuracy device the sheet
+    /// was still on screen while the two-second budget expired, and the first precise
+    /// request was close to guaranteed to fail.
+    ///
+    /// A refusal is not an error here. The handler's error is deliberately ignored:
+    /// declining means the request carries on at reduced accuracy and returns the coarse
+    /// fix, which is a real answer and much better than nothing.
     @MainActor
-    func begin(precision: LocationPrecision, resume: @escaping (CLLocation?) -> Void) {
-        // A request that was cancelled before it could be armed: resume immediately
-        // rather than starting a manager nobody is waiting on.
-        guard !isFinished else {
-            resume(nil)
-            return
+    func prepareAccuracy(precision: LocationPrecision) async {
+        guard precision == .precise else { return }
+        let manager = self.manager ?? CLLocationManager()
+        self.manager = manager
+        guard manager.accuracyAuthorization == .reducedAccuracy else { return }
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            manager.requestTemporaryFullAccuracyAuthorization(
+                withPurposeKey: "PreciseDistance") { _ in
+                cont.resume()
+            }
         }
-        self.resume = resume
-        let manager = CLLocationManager()
-        if precision == .precise, manager.accuracyAuthorization == .reducedAccuracy {
-            manager.requestTemporaryFullAccuracyAuthorization(withPurposeKey: "PreciseDistance")
-        }
+    }
+
+    @MainActor
+    func startUpdating(precision: LocationPrecision,
+                       onUpdate: @escaping (FixCandidate) -> Void,
+                       onFailure: @escaping (LocationFixFailure) -> Void) {
+        self.onUpdate = onUpdate
+        self.onFailure = onFailure
+        let manager = self.manager ?? CLLocationManager()
+        self.manager = manager
         manager.desiredAccuracy = precision == .precise
             ? kCLLocationAccuracyBest
             : kCLLocationAccuracyReduced
         manager.delegate = self
-        // The ONLY strong reference to the manager. `delegate` is weak, so without this
-        // the manager deallocates and never calls back.
-        self.manager = manager
-        manager.requestLocation()
+        manager.startUpdatingLocation()
     }
 
-    /// The caller's timeout fired. Resume with nil and tear the manager down, so the
-    /// awaiting task group can close instead of waiting on a fix that is not coming.
     @MainActor
-    func cancel() {
-        finish(nil)
-    }
-
-    /// Whether a resume has already happened — including a cancel that landed before
-    /// `begin` ran, which is why this is a stored flag rather than `resume == nil`
-    /// (that is also nil before arming).
-    private var isFinished = false
-
-    @MainActor
-    private func finish(_ location: CLLocation?) {
-        guard !isFinished else { return }
-        isFinished = true
-        let resume = self.resume
-        self.resume = nil
+    func stopUpdating() {
+        onUpdate = nil
+        onFailure = nil
+        manager?.stopUpdatingLocation()
         manager?.delegate = nil
         manager = nil
-        resume?(location)
     }
 
     func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
-        MainActor.assumeIsolated { finish(locations.last) }
+        MainActor.assumeIsolated {
+            guard let onUpdate else { return }
+            for location in locations {
+                onUpdate(FixCandidate(latitude: location.coordinate.latitude,
+                                      longitude: location.coordinate.longitude,
+                                      horizontalAccuracy: location.horizontalAccuracy,
+                                      timestamp: location.timestamp))
+            }
+        }
     }
 
     func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
         // Never log the request, only that it failed — a failure reason can name a
         // region and this file logs no place data at all.
-        Log.location.notice("location: fix failed (\(error.localizedDescription))")
-        MainActor.assumeIsolated { finish(nil) }
+        Log.location.notice("location: update failed (\(error.localizedDescription))")
+        // `kCLErrorLocationUnknown` means "not right now", and updates keep trying after
+        // it; ending the acquisition there would throw away exactly the case interim
+        // fixes exist to rescue. Only a denial is terminal.
+        let failure: LocationFixFailure =
+            (error as? CLError)?.code == .denied ? .denied : .unableToDetermine
+        MainActor.assumeIsolated { onFailure?(failure) }
     }
 }
 
@@ -371,30 +555,74 @@ private nonisolated final class AuthorizationWaiter: NSObject, CLLocationManager
     }
 }
 
-/// The single in-memory cached fix. Lock-guarded because `reading` may be called from
-/// concurrent turns. Holds one `CLLocation` and the precision it was taken at, and
-/// nothing else — no history, no disk.
+/// The single in-memory cached fix and its placemark. Lock-guarded because `reading` may
+/// be called from concurrent turns. Holds one fix, the precision it ACHIEVED, and the
+/// place line resolved for it — no history, no disk.
 private nonisolated final class CachedFix: @unchecked Sendable {
+    struct Hit {
+        let fix: FixCandidate
+        let precision: LocationPrecision
+        let placemark: String?
+    }
+
+    /// How far a cached placemark may be reused. A locality-level place line does not
+    /// change over a hundred metres, and re-resolving it costs a network round trip
+    /// stacked on top of the fix budget for an answer that cannot have changed.
+    static let placemarkReuseRadiusMeters: CLLocationDistance = 100
+
     private let lock = NSLock()
-    private var location: CLLocation?
+    private var fix: FixCandidate?
+    /// The precision the stored fix ACHIEVED — never the precision that was requested.
+    ///
+    /// Storing the requested one was wrong in both directions: a precise request that
+    /// degraded to a 3 km fix cached that fix as `precise`, so a LATER precise request
+    /// was served a coarse answer as though it had been fulfilled; and the same
+    /// degraded fix was rejected for later COARSE requests it could have answered
+    /// instantly, because nothing recorded that it was, in fact, coarse.
     private var precision: LocationPrecision?
+    private var placemark: String?
+    /// The fix the placemark was resolved for, so it is only reused near it.
+    private var placemarkFix: FixCandidate?
 
     /// The cached fix if it is young enough AND was taken at a precision that can
     /// answer `precision`. A reduced-accuracy fix can never answer a `precise` request;
     /// a full-accuracy one can always answer a `coarse` one.
-    func load(maxAge: TimeInterval, precision wanted: LocationPrecision) -> CLLocation? {
+    func load(maxAge: TimeInterval, precision wanted: LocationPrecision) -> Hit? {
         lock.lock()
         defer { lock.unlock() }
-        guard let location, let precision else { return nil }
+        guard let fix, let precision else { return nil }
         guard wanted == .coarse || precision == .precise else { return nil }
-        guard Date().timeIntervalSince(location.timestamp) <= maxAge else { return nil }
-        return location
+        guard Date().timeIntervalSince(fix.timestamp) <= maxAge else { return nil }
+        return Hit(fix: fix, precision: precision,
+                   placemark: Self.placemark(placemark, at: placemarkFix, near: fix))
     }
 
-    func store(_ location: CLLocation, precision: LocationPrecision) {
+    func store(_ fix: FixCandidate, precision: LocationPrecision) {
         lock.lock()
         defer { lock.unlock() }
-        self.location = location
+        self.fix = fix
         self.precision = precision
+    }
+
+    func storePlacemark(_ line: String, for fix: FixCandidate) {
+        lock.lock()
+        defer { lock.unlock() }
+        self.placemark = line
+        self.placemarkFix = fix
+    }
+
+    /// A cached placemark close enough to `fix` to describe it too.
+    func placemark(near fix: FixCandidate) -> String? {
+        lock.lock()
+        defer { lock.unlock() }
+        return Self.placemark(placemark, at: placemarkFix, near: fix)
+    }
+
+    private static func placemark(_ line: String?, at resolvedFor: FixCandidate?,
+                                  near fix: FixCandidate) -> String? {
+        guard let line, let resolvedFor else { return nil }
+        let a = CLLocation(latitude: resolvedFor.latitude, longitude: resolvedFor.longitude)
+        let b = CLLocation(latitude: fix.latitude, longitude: fix.longitude)
+        return a.distance(from: b) <= placemarkReuseRadiusMeters ? line : nil
     }
 }

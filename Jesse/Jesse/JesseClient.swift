@@ -481,6 +481,10 @@ struct JesseClient: JesseClientProtocol {
             locationContext: channel == .location ? outgoing.block : nil,
             locationContextRequested: channel == .location && outgoing.requested ? true : nil,
             locationContextUnavailable: channel == .location && outgoing.unavailable ? true : nil,
+            // The reason WHY, so the bridge can tell the agent "the fix timed out, try
+            // again" instead of listing four causes and sending him to Settings.
+            locationContextUnavailableReason: channel == .location
+                ? outgoing.unavailableReason : nil,
             mealCorrectionsAck: mealCorrectionsAck(),
             model: model)
         return try await bridge.sendPrepared(request)
@@ -580,6 +584,7 @@ struct JesseClient: JesseClientProtocol {
                             locationContext: String? = nil,
                             locationContextRequested: Bool? = nil,
                             locationContextUnavailable: Bool? = nil,
+                            locationContextUnavailableReason: String? = nil,
                             mealCorrectionsAck: Int? = nil,
                             requestId: UUID? = nil,
                             model: String? = nil) -> JesseRequest {
@@ -598,6 +603,7 @@ struct JesseClient: JesseClientProtocol {
             locationContext: locationContext,
             locationContextRequested: locationContextRequested,
             locationContextUnavailable: locationContextUnavailable,
+            locationContextUnavailableReason: locationContextUnavailableReason,
             mealCorrectionsAck: mealCorrectionsAck,
             // Encode the outbox idempotency key as its string form; nil drops the field.
             requestId: requestId?.uuidString,

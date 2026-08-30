@@ -123,10 +123,26 @@ public struct OutgoingDeviceContext: Sendable, Equatable {
     public var block: String?
     public var requested: Bool
     public var unavailable: Bool
-    public init(block: String?, requested: Bool, unavailable: Bool) {
+    /// WHY it was unavailable, when the channel can say. A short machine-readable
+    /// token the bridge renders into its own line — "the fix timed out, nothing is
+    /// misconfigured, try again" reads very differently from "you have not granted
+    /// permission", and telling the agent all the causes at once sends the owner to
+    /// check toggles that are already on.
+    ///
+    /// **A reason is not a place**: no coordinate, no accuracy, no place name, nothing
+    /// that narrows down where the phone is. That is what makes it free to carry, and
+    /// it must stay that way.
+    ///
+    /// Nil on a fulfilled context, and nil on a channel with no reason vocabulary
+    /// (health), which reproduces that channel's wire bytes exactly.
+    public var unavailableReason: String?
+
+    public init(block: String?, requested: Bool, unavailable: Bool,
+                unavailableReason: String? = nil) {
         self.block = block
         self.requested = requested
         self.unavailable = unavailable
+        self.unavailableReason = unavailableReason
     }
 
     /// The channel could not be fulfilled: no block, and the flag that makes the
@@ -134,6 +150,12 @@ public struct OutgoingDeviceContext: Sendable, Equatable {
     /// on every failure path.
     public static let unavailable = OutgoingDeviceContext(
         block: nil, requested: false, unavailable: true)
+
+    /// The same terminator, carrying the reason the channel gave.
+    public static func unavailable(reason: String?) -> OutgoingDeviceContext {
+        OutgoingDeviceContext(block: nil, requested: false, unavailable: true,
+                              unavailableReason: reason)
+    }
 
     /// A fulfilled channel carrying `block`.
     public static func fulfilled(_ block: String) -> OutgoingDeviceContext {
@@ -551,6 +573,14 @@ public struct JesseRequest: Encodable, Equatable, Sendable {
     // The app could NOT fulfill a location request this turn (toggle off, permission
     // denied, Location Services off, timed out, no fix).
     public let locationContextUnavailable: Bool?
+    // WHICH of those it was — one of the bridge's `NEEDS_LOCATION_UNAVAILABLE_REASONS`
+    // tokens. Only ever sent alongside `locationContextUnavailable`, and only when the
+    // app can say. Nil omits the key, which is what an older bridge and an older app
+    // both already handle: the bridge then renders its generic four-causes-at-once line.
+    //
+    // It carries NO place data — a token like "timed_out", never a coordinate, an
+    // accuracy or a place name — which is why it costs nothing in privacy terms.
+    public let locationContextUnavailableReason: String?
     // Meal-corrections ack (JESSE_MEAL_LOG v2): the highest `corrections_seq` the app
     // has taken responsibility for.
     public let mealCorrectionsAck: Int?
@@ -583,6 +613,7 @@ public struct JesseRequest: Encodable, Equatable, Sendable {
                 healthContextUnavailable: Bool?,
                 locationContext: String? = nil, locationContextRequested: Bool? = nil,
                 locationContextUnavailable: Bool? = nil,
+                locationContextUnavailableReason: String? = nil,
                 mealCorrectionsAck: Int?, requestId: String?,
                 model: String? = nil) {
         self.mode = mode
@@ -599,6 +630,7 @@ public struct JesseRequest: Encodable, Equatable, Sendable {
         self.locationContext = locationContext
         self.locationContextRequested = locationContextRequested
         self.locationContextUnavailable = locationContextUnavailable
+        self.locationContextUnavailableReason = locationContextUnavailableReason
         self.mealCorrectionsAck = mealCorrectionsAck
         self.requestId = requestId
         self.model = model
@@ -649,6 +681,7 @@ public struct JesseRequest: Encodable, Equatable, Sendable {
         case locationContext = "location_context"
         case locationContextRequested = "location_context_requested"
         case locationContextUnavailable = "location_context_unavailable"
+        case locationContextUnavailableReason = "location_context_unavailable_reason"
         case mealCorrectionsAck = "meal_corrections_ack"
         case requestId = "request_id"
         case model

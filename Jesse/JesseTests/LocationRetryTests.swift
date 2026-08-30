@@ -234,20 +234,30 @@ final class LocationRetryTests: XCTestCase {
     /// an ordinary turn and would put the agent back on the request instruction.
     func testFulfilPolicyAlwaysTerminatesRatherThanReturningAnOrdinaryTurn() async {
         struct OffChannel: DeviceContextFulfilling {
-            func mayFulfill() async -> Bool { false }
-            func block(for request: NeedsLocationRequest) async -> String? { "unreachable" }
+            func mayFulfill() async -> DeviceContextReadiness {
+                .notReady(LocationUnavailableReason.featureOff.rawValue)
+            }
+            func block(for request: NeedsLocationRequest) async -> DeviceContextOutcome {
+                .gathered("unreachable")
+            }
         }
         struct EmptyChannel: DeviceContextFulfilling {
-            func mayFulfill() async -> Bool { true }
-            func block(for request: NeedsLocationRequest) async -> String? { nil }
+            func mayFulfill() async -> DeviceContextReadiness { .ready }
+            func block(for request: NeedsLocationRequest) async -> DeviceContextOutcome {
+                .nothing(LocationUnavailableReason.timedOut.rawValue)
+            }
         }
         struct BlankChannel: DeviceContextFulfilling {
-            func mayFulfill() async -> Bool { true }
-            func block(for request: NeedsLocationRequest) async -> String? { "" }
+            func mayFulfill() async -> DeviceContextReadiness { .ready }
+            func block(for request: NeedsLocationRequest) async -> DeviceContextOutcome {
+                DeviceContextOutcome(block: "", reason: LocationUnavailableReason.noFix.rawValue)
+            }
         }
         struct GoodChannel: DeviceContextFulfilling {
-            func mayFulfill() async -> Bool { true }
-            func block(for request: NeedsLocationRequest) async -> String? { "Near: Edinburgh" }
+            func mayFulfill() async -> DeviceContextReadiness { .ready }
+            func block(for request: NeedsLocationRequest) async -> DeviceContextOutcome {
+                .gathered("Near: Edinburgh")
+            }
         }
         let request = NeedsLocationRequest(fields: [.placemark], precision: .coarse,
                                            maxAgeSeconds: 300)
@@ -260,11 +270,15 @@ final class LocationRetryTests: XCTestCase {
             XCTAssertFalse(outcome.requested, "\(channelName): not marked requested")
             XCTAssertTrue(outcome.unavailable,
                           "\(channelName): MUST carry the unavailable terminator")
+            XCTAssertNotNil(outcome.unavailableReason,
+                            "\(channelName): the terminator carries WHY, so the bridge "
+                            + "can render one cause instead of listing four")
         }
         let good = await fulfillDeviceContext(request, through: GoodChannel())
         XCTAssertEqual(good.block, "Near: Edinburgh")
         XCTAssertTrue(good.requested)
         XCTAssertFalse(good.unavailable)
+        XCTAssertNil(good.unavailableReason, "a fulfilled channel carries no reason")
     }
 
     // MARK: - Two channels on one turn

@@ -377,6 +377,12 @@ struct SettingsView: View {
     @AppStorage(LocationContextSettings.enabledKey) private var attachLocationContext = false
     @State private var connectingLocation = false
     @State private var locationDenied = false
+    // The live location diagnostic, refreshed on appear and after a connect. All three
+    // are read-only views of system state plus the in-memory last attempt; none of them
+    // is persisted, and none carries a coordinate or a place name.
+    @State private var locationStatusText = LocationPermissionStatus.statusText()
+    @State private var locationFullAccuracy = false
+    @State private var locationLastAttempt = "None yet this run"
 
     // "Write meals to Apple Health" — default OFF until write access is granted, then
     // flipped on. Same key `RunCoordinator`'s meal writer reads (`WriteMealsToHealthSettings`).
@@ -554,12 +560,25 @@ struct SettingsView: View {
                             .font(.callout)
                             .foregroundStyle(.secondary)
                     }
+                    // THE DIAGNOSTIC. The point of this row is that the next failure is
+                    // answerable from the phone in ten seconds — is the permission on,
+                    // is full accuracy on, and what did the last attempt actually do —
+                    // rather than by reading LocationContextProvider.swift on another
+                    // machine, which is what the failure that prompted it cost.
+                    //
+                    // In memory only, like the fix cache: `LocationAttemptLog` writes
+                    // nothing to disk, to SwiftData or to UserDefaults, and it holds an
+                    // outcome, an accuracy and an elapsed time — never a coordinate and
+                    // never a place name.
+                    LabeledContent("Permission", value: locationStatusText)
+                    LabeledContent("Full accuracy", value: locationFullAccuracy ? "Granted" : "Reduced")
+                    LabeledContent("Last attempt", value: locationLastAttempt)
                 } header: {
                     Text("Location")
                 } footer: {
                     Text("With this on, Jesse attaches where you are — the neighbourhood, town and postcode, never your street address — on turns that ask about here, nearby, or how far something is. Both this switch and the system permission have to be on, nothing is read on any other turn, and your location is never saved: it goes out with that one message and is gone. Off by default.")
                 }
-                .onAppear { locationDenied = LocationPermissionStatus.isDenied() }
+                .onAppear { refreshLocationDiagnostic() }
 
                 Section {
                     LabeledContent("App", value: AppVersion.display)
@@ -1018,7 +1037,18 @@ struct SettingsView: View {
         defer { connectingLocation = false }
         let granted = await LocationContextProvider.requestAuthorization()
         attachLocationContext = granted
+        refreshLocationDiagnostic()
+    }
+
+    /// Re-read the live location state for the Settings rows. Reads only — it never
+    /// touches the location manager in a way that could raise a prompt, so opening
+    /// Settings is not itself an ask.
+    private func refreshLocationDiagnostic() {
         locationDenied = LocationPermissionStatus.isDenied()
+        locationStatusText = LocationPermissionStatus.statusText()
+        locationFullAccuracy = LocationPermissionStatus.isFullAccuracyGranted()
+        locationLastAttempt = LocationAttemptLog.shared.last
+            .map { LocationAttemptLog.summary($0) } ?? "None yet this run"
     }
 
     private var scannerSheet: some View {
