@@ -85,7 +85,8 @@ change lives in one focused module:
 | `bind` | `is_bind_allowed` / `env_truthy` (bind safety) |
 | `ratelimit` | the token-bucket `RateLimiter` |
 | `jobstore` | the turn-survives-disconnect job store, persistence worker, eviction, `TurnGuard`; **live-stream state is isolated in `jobstore::streams`** as `StreamRegistry` — its broadcast map is a private field, so the "never hold the `streams`, `jobs`, and `aborts` locks at once" invariant is a module boundary, not a comment |
-| `claude` | `build_claude_args` + `run_claude_streaming` and the `stream-json` parsing/classification (`parse_stream_line`, `classify_result_value`, `resolve_stream_outcome`) |
+| `harness` | the agent program behind **three traits** — `Harness` (identity and policy), `SpawnedHarness` (everything that only means something for a child process), `InProcessHarness` (a harness that answers a turn in this process) — plus `Capability`, `TurnRequest`, the routed jobs' request builders, and the `HarnessRegistry`. `harness::claude_code` and `harness::codex` are the two implementations |
+| `claude` | `run_claude_streaming` (the one branch on `Harness::runner`) and its two arms, plus the outcome vocabulary and the `stream-json` classification helpers (`resolve_stream_outcome`) |
 | `attachments` | base64 decode + length helpers, magic-byte sniff, per-request `ScratchDir`, validation |
 | `apns` | the optional push path (device store, JWT minting, transport, completion→push decision) |
 | `conversations` | the conversation registry: the record, the session -> conversation reverse index, the in-flight claim table, and the one-time title/flag/deletion key migration |
@@ -474,6 +475,65 @@ be held (phone suspended, connection blip, an older client).
 > "stream, then fall back to poll once the stream finishes" logic blocked forever
 > and the reply never landed. So: a stalled, erroring, or never-opening stream
 > must never delay or block the reply — the poll resolves it regardless.
+
+### The harness traits, and the one branch
+
+An agent program answers a turn. **How it is reached is a second question**, and the code
+answers the two separately:
+
+| Trait | What lives on it | Who implements it |
+| --- | --- | --- |
+| `Harness` | identity and policy: `id`, `streams_text`, `expresses`, `default_concurrency`, `supports_write_lock`, `capability_args`, `shipped_rows`, `transcript_dir`, `attachment_support`, `supports_wire`, and `runner` | every harness |
+| `SpawnedHarness` | everything that only means something for a **child process**: `build_turn`, `parser`, `main_mcp_config`, `classify_stderr_line`, `stderr_classifier`, `hook_write_target`, `hook_read_target` | `claude-code`, `codex` |
+| `InProcessHarness` | `run_turn` — one whole turn, awaited in this process, with a `TurnSink` for the two mid-turn events and a `CancellationToken` for cancellation | **nothing yet**; the contract is written for the agent-loop adoption |
+
+`Harness::runner()` returns `Runner::Spawned(&dyn SpawnedHarness)` or
+`Runner::InProcess(&dyn InProcessHarness)`, and `run_claude_streaming` branches on it
+**exactly once**. Both arms push into the same job-store stream frames, honour the same
+per-turn timeout, apply the same streamed-text safety net when `streams_text` is true, and
+resolve to the same `Done` / `Failed` / `Cancelled` terminal. What they do **not** share is
+retry: the driver's three attempts belong to the spawned arm (they re-run the whole prompt
+and reset the stream, which is sound only because a killed child leaves nothing behind), and
+an in-process harness owns retrying inside its own turn.
+
+Every other call site that needs a spawned-only method asks the same question and handles the
+in-process case **explicitly** — `claude::spawned_only` returns a named `HarnessError` rather
+than a silent default, because the silent default here is "spawn nothing and report success".
+The write lock is the one place worth spelling out: `WriteLockChild` describes a hook *command
+string* for a child process and is installed inside `build_turn`, so hooks are spawned-only by
+construction. An in-process harness answering `supports_write_lock() == true` is promising it
+takes locks through the broker **directly**; one that answers `false` is capped at a single
+write-level slot by `resolve_slot_plan`, exactly as a spawned harness that has not implemented
+hooks is.
+
+### `kind` and `wire` — hosting and surface
+
+A model's `kind` says **where its backend lives** (`ambient` / `hosted` / `local` / `openai`);
+its `wire` says **which API contract the backend speaks** (`messages` / `chat` / `responses`).
+They were one key until the two questions needed different answers — a hosted endpoint on an
+OpenAI surface had no spelling.
+
+`wire` is optional everywhere and defaults from `kind`, so **every configuration written
+before the key existed resolves to exactly what it already meant**:
+
+| `kind` | default `wire` |
+| --- | --- |
+| `ambient` | `messages` |
+| `hosted` | `messages` |
+| `local` | `messages` |
+| `openai` | `responses` |
+
+Set it as `wire = "…"` in a `[[models]]` entry or as `JESSE_MODEL_<ID>_WIRE` for the
+env-triple models. `Harness::supports_wire` says which wires a harness can drive a turn over
+— `claude-code` drives `messages` only; `codex` drives `responses` (a provider endpoint) and
+`messages` (its own subscription login, which names no provider) — and
+`validate_model_config` refuses a pairing at **startup**, naming the model, the wire and the
+harness. No harness drives `chat` today, so declaring it is a startup error rather than a
+silent downgrade. The health probe's default path follows the **wire**, not the kind:
+`/chat/completions` for `chat` and `responses`, `/v1/messages` for `messages`. (`responses`
+probing the chat path is deliberate and unchanged: the minimal probe body is valid on both
+OpenAI contracts, so the chat path returns a real one-token completion and a green light means
+tokens were produced.) `GET /jesse/models` reports `wire` per model, beside `kind`.
 
 ### How `claude` is run
 

@@ -691,8 +691,8 @@ mod tests {
             fn capability_args(&self, _c: &Config, _cap: Capability) -> Vec<String> {
                 Vec::new()
             }
-            fn main_mcp_config(&self) -> &'static str {
-                EMPTY_MCP_CONFIG
+            fn supports_wire(&self, w: Wire) -> bool {
+                matches!(w, Wire::Messages)
             }
             fn shipped_rows(&self) -> &'static [ContainmentRow] {
                 &[]
@@ -700,16 +700,26 @@ mod tests {
             fn transcript_dir(&self, _c: &Config) -> Option<PathBuf> {
                 None
             }
+            fn attachment_support(&self) -> &'static AttachmentSupport {
+                // This fixture never spawns, so it never shows anything to anyone.
+                &CLAUDE_CODE_ATTACHMENTS
+            }
+            fn runner(&self) -> Runner<'_> {
+                Runner::Spawned(self)
+            }
+        }
+        // The child-process half, split out of `Harness` — the fixture still refuses to build
+        // a turn, which is the whole of what it ever did.
+        impl SpawnedHarness for Silent {
+            fn main_mcp_config(&self) -> &'static str {
+                EMPTY_MCP_CONFIG
+            }
             fn build_turn(
                 &self,
                 _c: &Config,
                 _r: &TurnRequest<'_>,
             ) -> Result<Command, HarnessError> {
                 Err(HarnessError::unsupported("silent", "a turn"))
-            }
-            fn attachment_support(&self) -> &'static AttachmentSupport {
-                // This fixture never spawns, so it never shows anything to anyone.
-                &CLAUDE_CODE_ATTACHMENTS
             }
             fn parser(&self) -> Box<dyn TurnParser> {
                 unreachable!("never spawned in this test")

@@ -112,6 +112,7 @@ fn with_vaultqa_offload(mut cfg: Config) -> Config {
         id: "local-vaultqa".to_string(),
         label: "Local vault QA".to_string(),
         kind: ModelKind::Local,
+        wire: Wire::default_for_kind(ModelKind::Local),
         backend: Some((
             "http://127.0.0.1:9100".into(),
             "vaultqa-dummy-tok".into(),
@@ -4871,6 +4872,7 @@ fn cfg_with_switch_registry(state_dir: &std::path::Path) -> Config {
                 id: "opus".into(),
                 label: "Claude Opus".into(),
                 kind: ModelKind::Ambient,
+                wire: Wire::default_for_kind(ModelKind::Ambient),
                 backend: None,
                 subagent_model: None,
                 configured: true,
@@ -4889,6 +4891,7 @@ fn cfg_with_switch_registry(state_dir: &std::path::Path) -> Config {
                 id: "glm-5.2".into(),
                 label: "GLM 5.2".into(),
                 kind: ModelKind::Hosted,
+                wire: Wire::default_for_kind(ModelKind::Hosted),
                 backend: Some((
                     "http://fireworks".into(),
                     "fw-tok".into(),
@@ -4911,6 +4914,7 @@ fn cfg_with_switch_registry(state_dir: &std::path::Path) -> Config {
                 id: "test-unarmed".into(),
                 label: "Unarmed Test Model".into(),
                 kind: ModelKind::Hosted,
+                wire: Wire::default_for_kind(ModelKind::Hosted),
                 backend: None,
                 subagent_model: None,
                 configured: false,
@@ -5169,10 +5173,19 @@ async fn the_models_endpoint_entry_shape_is_pinned() {
             "level",
             "streams_text",
             "vision",
+            "wire",
             "writes_allowed",
         ],
         "the models entry shape changed — update the clients and the changelog"
     );
+    // `wire` names the API surface, beside `kind`'s hosting arrangement. Every model in this
+    // fixture is Anthropic-surface, which is what the kind-derived default gives them.
+    for m in v["models"].as_array().unwrap() {
+        assert!(
+            ["messages", "chat", "responses"].contains(&m["wire"].as_str().unwrap()),
+            "wire is one of the three surface names: {m}"
+        );
+    }
     // The two new fields carry the right types and values.
     for m in v["models"].as_array().unwrap() {
         assert!(
@@ -5531,6 +5544,7 @@ async fn preprocess_pairs_and_frames_a_faithful_view() {
         id: "mock".into(),
         label: "Mock VL".into(),
         kind: ModelKind::Hosted,
+        wire: Wire::default_for_kind(ModelKind::Hosted),
         backend: Some((base, "t".into(), "m".into())),
         subagent_model: Some("m".into()),
         configured: true,
@@ -5545,6 +5559,7 @@ async fn preprocess_pairs_and_frames_a_faithful_view() {
         id: "glm".into(),
         label: "GLM".into(),
         kind: ModelKind::Hosted,
+        wire: Wire::default_for_kind(ModelKind::Hosted),
         backend: Some(("http://text".into(), "tt".into(), "tm".into())),
         subagent_model: Some("tm".into()),
         configured: true,
@@ -5618,6 +5633,7 @@ async fn unpaired_model_reports_no_vision() {
         id: "glm".into(),
         label: "GLM".into(),
         kind: ModelKind::Hosted,
+        wire: Wire::default_for_kind(ModelKind::Hosted),
         backend: Some(("http://text".into(), "tt".into(), "tm".into())),
         subagent_model: Some("tm".into()),
         configured: true,
@@ -5714,6 +5730,7 @@ async fn the_vision_path_is_identical_on_both_harnesses() {
         id: "mock".into(),
         label: "Mock VL".into(),
         kind: ModelKind::Hosted,
+        wire: Wire::default_for_kind(ModelKind::Hosted),
         backend: Some((base, "t".into(), "m".into())),
         subagent_model: Some("m".into()),
         configured: true,

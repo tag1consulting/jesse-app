@@ -6,17 +6,36 @@ pub use claude_code::*;
 mod codex;
 pub use codex::*;
 
-// ---- The agent program, behind a trait --------------------------------------
+// ---- The agent program, behind three traits ---------------------------------
 //
-// The bridge spawns a child agent program, reads its stdout, and turns what comes back
-// into a turn. Two halves of that were always separable and are now named:
+// An agent program answers a turn. HOW it is reached is a second question, and until now
+// there was only one answer: spawn a child, read its stdout. That assumption was spread
+// across one trait, so every method on it silently meant "…of the child process". Three
+// traits now say which half of that a method belongs to:
 //
-//   * HARNESS-SPECIFIC — how to build the child's `Command`, and how to read one line of
-//     its output. Claude Code's version lives in [`claude_code`].
-//   * NOT HARNESS-SPECIFIC — the driver: spawn, read stdout line by line, stop at the
-//     terminal result, bounded reap, resolve the outcome, retry a transient failure up to
-//     three attempts with a stream reset between them. That stays in [`crate::claude`] and
-//     calls through `&dyn Harness`.
+//   * [`Harness`] — IDENTITY AND POLICY. Everything true of a harness whether or not a
+//     process is involved: its id, whether it streams, which capabilities it expresses,
+//     its containment flags and shipped rows, its transcript layout, its attachment
+//     support, its default concurrency, whether it can take the vault write lock, and
+//     which API wire it drives a model over. Every harness implements this one.
+//   * [`SpawnedHarness`] — everything that only means something for a CHILD PROCESS:
+//     building the `Command`, parsing a line of its stdout, its main MCP server set,
+//     classifying a line of its stderr, and reading its hook payloads.
+//   * [`InProcessHarness`] — the other runner shape: a harness that answers the turn
+//     inside this process, with no child at all. Nothing implements it yet; its contract
+//     is written down so D5 implements a shape that was decided rather than discovered.
+//
+// [`Harness::runner`] is the ONE branch: it returns a [`Runner`] naming which of the two
+// shapes this harness is, and the driver in [`crate::claude`] branches on it exactly once.
+// Every other call site that needs a spawned-only method asks the same question and
+// handles the in-process case explicitly — never with a silent default, because a silent
+// default here means spawning nothing and reporting success.
+//
+// NOT HARNESS-SPECIFIC either way — the driver: for a spawned harness, spawn, read stdout
+// line by line, stop at the terminal result, bounded reap, resolve the outcome, retry a
+// transient failure up to three attempts with a stream reset between them; for an
+// in-process one, await its future. That stays in [`crate::claude`] and calls through
+// `&dyn Harness`.
 //
 // ---- THE MID-TURN EVENT CONTRACT --------------------------------------------
 //
@@ -24,6 +43,15 @@ pub use codex::*;
 // left implicit because Codex is the FIRST harness whose answer arrives whole, and there
 // is no second one to check the shape against — so the shape is stated, not inferred from
 // the one implementation that has it.
+//
+// **THE CONTRACT IS IDENTICAL FOR BOTH RUNNER SHAPES.** A [`SpawnedHarness`] delivers these
+// events by returning them from its [`TurnParser`] as it reads the child's stdout; an
+// [`InProcessHarness`] delivers exactly the same two, in the same vocabulary, by calling
+// [`TurnSink`]. Same events, same meanings, same prohibitions — the runner shape decides
+// how they travel, never what may travel. That is the whole reason the contract is written
+// here, above both traits, rather than in the one that happens to exist first: an
+// in-process harness that invented a third mid-turn event, or smuggled a tool RESULT into
+// an activity name, would be breaking the same rule a spawned one would.
 //
 // The bridge's mid-turn vocabulary is exactly TWO things, and a harness emits some mixture
 // of them per turn:
@@ -65,9 +93,11 @@ pub use codex::*;
 // because on a READ-ONLY harness a refusal is not an edge case: it is the boundary doing
 // its job, on a turn the model expected to be able to write. A user watching a turn work
 // around a boundary they were never shown has been told something false about what
-// happened. So the contract consumes stderr, via [`Harness::classify_stderr_line`], and
-// the cost is that ONE harness's stderr is load-bearing rather than log noise. Claude Code
-// takes the `None` default and is byte-for-byte unaffected.
+// happened. So the contract consumes stderr, via [`SpawnedHarness::classify_stderr_line`],
+// and the cost is that ONE harness's stderr is load-bearing rather than log noise. Claude
+// Code takes the `None` default and is byte-for-byte unaffected. An in-process harness has
+// no stderr at all, which is exactly why that method is on the spawned trait and not on
+// the shared one.
 //
 // WHAT IS STILL NOT IN THE CONTRACT, deliberately: tool RESULTS, tool INPUTS, token
 // counts, and any per-tool timing. All of them would reach a phone screen, all of them
@@ -104,6 +134,33 @@ pub use codex::*;
 ///   * The **working directory**. The `Basic` diet children run in the neutral scratch base
 ///     so the large vault `CLAUDE.md` cannot auto-load; the `Basic` title child runs in the
 ///     vault. Both are intentional, so do not unify them.
+///
+/// ---- THE AGENT CRATE'S `Level` IS THIS ENUM ---------------------------------
+///
+/// `agent/` (the provider-neutral agent layer, `jesse_agent`) declares its own
+/// `tools::Level` with the same three names in the same order, because that crate does not
+/// depend on the bridge in either direction and cannot re-export this one. D5 is where the
+/// bridge adopts it; until then the mapping is written down here rather than left for
+/// whoever writes the `From` impls to derive from two doc comments in different crates:
+///
+/// | `harness::Capability` | `jesse_agent::tools::Level` | means                        |
+/// |-----------------------|-----------------------------|------------------------------|
+/// | `Basic`               | `Level::Basic`              | no tools at all              |
+/// | `Read`                | `Level::Read`               | reads and lookups, no writes |
+/// | `Write`               | `Level::Write`              | the above plus vault writes  |
+///
+/// **THE MAPPING IS THE IDENTITY, AND THAT IS A DECISION, NOT A COINCIDENCE.** The agent
+/// crate's own doc comment says the same thing from the other side: declaring a second,
+/// differently-shaped vocabulary ("none / readonly / full") would make the mapping a table
+/// somebody has to keep true, and a level that means slightly different things on two sides
+/// of a boundary is how a `Read` turn ends up holding a write tool. Both enums derive
+/// `Ord` and both orderings are load-bearing in the same way.
+///
+/// So when the dependency lands, the two `From` impls are three arms each and neither is
+/// allowed to reorder, rename or collapse anything.
+/// `the_capability_vocabulary_is_the_agent_crates_level_vocabulary` pins this side of it
+/// today and asserts the other side under the `agent-vocabulary` feature, which is what
+/// turns a comment into a build failure the moment the dependency exists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Capability {
     /// No tools. Text in, text out.
@@ -327,11 +384,19 @@ impl From<HarnessError> for ApiError {
     }
 }
 
-/// One agent program the bridge knows how to spawn.
+/// One agent program the bridge knows how to run: its IDENTITY AND ITS POLICY.
 ///
 /// An implementation is a SHARED SINGLETON living in the [`HarnessRegistry`] and serving
 /// concurrent turns, so it holds no per-turn state — which is exactly why parsing is a
-/// separate per-turn object ([`Harness::parser`]) rather than a method here.
+/// separate per-turn object ([`SpawnedHarness::parser`]) rather than a method here.
+///
+/// **THIS TRAIT SAYS WHAT A HARNESS IS, NEVER HOW IT IS REACHED.** Everything on it is true
+/// of a harness whether or not a process is involved. The methods that only mean something
+/// for a child process live on [`SpawnedHarness`]; the ones that only mean something for a
+/// harness answering inside this process live on [`InProcessHarness`]; and
+/// [`Harness::runner`] is the single question that says which of the two a given harness
+/// is. That split is the whole point: before it, every consumer of a `&dyn Harness` could
+/// reach `build_turn` and none of them had to think about whether a child existed.
 pub trait Harness: Send + Sync {
     /// Stable id, and the registry key. `claude-code` for the one implementation today.
     fn id(&self) -> &'static str;
@@ -344,6 +409,10 @@ pub trait Harness: Send + Sync {
     /// envelope whose result field came back empty) only makes sense for a harness that
     /// streams. A whole-answer harness has no such net and must not be given a phantom one
     /// — its terminal outcome has to be complete on its own.
+    ///
+    /// True for either runner shape. An in-process harness that streams pushes
+    /// [`TurnSink::text_delta`] as its tokens arrive; the driver's safety net then covers it
+    /// exactly as it covers a spawned one.
     fn streams_text(&self) -> bool;
 
     /// Whether this harness can actually express this capability, as a posture distinct from
@@ -368,23 +437,33 @@ pub trait Harness: Send + Sync {
     /// is what keeps this from becoming a wish list of its own.
     fn expresses(&self, capability: Capability) -> bool;
 
-    /// Whether this harness drives its model over an **OpenAI-style** API surface
-    /// (`/v1/responses`) rather than Anthropic's `/v1/messages`.
+    /// Whether this harness can drive a model over `wire` — the API surface a request/response
+    /// is spoken on. Replaces `speaks_openai_backend`, whose single boolean could name only
+    /// one alternative to Anthropic's and could not say which.
     ///
-    /// The one thing [`ModelKind::OpenAi`] needs to know about a harness, and it lives here
-    /// for the same reason [`Harness::expresses`] does: it is a fact about what the harness
-    /// CAN do, and the alternative was [`validate_model_config`] hardcoding a harness id,
-    /// which puts a per-harness fact in the one file that is supposed to ask rather than
+    /// It lives here for the reason [`Harness::expresses`] does: it is a fact about what the
+    /// harness CAN do, and the alternative was [`validate_model_config`] hardcoding a harness
+    /// id, which puts a per-harness fact in the one file that is supposed to ask rather than
     /// know.
     ///
-    /// The default is `false` — a harness speaks Anthropic unless it says otherwise, which is
-    /// what every harness did before Codex gained a provider seam. The gate reads it in ONE
-    /// direction: an `openai`-kind model on a harness that answers `false` is refused. The
-    /// converse is legitimate and must stay so — a Codex model on its own OAuth login is
-    /// `hosted`, names no provider, and is exactly the deployed posture.
-    fn speaks_openai_backend(&self) -> bool {
-        false
-    }
+    /// **The asymmetry the old boolean encoded is preserved, and it is the part to keep.**
+    /// Claude Code answers [`Wire::Messages`] and nothing else: it drives its child over
+    /// Anthropic's `/v1/messages`, and handing it a base URL that answers only
+    /// `/v1/responses` produces a model the picker shows as healthy whose every turn 404s.
+    /// Codex answers BOTH `Responses` and `Messages`, and the second is not sloppiness: a
+    /// Codex model on its own subscription OAuth login names no provider at all, is declared
+    /// `hosted`, and is exactly the deployed posture. The gate reads this in ONE direction —
+    /// a model whose wire its harness does not support is refused — so the hosted-login case
+    /// must keep answering true or the deployed configuration stops booting.
+    ///
+    /// [`Wire::Chat`] is supported by NO harness today, deliberately: it is the wire the
+    /// OpenAI health probe speaks (see [`DEFAULT_OPENAI_HEALTH_PATH`]) and a wire the agent
+    /// layer speaks, but nothing here drives a TURN over it. A model that declares it is
+    /// refused at startup naming the harness, which is the honest answer.
+    ///
+    /// There is no default. A new harness must state which wires it drives, because the
+    /// safe-looking default ("Messages only") is a claim about a transport nobody checked.
+    fn supports_wire(&self, wire: Wire) -> bool;
 
     /// How many turns of a model on THIS harness may run at once, absent any config.
     ///
@@ -414,42 +493,20 @@ pub trait Harness: Send + Sync {
     /// Adding a third harness that implements nothing therefore produces a THROTTLED bridge,
     /// never an unlocked vault. `every_known_harness_declares_write_lock_support` holds every
     /// id in [`KNOWN_HARNESS_IDS`] against this so the question cannot be skipped.
+    ///
+    /// **AN IN-PROCESS HARNESS ANSWERING `true` IS MAKING A DIFFERENT PROMISE**, and it is
+    /// the one thing about this method the split changes. The hook machinery is spawned-only
+    /// by construction: [`WriteLockChild`] describes a hook COMMAND STRING for a child
+    /// process, and it is installed by [`SpawnedHarness::build_turn`], which an in-process
+    /// harness does not have. So an in-process harness answering `true` is promising that it
+    /// takes the lock through [`crate::LockBroker`] DIRECTLY, in this process, around every
+    /// write it performs — which is what D5's agent loop does, and which is strictly simpler
+    /// than the hook round trip because there is no process boundary to cross. An in-process
+    /// harness that has not done that answers `false`, and [`resolve_slot_plan`]'s cap then
+    /// applies to it exactly as it applies to a spawned harness that has not: one
+    /// write-level turn at a time. Nothing about the fail-safe changed shape.
     fn supports_write_lock(&self) -> bool {
         false
-    }
-
-    /// Parse one of THIS harness's hook payloads into the write it is about to perform.
-    ///
-    /// Per harness because the payloads genuinely differ, measured against the pinned
-    /// binaries on 2026-08-05:
-    ///
-    ///   * Claude Code hands over a STRUCTURED absolute path:
-    ///     `tool_name: "Write"`, `tool_input: {"file_path": "/abs/path", "content": …}`.
-    ///   * Codex hands over NO path field at all: `tool_name: "apply_patch"`, `tool_input:
-    ///     {"command": "*** Begin Patch\n*** Add File: hello.txt\n+…"}` — the target is
-    ///     inside patch envelope syntax and is RELATIVE to the payload's `cwd`.
-    ///
-    /// Those are exactly the two spellings of one file that must collapse to one lock key, so
-    /// every implementation returns a FULLY RESOLVED ABSOLUTE PATH (symlinks resolved) or
-    /// [`WriteTarget::Global`]. A harness that returns a cwd-relative path for one child and
-    /// an absolute one for another has built two locks over one file and protected nothing.
-    ///
-    /// The default is [`WriteTarget::Global`] for anything a harness does not recognise:
-    /// unknown means "lock everything", never "lock nothing".
-    fn hook_write_target(&self, _payload: &HookPayload) -> WriteTarget {
-        WriteTarget::Global
-    }
-
-    /// The file a hook payload says this call READ, whose content becomes the conversation's
-    /// compare-and-swap baseline. `None` when the call read nothing nameable.
-    ///
-    /// The default is `None`, which is the SAFE default here and the opposite of
-    /// [`Harness::hook_write_target`]'s: recording no baseline means the compare-and-swap has
-    /// nothing to compare and the write is allowed (the named hole), whereas recording a WRONG
-    /// baseline would refuse legitimate writes forever. A harness that cannot name what it
-    /// read should say nothing rather than guess.
-    fn hook_read_target(&self, _payload: &HookPayload) -> Option<PathBuf> {
-        None
     }
 
     /// The containment flags this harness turns a [`Capability`] into: the whole boundary,
@@ -465,23 +522,21 @@ pub trait Harness: Send + Sync {
     /// The recorded argv has to be identical on every machine or the startup comparison
     /// cannot be strict equality; the token is substituted for the turn's real working
     /// directory when the child is built, which is the only place that knows it.
-    fn capability_args(&self, cfg: &Config, capability: Capability) -> Vec<String>;
-
-    /// The MCP server set a MAIN turn of THIS harness spawns when no override is set.
     ///
-    /// PER HARNESS, because the postures genuinely differ: Claude Code's main turn loads
-    /// qmd plus the read-only Slack server, Codex's loads qmd alone. Sharing one const
-    /// meant adding a server to one harness silently changed the other's posture — and
-    /// since the containment record is keyed by MCP set, that would have invalidated a
-    /// record and orphaned its human `[[accepted]]` signatures as a side effect of a
-    /// change that had nothing to do with it.
-    fn main_mcp_config(&self) -> &'static str;
+    /// It stays on the SHARED trait rather than moving to [`SpawnedHarness`] even though the
+    /// word "argv" is in its name: what it describes is the BOUNDARY, the startup gate reads
+    /// it for every registered harness, and an in-process harness has a boundary too — it
+    /// just spells it as the tool set it hands its loop rather than as flags. A harness with
+    /// no argv to give returns the strings that name its posture; what must not happen is a
+    /// harness with no entry here, because that is a harness whose record vouches for
+    /// nothing.
+    fn capability_args(&self, cfg: &Config, capability: Capability) -> Vec<String>;
 
     /// Every (capability, MCP set) pair THIS harness actually spawns, and therefore every
     /// row its record must carry.
     ///
-    /// PER HARNESS for the same reason as [`Harness::main_mcp_config`], of which this is
-    /// the direct consequence: the rows a battery must probe follow from the server sets
+    /// PER HARNESS for the same reason as [`SpawnedHarness::main_mcp_config`], of which this
+    /// is the direct consequence: the rows a battery must probe follow from the server sets
     /// the harness spawns. A shared list forced every harness to be re-recorded whenever
     /// any one of them gained a server.
     fn shipped_rows(&self) -> &'static [ContainmentRow];
@@ -509,9 +564,6 @@ pub trait Harness: Send + Sync {
     /// machinery for a rare case and is not built.
     fn transcript_dir(&self, cfg: &Config) -> Option<PathBuf>;
 
-    /// Build the child `Command` for one turn — argv, cwd, stdio, env — or refuse.
-    fn build_turn(&self, cfg: &Config, req: &TurnRequest<'_>) -> Result<Command, HarnessError>;
-
     /// HOW THIS HARNESS'S MODEL GETS AT AN ATTACHMENT: the tool to tell it to use, and the
     /// on-disk types that tool can actually take.
     ///
@@ -527,9 +579,67 @@ pub trait Harness: Send + Sync {
     /// [`prepare_attachments_for_harness`].
     fn attachment_support(&self) -> &'static AttachmentSupport;
 
+    /// **WHICH RUNNER SHAPE THIS HARNESS IS** — the one branch, asked once per call site.
+    ///
+    /// Returning a borrow of `self` under one of two trait objects, rather than a boolean
+    /// plus a downcast, is what makes the branch total: the arm that says "spawned" is
+    /// handed the `&dyn SpawnedHarness` it needs, and the arm that says "in process" cannot
+    /// reach `build_turn` at all. A call site that only knows how to spawn must still write
+    /// the other arm, and what it writes there is a visible refusal rather than a silent
+    /// default — see [`crate::claude::run_claude_streaming`] for the shape.
+    ///
+    /// Constant per harness. Nothing about a turn changes the answer, so a call site may ask
+    /// it as often as it likes.
+    fn runner(&self) -> Runner<'_>;
+}
+
+/// Which of the two runner shapes a [`Harness`] is, carrying the borrow that shape needs.
+///
+/// An ENUM rather than two optional accessors (`as_spawned() -> Option<…>`), because the
+/// enum is what makes a `match` exhaustive: adding a third shape becomes a compile error at
+/// every call site, which is exactly the review this change exists to force. Two optional
+/// accessors would let a new shape land with every existing site silently taking its
+/// `None` path.
+pub enum Runner<'a> {
+    /// The harness answers a turn by spawning a CHILD PROCESS and reading its stdout.
+    Spawned(&'a dyn SpawnedHarness),
+    /// The harness answers a turn INSIDE THIS PROCESS, with no child at all.
+    InProcess(&'a dyn InProcessHarness),
+}
+
+/// A [`Harness`] that answers a turn by spawning a child process — everything that only
+/// means something once there IS a child.
+///
+/// Every method here was on `Harness` before the split and moved verbatim. They belong
+/// together because they are all about the same object: `build_turn` makes the child,
+/// `parser` reads its stdout, `classify_stderr_line`/`stderr_classifier` read its stderr,
+/// `main_mcp_config` names the servers it launches, and the two hook methods read the
+/// payloads its hooks send back. Not one of them has a meaning for a harness with no child.
+///
+/// Reached only through [`Runner::Spawned`], so a call site that holds one has already
+/// said what it does when there is no child to spawn.
+///
+/// `Harness` is a SUPERTRAIT: a spawned harness is a harness, and the driver that holds one
+/// still needs its id (to name a failure), its `streams_text` (to decide whether the
+/// streamed-text safety net applies) and the rest. Threading the same object through two
+/// parameters would have been the alternative, and it invites the two to disagree.
+pub trait SpawnedHarness: Harness {
+    /// Build the child `Command` for one turn — argv, cwd, stdio, env — or refuse.
+    fn build_turn(&self, cfg: &Config, req: &TurnRequest<'_>) -> Result<Command, HarnessError>;
+
     /// A FRESH parser for one spawn attempt. The driver creates one per attempt, so a retry
     /// never sees the previous attempt's half-accumulated state.
     fn parser(&self) -> Box<dyn TurnParser>;
+
+    /// The MCP server set a MAIN turn of THIS harness spawns when no override is set.
+    ///
+    /// PER HARNESS, because the postures genuinely differ: Claude Code's main turn loads
+    /// qmd plus the read-only Slack server, Codex's loads qmd alone. Sharing one const
+    /// meant adding a server to one harness silently changed the other's posture — and
+    /// since the containment record is keyed by MCP set, that would have invalidated a
+    /// record and orphaned its human `[[accepted]]` signatures as a side effect of a
+    /// change that had nothing to do with it.
+    fn main_mcp_config(&self) -> &'static str;
 
     /// Classify one line of the child's STDERR. `None` for the overwhelming majority of
     /// lines, which are log noise.
@@ -554,16 +664,213 @@ pub trait Harness: Send + Sync {
         None
     }
 
-    /// An OWNED classifier for one spawn's stderr, mirroring [`Harness::parser`] and for the
-    /// same structural reason: stderr must be drained by a task that OUTLIVES the borrow of
-    /// the registry, so the driver cannot hold a `&dyn Harness` across it.
+    /// An OWNED classifier for one spawn's stderr, mirroring [`SpawnedHarness::parser`] and
+    /// for the same structural reason: stderr must be drained by a task that OUTLIVES the
+    /// borrow of the registry, so the driver cannot hold a `&dyn SpawnedHarness` across it.
     ///
     /// Implementations are unit structs, so this is a boxed copy of nothing. Override it only
     /// if a harness ever needs per-spawn stderr state — and read the note on
-    /// [`Harness::classify_stderr_line`] about why none does today.
+    /// [`SpawnedHarness::classify_stderr_line`] about why none does today.
     fn stderr_classifier(&self) -> Box<dyn StderrClassifier> {
         Box::new(NoStderrSignals)
     }
+
+    /// Parse one of THIS harness's hook payloads into the write it is about to perform.
+    ///
+    /// Per harness because the payloads genuinely differ, measured against the pinned
+    /// binaries on 2026-08-05:
+    ///
+    ///   * Claude Code hands over a STRUCTURED absolute path:
+    ///     `tool_name: "Write"`, `tool_input: {"file_path": "/abs/path", "content": …}`.
+    ///   * Codex hands over NO path field at all: `tool_name: "apply_patch"`, `tool_input:
+    ///     {"command": "*** Begin Patch\n*** Add File: hello.txt\n+…"}` — the target is
+    ///     inside patch envelope syntax and is RELATIVE to the payload's `cwd`.
+    ///
+    /// Those are exactly the two spellings of one file that must collapse to one lock key, so
+    /// every implementation returns a FULLY RESOLVED ABSOLUTE PATH (symlinks resolved) or
+    /// [`WriteTarget::Global`]. A harness that returns a cwd-relative path for one child and
+    /// an absolute one for another has built two locks over one file and protected nothing.
+    ///
+    /// The default is [`WriteTarget::Global`] for anything a harness does not recognise:
+    /// unknown means "lock everything", never "lock nothing".
+    ///
+    /// SPAWNED-ONLY because a hook payload is a thing a CHILD sends back. An in-process
+    /// harness has no hooks to read; it takes its locks through the broker directly. See
+    /// [`Harness::supports_write_lock`].
+    fn hook_write_target(&self, _payload: &HookPayload) -> WriteTarget {
+        WriteTarget::Global
+    }
+
+    /// The file a hook payload says this call READ, whose content becomes the conversation's
+    /// compare-and-swap baseline. `None` when the call read nothing nameable.
+    ///
+    /// The default is `None`, which is the SAFE default here and the opposite of
+    /// [`SpawnedHarness::hook_write_target`]'s: recording no baseline means the
+    /// compare-and-swap has nothing to compare and the write is allowed (the named hole),
+    /// whereas recording a WRONG baseline would refuse legitimate writes forever. A harness
+    /// that cannot name what it read should say nothing rather than guess.
+    fn hook_read_target(&self, _payload: &HookPayload) -> Option<PathBuf> {
+        None
+    }
+}
+
+/// Where an [`InProcessHarness`] sends the two mid-turn events, and the ONLY way its text
+/// reaches the client before the turn ends.
+///
+/// The counterpart of [`TurnParser`] for the other runner shape, and deliberately narrower
+/// than one: a parser MAPS a line the child already wrote, so it can afford a `StreamEvent`
+/// with an `Ignore` variant and a `Done` variant. A sink is CALLED by a harness that has
+/// decided to say something, so the only two things it may say are the two the mid-turn
+/// contract at the top of this module names. There is no `Done` here and there must not be
+/// one: the terminal outcome is the future's return value, so a harness cannot deliver two
+/// different terminal answers.
+///
+/// `&self`, not `&mut self`, because a harness will hand this to whatever concurrency its
+/// loop uses (a provider reader task, a batch of tool calls awaiting together) and a
+/// `&mut` sink would force it to serialise through a lock it does not otherwise need. The
+/// driver's implementation forwards into the job store, which is already `Send + Sync` and
+/// already takes concurrent pushes from the stderr task today.
+pub trait TurnSink: Send + Sync {
+    /// A chunk of the visible answer, exactly as [`StreamEvent::TextDelta`] means it.
+    ///
+    /// Emitted only by a harness whose [`Harness::streams_text`] is true. **This is the only
+    /// way text reaches the client mid-turn**, and the harness owes the rest of the contract
+    /// with it: everything sent here must also appear in [`TurnOutcome::text`], and text
+    /// already sent must never be sent again (see [`InProcessHarness::run_turn`] on retries).
+    fn text_delta(&self, delta: &str);
+
+    /// A coarse "the harness is doing X" hint, exactly as [`StreamEvent::ToolActivity`] means
+    /// it — same one vocabulary across harnesses, same `refused` bit, and the same
+    /// prohibition on tool RESULTS, tool INPUTS, token counts and per-tool timing.
+    fn tool_activity(&self, activity: ToolActivity);
+}
+
+/// What an in-process turn hands back when it succeeds: exactly what the driver needs to
+/// build a `Done` frame today, and nothing else.
+///
+/// Four fields because the driver's success path reads four things off a
+/// [`ClaudeOutcome::Ok`] and its own accounting, and every one of them has to come from
+/// somewhere. It is deliberately NOT `ClaudeOutcome`: that type carries `Retryable`, which
+/// an in-process harness must never return (it owns its own retries — see
+/// [`InProcessHarness::run_turn`]), and modelling a variant the contract forbids is how a
+/// caller ends up handling it "just in case".
+pub struct TurnOutcome {
+    /// The final, complete answer text. Complete on its own even for a streaming harness:
+    /// the driver's streamed-text safety net is a fallback for an empty terminal answer, not
+    /// a licence to return one.
+    pub text: String,
+    /// The session this turn ran under, to re-key the conversation's ledger with. `None`
+    /// keeps whatever key the conversation already has.
+    ///
+    /// **It must never start with `local-`.** That prefix names a SYNTHETIC id the bridge
+    /// mints for a thread with no harness-side session behind it, and both resume builders
+    /// filter it out before passing a resume target down (`is_synthetic_session_id`). A
+    /// harness that returned one would be handing back an id that can never be resumed and
+    /// that the bridge would then dutifully store as the conversation's current session.
+    pub session_id: Option<String>,
+    /// Token usage for the per-turn cost badge, in the shape the badge already multiplies by
+    /// the active model's price deck. `ShadowUsage::default()` (all-`None`) when the harness
+    /// has no counts — the badge renders nothing rather than a zero.
+    pub usage: ShadowUsage,
+    /// How many tool calls this turn made — the harness's OWN authoritative total, counting
+    /// refused calls, which is what the spawned arm's activity events already amount to.
+    ///
+    /// It exists because the driver's count is otherwise derived from mid-turn activity, and
+    /// activity is a garnish rather than a guarantee on a streaming harness. The driver
+    /// reconciles the two with [`TurnTrace::note_tool_calls`], which takes the LARGER of the
+    /// two — a harness cannot lower a count of calls the driver watched happen.
+    pub tool_calls: usize,
+}
+
+/// Why an in-process turn did not produce a [`TurnOutcome`].
+///
+/// TWO variants, and the absence of a third is the contract. There is no `Retryable`: a
+/// transient upstream failure is the harness's own business to retry inside the turn (see
+/// [`InProcessHarness::run_turn`]), because the driver's retry re-runs the WHOLE prompt and
+/// an in-process harness that already streamed half an answer cannot survive that. What
+/// crosses this boundary is a decision, never a maybe.
+pub enum TurnFailure {
+    /// The turn failed and will not succeed on a re-run of the same prompt. `message` is
+    /// operator-facing and carries no credential material; the driver surfaces it as the
+    /// turn's error exactly as it surfaces a [`ClaudeOutcome::Fatal`].
+    Fatal { message: String },
+    /// The turn ended because its cancellation token fired. Distinguished from `Fatal`
+    /// because a cancelled turn is not a failed one: the driver resolves it to the job
+    /// store's `Cancelled`, which is the state the client already renders for a cancel.
+    Cancelled,
+}
+
+/// A [`Harness`] that answers a turn INSIDE THIS PROCESS — no child, no pipes, no reap.
+///
+/// **NOTHING IMPLEMENTS THIS YET.** It is written now because the trait split is only worth
+/// doing if the shape on the other side of it is decided rather than discovered, and D5 is
+/// what implements it (the `agent/` crate's loop, adopted behind this trait). Everything
+/// below is the contract D5 must satisfy; a reader adding a second in-process harness later
+/// reads exactly this.
+///
+/// `Harness` is a SUPERTRAIT for the same reason it is on [`SpawnedHarness`]: the driver
+/// holding one still asks it for its id and whether it streams.
+pub trait InProcessHarness: Harness {
+    /// Run one whole turn and return its outcome.
+    ///
+    /// ## The sink is the only mid-turn channel
+    ///
+    /// `sink` receives exactly the two events the mid-turn contract at the top of this
+    /// module names, and **it is the ONLY way text reaches the client before this future
+    /// resolves**. There is no second channel, no partial return, and no side door through
+    /// the job store: a harness that wants a token on the user's screen calls
+    /// [`TurnSink::text_delta`]. The same contract binds it as binds a spawned harness's
+    /// parser — same vocabulary, same `refused` bit, same prohibition on tool results,
+    /// tool inputs, token counts and per-tool timing.
+    ///
+    /// ## Retries are the harness's, and text is never re-delivered
+    ///
+    /// **This harness owns retrying a transient failure WITHIN the turn.** The driver's
+    /// three-attempt retry belongs to the spawned arm and does not run here, for a concrete
+    /// reason: that retry re-runs the whole prompt and calls `stream_reset` to discard the
+    /// discarded attempt's text, which works because a killed child has said nothing that
+    /// survives. An in-process harness holds its own conversation state and its own partial
+    /// answer, so a driver-level re-run would either duplicate work the harness already did
+    /// or throw away state only the harness can see.
+    ///
+    /// The obligation that comes with owning the retry: **text already delivered through the
+    /// sink must never be delivered again.** A harness that retries after streaming a
+    /// partial answer must resume from where it stopped, or reset its own visible state
+    /// before it starts over — it must not simply re-send from the beginning, because the
+    /// client appends deltas and would render the answer twice.
+    ///
+    /// ## Cancellation ends the future promptly and leaves the thread resumable
+    ///
+    /// `cancel` fires when the turn is cancelled or times out. The future must **end
+    /// promptly** — abandoning an in-flight upstream request rather than waiting for it, on
+    /// the same order of promptness the spawned arm gets from killing a child — and must
+    /// return [`TurnFailure::Cancelled`] rather than a `Fatal` dressed up as one.
+    ///
+    /// It must also leave the **thread resumable**: whatever state the next turn would
+    /// resume from has to be consistent at the moment the future returns. A half-written
+    /// thread append, a tool result recorded with no matching call, or a lock still held is
+    /// a cancelled turn that has broken the conversation rather than ended it. This is the
+    /// clause with no equivalent on the spawned side — a killed child's state is its own
+    /// problem — and it is the one most likely to be got wrong.
+    ///
+    /// ## The outcome
+    ///
+    /// A [`TurnOutcome`] on success, carrying the four things the driver needs to build a
+    /// `Done` frame. `TurnOutcome::session_id` must never start with `local-`; see the field.
+    ///
+    /// ## Why a boxed future rather than `async fn`
+    ///
+    /// The trait is used as `&dyn InProcessHarness` (that is the whole point of
+    /// [`Runner::InProcess`]), and an `async fn` in a trait is not dyn-compatible. The
+    /// explicit `Pin<Box<dyn Future + Send>>` is the shape that is, and `Send` is required
+    /// because the driver runs this inside a `tokio::spawn`ed turn task.
+    fn run_turn<'a>(
+        &'a self,
+        cfg: &'a Config,
+        req: &'a TurnRequest<'a>,
+        sink: &'a dyn TurnSink,
+        cancel: CancellationToken,
+    ) -> Pin<Box<dyn Future<Output = Result<TurnOutcome, TurnFailure>> + Send + 'a>>;
 }
 
 /// What the operator is told when a harness's daemon credential is dead, in ONE place so both
@@ -1035,6 +1342,55 @@ mod tests {
                 )
             });
             assert_eq!(h.id(), *id, "the registry keyed '{id}' under another id");
+        }
+    }
+
+    /// **THE TWO LEVEL VOCABULARIES ARE ONE VOCABULARY.** See the table on [`Capability`].
+    ///
+    /// The bridge's `Capability` and `jesse_agent::tools::Level` are declared separately
+    /// because the two crates do not depend on each other, and D5's adoption is a pair of
+    /// `From` impls that are only correct while the two agree on names AND on order — the
+    /// order is what `Ord` means on both sides, so a swapped pair would silently make `Read`
+    /// the most capable level.
+    ///
+    /// This half always runs and pins the bridge's side by NAME and by ORDER: the sort is on
+    /// the derived `Ord`, so a reordered enum fails here even though the name set is
+    /// unchanged.
+    ///
+    /// The other half is gated on the `agent-vocabulary` feature, which enables nothing
+    /// today and exists precisely so this assertion is WRITTEN before the dependency is.
+    /// D5 adds `jesse-agent` as an optional dependency of that feature, and the block below
+    /// starts compiling — and starts failing the build if the two enums have drifted. Adding
+    /// the dependency now, only to compare two enums, would put the whole agent crate in the
+    /// bridge's lockfile a step early; leaving the check unwritten is how the mapping ends up
+    /// being derived from two doc comments by whoever happens to write the impls.
+    #[test]
+    fn the_capability_vocabulary_is_the_agent_crates_level_vocabulary() {
+        let mut ours = [Capability::Write, Capability::Basic, Capability::Read];
+        ours.sort();
+        let names: Vec<String> = ours.iter().map(|c| format!("{c:?}")).collect();
+        assert_eq!(
+            names,
+            ["Basic", "Read", "Write"],
+            "the bridge's capability vocabulary changed; `jesse_agent::tools::Level` must \
+             change with it, in the same order, or D5's mapping stops being the identity"
+        );
+
+        #[cfg(feature = "agent-vocabulary")]
+        {
+            let mut theirs = [
+                jesse_agent::tools::Level::Write,
+                jesse_agent::tools::Level::Basic,
+                jesse_agent::tools::Level::Read,
+            ];
+            theirs.sort();
+            let their_names: Vec<String> = theirs.iter().map(|l| format!("{l:?}")).collect();
+            assert_eq!(
+                names, their_names,
+                "the two level vocabularies have drifted — same names, same order, or the \
+                 `From<Capability> for Level` mapping is no longer the identity it is \
+                 documented to be"
+            );
         }
     }
 

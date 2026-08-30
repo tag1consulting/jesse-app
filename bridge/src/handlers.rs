@@ -2359,6 +2359,12 @@ fn model_row(
         "id": m.id,
         "label": m.label,
         "kind": m.kind,
+        // The API SURFACE this model's turn is spoken on, beside the hosting arrangement
+        // `kind` names. Reported because the two were one key until now and a client (or an
+        // operator reading this endpoint instead of the config file) otherwise cannot tell a
+        // hosted Anthropic-surface model from a hosted OpenAI-surface one. Content-free, like
+        // every other field here: an enum, never a base url or a token.
+        "wire": m.wire,
         "configured": h.configured,
         "healthy": h.healthy,
         "available": h.available(),

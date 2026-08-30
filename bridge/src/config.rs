@@ -1669,6 +1669,108 @@ pub enum ModelKind {
     OpenAi,
 }
 
+/// The API SURFACE a model's request/response is spoken on — the wire, as distinct from
+/// where the endpoint is hosted.
+///
+/// **This is the axis [`ModelKind`] used to conflate, and separating them is the point of
+/// the key.** `kind` answered two questions at once: where does the backend live (ambient /
+/// hosted / local) and which contract does it speak (everything-but-`openai` meant
+/// Anthropic). That worked while there was exactly one non-Anthropic contract. It stops
+/// working the moment a hosted endpoint speaks OpenAI Chat Completions, or a local one
+/// speaks Anthropic Messages, because the pair "hosted + which wire" has no spelling.
+///
+/// So `kind` now means HOSTING ONLY, and this names the contract. A model that says nothing
+/// gets the wire its old `kind` implied (see [`RegistryModel::wire`]), so every existing
+/// config parses to exactly what it already meant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Wire {
+    /// Anthropic's `/v1/messages`. What Claude Code drives its child over, and what every
+    /// `hosted`/`local`/`ambient` model meant before this key existed.
+    Messages,
+    /// OpenAI's `/chat/completions`. **No harness drives a TURN over it today** — it is here
+    /// because it is a real contract the bridge already speaks somewhere (the OpenAI health
+    /// probe posts to exactly this path; the `agent/` crate has an adapter for it) and
+    /// because leaving it out would force the next reader to decide whether `responses`
+    /// means "OpenAI, whichever" or "Responses specifically". It means Responses
+    /// specifically. A model declaring `chat` is refused at startup naming its harness,
+    /// which is the honest answer rather than a silent downgrade to a wire that works.
+    Chat,
+    /// OpenAI's `/responses`. The only wire codex-cli 0.146.0 speaks, and what
+    /// [`ModelKind::OpenAi`] has always meant.
+    Responses,
+}
+
+impl Wire {
+    /// The wire a model gets when its config declares none, derived from its `kind` so every
+    /// pre-`wire` config parses to what it meant.
+    ///
+    /// | `kind`    | default `wire` |
+    /// |-----------|----------------|
+    /// | `ambient` | `messages`     |
+    /// | `hosted`  | `messages`     |
+    /// | `local`   | `messages`     |
+    /// | `openai`  | `responses`    |
+    ///
+    /// The `openai` row is the whole reason the default is kind-derived rather than a flat
+    /// `Messages`: that kind has always meant the Responses surface, and a flat default
+    /// would have silently moved every deployed `kind = "openai"` model onto a wire its
+    /// harness would then refuse at startup.
+    pub fn default_for_kind(kind: ModelKind) -> Wire {
+        match kind {
+            ModelKind::OpenAi => Wire::Responses,
+            ModelKind::Ambient | ModelKind::Hosted | ModelKind::Local => Wire::Messages,
+        }
+    }
+
+    /// The operator-facing name, and exactly the string the config key takes.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Wire::Messages => "messages",
+            Wire::Chat => "chat",
+            Wire::Responses => "responses",
+        }
+    }
+}
+
+/// Parse a declarative `wire` string. `None` for anything unrecognised, which the caller
+/// turns into the kind-derived default plus a warning — never a silent third meaning.
+pub fn parse_wire(wire: &str) -> Option<Wire> {
+    match wire.trim().to_ascii_lowercase().as_str() {
+        "messages" => Some(Wire::Messages),
+        "chat" => Some(Wire::Chat),
+        "responses" => Some(Wire::Responses),
+        _ => None,
+    }
+}
+
+/// The wire for an ENV-TRIPLE model: `<prefix>_WIRE` when set and recognised, else the
+/// kind-derived default.
+///
+/// One variable per model, exactly like `<prefix>_BASE_URL` and `<prefix>_PRICE_IN`, so an
+/// operator moving a model onto another surface needs no code change and no `[[models]]`
+/// entry. An unrecognised value warns and takes the default rather than failing the whole
+/// registry: the model still appears, and if its declared wire were the problem the startup
+/// gate would say so by name.
+pub fn model_wire_from_env(prefix: &str, id: &str, kind: ModelKind) -> Wire {
+    let default = Wire::default_for_kind(kind);
+    match env_string(&format!("{prefix}_WIRE")) {
+        None => default,
+        Some(raw) => match parse_wire(&raw) {
+            Some(w) => w,
+            None => {
+                eprintln!(
+                    "jesse-bridge: WARNING {prefix}_WIRE is not one of \
+                     'messages'/'chat'/'responses'; model '{id}' keeps its kind's default \
+                     wire ('{}').",
+                    default.as_str()
+                );
+                default
+            }
+        },
+    }
+}
+
 /// One selectable model in the registry. Built from the built-in ambient default, the
 /// `JESSE_MODEL_*` env triples, and the declarative `[[models]]` config; holds no secret
 /// beyond what the env supplied (the token lives ONLY inside `backend`, resolved from a
@@ -1681,6 +1783,20 @@ pub struct RegistryModel {
     /// The human label shown in the app's switcher.
     pub label: String,
     pub kind: ModelKind,
+    /// The API surface this model's turn is spoken on — see [`Wire`].
+    ///
+    /// **`kind` says where the backend lives; this says what it speaks.** Absent from config
+    /// it is [`Wire::default_for_kind`], so every configuration written before this key
+    /// existed resolves to exactly the wire its `kind` already implied and nothing about it
+    /// moves. Set explicitly (`wire = "messages" | "chat" | "responses"` in `[[models]]`, or
+    /// `JESSE_MODEL_<ID>_WIRE`) it is the operator saying the pair the old single key could
+    /// not spell — a hosted endpoint on the Responses surface, say.
+    ///
+    /// [`validate_model_config`] refuses a model whose wire its harness does not support,
+    /// naming all three, so a wire nothing can drive is a startup error rather than a turn
+    /// that 404s. The health prober reads it too: the probe path default follows the WIRE,
+    /// not the kind — see [`default_health_path`].
+    pub wire: Wire,
     /// `(base_url, auth_token, model_id)` — the same all-or-nothing triple shape as the
     /// role backends. `None` for the ambient entry (it applies nothing) AND for a
     /// hosted/local entry whose triple did not fully resolve (then `configured` is false).
@@ -1924,6 +2040,7 @@ fn glm_env_entry(default_interval_secs: u64, global_timeout_secs: Option<u64>) -
         id: "glm-5.2".to_string(),
         label: "GLM 5.2".to_string(),
         kind: ModelKind::Hosted,
+        wire: model_wire_from_env("JESSE_MODEL_GLM", "glm-5.2", ModelKind::Hosted),
         subagent_model: backend.as_ref().map(|(_, _, m)| m.clone()),
         configured: backend.is_some(),
         backend,
@@ -1981,6 +2098,7 @@ fn kimi_env_entry(default_interval_secs: u64, global_timeout_secs: Option<u64>) 
         // what the switch persists and what every stored selection already names.
         label: "Kimi K3 (Anthropic)".to_string(),
         kind: ModelKind::Hosted,
+        wire: model_wire_from_env("JESSE_MODEL_KIMI", "kimi-k3", ModelKind::Hosted),
         subagent_model: backend.as_ref().map(|(_, _, m)| m.clone()),
         configured: backend.is_some(),
         backend,
@@ -2053,6 +2171,7 @@ fn kimi_codex_env_entry(
         id: "kimi-k3-codex".to_string(),
         label: "Kimi K3 (Codex)".to_string(),
         kind: ModelKind::OpenAi,
+        wire: model_wire_from_env("JESSE_MODEL_KIMI_CODEX", "kimi-k3-codex", ModelKind::OpenAi),
         // NO `CLAUDE_CODE_SUBAGENT_MODEL` analogue on this harness: the codex child is not
         // handed a subagent model, and claiming one here would describe a switch that does
         // not exist.
@@ -2075,7 +2194,7 @@ fn kimi_codex_env_entry(
             interval_secs: default_interval_secs,
             // Probed at `/chat/completions` on the API root, NOT `/responses` — see
             // [`DEFAULT_OPENAI_HEALTH_PATH`].
-            path: default_health_path(ModelKind::OpenAi).to_string(),
+            path: default_health_path(Wire::Responses).to_string(),
             // K3 thinks before it answers on this surface too; the 3 s default would keep a
             // perfectly reachable model out of the picker.
             timeout_secs: resolve_health_timeout(
@@ -2108,6 +2227,7 @@ fn local_env_entry(default_interval_secs: u64, global_timeout_secs: Option<u64>)
         id: "local".to_string(),
         label: "Local".to_string(),
         kind: ModelKind::Local,
+        wire: model_wire_from_env("JESSE_MODEL_LOCAL", "local", ModelKind::Local),
         subagent_model: backend.as_ref().map(|(_, _, m)| m.clone()),
         configured: backend.is_some(),
         backend,
@@ -2230,6 +2350,9 @@ fn opus_entry() -> RegistryModel {
         id: DEFAULT_MODEL_ID.to_string(),
         label: "Claude Opus".to_string(),
         kind: ModelKind::Ambient,
+        // The ambient default speaks Anthropic Messages and is not configurable — no
+        // `JESSE_MODEL_OPUS_*` prefix exists to read a wire from, deliberately.
+        wire: Wire::Messages,
         backend: None,
         subagent_model: None,
         configured: true,
@@ -2287,6 +2410,11 @@ pub struct ModelToml {
     pub label: Option<String>,
     /// `hosted` | `local` (`ambient` is reserved for the built-in opus and refused).
     pub kind: Option<String>,
+    /// `messages` | `chat` | `responses`. Absent means [`Wire::default_for_kind`], so an
+    /// entry written before this key existed keeps the wire its `kind` implied. An
+    /// unrecognised value warns and falls back to that same default — the model still
+    /// loads, and `validate_model_config` is what refuses a wire its harness cannot drive.
+    pub wire: Option<String>,
     pub base_url: Option<String>,
     pub model: Option<String>,
     pub subagent_model: Option<String>,
@@ -2386,6 +2514,22 @@ pub fn registry_model_from_toml(
         );
         return None;
     };
+    // The wire this entry speaks. Absent → the kind's default, so an entry written before
+    // the key existed is unchanged; unrecognised → the same default, with one warning, and
+    // the startup gate is what refuses a wire the harness cannot drive.
+    let wire = match t.wire.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        None => Wire::default_for_kind(kind),
+        Some(raw) => parse_wire(raw).unwrap_or_else(|| {
+            let default = Wire::default_for_kind(kind);
+            eprintln!(
+                "jesse-bridge: WARNING declarative model '{id}' has invalid wire '{raw}' \
+                 (must be 'messages', 'chat' or 'responses'); using its kind's default \
+                 ('{}').",
+                default.as_str()
+            );
+            default
+        }),
+    };
     let token = resolve_declared_token(t.auth_token_env.as_deref());
     if token.is_none() {
         // Present-but-unarmed: log ONCE so a half-configured model is visible, then ship it
@@ -2435,9 +2579,9 @@ pub fn registry_model_from_toml(
                 .as_deref()
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
-                // The default is KIND-AWARE: an OpenAI-surface model's base_url answers
+                // The default is WIRE-AWARE: an OpenAI-surface model's base_url answers
                 // `/chat/completions`, not `/v1/messages`. See [`default_health_path`].
-                .unwrap_or_else(|| default_health_path(kind))
+                .unwrap_or_else(|| default_health_path(wire))
                 .to_string(),
             // Explicit per-model interval wins; else the global override; else the default.
             interval_secs: resolve_health_interval(h.interval_secs, global_interval),
@@ -2453,7 +2597,7 @@ pub fn registry_model_from_toml(
         // No `health` block at all: still honor the global overrides, and still take the
         // kind-aware default path.
         .unwrap_or_else(|| HealthConfig {
-            path: default_health_path(kind).to_string(),
+            path: default_health_path(wire).to_string(),
             interval_secs: resolve_health_interval(None, global_interval),
             timeout_secs: resolve_health_timeout(None, global_timeout, DEFAULT_HEALTH_TIMEOUT_SECS),
         });
@@ -2467,6 +2611,7 @@ pub fn registry_model_from_toml(
             .unwrap_or(id)
             .to_string(),
         kind,
+        wire,
         backend,
         subagent_model,
         configured,
@@ -3500,6 +3645,123 @@ mod tests {
         }
     }
 
+    /// **A CONFIG WITH NO `wire` KEY LOADS TO EXACTLY WHAT `kind` USED TO IMPLY.**
+    ///
+    /// This is the compatibility claim the whole key rests on, so it is asserted rather than
+    /// argued: before `wire` existed, `kind` answered two questions, and the second one
+    /// ("which contract does the backend speak") had exactly one non-Anthropic answer. Every
+    /// deployed config was written under that rule and none of them carry the new key, so if
+    /// a single kind resolved to a different wire than it used to imply, a running bridge
+    /// would fail its own startup gate on a config nobody edited.
+    ///
+    /// All FOUR kinds, and BOTH harnesses, because the pairing is what the startup gate
+    /// refuses — a wire that is right for the model and wrong for the harness is the failure
+    /// mode, and a test that only checked the model half would not see it.
+    ///
+    /// The health probe path is asserted in the same breath: it followed `kind` and now
+    /// follows `wire`, and the two must agree for the same reason.
+    #[test]
+    fn a_config_with_no_wire_key_resolves_to_the_kind_derived_wire_on_both_harnesses() {
+        // 1. THE AMBIENT DEFAULT, which has no config entry at all and never will.
+        let opus = opus_entry();
+        assert!(matches!(opus.kind, ModelKind::Ambient));
+        assert_eq!(opus.wire, Wire::Messages);
+
+        // 2. Every declarative kind, with `wire` absent, under each harness in turn.
+        for harness in [CLAUDE_CODE_ID, CODEX_ID] {
+            for (kind, expected_wire, expected_path) in [
+                ("hosted", Wire::Messages, DEFAULT_HEALTH_PATH),
+                ("local", Wire::Messages, DEFAULT_HEALTH_PATH),
+                ("openai", Wire::Responses, DEFAULT_OPENAI_HEALTH_PATH),
+            ] {
+                let mut t = model_toml(&format!("m-{kind}"), kind, None);
+                t.harness = Some(harness.to_string());
+                assert!(t.wire.is_none(), "the fixture must NOT declare a wire");
+                let m = registry_model_from_toml(&t, None, None)
+                    .unwrap_or_else(|| panic!("{kind} on {harness} must load"));
+                assert_eq!(
+                    m.wire, expected_wire,
+                    "kind '{kind}' on '{harness}' must keep the wire it always implied"
+                );
+                assert_eq!(
+                    m.health.path, expected_path,
+                    "kind '{kind}' on '{harness}': the probe path follows the wire"
+                );
+            }
+        }
+
+        // 3. AND THE PAIRINGS THE GATE THEN MAKES OF THEM are the old ones exactly: every
+        //    kind-derived wire is drivable by the harness that used to accept that kind, and
+        //    the one pairing that was refused before is still the one refused now.
+        for (kind, on_claude, on_codex) in [
+            ("hosted", true, true),
+            ("local", true, true),
+            ("openai", false, true),
+        ] {
+            let wire = Wire::default_for_kind(parse_declared_kind(kind).expect("a valid kind"));
+            assert_eq!(
+                ClaudeCode.supports_wire(wire),
+                on_claude,
+                "claude-code and kind '{kind}'"
+            );
+            assert_eq!(
+                Codex.supports_wire(wire),
+                on_codex,
+                "codex and kind '{kind}'"
+            );
+        }
+
+        // 4. The env-triple models take the same default when their `_WIRE` var is unset —
+        //    the same rule, reached through the other door.
+        let _guard = ENV_LOCK.lock_ok();
+        for var in ["JESSE_MODEL_GLM_WIRE", "JESSE_MODEL_KIMI_CODEX_WIRE"] {
+            std::env::remove_var(var);
+        }
+        assert_eq!(
+            model_wire_from_env("JESSE_MODEL_GLM", "glm-5.2", ModelKind::Hosted),
+            Wire::Messages
+        );
+        assert_eq!(
+            model_wire_from_env("JESSE_MODEL_KIMI_CODEX", "kimi-k3-codex", ModelKind::OpenAi),
+            Wire::Responses
+        );
+    }
+
+    /// The key is only worth adding if it can say something `kind` could not — so this pins
+    /// the pairing that had no spelling before: a HOSTED endpoint on the Responses surface.
+    ///
+    /// Under the old rule that model had to be declared `openai` to get the right wire, which
+    /// also declared something false about where it lives; declaring it `hosted` got it the
+    /// Anthropic surface and a turn that 404s. Neither was right, and there was no third
+    /// option.
+    #[test]
+    fn an_explicit_wire_says_what_kind_alone_could_not() {
+        let mut t = model_toml("hosted-on-responses", "hosted", None);
+        t.harness = Some(CODEX_ID.to_string());
+        t.wire = Some("responses".to_string());
+        let m = registry_model_from_toml(&t, None, None).expect("it loads");
+        assert!(matches!(m.kind, ModelKind::Hosted), "hosting is unchanged");
+        assert_eq!(m.wire, Wire::Responses, "the surface is what moved");
+        assert_eq!(
+            m.health.path, DEFAULT_OPENAI_HEALTH_PATH,
+            "and the probe follows the wire, not the kind"
+        );
+        assert!(Codex.supports_wire(m.wire), "codex drives it");
+        assert!(!ClaudeCode.supports_wire(m.wire), "claude-code does not");
+
+        // An unrecognised value is NOT a silent third meaning: it warns and takes the
+        // kind's default, and the model still loads (the startup gate is what refuses a
+        // pairing, and a config typo must not take the persona file down with it).
+        let mut bad = model_toml("typo", "hosted", None);
+        bad.wire = Some("responsez".to_string());
+        assert_eq!(
+            registry_model_from_toml(&bad, None, None)
+                .expect("a typo'd wire still loads the model")
+                .wire,
+            Wire::Messages
+        );
+    }
+
     /// The nine `JESSE_MODEL_*` env-triple vars, cleared so a test's registry is deterministic.
     const MODEL_ENV_VARS: [&str; 12] = [
         "JESSE_MODEL_GLM_BASE_URL",
@@ -3631,6 +3893,7 @@ mod tests {
             id: "vl".into(),
             label: "VL".into(),
             kind: ModelKind::Hosted,
+            wire: Wire::default_for_kind(ModelKind::Hosted),
             backend: None,
             subagent_model: None,
             configured: false,
@@ -3645,6 +3908,7 @@ mod tests {
             id: "glm".into(),
             label: "GLM".into(),
             kind: ModelKind::Hosted,
+            wire: Wire::default_for_kind(ModelKind::Hosted),
             backend: Some(("http://b".into(), "t".into(), "m".into())),
             subagent_model: Some("m".into()),
             configured: true,
@@ -3690,6 +3954,7 @@ mod tests {
             id: Some("codex".into()),
             label: Some("Codex".into()),
             kind: Some("local".into()),
+            wire: None,
             base_url: Some("http://127.0.0.1:8900".into()),
             model: Some("gpt-5-codex".into()),
             subagent_model: Some("gpt-5-mini".into()),

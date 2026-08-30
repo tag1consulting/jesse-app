@@ -335,14 +335,24 @@ pub fn unresolved_stdio_commands(mcp_config: &str, child_path: &str) -> Vec<(Str
 
 /// The unresolvable stdio servers across the main config of every harness in use.
 ///
-/// It reads `Harness::main_mcp_config` — THE CONFIG A CHILD IS ACTUALLY SPAWNED WITH — rather
-/// than any list written for this check. A second copy of the server set would be one more
-/// thing to keep in step, and the whole point here is that nothing was keeping the copies in
-/// step.
+/// It reads `SpawnedHarness::main_mcp_config` — THE CONFIG A CHILD IS ACTUALLY SPAWNED WITH
+/// — rather than any list written for this check. A second copy of the server set would be
+/// one more thing to keep in step, and the whole point here is that nothing was keeping the
+/// copies in step.
+///
+/// **AN IN-PROCESS HARNESS IS SKIPPED, and that is a real answer rather than a default.**
+/// This check exists to catch one failure: the bridge spawns a child that launches an MCP
+/// server binary, and that binary is not on the child's `PATH`, so a capability silently
+/// vanishes. A harness with no child launches no server binaries, so it has no such
+/// capability to lose — there is nothing here that could be missing. Its tool set is handed
+/// to its own loop in this process, and whatever check that needs is its own, not this one.
 pub fn detect_unresolved_mcp_servers(cfg: &Config, child_path: &str) -> Vec<UnresolvedMcpServer> {
     let mut out = Vec::new();
     for id in harnesses_in_use(cfg) {
         let Some(harness) = cfg.harnesses.get(&id) else {
+            continue;
+        };
+        let Runner::Spawned(harness) = harness.runner() else {
             continue;
         };
         for (server, command) in unresolved_stdio_commands(harness.main_mcp_config(), child_path) {

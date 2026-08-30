@@ -31,8 +31,8 @@
 use std::io::Read;
 
 use jesse_bridge::{
-    ask_broker_blocking, registry_harness, HarnessRegistry, HookPayload, HookRequest, WriteTarget,
-    CLAUDE_CODE_ID, CODEX_ID,
+    ask_broker_blocking, registry_harness, HarnessRegistry, HookPayload, HookRequest, Runner,
+    WriteTarget, CLAUDE_CODE_ID, CODEX_ID,
 };
 
 struct Args {
@@ -128,6 +128,22 @@ fn main() {
         deny(
             &args.harness,
             &format!("jesse-hook does not know the harness '{}'", args.harness),
+        );
+    };
+    // A HOOK IS A CHILD PROCESS PHENOMENON. This binary exists because a spawned child calls
+    // out to it; the payloads it parses are that child's, and the two methods that read them
+    // live on `SpawnedHarness` for exactly that reason. An in-process harness has no hooks
+    // and never invokes this binary — so reaching here under one is a wiring fault, and the
+    // safe answer to a wiring fault is the same one every other unrecognised input gets:
+    // deny, rather than allow an unlocked write on a guess.
+    let Runner::Spawned(harness) = harness.runner() else {
+        deny(
+            &args.harness,
+            &format!(
+                "jesse-hook was invoked for harness '{}', which answers turns in process and \
+                 installs no hooks; refusing the tool call rather than allowing it unlocked",
+                args.harness
+            ),
         );
     };
 

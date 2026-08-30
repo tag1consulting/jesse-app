@@ -14,6 +14,183 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [bridge 0.109.0] - 2026-08-30
+
+### Changed
+
+- **The harness trait says what a harness IS; two smaller traits say how it is reached.**
+  `Harness` had grown to hold both, and the second half was never named — so every method on
+  it silently meant "…of the child process", and every consumer of a `&dyn Harness` could
+  reach `build_turn` without ever deciding what it would do if there were no child to build.
+  That is fine while every harness spawns one. It stops being fine the moment one does not.
+
+  `Harness` keeps identity and policy: `id`, `streams_text`, `expresses`,
+  `default_concurrency`, `supports_write_lock`, `capability_args`, `shipped_rows`,
+  `transcript_dir`, `attachment_support`, the new `supports_wire`, and one new method,
+  `runner`. **Seven methods moved to `SpawnedHarness`** — `build_turn`, `parser`,
+  `main_mcp_config`, `classify_stderr_line`, `stderr_classifier`, `hook_write_target` and
+  `hook_read_target` — and they belong together because they are all about the same object:
+  one makes the child, one reads its stdout, one names the servers it launches, two read its
+  stderr, and two read the payloads its hooks send back. Not one of them has a meaning for a
+  harness with no child. `Harness` is a supertrait of `SpawnedHarness`, so the driver holding
+  one still gets the id it names a failure with.
+
+  `Harness::runner()` returns `Runner::Spawned(&dyn SpawnedHarness)` or
+  `Runner::InProcess(&dyn InProcessHarness)` — an enum rather than two optional accessors,
+  because an enum makes the `match` exhaustive and a third shape a compile error at every
+  call site rather than a silently-taken `None` branch.
+
+- **The driver branches once, and the two arms share everything except retry.**
+  `run_claude_streaming` resolves the resume target (which reads `transcript_dir`, and is
+  therefore above the branch), asks `runner()`, and delegates. The `Spawned` arm is the
+  existing code moved wholesale into `run_spawned_turn` with no behavioural change: same
+  three attempts, same per-attempt fresh `Command` and fresh parser, same concurrent
+  line-classified stderr drain, same terminal-event completion rule, same bounded reap, same
+  auth-failure override, same byte-based truncation cap. The `InProcess` arm awaits
+  `run_turn` with a sink that forwards into the same job-store frames, under the same
+  timeout, with the same streamed-text safety net, resolving through the same
+  `resolve_stream_outcome`.
+
+  What the arms deliberately do not share is the retry loop. The driver's three attempts
+  re-run the whole prompt and call `stream_reset` between them, which is sound only because a
+  killed child has left nothing behind; an in-process harness holds its own conversation
+  state and its own partial answer, so it owns retrying inside the turn. That is written into
+  `InProcessHarness::run_turn` as a contract, along with the obligation that comes with it —
+  text already delivered through the sink must never be delivered again.
+
+- **Every call site that used a moved method now asks `runner()` and answers for the
+  in-process case out loud.** `claude::spawned_only` is the seam, and each caller names the
+  thing it was about to do, because the silent default here is "spawn nothing and report
+  success". The four one-shot runners (title, diet extract, diet verify, vault-QA) refuse
+  with a named `HarnessError` their callers already degrade from; the startup MCP-resolution
+  check skips an in-process harness, which is a real answer rather than a default (a harness
+  that launches no server binaries has no server binary that could be missing); the
+  containment battery refuses with `inconclusive`, which fails the gate rather than recording
+  a posture nobody probed; and `jesse-hook` denies, because a hook payload arriving for a
+  harness that installs no hooks is a wiring fault and the safe answer to a wiring fault is
+  not to allow an unlocked write.
+
+- **`resolve_slot_plan`'s one-write-slot cap is unchanged, and `supports_write_lock` now says
+  what an in-process `true` means.** `WriteLockChild` describes a hook *command string* for a
+  child process and is installed inside `build_turn`, so hooks are spawned-only by
+  construction. An in-process harness answering `true` is therefore promising something
+  different: that it takes locks through the broker **directly**, in this process, around
+  every write it performs. One that has not done that answers `false` and gets capped at a
+  single write-level turn, exactly as a spawned harness that has not implemented hooks does.
+  The fail-safe did not change shape.
+
+### Added
+
+- **`wire`, so a model can say which API contract its backend speaks separately from where it
+  lives.** `kind` answered both questions, which worked while there was exactly one
+  non-Anthropic contract in play. It stops working the moment a hosted endpoint speaks OpenAI
+  Responses, or a local one speaks Anthropic Messages: the pair "hosted + which wire" had no
+  spelling, and the only way to get the right wire was to declare a hosting arrangement that
+  was false.
+
+  `kind` now means hosting only. `wire = "messages" | "chat" | "responses"` in a `[[models]]`
+  entry, or `JESSE_MODEL_<ID>_WIRE` for the env-triple models, names the surface. **It is
+  optional and defaults from `kind`** — `ambient`, `hosted` and `local` give `messages`,
+  `openai` gives `responses` — so every configuration written before the key existed parses
+  to exactly the wire it already implied. That is asserted rather than argued, for all four
+  kinds on both harnesses, because if a single kind resolved differently a running bridge
+  would fail its own startup gate on a config nobody edited.
+
+  `Harness::supports_wire(wire)` replaces `speaks_openai_backend()`, and the asymmetry the
+  old boolean carried is preserved deliberately: `claude-code` answers `messages` only, while
+  `codex` answers **both** `responses` (a provider endpoint) and `messages` (its own
+  subscription login, which names no provider at all and is the deployed posture). The old
+  method was read in one direction only — an `openai`-kind model on a harness answering
+  `false` was refused, and the converse was legitimate — so a `supports_wire` answering
+  `responses` alone would have inverted that reading and refused the one configuration
+  actually in production. `validate_model_config` refuses a pairing at startup naming the
+  model, the wire and the harness, and it now covers strictly more than the check it
+  replaced, which could only ever catch one bad pairing.
+
+  No harness drives `chat` today, and declaring it is a startup error saying so plainly
+  ("registered for this wire: none") rather than a silent downgrade to a wire that happens to
+  work. The variant exists because the health probe already posts to that path and because
+  `responses` has to mean Responses specifically.
+
+- **The health probe's default path follows the wire.** `/chat/completions` for `chat` and
+  `responses`, `/v1/messages` for `messages`, with the same explicit `health.path` override
+  winning as before. `responses` probing the **chat** path is the unchanged reasoning from
+  0.53.0: the minimal probe body is a valid request on both OpenAI contracts, so the chat path
+  answers `200` with a real one-token completion and the green light means this key on this
+  endpoint produced tokens — rather than "the endpoint rejected our body with a 400 we
+  tolerate". The turn still runs on `/responses`; same host, same key, same model.
+
+- **`GET /jesse/models` reports `wire` per model**, beside `kind`. Content-free like every
+  other field on that row — an enum, never a base url or a token. The two were one key until
+  now, so a client (or an operator reading the endpoint instead of the config file) otherwise
+  cannot tell a hosted Anthropic-surface model from a hosted OpenAI-surface one.
+
+- **A committed pre-split argv fixture, generated on the parent commit.**
+  `bridge/tests/fixtures/argv-before-split.json` records the full argv, the working directory
+  and the **names** of the environment variables — never their values — for every
+  `TurnRequest` builder on both harnesses, captured on `main` before any of this landed.
+  `tests/argv_split_fixture.rs` rebuilds the same children afterwards and asserts byte
+  equality. The golden argv tests already in `harness/claude_code.rs` are excellent but live
+  in the same commit as the change, so a refactor that moved a flag and updated the golden in
+  one breath would pass them; a fixture generated on the parent commit cannot be
+  rationalised. The diff is empty.
+
+  Env values are excluded by the capture function rather than by a reviewer's attention,
+  because a Codex provider turn carries its API key in the environment — that is the whole
+  point of `CODEX_PROVIDER_KEY_ENV`, the argv naming only the variable — and a fixture that
+  recorded values would write a secret into the repository the first time somebody
+  regenerated it on a configured host. An argument that is long or carries a URL is stored as
+  its SHA-256 for a related reason: both harnesses' main-turn argv embeds the MCP server set,
+  which names the Home Assistant endpoint by address, and `scripts/ci-guards.sh` exempts
+  exactly one line in the tree for that address. A digest is exact — one byte moves and the
+  hex changes, which is the whole claim — and a JSON file could not carry the per-line
+  exemption marker in any case.
+
+- **The agent crate's level vocabulary is pinned against this one, before the dependency
+  exists.** `harness::Capability` and `jesse_agent::tools::Level` are the same three ordered
+  levels declared twice, because the two crates depend on each other in neither direction.
+  The mapping is meant to be the identity, so it is written as a table beside `Capability`
+  and asserted by a test: the always-compiled half pins this side by name *and* by order (the
+  sort is on the derived `Ord`, so a swapped pair fails even though the name set is
+  unchanged), and the cross-crate half sits behind a new `agent-vocabulary` feature that
+  enables nothing today. Adding the dependency now, only to compare two enums, would put the
+  whole agent crate in the bridge's lockfile a step early; leaving the check unwritten is how
+  a mapping ends up derived from two doc comments in different crates.
+
+- **`TurnTrace::note_tool_calls`**, so a harness that reports its own authoritative tool count
+  can reconcile it with the count the driver derived from mid-turn activity. `max`, never
+  assignment: a harness reporting a smaller number has not un-made calls the driver watched
+  happen, and letting it lower the count would make "43 tool calls and nothing said" — the one
+  diagnosis `TurnTrace::partial` exists to deliver — quietly wrong.
+
+### What did not change
+
+**No argv, no probe path, no containment record, and no wire on any configured model.** The
+committed pre-split fixture is byte-identical on both harnesses at every `TurnRequest` builder
+— same flags, same order, same working directory, same environment variable names — so the
+`claude` and `codex` children this bridge spawns are the ones 0.108.0 spawned. Both containment
+records are untouched and every embedded row still agrees with what its harness declares; no
+row label moved, so no operator `[[accepted]]` signature was orphaned. Codex still does not get
+the `build` or `places` servers, for the reasons recorded on its `main_mcp_config`. The probe
+path of every model resolves to what it resolved to before, because the four kind-derived wire
+defaults are exactly the old kind-based rule written down.
+
+**Nothing implements `InProcessHarness`, and the bridge still does not depend on `agent/`.**
+The in-process arm of the driver is reachable only by a harness that returns
+`Runner::InProcess`, and neither shipped harness does; both return `Runner::Spawned`. The new
+`tokio-util` dependency is for `CancellationToken` alone and was already in the lockfile
+transitively — it is the same third-party crate the agent crate chose, picked here for the same
+reason, and not a dependency on the agent crate.
+
+**One thing an in-process harness will need that this change does not solve**, written down
+rather than discovered later: `POST /jesse/cancel` cancels a turn by **aborting its task**, so
+the future is dropped outright and never runs again. The driver fires the cancellation token
+from a drop guard, which reaches anything the harness spawned off the future, but it cannot
+give the future itself a chance to wind down — only the timeout path can, and it does, under a
+bounded grace period that mirrors the spawned arm's bounded reap. So an in-process harness must
+be safe to drop mid-turn as well as safe to cancel, or the cancel path has to move from an
+abort to a token before one ships.
+
 ## [agent 0.3.0] - 2026-08-30
 
 The real tool set. D2's loop ran over a throwaway fixture; this is the typed set the
