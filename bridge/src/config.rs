@@ -1106,6 +1106,9 @@ pub struct Config {
     // `AppState` so every path that already carries a `&Config` — the turn driver, the
     // resume check, the GC sweep — can ask which harness serves it without a new argument.
     pub harnesses: Arc<HarnessRegistry>,
+    /// The `[direct]` table — the vault settings every `direct` turn runs under. Inert on a
+    /// deployment with no direct model. See [`DirectSettings`].
+    pub direct: DirectSettings,
 }
 
 impl Config {
@@ -1771,6 +1774,70 @@ pub fn model_wire_from_env(prefix: &str, id: &str, kind: ModelKind) -> Wire {
     }
 }
 
+/// How a `direct` model's token is presented on the wire.
+///
+/// The two schemes that exist in practice. `None` on a model means the agent layer picks by
+/// HOST — `x-api-key` for `api.anthropic.com` (their documented scheme), bearer everywhere
+/// else — which is right for every endpoint this repository has deployed. This key exists for
+/// the one shape a host test cannot recognise: a gateway that speaks one vendor's API but
+/// wants the other's header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DirectAuthScheme {
+    /// `authorization: Bearer <token>`.
+    Bearer,
+    /// `x-api-key: <token>`.
+    XApiKey,
+}
+
+/// Parse an `auth_scheme` string. `None` for anything unrecognised, which the caller turns
+/// into the host default plus a warning — never a silent third meaning.
+pub fn parse_auth_scheme(s: &str) -> Option<DirectAuthScheme> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "bearer" => Some(DirectAuthScheme::Bearer),
+        "x-api-key" | "x_api_key" | "xapikey" => Some(DirectAuthScheme::XApiKey),
+        _ => None,
+    }
+}
+
+/// How hard a `direct` model thinks before answering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DirectThinking {
+    Off,
+    Low,
+    Medium,
+    High,
+}
+
+/// Parse a `thinking` string. `None` for anything unrecognised.
+pub fn parse_thinking(s: &str) -> Option<DirectThinking> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "off" | "none" => Some(DirectThinking::Off),
+        "low" => Some(DirectThinking::Low),
+        "medium" | "med" => Some(DirectThinking::Medium),
+        "high" => Some(DirectThinking::High),
+        _ => None,
+    }
+}
+
+/// Per-host wire quirks for a `direct` model, each `None` unless the operator set it.
+///
+/// **THREE `Option<bool>`s RATHER THAN THREE `bool`s**, and the difference is the whole point:
+/// the agent layer already picks a default per host (reasoning-effort and strict-tools on for
+/// `api.openai.com`, off elsewhere; multiple system messages off everywhere), and a plain
+/// `bool` here would silently overwrite all three whenever an operator set one. `None` means
+/// "keep what the host default chose".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+pub struct DirectQuirks {
+    /// Send `reasoning_effort` on the Chat wire when thinking is not off.
+    pub reasoning_effort_supported: Option<bool>,
+    /// Emit the system prefix as several leading system messages rather than one.
+    pub multiple_system_messages: Option<bool>,
+    /// Pass a tool's `strict` flag through to the wire.
+    pub strict_tools: Option<bool>,
+}
+
 /// One selectable model in the registry. Built from the built-in ambient default, the
 /// `JESSE_MODEL_*` env triples, and the declarative `[[models]]` config; holds no secret
 /// beyond what the env supplied (the token lives ONLY inside `backend`, resolved from a
@@ -1826,6 +1893,26 @@ pub struct RegistryModel {
     /// entry declares none. The registry instantiates only the harnesses some configured
     /// model actually names.
     pub harness: String,
+    /// How this model's token is presented, when the per-host default is wrong.
+    ///
+    /// `None` — the overwhelmingly common case — means the agent layer decides by HOST:
+    /// `x-api-key` for `api.anthropic.com`, bearer everywhere else. Set it when a gateway in
+    /// front of one of those wants the other header, which is a real deployment shape no host
+    /// test can recognise. **Read only by the `direct` harness**: the CLI harnesses hand their
+    /// child a token through the environment and the CLI chooses its own header.
+    pub auth_scheme: Option<DirectAuthScheme>,
+    /// Per-host wire quirks, when the agent layer's defaults are wrong for this endpoint.
+    ///
+    /// Every field is `Option` and `None` means "keep the default the agent layer picked for
+    /// this host", so setting one quirk never silently resets the other two. **Read only by
+    /// the `direct` harness.**
+    pub quirks: DirectQuirks,
+    /// How hard this model should think before answering, when the wire supports it.
+    ///
+    /// `None` means `off`, which is the default for every model and the only value that is
+    /// certainly safe: a host that has no reasoning concept rejects the field outright, so
+    /// asking for thinking is opt-in per model. **Read only by the `direct` harness.**
+    pub thinking: Option<DirectThinking>,
     /// The price deck for the per-turn cost badge.
     pub price: PriceDeck,
     /// The health-probe cadence + endpoint for this model (unused for the ambient entry,
@@ -2048,6 +2135,9 @@ fn glm_env_entry(default_interval_secs: u64, global_timeout_secs: Option<u64>) -
         // one of these at Write says so in the `[[models]]` array.
         level: Capability::Read,
         harness: CLAUDE_CODE_ID.to_string(),
+        auth_scheme: None,
+        quirks: DirectQuirks::default(),
+        thinking: None,
         price: PriceDeck {
             in_per_m: FW_GLM_IN_PER_M,
             cached_per_m: FW_GLM_CACHED_PER_M,
@@ -2106,6 +2196,9 @@ fn kimi_env_entry(default_interval_secs: u64, global_timeout_secs: Option<u64>) 
         // one of these at Write says so in the `[[models]]` array.
         level: Capability::Read,
         harness: CLAUDE_CODE_ID.to_string(),
+        auth_scheme: None,
+        quirks: DirectQuirks::default(),
+        thinking: None,
         // Fireworks' published K3 deck (3.00 / 0.30 / 15.00), still overridable from env
         // via `JESSE_MODEL_KIMI_PRICE_{IN,CACHED,OUT}` if Fireworks reprices.
         price: model_price_from_env(
@@ -2180,6 +2273,9 @@ fn kimi_codex_env_entry(
         backend,
         level: Capability::Read,
         harness: CODEX_ID.to_string(),
+        auth_scheme: None,
+        quirks: DirectQuirks::default(),
+        thinking: None,
         // The same weights on the same provider, so the same deck as the sibling — shared
         // `JESSE_MODEL_KIMI_PRICE_*` overrides included, since a reprice moves both.
         price: model_price_from_env(
@@ -2235,6 +2331,9 @@ fn local_env_entry(default_interval_secs: u64, global_timeout_secs: Option<u64>)
         // one of these at Write says so in the `[[models]]` array.
         level: Capability::Read,
         harness: CLAUDE_CODE_ID.to_string(),
+        auth_scheme: None,
+        quirks: DirectQuirks::default(),
+        thinking: None,
         price: PriceDeck::ZERO,
         health: HealthConfig {
             interval_secs: default_interval_secs,
@@ -2362,6 +2461,9 @@ fn opus_entry() -> RegistryModel {
         // refused), which is what keeps the ambient contract out of config's reach.
         level: Capability::Write,
         harness: CLAUDE_CODE_ID.to_string(),
+        auth_scheme: None,
+        quirks: DirectQuirks::default(),
+        thinking: None,
         price: PriceDeck {
             in_per_m: OPUS_IN_PER_M,
             cached_per_m: OPUS_CACHED_PER_M,
@@ -2426,6 +2528,12 @@ pub struct ModelToml {
     /// The CEILING this model may be granted: `basic` | `read` | `write`. Absent means
     /// `read`. See [`RegistryModel::level`].
     pub level: Option<String>,
+    /// `bearer` | `x-api-key`. Absent means the per-host default. Read by `direct` only.
+    pub auth_scheme: Option<String>,
+    /// `off` | `low` | `medium` | `high`. Absent means `off`. Read by `direct` only.
+    pub thinking: Option<String>,
+    /// The optional `[models.quirks]` sub-table. Read by `direct` only.
+    pub quirks: Option<QuirksToml>,
     /// REMOVED, and parsed only so its presence can be REFUSED at startup.
     ///
     /// The models deserializer ignores unknown keys (so a forward-looking example file
@@ -2441,6 +2549,15 @@ pub struct ModelToml {
     pub vision: Option<Vec<VisionPartnerToml>>,
     /// Complementary mode toggle (default false). See [`RegistryModel::vision_complementary`].
     pub vision_complementary: Option<bool>,
+}
+
+/// The optional `[models.quirks]` sub-table: three tri-state flags, each absent by default so
+/// setting one never resets the others. See [`DirectQuirks`].
+#[derive(Deserialize, Debug, Default, Clone)]
+pub struct QuirksToml {
+    pub reasoning_effort_supported: Option<bool>,
+    pub multiple_system_messages: Option<bool>,
+    pub strict_tools: Option<bool>,
 }
 
 /// One `vision = [{ id = "...", role = "doc|general|any" }]` partner entry. `id` is
@@ -2631,6 +2748,48 @@ pub fn registry_model_from_toml(
             .filter(|s| !s.is_empty())
             .unwrap_or(CLAUDE_CODE_ID)
             .to_string(),
+        // The three direct-only keys. Each defaults to `None` — meaning "let the agent layer
+        // decide by host" — and an unrecognised value warns and takes that same default rather
+        // than failing the entry: a typo in an optional tuning key must not take a model out
+        // of the registry.
+        auth_scheme: t
+            .auth_scheme
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .and_then(|raw| {
+                let parsed = parse_auth_scheme(raw);
+                if parsed.is_none() {
+                    eprintln!(
+                        "jesse-bridge: WARNING model '{id}' has invalid auth_scheme '{raw}' \
+                         (must be 'bearer' or 'x-api-key'); using the per-host default."
+                    );
+                }
+                parsed
+            }),
+        quirks: DirectQuirks {
+            reasoning_effort_supported: t
+                .quirks
+                .as_ref()
+                .and_then(|q| q.reasoning_effort_supported),
+            multiple_system_messages: t.quirks.as_ref().and_then(|q| q.multiple_system_messages),
+            strict_tools: t.quirks.as_ref().and_then(|q| q.strict_tools),
+        },
+        thinking: t
+            .thinking
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .and_then(|raw| {
+                let parsed = parse_thinking(raw);
+                if parsed.is_none() {
+                    eprintln!(
+                        "jesse-bridge: WARNING model '{id}' has invalid thinking '{raw}' \
+                         (must be off/low/medium/high); using 'off'."
+                    );
+                }
+                parsed
+            }),
         price,
         health,
         vision: t
@@ -2873,6 +3032,7 @@ impl Config {
             // start at all — the gate refused it as an "unknown harness", so registering
             // Codex in `KNOWN_HARNESS_IDS` and `for_models` bought nothing on the startup
             // path and every Codex test had to hand-patch this field to pass.
+            direct: load_direct_settings(&home),
             harnesses: Arc::new(HarnessRegistry::for_models(
                 model_registry
                     .models
@@ -3853,6 +4013,9 @@ mod tests {
         std::env::set_var("JESSE_TEST_VIS_TOKEN", "tok");
         let t = ModelToml {
             harness: None,
+            auth_scheme: None,
+            quirks: None,
+            thinking: None,
             default_writes: None,
             id: Some("glm".into()),
             kind: Some("hosted".into()),
@@ -3899,6 +4062,9 @@ mod tests {
             configured: false,
             level: Capability::Read,
             harness: CLAUDE_CODE_ID.to_string(),
+            auth_scheme: None,
+            quirks: DirectQuirks::default(),
+            thinking: None,
             price: PriceDeck::ZERO,
             health: HealthConfig::default(),
             vision: Vec::new(),
@@ -3914,6 +4080,9 @@ mod tests {
             configured: true,
             level: Capability::Read,
             harness: CLAUDE_CODE_ID.to_string(),
+            auth_scheme: None,
+            quirks: DirectQuirks::default(),
+            thinking: None,
             price: PriceDeck::ZERO,
             health: HealthConfig::default(),
             vision: vec![VisionPartner {
@@ -3950,6 +4119,9 @@ mod tests {
         std::env::set_var("JESSE_TEST_DECL_TOKEN2", "tok");
         let t = ModelToml {
             harness: None,
+            auth_scheme: None,
+            quirks: None,
+            thinking: None,
             default_writes: None,
             id: Some("codex".into()),
             label: Some("Codex".into()),

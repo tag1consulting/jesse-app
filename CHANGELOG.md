@@ -14,6 +14,157 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [bridge 0.110.0] - 2026-08-30
+
+### Added
+
+- **A third harness, `direct`, that answers a turn with no child process at all.** D4 split
+  the harness trait so that one arm of the driver could run a turn in this process; this is
+  the harness on that arm. A `[[models]]` entry with `harness = "direct"` now serves real
+  turns from the phone, selected by the model chip like any other model, beside `claude-code`
+  and `codex`.
+
+  It is a BINDING, not a re-implementation. The turn loop, the two wire adapters, the vault
+  tool set with its path jail and write guard, the thread store and the usage sink all live in
+  `agent/` and know nothing about jobs, conversations or a phone; `harness/direct.rs` turns a
+  bridge `TurnRequest` into the loop's `TurnInput`, hands it a sink that forwards into the same
+  job-store frames a claude-code delta lands in, and turns the outcome back into what the
+  driver already builds a `Done` frame from. The bridge gained a path dependency on `agent/`
+  and nothing else moved: `bridge/` is still excluded from the root workspace, still builds
+  from `working-directory: bridge` with its own lockfile, and the lock diff adds `jesse-agent`
+  and the `regex` trio it pulls.
+
+- **The boundary is a different mechanism, and the record says so.** A claude-code turn is
+  contained by a tool allowlist over a CLI that also has a shell; a codex turn by an OS sandbox
+  around a process that is mostly a shell. A direct turn has no shell, no subprocess and no MCP
+  servers — it has eight typed tools dispatched by exact name over a store that canonicalises
+  every path inside the vault root. So there is no argv to record, and `capability_args`
+  records the MANIFEST instead, argv-shaped (`["--tools", "a,b,c"]`, sorted, `["--tools", ""]`
+  at `basic`) so `validate_toolset_argv`'s strict equality and the record format work unchanged
+  rather than growing a second shape for one harness.
+
+  `basic` here is a genuinely empty tool set — the level Codex cannot express at all — because
+  the set is constructed rather than configured.
+
+- **`bridge/containment-direct.toml`, machine-generated from the agent crate's own battery.**
+  90 adversarial tool calls at three levels, scored out of band: canaries in no tool result, no
+  request body, no thread file and no trace; the sibling tree hashed before and after; a probe
+  the loop never issued is `inconclusive`, and inconclusive fails. The probes are NOT restated
+  in the bridge — a second battery is a second thing to keep in step with the tool set, and the
+  copy that drifted would be the one vouching for the boundary — so `containment-probe
+  --harness direct` reads the battery's summary and renders the rows. It gates startup exactly
+  as the other two records do.
+
+  It carries no `model` key, and the absence is the point: this battery drives the loop with a
+  SCRIPTED provider, which makes it stronger about the boundary (every escape is definitely
+  attempted rather than attempted if the model thought of it) and silent about model behaviour,
+  which the two live batteries do cover. `binary_version` names the agent crate.
+
+- **Threads, hydration and a per-call usage ledger of its own.** `FileThreadStore` under
+  `<state_dir>/direct-threads/`; `JsonlUsageSink` at `<state_dir>/usage.jsonl`, mode 0600 and
+  content-free, pruned at 90 days on startup. `Harness::transcript_dir` is `None` — the
+  directory scan cannot see those threads — but the new `Harness::hydrate` renders them, so a
+  direct conversation hydrates with real history instead of the empty turn list D4 documented
+  as the transcript-less degradation. That degradation was accepted while the only
+  transcript-less harness genuinely had no readable history; it stops applying to one that
+  keeps a complete thread log.
+
+  Tool messages are deliberately not rendered. The phone has never shown a tool call or its
+  result, and a harness whose tool results are vault content must not be the one that starts.
+
+- **`GET /jesse/result/{id}` gains `usage`** beside `timing` — four token counts and a dollar
+  cost, nothing else. `null` for every claude-code and codex turn, whose counts feed the badge
+  but were never carried onto the per-job record.
+
+- **The app names the new activities.** `vault_search` "Searching the vault…", `vault_read`
+  "Reading the vault…", `vault_list` "Browsing the vault…", `vault_write`/`vault_edit` "Editing
+  a note…", `vault_move` "Moving a note…", `deliver_artifact` "Preparing a file…", `fetch_url`
+  the same "Searching the web…" line `WebFetch` gets. Without a case each, a direct turn would
+  spend its whole run showing the user a function name.
+
+- **Three per-model keys and a `[direct]` table.** `auth_scheme` (`bearer` | `x-api-key`, for a
+  gateway a host test cannot recognise), `thinking` (`off` by default — a host with no
+  reasoning concept rejects the field outright), and `[models.quirks]`, whose three flags are
+  tri-state so setting one never resets the other two. `[direct]` carries the vault settings —
+  `exclude`, `cold_prefixes`, `fetch_allow`, `qmd` + `qmd_collection`, and the per-turn
+  ceilings — as one table rather than per-model keys, because it describes the VAULT and
+  per-model copies would be a way for two models to disagree about which documents exist.
+
+### Fixed
+
+- **The startup binary check no longer refuses to boot over a harness that has no binary.**
+  It exited when a harness in use named neither an env var nor a default binary, which was
+  right while that could only be true of an id nobody could construct. It is now also true of
+  `direct`, which answers turns in this process — so a correctly configured deployment would
+  have failed to start. The check asks `runner()` rather than inferring from a missing name,
+  and stays strict for a SPAWNED harness with no binary, which is still a build that
+  registered a harness it cannot run.
+
+  Found by running the bridge, not by a test: the first scratch start with a direct model
+  configured exited on this line.
+
+### Changed
+
+- **The write lock is taken through the broker directly.** `BrokerGuard` implements the agent
+  crate's `WriteGuard` over the bridge's own `LockBroker` — same broker, same lock table, same
+  keys, same wait timeout, so a claude-code turn and a direct turn writing the same file
+  contend for the same lock. There is no hook config, no helper binary and no command string on
+  this path, because those exist to get a CHILD to the broker.
+
+  **The compare-and-swap is now enforced in one place, and the other was removed from this
+  path.** The STORE holds it: `vault_read` hands the model a hash and the write demands it
+  back, checked under the lock against a re-read. The broker's own per-conversation
+  `check_baseline` is not invoked for a direct write. Three reasons, in order of weight: the
+  store's check is inside the same critical section as the write rather than in a hook whose
+  answer is advisory by the time the child writes; the store's baseline is the one the model is
+  actually holding ("the bytes I decided this edit against") rather than "the last bytes anyone
+  in this conversation saw"; and two enforcement points mean two refusal messages for one
+  condition, one of them phrased for a CLI child. The broker's baseline is still FED — on every
+  read and after every write — because a conversation can be served by a different harness on a
+  later turn, and a claude-code turn that follows a direct one must not be blind to what it
+  read nor falsely refused by what it wrote.
+
+- **The four routed jobs run on either runner shape.** Title, diet extract, diet verify and
+  vault-QA now branch once in `run_routed_oneshot` instead of refusing an in-process harness.
+  The in-process arm is not a second driver: it calls the same `run_turn`, with a sink that
+  drops both mid-turn events because a one-shot has no job to stream onto. `apply_routed_env`
+  is deliberately absent there — it exists to point a CHILD at a backend through `ANTHROPIC_*`,
+  and an in-process harness already holds a provider built from the picked model's own entry.
+
+- **`TurnRequest` gained `turn_id` and `artifact_dir`.** Both are additive for the spawned
+  harnesses and neither reaches a child's argv, env or files — the D4 argv fixture still
+  matches byte for byte, which is the proof. `turn_id` is the key an in-process turn's usage
+  records, trace and write locks are filed under; a spawned child is identified by its process
+  and session instead.
+
+### What did not change
+
+**No argv, no probe path, and neither existing containment record.** `containment.toml` and
+`containment-codex.toml` are untouched; no row label moved, so no operator `[[accepted]]`
+signature was orphaned. `tests/fixtures/argv-before-split.json` — captured on `main` before the
+D4 split — still matches every child both spawned harnesses build, at every `TurnRequest`
+builder, including the two new fields. The fixture test now skips in-process harnesses, and
+checks rather than assumes that it is doing so: a spawned harness added later would still have
+to be captured.
+
+**Nothing about a claude-code or codex turn.** They take the same driver arm they took in
+0.109.0, with the same three attempts, the same stderr classification, the same bounded reap
+and the same streamed-text safety net. The `direct` harness is registered only when a
+configured model names it, so a deployment with no direct model builds the same registry it
+built before and never constructs a provider, a thread store or a usage log.
+
+**The `[direct]` defaults are the conservative ones and they are the shipped posture.** A
+deployment that writes no table gets no exclusions beyond the agent crate's built-in list, no
+cold documents, an EMPTY fetch allowlist (so `fetch_url` is in the manifest at `read` and
+refuses every URL), and the built-in grep index.
+
+**What a direct turn cannot do that a claude-code turn can**, stated because it is the accepted
+asymmetry rather than a gap to close: 35 allowlisted `Bash` verb patterns, 6 `Skill` grants, 16
+MCP servers (several of them full-control), and root `WebSearch`/`WebFetch`. It has none of
+them, so it also cannot run the diet scripts, regenerate the dashboard or serve the morning
+routine — and the operating manual it is given is framed with a header telling it to say so
+rather than narrate having done them. SECURITY.md carries the full comparison.
+
 ## [bridge 0.109.0] - 2026-08-30
 
 ### Changed

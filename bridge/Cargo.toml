@@ -1,6 +1,6 @@
 [package]
 name = "jesse-bridge"
-version = "0.109.0"
+version = "0.110.0"
 edition = "2021"
 license = "Apache-2.0"
 
@@ -18,23 +18,6 @@ license = "Apache-2.0"
 #   cargo build   --release                             # the serving binary, without it
 [features]
 containment-probe = []
-
-# NOT A BUILD OPTION — a switch for ONE TEST, and it enables nothing today.
-#
-# `harness::Capability` and `jesse_agent::tools::Level` are the same three-level vocabulary
-# declared twice, because `agent/` depends on the bridge in neither direction (see the note
-# at the top of `agent/Cargo.toml`). D5 adopts the agent crate and writes the two `From`
-# impls; those are correct only while the two enums agree on names AND on order, and the
-# check that says so is written NOW —
-# `the_capability_vocabulary_is_the_agent_crates_level_vocabulary` — with its cross-crate
-# half behind this feature.
-#
-# So: enabling it today does not compile, deliberately. D5 makes `jesse-agent` an optional
-# dependency of this feature, and the assertion starts running. Adding that dependency here
-# just to compare two enums would put the whole agent crate in the bridge's lockfile a step
-# early, and deleting the check until then is how a mapping ends up derived from two doc
-# comments in different crates.
-agent-vocabulary = []
 
 # Declared (rather than auto-discovered) so `required-features` can keep them out of a
 # default build; every other bin under src/bin stays auto-discovered.
@@ -182,6 +165,22 @@ iana-time-zone = "0.1"
 # and fall-back cases are asserted against `America/New_York` rather than against whatever
 # zone the machine running `cargo test` happens to be in.
 chrono-tz = { version = "0.10.4", default-features = false }
+
+# THE AGENT LOOP, adopted. `agent/` is the provider-neutral turn loop (D1–D3): the two wire
+# adapters, the tool-calling loop, the vault tool set with its path jail and write guard, the
+# thread store and the usage sink. The `direct` harness in `src/harness/direct.rs` is a thin
+# binding of it to this bridge's `InProcessHarness` seam — the loop itself knows nothing about
+# jobs, conversations, or the phone.
+#
+# A PATH DEPENDENCY ACROSS A WORKSPACE BOUNDARY, and it resolves cleanly. `agent/` is a member
+# of the ROOT workspace and `bridge/` is deliberately excluded from it (see the root
+# `Cargo.toml`), so this crate still builds as its own single-package workspace with its own
+# `Cargo.lock` and its own target dir — which is what the CI job's `working-directory: bridge`
+# depends on. Cargo has no objection to depending on a crate that happens to be another
+# workspace's member: membership decides which lockfile RESOLVES that crate's own
+# dependencies, not who may depend on it. Verified before this line was written; the resulting
+# lock diff adds `jesse-agent` and the `regex` trio it pulls, and nothing else moves.
+jesse-agent = { path = "../agent" }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }   # ServiceExt::oneshot

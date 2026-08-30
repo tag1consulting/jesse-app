@@ -74,6 +74,7 @@ pub(crate) use tokio_util::sync::CancellationToken;
 
 // ---- Modules --------------------------------------------------------------
 
+mod agentmap;
 mod apns;
 mod artifacts;
 mod attachments;
@@ -158,6 +159,7 @@ mod writelock;
 
 // Flat internal namespace: every module's items reachable crate-wide by bare
 // name (so `use crate::*` in each module works exactly like the old single file).
+pub use agentmap::*;
 pub use apns::*;
 pub use artifacts::*;
 pub use attachments::*;

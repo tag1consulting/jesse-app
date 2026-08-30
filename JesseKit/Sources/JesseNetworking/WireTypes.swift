@@ -263,10 +263,20 @@ public struct ToolActivity: Equatable, Sendable {
     /// something to show anyone; the server is the useful half. This case needs handling
     /// because a Read-level Codex turn's visible work is mostly qmd calls — without it, most
     /// of the turn would read `Using mcp__qmd__query…`.
+    ///
+    /// THE `direct` HARNESS'S TOOLS ARE NAMED HERE TOO, in the same style and for the same
+    /// reason the others are: they are a third vocabulary — `vault_read`, `vault_search`,
+    /// `deliver_artifact` — and without a case each they would render as `Using vault_read…`,
+    /// which is a function name on a phone screen. They are grouped by what the user would
+    /// say is happening rather than one line per tool: browsing, reading and searching are
+    /// three tools and one activity, and `vault_write`/`vault_edit` are two spellings of
+    /// editing. `fetch_url` deliberately shares the web line with `WebFetch`, because from
+    /// the user's side it is the same act on whichever harness performs it.
     public var displayLabel: String {
         if refused {
             switch name {
-            case "Write", "Edit", "NotebookEdit": return "Blocked from writing a file…"
+            case "Write", "Edit", "NotebookEdit", "vault_write", "vault_edit", "vault_move":
+                return "Blocked from writing a file…"
             case "Bash": return "Blocked from running a command…"
             default: return "Blocked from using \(Self.showable(name))…"
             }
@@ -277,6 +287,14 @@ public struct ToolActivity: Equatable, Sendable {
         case "Bash": return "Running a command…"
         case "WebFetch", "WebSearch": return "Searching the web…"
         case "Task": return "Working on it…"
+        // The `direct` harness's eight tools.
+        case "vault_search": return "Searching the vault…"
+        case "vault_read": return "Reading the vault…"
+        case "vault_list": return "Browsing the vault…"
+        case "vault_write", "vault_edit": return "Editing a note…"
+        case "vault_move": return "Moving a note…"
+        case "deliver_artifact": return "Preparing a file…"
+        case "fetch_url": return "Searching the web…"
         default: return "Using \(Self.showable(name))…"
         }
     }

@@ -174,12 +174,21 @@ diet_keywords_extra = [
 #                  the model configured-but-unarmed (it appears in the list, disabled,
 #                  until the var is set). No token is ever written to this file, to
 #                  model.json, or to any endpoint response.
-#   harness        the agent program that runs this model's child ("claude-code", "codex").
+#   harness        the agent program that answers this model's turns ("claude-code", "codex",
+#                  "direct").
 #                  Absent means "claude-code". An id no harness is registered under is a
-#                  STARTUP ERROR naming the model, never a silent fallback. Each harness
-#                  has one binary-path env var (claude-code: JESSE_CLAUDE_BIN, codex:
-#                  JESSE_CODEX_BIN) which is consulted, and only fatal, for a harness some
-#                  configured model uses.
+#                  STARTUP ERROR naming the model, never a silent fallback. The two CLI
+#                  harnesses have one binary-path env var each (claude-code:
+#                  JESSE_CLAUDE_BIN, codex: JESSE_CODEX_BIN) which is consulted, and only
+#                  fatal, for a harness some configured model uses.
+#
+#                  `direct` HAS NO BINARY AND SPAWNS NO CHILD. It answers the turn inside
+#                  the bridge, through the agent loop, with eight typed tools over the vault
+#                  (list / search / read / write / edit / move / deliver a file / fetch a
+#                  URL) — no shell, no MCP servers, no CLI. Its vault settings live in the
+#                  `[direct]` table at the bottom of this file, and its containment record is
+#                  `bridge/containment-direct.toml`. See SECURITY.md for what it can and
+#                  cannot reach compared with a claude-code turn.
 #
 #                  THE HARNESS BOUNDS THE LEVEL, and not every harness has every level.
 #                  A harness declares which levels it can EXPRESS, and a level it cannot
@@ -204,6 +213,24 @@ diet_keywords_extra = [
 #                  There is NO per-model writes toggle — `default_writes` was removed and
 #                  a leftover key is a startup error. What a model may touch is config,
 #                  not something a phone can change.
+#
+#   ---- `harness = "direct"` ONLY. Ignored by the two CLI harnesses, which hand their
+#        child a token through the environment and let the CLI choose its own transport. ----
+#
+#   auth_scheme    "bearer" | "x-api-key". Absent means the per-HOST default: `x-api-key`
+#                  for api.anthropic.com (their documented scheme), bearer everywhere else.
+#                  Set it for the one shape a host test cannot recognise — a gateway that
+#                  speaks one vendor's API but wants the other's header.
+#   thinking       "off" | "low" | "medium" | "high". Absent means "off", and off is the
+#                  only value that is certainly safe: a host with no reasoning concept
+#                  rejects the field outright, so asking for thinking is opt-in per model.
+#   [models.quirks] three tri-state flags for a host whose defaults are wrong. Each is
+#                  ABSENT unless set, so setting one never resets the other two:
+#                    reasoning_effort_supported  send `reasoning_effort` on the chat wire
+#                    multiple_system_messages    several leading system messages, not one
+#                    strict_tools                pass a tool's `strict` flag to the wire
+#                  Defaults are per host (both `strict_tools` and `reasoning_effort` on for
+#                  api.openai.com, off elsewhere; `multiple_system_messages` off everywhere).
 #
 #                  WHAT `level` DOES NOT BOUND, so "read" is not read as "nothing can
 #                  happen": it bounds the TOOLS the model is granted. It does not bound the
@@ -750,3 +777,94 @@ diet_keywords_extra = [
 # prompt_file = "prompts/weekly-deep-pass.md"
 # timeout_secs = 5400                    # 90 min, well past the usual turn limit
 # notify = true                          # the default; this one you want to hear
+
+
+# ---------------------------------------------------------------------------
+# [direct] — the vault settings every `harness = "direct"` turn runs under
+# ---------------------------------------------------------------------------
+#
+# ONE TABLE, NOT PER-MODEL KEYS, because it describes the VAULT rather than a model: every
+# direct model on this deployment reads the same documents with the same exclusions and the
+# same cold list, and per-model copies would be a way for two models to disagree about which
+# documents exist.
+#
+# ABSENT IS THE SHIPPED POSTURE and it is deliberately conservative: no exclusions beyond the
+# agent layer's own built-in list, no cold documents, NO FETCH ALLOWLIST AT ALL (so the
+# `fetch_url` tool appears in the manifest at `read` and refuses every URL), and the built-in
+# grep index. A deployment that writes nothing here gets a harness that can read and search
+# its vault and reach nothing outside it.
+#
+# [direct]
+# # Paths never listed, read, searched or written, on top of the built-in list (which already
+# # covers `.git`, the artifact staging directories, and the bridge's own state). A trailing
+# # `/` matches a directory and everything under it.
+# exclude = ["_to-purge/", "Ops-Notes/secrets/"]
+#
+# # COLD documents: listable by title, unreadable, unsearchable, unwritable. The split from
+# # `exclude` is the point — an excluded document answers exactly as an absent one does, while
+# # a cold one is visibly there and visibly refused. Use `exclude` for what the assistant has
+# # no business knowing exists, and `cold_prefixes` for what the owner can see in their own
+# # vault and would notice being denied.
+# cold_prefixes = ["Private/", "Medical/"]
+#
+# # Hosts `fetch_url` may reach. EMPTY BY DEFAULT — every URL is refused, and that is not a
+# # placeholder. `*.example.com` matches the domain and its subdomains; a bare `*` means any
+# # host and has to be typed deliberately.
+# fetch_allow = ["docs.rs", "*.wikipedia.org"]
+#
+# # Search with `qmd` rather than the built-in grep index. Needs the collection name too: qmd
+# # reports a hit as `qmd://<collection>/<path>` and the wrong prefix produces ids that resolve
+# # to the wrong documents or to none, so it is required rather than guessed. With `qmd = true`
+# # and no collection the bridge warns once and falls back to grep.
+# qmd = true
+# qmd_collection = "vault"
+#
+# # Per-turn ceilings, overriding the agent layer's defaults. The WALL clock is not here: it is
+# # JESSE_TIMEOUT, so the loop stops itself just before the driver would cut it off and the
+# # user gets a partial answer with a reason rather than a bare 504.
+# max_iterations = 24
+# max_tool_calls = 60
+
+# ---------------------------------------------------------------------------
+# Two `direct` models, one per wire the harness drives
+# ---------------------------------------------------------------------------
+#
+# Same three fields every other model takes — base_url, model, auth_token_env — plus
+# `harness = "direct"` and the wire. NOTHING about a direct model is configured in a new
+# place; the harness key is the only thing that changes.
+#
+# Anthropic Messages, straight at the vendor. `auth_scheme` is omitted because the per-host
+# default is already `x-api-key` for this host, which is Anthropic's documented scheme.
+# Arm it with: ANTHROPIC_API_KEY=...
+# [[models]]
+# id = "sonnet-direct"
+# label = "Sonnet (direct)"
+# kind = "hosted"                              # hosting: a provider endpoint
+# wire = "messages"                            # implied by kind, spelled out for contrast
+# base_url = "https://api.anthropic.com"       # the host; the adapter appends /v1/messages
+# model = "claude-sonnet-4-6"
+# auth_token_env = "ANTHROPIC_API_KEY"
+# harness = "direct"
+# level = "read"                               # the safe default; raise deliberately
+# price = { in_per_m = 3.00, cached_per_m = 0.30, out_per_m = 15.00 }
+#
+# OpenAI Chat Completions, on Fireworks' OpenAI-compatible root. NOTE THE `/v1`: it is the
+# API ROOT the adapter appends `/chat/completions` to, where the Anthropic-surface entry
+# above takes a bare host. The quirks block is what a non-OpenAI host serving an
+# OpenAI-shaped API usually needs.
+# Arm it with: FIREWORKS_API_KEY=...
+# [[models]]
+# id = "glm-direct"
+# label = "GLM (direct)"
+# kind = "hosted"
+# wire = "chat"                                # /chat/completions, not /v1/messages
+# base_url = "https://api.fireworks.ai/inference/v1"   # the API ROOT
+# model = "accounts/fireworks/models/glm-5p2"
+# auth_token_env = "FIREWORKS_API_KEY"
+# harness = "direct"
+# level = "read"
+# thinking = "off"                             # the default; this host rejects the field
+# price = { in_per_m = 0.55, cached_per_m = 0.55, out_per_m = 2.19 }
+# [models.quirks]
+# reasoning_effort_supported = false           # already the default off api.openai.com
+# strict_tools = false                         # ditto; spelled out because this host rejects it

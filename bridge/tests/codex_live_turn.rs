@@ -146,6 +146,7 @@ async fn a_codex_turn_answers_and_shows_what_it_was_doing() {
         None,
         // no attachments on this turn
         None,
+        None,
         &TurnTrace::from_cfg(&cfg),
     )
     .await;
@@ -237,6 +238,7 @@ async fn a_kimi_turn_uses_a_tool_through_codex_against_an_openai_provider() {
         None,
         // no attachments on this turn
         None,
+        None,
         &TurnTrace::from_cfg(&cfg),
     )
     .await;
@@ -308,6 +310,7 @@ async fn a_refused_write_reaches_the_client_as_activity_not_silence() {
         &spawned,
         None,
         // no attachments on this turn
+        None,
         None,
         &TurnTrace::from_cfg(&cfg),
     )

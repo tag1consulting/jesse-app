@@ -231,6 +231,17 @@ pub fn resolve_stream_outcome(
     }
 }
 
+/// A routed one-shot's own turn id.
+///
+/// A one-shot creates no job, so there is no job id to borrow — but it IS a turn, and on an
+/// in-process harness it produces its own usage records. A fresh id per call is what keeps
+/// those attributable: two title children running at once would otherwise file their calls
+/// under one key. The label prefix is there so a human reading `usage.jsonl` can tell a title
+/// turn from a diet extraction without joining anything.
+fn oneshot_turn_id(label: &str) -> String {
+    format!("{label}-{}", uuid::Uuid::new_v4())
+}
+
 /// **THE SPAWNED-ONLY SEAM.** Resolve a harness to its child-process half, or refuse.
 ///
 /// Every call site that needs a [`SpawnedHarness`] method goes through this, and every one
@@ -367,6 +378,78 @@ async fn run_stateless_oneshot(
     }
 }
 
+/// Run one stateless routed one-shot on WHICHEVER runner shape its harness is.
+///
+/// The four routed jobs (title, diet extract, diet verify, vault-QA) are all the same shape:
+/// a self-contained prompt, no session, no job, no live stream, a short timeout, and a caller
+/// that degrades to the hosted path on any non-2xx. What differs is only how the harness is
+/// reached — so the branch is here, once, and each caller passes its own already-built
+/// request.
+///
+/// **The in-process arm is not a second driver.** It calls the same `run_turn` a main turn
+/// calls, with a sink that DROPS both mid-turn events: a one-shot has no job, so there is no
+/// stream to push a delta onto and no client watching. The text comes back in the outcome,
+/// which is exactly what the spawned arm gets from `resolve_stream_outcome`.
+async fn run_routed_oneshot(
+    cfg: &Config,
+    harness: &dyn Harness,
+    req: &TurnRequest<'_>,
+    pick: &RoutedPick,
+    timeout_secs: u64,
+    label: &str,
+) -> Result<String, ApiError> {
+    match harness.runner() {
+        Runner::Spawned(h) => {
+            let mut cmd = h.build_turn(cfg, req)?;
+            // The routing rule's pick. A no-op for an ambient pick; for a hosted/local one it
+            // layers the backend triple onto this child and nothing else.
+            apply_routed_env(&mut cmd, pick);
+            run_stateless_oneshot(cfg, h, cmd, timeout_secs, label).await
+        }
+        Runner::InProcess(h) => {
+            // NO ENV OVERRIDE HERE, and its absence is the point: `apply_routed_env` exists to
+            // point a CHILD at a backend through `ANTHROPIC_*`. An in-process harness already
+            // holds a provider built from this model's own registry entry, so the backend is
+            // chosen by the pick the same way — through the model — with nothing to layer on.
+            let sink = NullTurnSink;
+            let cancel = CancellationToken::new();
+            let _cancel_on_drop = cancel.clone().drop_guard();
+            let mut fut = h.run_turn(cfg, req, &sink, cancel.clone());
+            match timeout(Duration::from_secs(timeout_secs), &mut fut).await {
+                Ok(Ok(out)) => Ok(out.text),
+                Ok(Err(TurnFailure::Fatal { message })) => Err((StatusCode::BAD_GATEWAY, message)),
+                Ok(Err(TurnFailure::Cancelled)) => {
+                    Err((StatusCode::BAD_GATEWAY, format!("{label} was cancelled")))
+                }
+                Err(_) => {
+                    // Cancel and give it the same bounded moment to wind down that the main
+                    // turn's in-process arm does, then report the timeout the caller already
+                    // degrades from.
+                    cancel.cancel();
+                    let _ = timeout(Duration::from_secs(5), &mut fut).await;
+                    Err((
+                        StatusCode::GATEWAY_TIMEOUT,
+                        format!("{label} exceeded the {timeout_secs}s limit"),
+                    ))
+                }
+            }
+        }
+    }
+}
+
+/// The sink for a turn nobody is watching — a routed one-shot.
+///
+/// Dropping both events is correct rather than lazy: a one-shot creates no job, so
+/// `stream_push_delta` would have no stream to push onto, and its answer is validated by the
+/// bridge before anything reaches a user. There is deliberately no `TurnTrace` here either,
+/// for the same reason: a one-shot has no timing record.
+struct NullTurnSink;
+
+impl TurnSink for NullTurnSink {
+    fn text_delta(&self, _delta: &str) {}
+    fn tool_activity(&self, _activity: ToolActivity) {}
+}
+
 /// A stateless, single agent invocation — the primitive behind `POST /jesse/title`.
 /// **Stateless and NOT a turn:** no job is created, no session, nothing is persisted, no
 /// live stream, and none of the jobs/streams/aborts mutexes are touched. The caller passes
@@ -385,16 +468,7 @@ pub async fn run_claude_oneshot(
     timeout_secs: u64,
     pick: &RoutedPick,
 ) -> Result<String, ApiError> {
-    // ONE-SHOTS ARE SPAWNED-ONLY, and say so rather than defaulting. Every one of the four
-    // below builds a `Command` and hands it to `run_stateless_oneshot`; an in-process
-    // harness has no command to build, and the right answer is a named refusal the caller
-    // degrades from exactly as it degrades from any other non-2xx (each of these paths falls
-    // back to the hosted turn). Adopting the in-process arm here is deliberately D5's, not
-    // this change's: it needs its own sink-less variant of the one-shot runner.
-    let harness = spawned_only(
-        cfg.harnesses.serving_pick(pick),
-        "building the title one-shot's child",
-    )?;
+    let harness = cfg.harnesses.serving_pick(pick);
     // The title path is AMBIENT and untouched by the model switch, so it passes the ambient
     // model — the command is byte-for-byte today's, and `apply_title_env` below still layers
     // any title backend on top (the two never mix). BASIC with no MCP servers is stated at
@@ -404,14 +478,14 @@ pub async fn run_claude_oneshot(
     // vault, for a job whose entire output is a handful of words the bridge then validates
     // and truncates. Nothing about the title contract wanted that.
     let ambient = ActiveModel::ambient();
-    let mut cmd = harness.build_turn(cfg, &title_child_request(cfg, prompt, &ambient))?;
+    let turn_id = oneshot_turn_id("title");
+    let req = title_child_request(cfg, prompt, &ambient, &turn_id);
     // Title-only backend override: point THIS child at the configured
     // base_url/token/model when all three JESSE_TITLE_* vars are set. A no-op
     // otherwise (ambient backend). Main turns never call this.
     // The routing rule's pick for this job. `RoutedPick::log` already named the model and
     // harness that serves it (no prompt content), so there is no second provenance line.
-    apply_routed_env(&mut cmd, pick);
-    run_stateless_oneshot(cfg, harness, cmd, timeout_secs, "title generation").await
+    run_routed_oneshot(cfg, harness, &req, pick, timeout_secs, "title generation").await
 }
 
 /// The stateless diet EXTRACT one-shot: parse a raw food/exercise/weigh-in
@@ -428,14 +502,11 @@ pub async fn run_diet_extract(
     timeout_secs: u64,
     pick: &RoutedPick,
 ) -> Result<String, ApiError> {
-    let harness = spawned_only(
-        cfg.harnesses.serving_pick(pick),
-        "building the diet extract child",
-    )?;
+    let harness = cfg.harnesses.serving_pick(pick);
     let ambient = ActiveModel::ambient();
-    let mut cmd = harness.build_turn(cfg, &diet_child_request(cfg, prompt, &ambient))?;
-    apply_routed_env(&mut cmd, pick);
-    run_stateless_oneshot(cfg, harness, cmd, timeout_secs, "diet extraction").await
+    let turn_id = oneshot_turn_id("diet-extract");
+    let req = diet_child_request(cfg, prompt, &ambient, &turn_id);
+    run_routed_oneshot(cfg, harness, &req, pick, timeout_secs, "diet extraction").await
 }
 
 /// The stateless diet VERIFY one-shot: a hosted judgment call that never touches
@@ -452,14 +523,11 @@ pub async fn run_diet_verify(
     // The verifier is whatever the routing rule picked at `Write`, with the extractor
     // EXCLUDED — see `RoutedJob::DietVerify`. Ambient when nothing else qualifies, which is
     // exactly the old behavior (the verify child was unconditionally ambient).
-    let harness = spawned_only(
-        cfg.harnesses.serving_pick(pick),
-        "building the diet verify child",
-    )?;
+    let harness = cfg.harnesses.serving_pick(pick);
     let ambient = ActiveModel::ambient();
-    let mut cmd = harness.build_turn(cfg, &diet_child_request(cfg, prompt, &ambient))?;
-    apply_routed_env(&mut cmd, pick);
-    run_stateless_oneshot(cfg, harness, cmd, timeout_secs, "diet verification").await
+    let turn_id = oneshot_turn_id("diet-verify");
+    let req = diet_child_request(cfg, prompt, &ambient, &turn_id);
+    run_routed_oneshot(cfg, harness, &req, pick, timeout_secs, "diet verification").await
 }
 
 /// Run the contained read-only vault-QA child: a toolless-except-read one-shot
@@ -473,14 +541,11 @@ pub async fn run_vaultqa_child(
     timeout_secs: u64,
     pick: &RoutedPick,
 ) -> Result<String, ApiError> {
-    let harness = spawned_only(
-        cfg.harnesses.serving_pick(pick),
-        "building the vault-QA child",
-    )?;
+    let harness = cfg.harnesses.serving_pick(pick);
     let ambient = ActiveModel::ambient();
-    let mut cmd = harness.build_turn(cfg, &vaultqa_child_request(cfg, prompt, &ambient))?;
-    apply_routed_env(&mut cmd, pick);
-    run_stateless_oneshot(cfg, harness, cmd, timeout_secs, "vault-QA lookup").await
+    let turn_id = oneshot_turn_id("vaultqa");
+    let req = vaultqa_child_request(cfg, prompt, &ambient, &turn_id);
+    run_routed_oneshot(cfg, harness, &req, pick, timeout_secs, "vault-QA lookup").await
 }
 
 /// Invoke the agent in the vault, streaming its output. Returns (reply_text,
@@ -525,6 +590,7 @@ pub async fn run_claude_streaming(
     spawned: &SpawnedSessions,
     write_lock: Option<&WriteLockChild>,
     attachment_dir: Option<&Path>,
+    artifact_dir: Option<&Path>,
     trace: &TurnTrace,
 ) -> Result<(String, Option<String>, ShadowUsage), ApiError> {
     // Resume-after-sweep safety: if the requested session's transcript no longer
@@ -559,6 +625,7 @@ pub async fn run_claude_streaming(
                 spawned,
                 write_lock,
                 attachment_dir,
+                artifact_dir,
                 trace,
             )
             .await
@@ -575,6 +642,7 @@ pub async fn run_claude_streaming(
                 spawned,
                 write_lock,
                 attachment_dir,
+                artifact_dir,
                 trace,
             )
             .await
@@ -607,6 +675,7 @@ async fn run_spawned_turn(
     spawned: &SpawnedSessions,
     write_lock: Option<&WriteLockChild>,
     attachment_dir: Option<&Path>,
+    artifact_dir: Option<&Path>,
     trace: &TurnTrace,
 ) -> Result<(String, Option<String>, ShadowUsage), ApiError> {
     const MAX_ATTEMPTS: u32 = 3; // 1 try + 2 retries
@@ -634,6 +703,7 @@ async fn run_spawned_turn(
             active,
             turn_capability(active),
             main_mcp_config(cfg, harness),
+            job_id,
         );
         // THE VAULT WRITE LOCK, installed per attempt because the child is rebuilt per
         // attempt. `None` for a turn that cannot write the vault or a deployment where the
@@ -645,6 +715,9 @@ async fn run_spawned_turn(
         // no attachments and on every turn the vision helper serves, which is then
         // byte-for-byte the child 0.60.1 built.
         req.attachment_dir = attachment_dir;
+        // Set for the same reason, and ignored by both spawned harnesses: they learn about the
+        // staging directory from the prompt, so no child's argv changes because this exists.
+        req.artifact_dir = artifact_dir;
         let mut cmd = harness.build_turn(cfg, &req)?;
 
         let mut child = cmd.spawn().map_err(|e| {
@@ -994,6 +1067,7 @@ async fn run_in_process_turn(
     spawned: &SpawnedSessions,
     write_lock: Option<&WriteLockChild>,
     attachment_dir: Option<&Path>,
+    artifact_dir: Option<&Path>,
     trace: &TurnTrace,
 ) -> Result<(String, Option<String>, ShadowUsage), ApiError> {
     /// How long a cancelled in-process turn may take to wind down before the driver stops
@@ -1018,6 +1092,7 @@ async fn run_in_process_turn(
         // as child processes, and inventing a server set for it here would describe a
         // posture nothing spawns.
         cfg.main_mcp_config.as_deref().unwrap_or(EMPTY_MCP_CONFIG),
+        job_id,
     );
     // Set for the same reasons as in the spawned arm, and read by the harness the same way.
     // `write_lock` reaching an in-process harness means the broker is armed and this turn
@@ -1026,6 +1101,10 @@ async fn run_in_process_turn(
     // `Harness::supports_write_lock`.
     req.write_lock = write_lock;
     req.attachment_dir = attachment_dir;
+    // THE ARTIFACT CHANNEL. `None` below `Capability::Write` and on a deployment with the
+    // channel off, in which case the harness's artifact tool has nowhere to write and the
+    // tool set simply does not offer it.
+    req.artifact_dir = artifact_dir;
 
     let sink = JobStoreSink {
         jobs,
@@ -1132,6 +1211,11 @@ async fn run_in_process_turn(
                     report_tool_id_collisions(cfg, harness, &active.id, sid);
                 }
             }
+            // THE TURN'S BILL, onto the trace, so `GET /jesse/result/{id}` can answer "what
+            // did this cost" for the harness whose per-call ledger the bridge itself writes.
+            // The deck is the ACTIVE model's, which is the same multiplication the badge
+            // performs — one usage vector, one deck, two readers that cannot disagree.
+            trace.note_usage(usage.clone(), usage.cost_on(&active.price));
             Ok((
                 truncate_bytes_on_char_boundary(&result, MAX_OUTPUT_BYTES).to_string(),
                 session_id,

@@ -55,8 +55,33 @@ fn harness_for(id: &str) -> Box<dyn Harness> {
     match id {
         CODEX_ID => Box::new(Codex),
         CLAUDE_CODE_ID => Box::new(ClaudeCode),
+        DIRECT_ID => Box::new(Direct),
         other => panic!("no harness for embedded record '{other}'"),
     }
+}
+
+/// **THE SPAWNED RECORDS ONLY.** Three of the tests below hold a record against `PROBES` —
+/// the bridge's own list of adversarial probes — and that list describes escapes attempted by
+/// a CHILD PROCESS: reading a parent directory, writing outside the sandbox, reaching the
+/// bridge's state dir, exfiltrating an env token.
+///
+/// The `direct` record is produced by a different battery, in the agent crate, over a
+/// different surface: its 90 probes are typed tool calls (`read-traversal`,
+/// `write-through-symlinked-dir`, `fetch-file-scheme`, `tool-Bash`), and it has no shell for
+/// most of `PROBES` to even describe an attempt against. Holding it against this list would
+/// not be a stricter test — it would be a category error that could only be satisfied by
+/// inventing probe ids nobody ran.
+///
+/// What DOES check that record is `the_record_covers_every_row_the_bridge_actually_spawns`
+/// (below, which runs for every record including this one), `validate_toolset_argv` against
+/// the manifest, `the_containment_records_agree_with_what_each_harness_declares` in
+/// `levelgate`, and the agent crate's own battery — which fails on an inconclusive probe, so
+/// a summary with a probe missing cannot be written in the first place.
+fn spawned_records() -> Vec<(&'static str, BatteryResults)> {
+    records()
+        .into_iter()
+        .filter(|(id, _)| *id != DIRECT_ID)
+        .collect()
 }
 
 #[test]
@@ -90,7 +115,7 @@ fn the_record_covers_every_row_the_bridge_actually_spawns() {
 
 #[test]
 fn every_row_records_every_probe() {
-    for (id, r) in records() {
+    for (id, r) in spawned_records() {
         for row in &r.rows {
             for p in PROBES {
                 let rec = row.probe(p.id).unwrap_or_else(|| {
@@ -116,7 +141,7 @@ fn every_row_records_every_probe() {
 
 #[test]
 fn no_probe_is_recorded_in_a_state_the_scoring_rules_could_not_produce() {
-    for (id, r) in records() {
+    for (id, r) in spawned_records() {
         for row in &r.rows {
             let key = ContainmentRow {
                 capability: parse_capability(&row.capability).expect("a known capability"),
@@ -198,7 +223,7 @@ fn every_committed_record_is_exactly_what_the_writer_emits() {
 /// and the known-open findings in its output.
 #[test]
 fn the_record_states_its_failures_and_its_known_open_findings_out_loud() {
-    for (id, r) in records() {
+    for (id, r) in spawned_records() {
         let failures = r.hard_gate_failures();
         let open = r.known_open();
         eprintln!(

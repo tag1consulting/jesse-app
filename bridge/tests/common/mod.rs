@@ -92,6 +92,9 @@ pub fn test_config() -> Config {
         vision: VisionConfig::default(),
         // The shipped harness registry: `claude-code` only, exactly as `from_env` builds it.
         harnesses: Arc::new(HarnessRegistry::claude_code_only()),
+        // No `[direct]` table in the fixture: the direct harness is not registered here, so
+        // every setting is inert and every existing turn assertion is unaffected.
+        direct: DirectSettings::default(),
     }
 }
 pub fn test_state() -> AppState {

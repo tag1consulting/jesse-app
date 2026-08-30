@@ -93,7 +93,10 @@ pub struct ToolCallTiming {
 /// This is the data that makes the next slow turn diagnosable in one command
 /// (`grep <job_id> ~/.jesse-bridge/turn-timings.jsonl | jq`) instead of an hour of
 /// forensics. Content-free by construction — see the module docs.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+// `Eq` is gone with the arrival of `cost_usd`: a dollar amount is an `f64` and `f64` is not
+// `Eq`. Nothing compared two timing records for equality outside the tests, which use
+// `assert_eq!` on `PartialEq` and are unaffected.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TurnTiming {
     /// Schema version, so a later shape change can be told apart on sight.
     pub v: u8,
@@ -114,6 +117,20 @@ pub struct TurnTiming {
     /// children rather than traced agent turns, so the record still carries the turn's
     /// wall time and status but has no tool timeline to report.
     pub tools: Vec<ToolCallTiming>,
+    /// The turn's token counts, when the harness reported them.
+    ///
+    /// OMITTED rather than zeroed when absent, and absent is the common case: a claude-code
+    /// or codex turn reports usage on its terminal event and the badge consumes it, but the
+    /// counts were never carried onto this record — so an existing record has no `usage` key
+    /// and parses unchanged, and a client sees the field only where it means something.
+    /// The `direct` harness fills it on every turn, which is what makes
+    /// `GET /jesse/result/{id}` able to answer "what did this turn cost" for the harness
+    /// whose per-call ledger the bridge itself writes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<ShadowUsage>,
+    /// The turn's dollar cost on its model's deck. Present exactly when `usage` is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
 }
 
 // ---- The trace ------------------------------------------------------------
@@ -145,6 +162,8 @@ struct TraceInner {
     tools: Vec<ToolCallTiming>,
     /// The call in flight: its name and when it started. Closed by the next event.
     pending: Option<(String, Instant)>,
+    /// The turn's aggregate token usage and dollar cost, once the driver knows them.
+    usage: Option<(ShadowUsage, f64)>,
     /// Every tool call seen, including any beyond what `tools` retains.
     tool_calls: usize,
     /// Anything the ring dropped or trimmed.
@@ -203,6 +222,17 @@ impl TurnTrace {
         g.open = false;
         g.tool_calls += 1;
         g.pending = Some((name.to_string(), Instant::now()));
+    }
+
+    /// Record the turn's aggregate usage and its cost on the active model's deck.
+    ///
+    /// Called once, by the driver, when the turn resolves — so a turn that failed before any
+    /// provider call records nothing rather than a row of zeroes. The COST is computed here
+    /// rather than at read time because it depends on the model's price deck, which the
+    /// timing log does not carry and should not have to look up later.
+    pub fn note_usage(&self, usage: ShadowUsage, cost_usd: f64) {
+        let mut g = self.inner.lock_ok();
+        g.usage = Some((usage, cost_usd));
     }
 
     /// Reconcile the running tool count with a harness that reports its OWN authoritative
@@ -285,6 +315,8 @@ impl TurnTrace {
             status: status.to_string(),
             tool_calls: g.tool_calls,
             tools: g.tools.clone(),
+            usage: g.usage.as_ref().map(|(u, _)| u.clone()),
+            cost_usd: g.usage.as_ref().map(|(_, c)| *c),
         }
     }
 
@@ -547,6 +579,24 @@ pub fn timing_to_value(rec: Option<&TurnTiming>) -> Value {
     }
 }
 
+/// The `usage` object for `GET /jesse/result/{id}` — token counts and cost only — or
+/// `Value::Null` when this turn's harness reported none.
+///
+/// CONTENT-FREE by construction: four integers and a dollar amount. It carries no prompt, no
+/// answer, no model id (that is already on `provenance`) and no endpoint.
+pub fn usage_to_value(rec: Option<&TurnTiming>) -> Value {
+    match rec.and_then(|r| r.usage.as_ref().map(|u| (u, r.cost_usd))) {
+        Some((u, cost)) => {
+            let mut v = serde_json::to_value(u).unwrap_or(Value::Null);
+            if let (Some(obj), Some(c)) = (v.as_object_mut(), cost) {
+                obj.insert("cost_usd".to_string(), json!(c));
+            }
+            v
+        }
+        None => Value::Null,
+    }
+}
+
 /// The `partial` object for `GET /jesse/result/{id}`, or `Value::Null` when the turn was
 /// not cut off.
 pub fn partial_to_value(p: Option<&PartialTurn>) -> Value {
@@ -708,6 +758,8 @@ mod tests {
             status: "done".to_string(),
             tool_calls: 0,
             tools: vec![],
+            usage: None,
+            cost_usd: None,
         };
         rewrite_timing_lines(
             &path,

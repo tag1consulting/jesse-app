@@ -15,6 +15,87 @@ boundaries the bridge enforces and the deployment posture it assumes.
 - The agent the bridge launches is powerful. The in-process controls below
   reduce blast radius; they do not replace OS-level isolation.
 
+## The `direct` harness (no child process, no shell)
+
+A `harness = "direct"` model is answered by the agent loop **inside the bridge**, with no CLI,
+no subprocess and no MCP servers. Its boundary is therefore a different mechanism from the
+other two harnesses', and this section states what it is, what proves it, and what it gives up.
+
+### The boundary
+
+- **Typed tools, dispatched by exact name.** Eight of them, and there is no other way for the
+  model to affect anything: `vault_list`, `vault_search`, `vault_read` and `fetch_url` at
+  `read`; plus `vault_write`, `vault_edit`, `vault_move` and `deliver_artifact` at `write`. A
+  tool name that is not one of these is refused before any argument is looked at — there is no
+  interpreter, no name-prefix matching, and no fallback.
+- **`basic` is a genuinely empty tool set.** The model is sent no tools at all. This is the
+  level Codex cannot express (its shell is not an optional tool), and it is trivial here
+  because the set is constructed rather than configured.
+- **A path jail on resolved paths.** Every document id is joined to the vault root,
+  canonicalised (following symlinks) and refused unless the result is still inside the
+  canonical root. Testing the unresolved path is the classic hole —
+  `root/link-to-etc/passwd` starts with the root and *is* `/etc/passwd` — and it is what the
+  `read-through-symlink` and `read-through-symlinked-dir` probes exist to catch.
+- **Cold documents.** Configured prefixes (and a `visibility: cold` front-matter key) are
+  **listable by title, unreadable, unsearchable, unwritable**. Listable is the deliberate part:
+  hiding them would make the assistant tell the owner a document they can see in their own
+  vault does not exist. Excluded folders instead answer exactly as an absent document does,
+  because the existence of an excluded file is itself information.
+- **Deny-by-default network egress.** `fetch_url` is in the manifest at `read` because it is an
+  egress-class tool, but its allowlist is **empty unless configured** (`[direct] fetch_allow`),
+  so by default every URL is refused. `file://` and other non-HTTP schemes are refused whatever
+  the allowlist says.
+- **No shell.** There is no `Bash`, no `Skill`, no exec of any kind, and nothing that takes a
+  command string.
+- **Writes take the same vault lock the CLI harnesses take**, through the same `LockBroker` —
+  called directly rather than through a hook subprocess, inside the same critical section as
+  the write. The compare-and-swap is the store's: `vault_read` hands the model a content hash
+  and `vault_write`/`vault_edit` demand it back, checked under the lock against a re-read.
+
+### What proves it
+
+`agent/tests/containment_direct.rs` — 90 adversarial tool calls, at all three levels, scored
+**out of band**: canary strings must appear in no tool result, no provider request body, no
+thread file on disk and no trace; the whole sibling tree is hashed before and after and no file
+outside the root may change; at `basic` and `read` no file inside the root may change either.
+A probe the loop did not actually issue is `inconclusive`, and inconclusive **fails** — a
+battery that quietly skipped a probe would otherwise report a clean sweep for escapes nobody
+attempted.
+
+It runs with a **scripted provider and no model**, which makes it stronger about the boundary
+than the other two harnesses' batteries (every escape is definitely attempted, rather than
+attempted if the model thought of it) and silent about model behaviour, which those batteries
+do cover. `bridge/containment-direct.toml` is generated from its summary and gates startup the
+same way the other two records do.
+
+### The accepted asymmetry: this harness has none of the shell surface
+
+A `claude-code` turn at `write` on this deployment can reach a great deal that a `direct` turn
+cannot, and the gap is the whole point rather than a limitation to close:
+
+- **35 allowlisted `Bash` verb patterns**, including `git:*`, `mv:*`, `find:*`, `shasum:*`,
+  eleven `gh` subcommands, four `node vault/*.js` scripts and six vault shell scripts.
+- **6 `Skill` grants** (`diet-logging`, `health-new-day`, `dashboard-regen`,
+  `archive-processing`, `draft-lint`, `health-export-import`), each of which is a directory of
+  instructions and scripts.
+- **16 MCP servers** — `qmd`, `slack`, `browser`, `homeassistant`, `roon`, `google`, `github`,
+  `fastmail`, `unifi`, `routeros`, `proxmox`, `whatsapp`, `imcp`, `google-perseido`, `build`,
+  `places` — several of which are documented in this file as full-control (Home Assistant,
+  UniFi, Proxmox) and several of which reach correspondence and documents.
+- **`WebSearch` / `WebFetch`** at the root, with no host allowlist.
+
+A `direct` turn has **none** of it. It cannot run a command, invoke a skill, reach the network
+except through an explicitly allowlisted host, touch Home Assistant, read mail, or see anything
+outside the vault root. That means it also cannot do the things those grants exist for — the
+diet scripts, the dashboard regeneration, the morning routine — and a model asked to do them
+should say so rather than pretend. The bridge tells it so explicitly: the operating manual is
+framed with a header stating that instructions requiring a shell or a program cannot be
+followed and must be reported as such, never faked.
+
+The residual risks this harness does **not** remove: it runs as the same unix user as the
+bridge, so a bug in the path jail would have that user's reach; and its provider calls carry
+vault content to whatever endpoint the model names, exactly as every other harness's do.
+
 ## Agent tool allowlist (in-process boundary)
 
 The bridge launches `claude` with `--permission-mode default` plus an explicit

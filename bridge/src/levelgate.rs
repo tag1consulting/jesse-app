@@ -40,6 +40,7 @@ use crate::*;
 pub const CONTAINMENT_RECORDS: &[(&str, &str)] = &[
     (CLAUDE_CODE_ID, include_str!("../containment.toml")),
     (CODEX_ID, include_str!("../containment-codex.toml")),
+    (DIRECT_ID, include_str!("../containment-direct.toml")),
 ];
 
 /// The embedded record for one harness, or `None` when this build embeds none for it.
@@ -720,6 +721,9 @@ mod tests {
             configured: true,
             level,
             harness: harness.to_string(),
+            auth_scheme: None,
+            quirks: DirectQuirks::default(),
+            thinking: None,
             price: PriceDeck::ZERO,
             health: HealthConfig::default(),
             vision: Vec::new(),
@@ -914,6 +918,7 @@ mod tests {
             let r = parse_results(text).expect("parses");
             let h: Box<dyn Harness> = match *id {
                 CODEX_ID => Box::new(Codex),
+                DIRECT_ID => Box::new(Direct),
                 _ => Box::new(ClaudeCode),
             };
             let errors = validate_toolset_argv(&test_config(), h.as_ref(), &r);
@@ -1087,6 +1092,56 @@ mod tests {
             .find(|e| e.model.as_deref() == Some("codex-chat"))
             .expect("no harness drives a turn over chat completions");
         assert!(e.message.contains("none"), "{e}");
+    }
+
+    /// **A `direct` MODEL STARTS AT EVERY LEVEL, ON EVERY WIRE IT DRIVES.**
+    ///
+    /// The definition of done for the third harness, asserted rather than assumed. Three
+    /// levels times two wires, all of which must pass — and the one pairing that must NOT,
+    /// which is the wire the agent layer has no adapter for yet.
+    ///
+    /// It is worth pinning all six rather than one because each factor is checked by a
+    /// different gate: the LEVEL by `expresses` plus the record's highest passing row, and
+    /// the WIRE by `supports_wire`. A model can fail either independently.
+    #[test]
+    fn a_direct_model_starts_at_every_level_on_every_wire_it_drives() {
+        for level in [Capability::Basic, Capability::Read, Capability::Write] {
+            for wire in [Wire::Messages, Wire::Chat] {
+                let mut cfg = cfg_with_model("d", DIRECT_ID, level);
+                cfg.harnesses = Arc::new(HarnessRegistry::new(vec![Box::new(Direct)]));
+                if let Some(m) = cfg.model_registry.models.iter_mut().find(|m| m.id == "d") {
+                    m.wire = wire;
+                }
+                let errors = validate(&cfg, &[], CONTAINMENT_RECORDS);
+                assert!(
+                    errors.is_empty(),
+                    "direct at {} on {} must start: {errors:?}",
+                    capability_label(level),
+                    wire.as_str()
+                );
+            }
+        }
+    }
+
+    /// **AND IS REFUSED ON THE WIRE THE AGENT LAYER CANNOT SPEAK YET.**
+    ///
+    /// `build_provider` returns `UnimplementedWire` for Responses, so a model declaring it
+    /// would pass startup and then fail at provider construction on its first turn — the same
+    /// healthy-then-dead shape the wire gate exists to prevent, arrived at from the library
+    /// side rather than the endpoint side.
+    #[test]
+    fn a_direct_model_on_the_responses_wire_is_refused_until_the_adapter_exists() {
+        let mut cfg = cfg_with_model("d", DIRECT_ID, Capability::Read);
+        cfg.harnesses = Arc::new(HarnessRegistry::new(vec![Box::new(Direct)]));
+        if let Some(m) = cfg.model_registry.models.iter_mut().find(|m| m.id == "d") {
+            m.wire = Wire::Responses;
+        }
+        let e = validate(&cfg, &[], CONTAINMENT_RECORDS)
+            .into_iter()
+            .find(|e| e.model.as_deref() == Some("d"))
+            .expect("the responses wire is not one this harness drives");
+        assert!(e.message.contains("responses"), "{e}");
+        assert!(e.message.contains(DIRECT_ID), "{e}");
     }
 
     /// A harness with no embedded record is a different fault from one whose record has no
