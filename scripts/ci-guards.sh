@@ -271,6 +271,7 @@ fi
 DIRECTIVES_RS="$ROOT/bridge/src/directives.rs"
 METRIC_SWIFT="$ROOT/Jesse/Jesse/RequestableMetric.swift"
 LOCATION_SWIFT="$ROOT/Jesse/Jesse/RequestableLocation.swift"
+FIXPOLICY_SWIFT="$ROOT/Jesse/Jesse/LocationFixPolicy.swift"
 
 # Extract a Rust `pub const NAME: &[&str] = &["a", "b"];` list as one value per line.
 # The declaration may wrap over several lines, so read from the name to the first `];`.
@@ -302,7 +303,8 @@ swift_cases() {  # $1 = file, $2 = enum name
 CHANNELS="health metrics|NEEDS_HEALTH_METRICS|$METRIC_SWIFT|RequestableMetric
 health sections|NEEDS_HEALTH_SECTIONS|$METRIC_SWIFT|HealthSection
 location fields|NEEDS_LOCATION_FIELDS|$LOCATION_SWIFT|RequestableLocationField
-location precisions|NEEDS_LOCATION_PRECISIONS|$LOCATION_SWIFT|LocationPrecision"
+location precisions|NEEDS_LOCATION_PRECISIONS|$LOCATION_SWIFT|LocationPrecision
+location unavailable reasons|NEEDS_LOCATION_UNAVAILABLE_REASONS|$FIXPOLICY_SWIFT|LocationUnavailableReason"
 
 while IFS='|' read -r label rust_const swift_file swift_enum; do
   [ -n "$label" ] || continue

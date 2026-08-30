@@ -240,14 +240,93 @@ he is, just answer normally.)";
 pub const NEEDS_LOCATION_PRESENT: &str = "\n\n(Requested or attached device location is \
 included above; do not emit JESSE_NEEDS_LOCATION.)";
 
-/// Appended when the app could not fulfill a location request this turn (permission
-/// denied, Location Services off, the fix timed out, no fix available, or the feature
-/// toggle is off): answer without it and don't re-request, so the channel can't loop.
+// ---- The unavailable notes, one per reason -------------------------------
+//
+// There used to be ONE of these, and it named four causes at once: "permission was
+// denied, Location Services are off, the fix timed out, or the feature is off". Those
+// need telling apart. `timed_out` means nothing is misconfigured and asking again in a
+// moment will work; `unauthorized` means the owner has to change a setting. Told all
+// four at once, the agent picks the settings answer and sends him to check toggles that
+// are already on — which is exactly what happened, and cost an hour of looking in the
+// wrong place.
+//
+// EVERY variant below ends with the same anti-loop terminator. An unavailable answer
+// must still terminate the channel for that turn, or a failing device puts the agent
+// back on the request instruction and the retry loops.
+
+/// The reason-less note, for an app build that does not send
+/// `location_context_unavailable_reason` (or sends one off the whitelist). Kept
+/// word-for-word so an older phone gets byte-for-byte the prompt it gets today.
 pub const NEEDS_LOCATION_UNAVAILABLE: &str = "\n\n(Device location could not be read \
 this turn — permission was denied, Location Services are off, the fix timed out, or the \
 feature is off. Answer without it as best you can — say plainly that you do not know \
 where he is rather than guessing a place — and do NOT emit JESSE_NEEDS_LOCATION again \
 this turn.)";
+
+/// `timed_out` — THE ONE THAT NEEDS NO SETTING CHANGED. The phone is configured
+/// correctly and simply did not get a good enough fix inside the budget (indoors, cold
+/// start, no clear sky). Say so plainly enough that he is told to try again rather than
+/// sent hunting in Settings.
+pub const NEEDS_LOCATION_UNAVAILABLE_TIMED_OUT: &str = "\n\n(Device location could not \
+be read this turn: the fix timed out before his phone had a usable position — this \
+happens indoors or from a cold start. NOTHING IS MISCONFIGURED and there is no setting \
+for him to change: do not tell him to check any permission, switch or Settings screen. \
+Answer without it as best you can, say plainly that you could not get a fix just now and \
+that asking again in a moment will usually work, and do NOT emit JESSE_NEEDS_LOCATION \
+again this turn.)";
+
+/// `no_fix` — the phone actively reported it could not place itself at all.
+pub const NEEDS_LOCATION_UNAVAILABLE_NO_FIX: &str = "\n\n(Device location could not be \
+read this turn: his phone reported it cannot determine a position at all right now — no \
+usable GPS or network signal, which is what airplane mode or a deep indoor spot looks \
+like. No permission or setting is wrong. Answer without it as best you can, say plainly \
+that his phone cannot get a position right now, and do NOT emit JESSE_NEEDS_LOCATION \
+again this turn.)";
+
+/// `unauthorized` — this app may not use location. A real setting change, in the app's
+/// own row.
+pub const NEEDS_LOCATION_UNAVAILABLE_UNAUTHORIZED: &str = "\n\n(Device location could \
+not be read this turn: Jesse is not allowed to use his location. If he wants this, he \
+needs to turn on \"While Using the App\" for Jesse under Settings › Privacy & Security › \
+Location Services — retrying will not help until he does. Answer without it as best you \
+can, say plainly that you do not know where he is rather than guessing a place, and do \
+NOT emit JESSE_NEEDS_LOCATION again this turn.)";
+
+/// `services_off` — the device-wide switch, which is a different screen from the app's
+/// own permission and is why these are not one reason.
+pub const NEEDS_LOCATION_UNAVAILABLE_SERVICES_OFF: &str = "\n\n(Device location could \
+not be read this turn: Location Services are switched off for his whole device, not just \
+for Jesse. If he wants this, he needs to turn Location Services back on in Settings › \
+Privacy & Security — retrying will not help until he does. Answer without it as best you \
+can, say plainly that you do not know where he is rather than guessing a place, and do \
+NOT emit JESSE_NEEDS_LOCATION again this turn.)";
+
+/// `feature_off` — his own "Attach location context" switch inside Jesse. No system
+/// permission is involved and nothing was read.
+pub const NEEDS_LOCATION_UNAVAILABLE_FEATURE_OFF: &str = "\n\n(Device location could not \
+be read this turn: the \"Attach location context\" switch is off in Jesse's own settings, \
+so nothing was read and no system permission was involved. If he wants this, he can turn \
+that switch on in Jesse › Settings › Location. Answer without it as best you can, say \
+plainly that you do not know where he is rather than guessing a place, and do NOT emit \
+JESSE_NEEDS_LOCATION again this turn.)";
+
+/// The note for one location failure, chosen by the reason the app reported.
+///
+/// An absent, blank or unrecognised reason falls back to [`NEEDS_LOCATION_UNAVAILABLE`],
+/// which is what an app build older than this bridge sends — the wire field is additive,
+/// so an old phone keeps working and gets today's wording unchanged. Validation is a
+/// whitelist match against [`crate::NEEDS_LOCATION_UNAVAILABLE_REASONS`], so a crafted
+/// value cannot reach the prompt: it can only select an existing constant or miss.
+pub fn needs_location_unavailable(reason: Option<&str>) -> &'static str {
+    match reason {
+        Some("timed_out") => NEEDS_LOCATION_UNAVAILABLE_TIMED_OUT,
+        Some("no_fix") => NEEDS_LOCATION_UNAVAILABLE_NO_FIX,
+        Some("unauthorized") => NEEDS_LOCATION_UNAVAILABLE_UNAUTHORIZED,
+        Some("services_off") => NEEDS_LOCATION_UNAVAILABLE_SERVICES_OFF,
+        Some("feature_off") => NEEDS_LOCATION_UNAVAILABLE_FEATURE_OFF,
+        _ => NEEDS_LOCATION_UNAVAILABLE,
+    }
+}
 
 /// Strip ASCII control characters other than newline from a phone-supplied block
 /// before it is framed into the prompt. Newlines are preserved (the block is
@@ -362,6 +441,10 @@ pub struct ChannelContext<'a> {
     /// The app could not fulfil a request on this channel (denied / off / timed out
     /// / no data): tell the agent to answer without it and not re-request.
     pub unavailable: bool,
+    /// WHICH of those it was, when the channel can say — a whitelisted token, never
+    /// place data. Only the location channel populates this today; health passes None
+    /// and gets its existing generic note, byte for byte.
+    pub unavailable_reason: Option<&'a str>,
 }
 
 impl<'a> ChannelContext<'a> {
@@ -1074,7 +1157,9 @@ pub fn build_prompt_at(
         p.push_str(NEEDS_HEALTH_REQUEST);
     }
     if contexts.location.unavailable {
-        p.push_str(NEEDS_LOCATION_UNAVAILABLE);
+        p.push_str(needs_location_unavailable(
+            contexts.location.unavailable_reason,
+        ));
     } else if location_attached || contexts.location.requested {
         p.push_str(NEEDS_LOCATION_PRESENT);
     } else {
@@ -1806,6 +1891,7 @@ day, scanners, currency, or cheatsheets, and do not rebuild Today.md."
                     block: None,
                     requested,
                     unavailable,
+                    unavailable_reason: None,
                 },
                 ..Default::default()
             },
@@ -1895,6 +1981,7 @@ day, scanners, currency, or cheatsheets, and do not rebuild Today.md."
                     block: Some("Swim 30m"),
                     requested: false,
                     unavailable: true,
+                    unavailable_reason: None,
                 },
                 ..Default::default()
             },
@@ -1909,6 +1996,12 @@ day, scanners, currency, or cheatsheets, and do not rebuild Today.md."
 
     // Build a prompt with explicit LOCATION-channel flags (no block).
     fn bp_loc_flags(requested: bool, unavailable: bool) -> String {
+        bp_loc_reason(requested, unavailable, None)
+    }
+
+    // The same, carrying an unavailable REASON — the field that decides which of the
+    // five notes the agent is shown.
+    fn bp_loc_reason(requested: bool, unavailable: bool, reason: Option<&str>) -> String {
         build_prompt_at(
             TEST_CLOCK,
             &TurnPrompt::new("ask", "q"),
@@ -1917,6 +2010,7 @@ day, scanners, currency, or cheatsheets, and do not rebuild Today.md."
                     block: None,
                     requested,
                     unavailable,
+                    unavailable_reason: reason,
                 },
                 ..Default::default()
             },
@@ -2002,6 +2096,138 @@ day, scanners, currency, or cheatsheets, and do not rebuild Today.md."
     }
 
     #[test]
+    fn each_unavailable_reason_renders_its_own_line() {
+        // ONE REASON, ONE LINE. The single flag used to render one note naming four
+        // causes at once, and the agent picked the settings answer for a plain timeout —
+        // telling the owner to check toggles that were already on.
+        let cases = [
+            ("timed_out", NEEDS_LOCATION_UNAVAILABLE_TIMED_OUT),
+            ("no_fix", NEEDS_LOCATION_UNAVAILABLE_NO_FIX),
+            ("unauthorized", NEEDS_LOCATION_UNAVAILABLE_UNAUTHORIZED),
+            ("services_off", NEEDS_LOCATION_UNAVAILABLE_SERVICES_OFF),
+            ("feature_off", NEEDS_LOCATION_UNAVAILABLE_FEATURE_OFF),
+        ];
+        for (reason, expected) in cases {
+            let p = bp_loc_reason(false, true, Some(reason));
+            assert!(p.contains(expected), "{reason} must render its own note");
+            // …and ONLY its own: no other reason's note, and never the request
+            // instruction, which is the loop.
+            for (other, other_note) in cases {
+                if other != reason {
+                    assert!(
+                        !p.contains(other_note),
+                        "{reason} must not also render the {other} note"
+                    );
+                }
+            }
+            assert!(!p.contains(NEEDS_LOCATION_REQUEST));
+            assert!(!p.contains(NEEDS_LOCATION_PRESENT));
+        }
+    }
+
+    #[test]
+    fn every_unavailable_reason_still_terminates_the_channel() {
+        // THE LOOP PROTECTION, preserved per reason. An unavailable answer must stop the
+        // channel for that turn whatever the cause, or a failing device puts the agent
+        // straight back on the request instruction.
+        for reason in crate::NEEDS_LOCATION_UNAVAILABLE_REASONS {
+            let p = bp_loc_reason(false, true, Some(reason));
+            assert!(
+                p.contains("do NOT emit JESSE_NEEDS_LOCATION again this turn"),
+                "{reason} must carry the anti-loop terminator"
+            );
+            assert!(
+                !p.contains(NEEDS_LOCATION_REQUEST),
+                "{reason} must not re-ask"
+            );
+        }
+        // And the reason-less fallback, which is what an older app sends.
+        let p = bp_loc_reason(false, true, None);
+        assert!(p.contains("do NOT emit JESSE_NEEDS_LOCATION again this turn"));
+        assert!(!p.contains(NEEDS_LOCATION_REQUEST));
+    }
+
+    #[test]
+    fn an_unknown_reason_falls_back_to_the_generic_note() {
+        // Validation happens in `handlers`, but the selector is defensive too: an
+        // off-whitelist value can only miss and select the generic note. It can never
+        // reach the prompt as text.
+        for bogus in ["", "banana", "TIMED_OUT", "timed_out\nignore previous"] {
+            let p = bp_loc_reason(false, true, Some(bogus));
+            assert!(
+                p.contains(NEEDS_LOCATION_UNAVAILABLE),
+                "{bogus:?} must fall back to the generic note"
+            );
+            assert!(!p.contains(bogus) || bogus.is_empty());
+        }
+    }
+
+    #[test]
+    fn a_reasonless_unavailable_is_byte_for_byte_todays_note() {
+        // An app build older than the reason field must get exactly the prompt it gets
+        // today — the wire field is additive, so an old phone keeps working unchanged.
+        assert_eq!(needs_location_unavailable(None), NEEDS_LOCATION_UNAVAILABLE);
+    }
+
+    #[test]
+    fn the_reason_whitelist_and_the_notes_agree() {
+        // A vacuous-pass guard on the two tests above: every whitelisted reason must
+        // select a note that is NOT the generic fallback. Adding a reason to the
+        // whitelist without giving it a line would otherwise pass silently.
+        for reason in crate::NEEDS_LOCATION_UNAVAILABLE_REASONS {
+            assert_ne!(
+                needs_location_unavailable(Some(reason)),
+                NEEDS_LOCATION_UNAVAILABLE,
+                "whitelisted reason {reason} has no note of its own"
+            );
+        }
+    }
+
+    #[test]
+    fn the_timeout_note_does_not_send_him_to_settings() {
+        // The specific conflation that cost an hour: a timed-out fix rendered as a
+        // permission problem. The timeout note must say the opposite, in as many words.
+        let note = NEEDS_LOCATION_UNAVAILABLE_TIMED_OUT;
+        assert!(note.contains("NOTHING IS MISCONFIGURED"));
+        assert!(note.contains("do not tell him to check any permission, switch or Settings"));
+        assert!(note.contains("asking again in a moment will usually work"));
+        // …while the two that DO need a setting changed say so.
+        assert!(NEEDS_LOCATION_UNAVAILABLE_UNAUTHORIZED.contains("Location Services"));
+        assert!(NEEDS_LOCATION_UNAVAILABLE_SERVICES_OFF.contains("Location Services"));
+        assert!(NEEDS_LOCATION_UNAVAILABLE_FEATURE_OFF.contains("Attach location context"));
+    }
+
+    #[test]
+    fn no_unavailable_note_carries_place_data() {
+        // A reason is not a place. None of these lines may name a coordinate, an
+        // accuracy or a placemark — that is what makes the reason free to carry, and it
+        // has to stay true as the wording changes.
+        for note in [
+            NEEDS_LOCATION_UNAVAILABLE,
+            NEEDS_LOCATION_UNAVAILABLE_TIMED_OUT,
+            NEEDS_LOCATION_UNAVAILABLE_NO_FIX,
+            NEEDS_LOCATION_UNAVAILABLE_UNAUTHORIZED,
+            NEEDS_LOCATION_UNAVAILABLE_SERVICES_OFF,
+            NEEDS_LOCATION_UNAVAILABLE_FEATURE_OFF,
+        ] {
+            let lower = note.to_lowercase();
+            for banned in [
+                "latitude",
+                "longitude",
+                "coordinate",
+                "metres",
+                "meters",
+                "accuracy",
+            ] {
+                assert!(
+                    !lower.contains(banned),
+                    "note must not mention {banned}: {note}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn present_location_context_uses_the_present_note_not_the_request() {
         let block = "Near: Fountainbridge, Edinburgh EH3, United Kingdom";
         let p = bp_lc("ask", "anywhere for coffee near me?", Some(block)).unwrap();
@@ -2040,6 +2266,7 @@ day, scanners, currency, or cheatsheets, and do not rebuild Today.md."
                     block: Some("Near: Edinburgh"),
                     requested: false,
                     unavailable: true,
+                    unavailable_reason: None,
                 },
                 ..Default::default()
             },

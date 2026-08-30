@@ -133,6 +133,28 @@ pub const NEEDS_LOCATION_FIELDS: &[&str] = &["coordinates", "placemark", "accura
 /// full-accuracy prompt mid-turn. Kept in sync with the app's `LocationPrecision`.
 pub const NEEDS_LOCATION_PRECISIONS: &[&str] = &["coarse", "precise"];
 
+/// The reasons the app may give for failing to fulfil a location request, on
+/// `location_context_unavailable_reason`. **Kept in exact sync with the app's
+/// `LocationUnavailableReason` enum**, checked by `scripts/ci-guards.sh` alongside the
+/// field and precision whitelists.
+///
+/// They exist because the single `unavailable` flag used to render one line naming four
+/// causes at once — permission denied, Location Services off, the fix timed out, or the
+/// feature is off — and those need telling apart. `timed_out` needs nothing but a retry;
+/// `unauthorized` needs the owner to change a setting. Conflated, the agent sends him to
+/// check toggles that are already on, which is exactly what happened and cost an hour.
+///
+/// A reason is NOT a place: no coordinate, no accuracy figure, no place name, nothing
+/// that narrows down where the phone is. That is what makes it free to carry, and any
+/// future addition here has to keep it that way.
+pub const NEEDS_LOCATION_UNAVAILABLE_REASONS: &[&str] = &[
+    "feature_off",
+    "no_fix",
+    "services_off",
+    "timed_out",
+    "unauthorized",
+];
+
 /// Max fields one directive may request — the whole whitelist, so a directive can ask
 /// for everything at once but can never repeat itself into a large payload.
 pub const MAX_NEEDS_LOCATION_FIELDS: usize = 3;

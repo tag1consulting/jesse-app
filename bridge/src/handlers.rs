@@ -88,6 +88,17 @@ pub struct JesseRequest {
     // loop. Absent/false on an ordinary turn.
     #[serde(default)]
     location_context_unavailable: Option<bool>,
+    // WHICH of those it was, from the app's `LocationUnavailableReason`: one of
+    // `NEEDS_LOCATION_UNAVAILABLE_REASONS`. The single flag above used to render one
+    // note naming four causes at once, and they need telling apart — "the fix timed out,
+    // try again" and "you have not granted permission" are different conversations, and
+    // conflating them sent a reader to check toggles that were already on.
+    //
+    // It carries NO place data: a token like "timed_out", never a coordinate, an
+    // accuracy or a place name. Absent (an older app) or off-whitelist falls back to the
+    // generic note, so this is purely additive on the wire.
+    #[serde(default)]
+    location_context_unavailable_reason: Option<String>,
     // Meal-corrections ack (JESSE_MEAL_LOG v2): the highest `corrections_seq` the app has
     // APPLIED from a delivered `meal_log`. On receipt the bridge prunes every queued batch
     // at or below this seq. Absent on an ordinary turn (old app builds simply omit it);
@@ -191,6 +202,7 @@ impl JesseRequest {
             location_context: None,
             location_context_requested: None,
             location_context_unavailable: None,
+            location_context_unavailable_reason: None,
             meal_corrections_ack: None,
             request_id: None,
         }
@@ -776,11 +788,23 @@ pub async fn start_turn(
             block: req.health_context.as_deref(),
             requested: req.health_context_requested.unwrap_or(false),
             unavailable: req.health_context_unavailable.unwrap_or(false),
+            // Health has no reason vocabulary: HealthKit hides read denials by design,
+            // so the app genuinely cannot tell "denied" from "no data" and must not
+            // guess. Its note is unchanged.
+            unavailable_reason: None,
         },
         location: ChannelContext {
             block: req.location_context.as_deref(),
             requested: req.location_context_requested.unwrap_or(false),
             unavailable: req.location_context_unavailable.unwrap_or(false),
+            // Validated against the whitelist HERE rather than in the prompt: an
+            // off-list value becomes None and selects the generic note, which is also
+            // what an app build older than this field produces. A crafted value can
+            // only miss — it can never reach the prompt as text.
+            unavailable_reason: req
+                .location_context_unavailable_reason
+                .as_deref()
+                .filter(|r| crate::NEEDS_LOCATION_UNAVAILABLE_REASONS.contains(r)),
         },
     };
     // Framed ONCE here, ahead of the concurrency permit (so an oversized block on either
