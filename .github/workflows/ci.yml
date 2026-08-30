@@ -35,12 +35,9 @@ jobs:
   # `working-directory: bridge` with its own Cargo.lock, so one `cargo` invocation cannot
   # cover both and nothing here changes how the bridge is built.
   #
-  # SCOPED TO `-p jesse-agent`, NOT THE WHOLE WORKSPACE, and that is deliberate. The other
-  # member, `eval/`, has never been in CI and does not pass `cargo clippy -- -D warnings`
-  # today (6 x doc_overindented_list_items) — the `Format check` step in the bridge job
-  # below records exactly that. An unscoped job here would therefore fail on code this
-  # change does not touch, and fixing `eval` to make an unrelated crate's CI green is not
-  # this job's business. When `eval` is cleaned up it joins by widening these `-p` flags.
+  # SCOPED TO `-p jesse-agent`, NOT THE WHOLE WORKSPACE. The other member, `eval/`, has its
+  # own job below: the two crates fail for different reasons and a combined job would make
+  # "CI is red" stop telling you which one. Nothing about the bridge changes either way.
   agent:
     name: agent (build, test, clippy, fmt)
     runs-on: ubuntu-latest
@@ -73,6 +70,47 @@ jobs:
 
       - name: Format check
         run: cargo fmt -p jesse-agent --check
+
+  # THE EVAL HARNESS. New in D7, and it joins CI at the same time as the `product-v1`
+  # suite it validates: the teeth check (good mock scores every task, known-bad mock scores
+  # none, on BOTH drivers) lives in `eval/tests/integration.rs` and is worth nothing unless
+  # something runs it on every PR. Until this job existed, `vaultqa-example`'s equivalent
+  # check had been green locally and unrun in CI.
+  #
+  # `--all-targets` so `tests/integration.rs` is compiled and run; it drives the real
+  # binary with `--mock`, so there is no network and no model in any of it.
+  eval:
+    name: eval (build, test, clippy, fmt)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        run: rustup component add clippy rustfmt
+
+      - name: Cache cargo
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-eval-${{ hashFiles('Cargo.lock') }}
+
+      - name: Build
+        run: cargo build -p jesse-eval
+
+      # This is the teeth check. `product_v1_{direct,cli}_{good,bad}_mock_*` are four of the
+      # tests it runs, and between them they are the claim that the suite's assertions catch
+      # exactly the defects they name — on both drivers.
+      - name: Test
+        run: cargo test -p jesse-eval --all-targets
+
+      - name: Clippy
+        run: cargo clippy -p jesse-eval --all-targets -- -D warnings
+
+      - name: Format check
+        run: cargo fmt -p jesse-eval --check
 
   bridge:
     name: bridge (build, test, clippy, guards, audit, coverage)
@@ -130,13 +168,10 @@ jobs:
       # through files it never touched or hand-reverting rustfmt after each run. Neither
       # is reviewable, so the drift is now a build failure instead of a judgement call.
       #
-      # SCOPE: the bridge only. `eval/` is fmt-clean as of bf8225f but no CI job compiles
-      # or checks it, and this job's `working-directory: bridge` means this step cannot
-      # see it — `bridge/` is deliberately excluded from the root workspace (see the root
-      # Cargo.toml), so one `cargo fmt` never covers both. Enforcing eval needs its own
-      # step at the workspace root, which is worth doing when eval joins CI at all: it
-      # currently fails `cargo clippy -- -D warnings` (6 x doc_overindented_list_items),
-      # so a step there would need that fixed first if it ever grows past --check.
+      # SCOPE: the bridge only. This job's `working-directory: bridge` means this step
+      # cannot see the root workspace — `bridge/` is deliberately excluded from it (see the
+      # root Cargo.toml), so one `cargo fmt` never covers both. The root workspace's two
+      # members enforce their own formatting in the `agent` and `eval` jobs above.
       - name: Format check
         run: cargo fmt --all --check
 

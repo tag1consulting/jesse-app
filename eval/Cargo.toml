@@ -1,8 +1,8 @@
 [package]
 name = "jesse-eval"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "Offline eval harness for the Jesse assistant: runs task suites against a Claude-compatible endpoint and judges candidates against a baseline."
+description = "Offline eval harness for the Jesse assistant: runs task suites against a Claude-compatible endpoint or the in-process agent loop, and judges candidates against a baseline."
 
 [[bin]]
 name = "jesse-eval"
@@ -14,6 +14,23 @@ serde_json = "1"
 regex = "1"
 clap = { version = "4", features = ["derive"] }
 tempfile = "3"
+# THE OWNED LOOP, as a library. The `direct` driver builds a provider, a vault tool set and
+# a persona prefix out of this crate and calls `run_turn` in-process — which is the whole
+# point of the driver seam: one suite, one scorecard, two runners.
+#
+# `scripted` is turned on HERE and nowhere else in a shipped build. It is what makes the
+# direct driver's `--mock` possible: a provider that plays a fixture instead of calling an
+# endpoint, so a mock run exercises the REAL tool set against REAL fixture files with no
+# network. The feature is off by default in `jesse-agent` precisely so that turning it on
+# is a visible decision in one manifest.
+jesse-agent = { path = "../agent", features = ["scripted"] }
+# The runtime the loop needs. `rt` for the current-thread runtime the runner blocks on,
+# `macros` for `select!` inside the agent's own reader, `time` for its backoff. NOT
+# `rt-multi-thread`: the harness runs one task at a time and the loop needs concurrency,
+# never parallelism — the same reasoning `agent/Cargo.toml` records.
+tokio = { version = "1", features = ["rt", "macros", "time"] }
+# `CancellationToken` — the type `Driver::run_task` takes and the agent loop honours.
+tokio-util = "0.7"
 
 [dev-dependencies]
 serde_json = "1"

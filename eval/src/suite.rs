@@ -6,6 +6,7 @@
 //! against the real vault (`$JESSE_VAULT`, else `~/vault`) and MUST be restricted
 //! to read tools only — enforced by [`Task::validate`].
 
+use jesse_agent::{Level, PersonaPack};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -69,6 +70,23 @@ pub enum Assertion {
     },
     /// A terminal `result` line must have arrived at all.
     Completed,
+    /// The final answer must break NOTHING in the task's [`PersonaPack`] — the style
+    /// checker (`jesse_agent::persona::check`) reports at most `max_hits` findings.
+    ///
+    /// The pack comes from the TASK, not from the assertion, so the prose the model was
+    /// asked to write in and the rules it is graded against cannot drift apart: one pack is
+    /// rendered into the system prefix and handed to the checker. A task with no `persona`
+    /// fails this assertion with a message saying so rather than passing vacuously.
+    StyleClean {
+        /// Findings tolerated. `0` — the default — is the useful setting; a non-zero
+        /// ceiling is for a task deliberately grading "mostly clean".
+        #[serde(default)]
+        max_hits: usize,
+    },
+    /// Every one of these tool names must appear in the transcript's tool calls.
+    ToolsInclude { names: Vec<String> },
+    /// NONE of these tool names may appear in the transcript's tool calls.
+    ToolsExclude { names: Vec<String> },
 }
 
 /// A single eval task.
@@ -81,8 +99,37 @@ pub struct Task {
     pub prompt: String,
     pub workspace: Workspace,
     /// Tools passed to `--allowedTools` (comma-joined). Empty = no tools.
+    ///
+    /// These are the CLI's names, and they stay the CLI's names: the direct driver maps
+    /// them onto its own manifest by the table in `eval/README.md` rather than the suite
+    /// carrying two allowlists that could disagree.
     #[serde(default)]
     pub allowed_tools: Vec<String>,
+    /// How much the turn is trusted with, for a driver that has levels.
+    ///
+    /// `None` takes the default from the workspace — `read` for `vault-readonly`, `write`
+    /// for `fixture` — which is what the two workspaces already mean. Spelling it out is
+    /// for the task that wants LESS than its workspace's default (a refusal task granted
+    /// only `read`), and `vault-readonly` + `write` is refused by [`Task::validate`]
+    /// alongside the tool allowlist, for the same reason.
+    #[serde(default)]
+    pub level: Option<Level>,
+    /// Extra system-prefix text, as fixture blocks, ahead of the persona.
+    ///
+    /// The direct driver passes these as [`jesse_agent::SystemBlock`]s. The CLI takes no
+    /// system prefix on the flags this harness uses, so its driver prepends the same text
+    /// to the prompt — the model sees the same instructions either way, which is what makes
+    /// a suite carrying `system` runnable on both drivers.
+    #[serde(default)]
+    pub system: Vec<String>,
+    /// The persona this task's answer is written under AND graded against.
+    ///
+    /// ONE pack, two uses: the direct driver renders it into the system prefix with
+    /// `jesse_agent::render_persona`, and the `style_clean` assertion checks the answer
+    /// against the same value. A suite that carried the rendered prose in `system` and the
+    /// rules in the assertion would be carrying the same pack twice, in two spellings.
+    #[serde(default)]
+    pub persona: Option<PersonaPack>,
     /// For `fixture` workspaces: files written into the temp dir before the run.
     #[serde(default)]
     pub fixture_files: BTreeMap<String, String>,
@@ -128,12 +175,38 @@ impl Task {
         self.allowed_tools.join(",")
     }
 
+    /// The level this task runs at, defaulted from its workspace.
+    ///
+    /// `write` for a fixture (a hermetic temp dir, which is the point of one) and `read`
+    /// for the vault (which is the whole posture of `vault-readonly`). Naming a level in
+    /// the task overrides this, EXCEPT that `vault-readonly` + `write` is refused — see
+    /// [`Task::validate`].
+    pub fn level(&self) -> Level {
+        self.level.unwrap_or(match self.workspace {
+            Workspace::Fixture => Level::Write,
+            Workspace::VaultReadonly => Level::Read,
+        })
+    }
+
     /// Load-bearing safety check. A `vault-readonly` task must declare only
-    /// read tools; any other tool (Write, Edit, any Bash, …) is refused so an
-    /// eval run can never modify the vault. Also requires judged tasks to carry
-    /// a rubric. Returns `Err` with a human-readable reason on any violation.
+    /// read tools and may not ask for `level: write`; any other tool (Write, Edit,
+    /// any Bash, …) is refused so an eval run can never modify the vault. Also
+    /// requires judged tasks to carry a rubric, and `style_clean` to have a pack to
+    /// check against. Returns `Err` with a human-readable reason on any violation.
     pub fn validate(&self) -> Result<(), String> {
         if self.workspace == Workspace::VaultReadonly {
+            // THE SAME REFUSAL, ONE RUNG UP. The allowlist below names the CLI's tools; a
+            // level names what the DIRECT driver's tool set is built with, and a
+            // `vault-readonly` task at `write` would be built with `vault_write` no matter
+            // how empty its `allowed_tools` was. Both spellings of "this task may modify
+            // the vault" are refused in the same place, before anything runs.
+            if self.level == Some(Level::Write) {
+                return Err(format!(
+                    "task '{}' is vault-readonly but asks for level: write, \
+                     which would build a tool set that can modify the vault",
+                    self.id
+                ));
+            }
             for tool in &self.allowed_tools {
                 if !VAULT_ALLOWED_TOOLS.contains(&tool.as_str()) {
                     return Err(format!(
@@ -149,6 +222,17 @@ impl Task {
         if self.judged && self.rubric.as_deref().unwrap_or("").trim().is_empty() {
             return Err(format!(
                 "task '{}' is judged but has no rubric text",
+                self.id
+            ));
+        }
+        if self.persona.is_none()
+            && self
+                .assertions
+                .iter()
+                .any(|a| matches!(a, Assertion::StyleClean { .. }))
+        {
+            return Err(format!(
+                "task '{}' asserts style_clean but declares no `persona` pack to check against",
                 self.id
             ));
         }
@@ -179,6 +263,9 @@ mod tests {
             prompt: "p".into(),
             workspace,
             allowed_tools: tools.iter().map(|s| s.to_string()).collect(),
+            level: None,
+            system: vec![],
+            persona: None,
             fixture_files: BTreeMap::new(),
             judged: false,
             rubric: None,
@@ -224,6 +311,44 @@ mod tests {
     fn fixture_allows_anything() {
         // Fixture workspaces are hermetic temp dirs, so any tool is fine there.
         let t = task_with(Workspace::Fixture, &["Write", "Edit", "Bash"]);
+        assert!(t.validate().is_ok());
+    }
+
+    #[test]
+    fn vault_refuses_write_level_even_with_an_empty_allowlist() {
+        // The allowlist is empty and every tool in it would have been legal — the refusal
+        // is the LEVEL, which is what the direct driver builds its tool set from.
+        let mut t = task_with(Workspace::VaultReadonly, &[]);
+        t.level = Some(Level::Write);
+        let err = t.validate().unwrap_err();
+        assert!(err.contains("level: write"), "got: {err}");
+    }
+
+    #[test]
+    fn vault_allows_an_explicit_read_level() {
+        let mut t = task_with(Workspace::VaultReadonly, &["Read"]);
+        t.level = Some(Level::Read);
+        assert!(t.validate().is_ok());
+        t.level = Some(Level::Basic);
+        assert!(t.validate().is_ok());
+    }
+
+    #[test]
+    fn the_level_defaults_to_what_the_workspace_means() {
+        assert_eq!(task_with(Workspace::Fixture, &[]).level(), Level::Write);
+        assert_eq!(
+            task_with(Workspace::VaultReadonly, &[]).level(),
+            Level::Read
+        );
+    }
+
+    #[test]
+    fn style_clean_without_a_pack_is_refused_at_load() {
+        let mut t = task_with(Workspace::Fixture, &[]);
+        t.assertions = vec![Assertion::StyleClean { max_hits: 0 }];
+        let err = t.validate().unwrap_err();
+        assert!(err.contains("persona"), "got: {err}");
+        t.persona = Some(PersonaPack::default());
         assert!(t.validate().is_ok());
     }
 
