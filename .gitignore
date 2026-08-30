@@ -38,3 +38,19 @@ scripts/ci-guards.local.sh
 # vaultqa-example.json is the generic template; real suites live here, gitignored.
 eval/suites/local/
 todo-list/
+
+# Eval run artifacts under eval-runs/. THE SPLIT IS DELIBERATE, not a size
+# optimisation: `results.json`, `scorecard.md`, `judgment.md` and `compare.md`
+# are the RECORD a gate report cites and they are tracked; `transcripts/` and
+# `answers/` are bulk model output that nothing cites line-by-line, so they stay
+# out of git and out of every diff.
+eval-runs/*/transcripts/
+eval-runs/*/answers/
+
+# A run of a suite with `workspace = "vault-readonly"` tasks reads the owner's
+# real vault, and its `results.json` carries `final_answer` — i.e. VAULT CONTENT.
+# Those runs are therefore ignored WHOLE, not merely trimmed: only their
+# aggregate numbers (pass rate, latency, tool calls) may be quoted, in a report.
+# The fixture-only suites (product-v1, diet-v1) touch no vault and stay tracked.
+eval-runs/*vaultqa*/
+eval-runs/*jesse-v1*/
