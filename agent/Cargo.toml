@@ -1,9 +1,9 @@
 [package]
 name = "jesse-agent"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "Apache-2.0"
-description = "Provider-neutral agent layer for Jesse: one request/response model, one streaming event vocabulary, and per-wire adapters (Anthropic Messages, OpenAI Chat Completions)."
+description = "Provider-neutral agent layer for Jesse: one request/response model, one streaming event vocabulary, per-wire adapters (Anthropic Messages, OpenAI Chat Completions), and the tool-calling turn loop that runs on top of them."
 
 # NO DEPENDENCY ON `bridge/` IN EITHER DIRECTION. The bridge is excluded from the root
 # workspace (see the root Cargo.toml) and builds standalone from its own Cargo.lock; a
@@ -27,7 +27,13 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-
 # The async runtime pieces the provider layer itself uses: `rt` to spawn the one reader
 # task per call, `sync` for the event channel and the audit slot, `time` for the retry
 # backoff and the header-phase timeout. `macros` for `select!` in the reader loop.
-tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
+# `signal` is for the CLI's Ctrl-C handler (`src/bin/jesse-agent.rs`), which CANCELS the
+# turn rather than killing the process — so the partial answer, the thread append and the
+# usage records all still happen. `rt-multi-thread` is deliberately NOT added: the binary
+# runs on a current-thread runtime, because the loop needs concurrency (a batch of reads
+# awaiting together) and never parallelism, and a library dependency added for one
+# binary's convenience is paid for by every consumer of the library.
+tokio = { version = "1", features = ["rt", "sync", "time", "macros", "signal"] }
 # `CancellationToken` — the cancellation primitive `Provider::stream` takes. Hand-rolling
 # one over `AtomicBool` + `Notify` was rejected: cancellation has to compose (D2's loop
 # will hold a turn-scoped parent and hand child tokens to each provider call), and
@@ -43,8 +49,29 @@ futures-core = "0.3"
 # scanner it replaced was longer and got the boundary cases wrong. `regex` is already
 # in this workspace's lockfile (`eval/` uses it), so this pulls no new compiled code.
 regex = "1"
+# Sixteen random bytes per thread id, and nothing else. `rand` was rejected as a large
+# dependency for one call, and the crate's own `provider::http::jitter` was rejected
+# because it says in its own doc comment that it is not cryptographic — a thread id is a
+# handle a stored conversation is fetched by, so it needs the property jitter disclaims.
+# Already in this workspace's lockfile, so it adds no new compiled code to the workspace.
+getrandom = "0.4"
+
+[features]
+# The scripted `Provider` (`provider::scripted`) and the `EventStream::scripted`
+# constructor it needs. OFF by default so a release build of this library contains no
+# `Provider` that fabricates answers; the crate's own tests get it through `cfg(test)`,
+# and the eval driver turns it on explicitly.
+scripted = []
 
 [dev-dependencies]
+# THE CRATE, AS A DEV-DEPENDENCY ON ITSELF, to turn the `scripted` feature on for test
+# targets only. Cargo permits this cycle for dev-dependencies specifically, and it is the
+# only way an INTEGRATION test (which links the library as an external crate, without
+# `cfg(test)`) can see a feature-gated module. Without it the loop's scripted-provider
+# cases and its loopback-adapter cases would have to live in different files, and the claim
+# that a turn produces IDENTICAL thread contents on all three providers could not be
+# asserted in one function. `cargo build` is unaffected: dev-dependencies are not built.
+jesse-agent = { path = ".", features = ["scripted"] }
 # The conformance suite binds real loopback sockets and speaks HTTP/1.1 by hand, the
 # same way `bridge/tests/integration.rs` stands up its mock `/v1/messages` helper. That
 # needs the full runtime (`net`, `io-util`, `rt-multi-thread`).

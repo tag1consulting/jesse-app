@@ -233,6 +233,50 @@ impl EventStream {
     pub fn audit(&self) -> AuditHandle {
         self.audit.clone()
     }
+
+    /// Build a stream over a FIXED event sequence, for a [`super::Provider`] that speaks
+    /// no HTTP.
+    ///
+    /// ADDED IN D2 for `provider::scripted`, and gated to the same `cfg` that module is,
+    /// so it exists in a release build exactly as often as its only caller does: never.
+    /// The alternative was making `EventStream`'s fields `pub(crate)` and letting the
+    /// scripted provider assemble one — which would have put the invariant that the
+    /// receiver and the task belong together in a second place, where nothing enforces it.
+    ///
+    /// The reader task honours `cancel` between events, so a scripted call is cancellable
+    /// at the same granularity a real one is (`http::start_call` selects on the token while
+    /// blocked on the socket; this selects on it while blocked on the channel). Without
+    /// that, a cancellation test could pass on the scripted provider and fail on a wire.
+    ///
+    /// The audit is published WITHOUT printing the stderr line a real call prints: this is
+    /// not a call anyone was billed for, and a suite of loop tests emitting audit lines for
+    /// imaginary calls is how a real one stops being noticed.
+    #[cfg(any(test, feature = "scripted"))]
+    pub(crate) fn scripted(
+        events: Vec<Event>,
+        audit: CallAudit,
+        cancel: CancellationToken,
+    ) -> EventStream {
+        let (tx, rx) = mpsc::channel(EVENT_CHANNEL_DEPTH);
+        let task = tokio::spawn(async move {
+            for event in events {
+                if cancel.is_cancelled() {
+                    let _ = tx.send(Event::Error(ProviderError::Cancelled)).await;
+                    return;
+                }
+                if tx.send(event).await.is_err() {
+                    return; // the caller dropped the stream
+                }
+            }
+        });
+        let handle = AuditHandle::default();
+        handle.set(audit);
+        EventStream {
+            rx,
+            task,
+            audit: handle,
+        }
+    }
 }
 
 impl Stream for EventStream {
