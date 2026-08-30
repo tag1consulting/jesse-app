@@ -7,5 +7,5 @@
 # same build as before this workspace existed. Nothing about the bridge changes.
 [workspace]
 resolver = "2"
-members = ["eval"]
+members = ["agent", "eval"]
 exclude = ["bridge"]
