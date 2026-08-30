@@ -7,6 +7,8 @@ vocabulary, per-wire adapters, and **the tool-calling turn loop that runs on top
   `AnthropicMessages` / `OpenAiChat` adapters.
 * **D2** built the loop — `turn::run_turn`, the tool boundary, the thread store, budgets,
   framing, and the usage ledger seam.
+* **D3** built the real tool set — the document store and search index traits, the vault
+  tools, the write-guard seam, and the structural containment battery.
 
 No dependency on `bridge/` in either direction.
 
@@ -50,6 +52,9 @@ make them structurally true rather than rules somebody remembers:
 
 | Layer | Owns | Must never |
 |---|---|---|
+| `tools::vault` | The eight product tools, their descriptions and their refusals. | Frame its own results, or decide policy the store owns (and vice versa). |
+| `store` | Documents: the jail, exclusions, visibility, the compare-and-swap. | Know what a *tool* is, or take a lock decision the guard owns. |
+| `index` | Search, through the store so visibility cannot be bypassed. | Return a hit the store would not open. |
 | `turn` (loop.rs) | The loop, the trace, and the projection to the bridge's two mid-turn events. | Learn anything about a wire, or let a tool result reach the model unframed. |
 | `tools` | The boundary: a set built AT a level, dispatch by exact name. | Check a level at call time — filtering happens once, at construction. |
 | `framing` | Every tool result the model sees. | Filter or rewrite content. It says what the text *is*; it never decides what it *means*. |
@@ -163,6 +168,162 @@ would make a tool that lies about what it read.
 
 Structured results are pretty-printed inside the frame. Images cannot go inside a text frame
 and ride alongside it as their own content blocks, with the frame stating how many follow.
+
+
+## The vault tool set
+
+The typed tools the product's agent has instead of a shell. `--root` selects the vault;
+documents are addressed by **vault-relative path**.
+
+| Tool | Class | Arguments | Refuses |
+|---|---|---|---|
+| `vault_list` | `Read` | `prefix?`, `depth?`, `page?` | a prefix that is absolute or leaves the root |
+| `vault_search` | `Read` | `query`, `limit?`, `mode?` | an empty query; never returns cold or excluded documents |
+| `vault_read` | `Read` | `id`, `from_line?`, `to_line?` | cold documents; anything outside the jail; excluded ids answer *not found* |
+| `fetch_url` | `Egress` | `url`, `max_bytes?` | **every URL by default**; non-http schemes; a host off the allowlist, at every redirect hop |
+| `vault_write` | `VaultWrite` | `id`, `body`, `expected_hash?` | a blind overwrite of an existing document; cold; a stale hash; a missing parent folder |
+| `vault_edit` | `VaultWrite` | `id`, `find`, `replace`, `expected_hash` | `find` matching zero or more than one time (the count is reported); a stale hash |
+| `vault_move` | `VaultWrite` | `from`, `to` | overwriting an existing destination; cold; leaving the root |
+| `deliver_artifact` | `VaultWrite` | `filename`, `text?`/`base64?` | no staging directory set; a path separator or leading dot in the filename |
+
+Every schema sets `additionalProperties: false`. A model that invents an argument is a model
+that believes it did something it did not — `vault_read {id, raw: true}` silently ignoring
+`raw` is worse than refusing it.
+
+**The descriptions are part of the product's API.** They are the only documentation the
+model ever reads, and each says what the tool does, *what it refuses*, and that an id is a
+vault-relative path. A model that knows a refusal is possible asks for something else; one
+that does not retries until a budget stops it.
+
+## Store and index
+
+`DocumentStore` and `SearchIndex` are traits with filesystem implementations for Phase 1.
+**Phase 2 replaces them with Postgres, object storage and a hosted index without touching a
+tool** — that is the whole reason they are traits, because a model's view of `vault_read` is
+part of the product's API and re-teaching it is a migration nobody can stage.
+
+Both traits are **async**, which `ThreadStore` deliberately is not: a write must `await` the
+write guard, and the Phase 2 implementation is a database. Every method takes the `Scope`,
+and every filesystem implementation ignores it — the single-tenant bridge binds one scope, and
+the parameter exists so the product implementation keys on it without a signature change.
+
+`DocumentId` is the vault-relative path **as a Phase 1 choice**, stated so because every tool
+description tells the model an id is a path; Phase 2 either keeps paths as an alias or
+re-teaches the model. Its inner string is private with a validating `parse`, because the id
+becomes a filename.
+
+`ContentHash` is **byte-identical to `bridge/src/writelock.rs`'s `hash_file`** — same SHA-256,
+same crate, same hex. D4 feeds these to the bridge's compare-and-swap baseline, and two hashes
+that disagreed would make every comparison fail.
+
+### Visibility
+
+| | `list` | `read` / `stat` | `search` | `write` |
+|---|---|---|---|---|
+| ordinary | ✅ | ✅ | ✅ | ✅ at `Write` |
+| **cold** | ✅ *(title only)* | ❌ `Refused` | ❌ absent | ❌ `Refused` |
+| **excluded** | ❌ absent | ❌ `NotFound` | ❌ absent | ❌ `NotFound` |
+
+A document is cold when its front matter says `visibility: cold` or its path matches a
+configured cold prefix. The front-matter scan stops at the closing `---`, so a document
+*about* this feature is not made cold by explaining it.
+
+**Excluded is `NotFound`, cold is `Refused`, and the split is deliberate.** The existence of
+an excluded file is itself information, so it answers exactly as an absent one does — the
+assistant cannot tell an excluded folder from an empty one. A cold document is the opposite:
+the owner has been told cold documents stay listable, so the assistant already knows it is
+there. Refusing is honest; hiding would be a lie it could detect by listing.
+
+### The jail
+
+Every path is resolved with `canonicalize` — which follows symlinks — and the containment
+test is on the **resolved** path. The classic hole is testing an unresolved one:
+`root/link-to-etc/passwd` starts with the root and *is* `/etc/passwd`. For a write the file
+may not exist, so the **parent** is resolved and the last component must be a plain name —
+which is what stops a write through a symlinked directory, a case that resolving only the
+whole path misses entirely.
+
+`..`, absolute ids, backslashes and NUL bytes are refused by `DocumentId::parse` before any
+of this, and they classify as **containment** refusals rather than malformed arguments, so
+the trace's refusal count includes every traversal attempt.
+
+### Search
+
+`GrepIndex` walks **through the store**, so exclusions and cold visibility apply by
+construction — there is no code path in it that could return a hit the store would not open.
+It always exists (CI has no `qmd`), and it stops after 2 000 documents and says so.
+
+`QmdIndex` shells to the `qmd` binary with an **argument vector, never a shell**, and
+**filters every hit through the store before returning it** — mandatory and tested, because
+`qmd` indexes what its collection pattern matched, which is not the set the store considers
+visible. It degrades to `GrepIndex` with a logged note when the binary is missing or fails,
+because a missing binary is an operational fact and not a reason for a turn to fail. The
+binary path and the collection name are **configuration and never guessed**: `qmd` reports a
+hit as `qmd://<collection>/<path>`, and stripping the wrong prefix produces ids that resolve
+to the wrong documents or to none.
+
+## The write-guard seam
+
+Phase 1 runs the direct loop **beside the existing bridge**, on one git-backed vault, with
+concurrent turns. So the store takes the same locks the CLI children take, and `WriteGuard`
+is the seam **D4 implements over `bridge/src/writelock.rs`'s `LockBroker`**:
+
+| This trait | The broker |
+|---|---|
+| `acquire` | `LockKey::Path`, blocking up to `LOCK_WAIT_TIMEOUT` (30 s) |
+| `release` | per-turn release; `release_turn` remains the backstop |
+| `note_read` | the per-**conversation** compare-and-swap baseline |
+
+**A `GuardRefused` after the wait timeout is a loud tool failure, never a silent write.** The
+tempting behaviour — proceed without the lock when the broker is unreachable — is exactly
+wrong: the case where the broker is down is the case where another writer is unaccounted for.
+
+`NoGuard` is the honest name for "there is no lock", right for a single-writer CLI turn and
+wrong beside the bridge. The CLI prints which one it is using.
+
+## The fetch posture
+
+**`fetch_url` denies every URL by default.** This is the exfiltration channel: the framing
+layer mitigates the instruction half of prompt injection, and this tool is the other half —
+the one that can carry vault contents off the host in a URL. `ActionClass::Egress` exists in
+the level system precisely so it is nameable apart from an ordinary read.
+
+Present-but-denied is deliberately preferred over absent: a model that can see the tool and be
+told "no host is allowed" reports that to the owner, where one that cannot see it invents a
+reason it could not answer. The bridge denies its CLI child's fetch tool for the same reason.
+
+The allowlist is **re-checked at every redirect hop** (at most three), inside the redirect
+policy rather than after the fact — by the time a response has come back from a disallowed
+host, the request has already been sent there.
+
+## The containment battery
+
+`tests/containment_direct.rs` builds a scratch world per probe — visible, excluded and cold
+documents, a canary directory outside the root, a symlink out of the root, and a symlinked
+directory — and drives `run_turn` with the scripted provider issuing 30 adversarial tool
+calls at each of the three levels.
+
+**The verdict is always out of band.** A tool returning `Refused` is recorded and is *not*
+the verdict; a boundary that refused and leaked anyway would pass a test that trusted the
+return value. What is checked:
+
+* No canary string in any tool result, any provider request body, the thread, the trace, the
+  usage records or the answer.
+* No file outside the root changed — the whole sibling tree is hashed before and after.
+* At `Basic` and `Read`, no file inside the root changed either.
+* The staging directory's own `.gitignore` is intact, and no artifact escaped it.
+
+**A probe the loop did not actually issue is `inconclusive`, and inconclusive fails the
+test.** That rule is what keeps the battery honest: a typo in the scripted provider, a
+renamed tool, or a loop that silently dropped a call would otherwise produce a clean sweep of
+green verdicts for probes that never ran.
+
+Two meta-tests guard the scoring itself: one asserts the out-of-band checks *detect* a real
+change, and one asserts the tools actually work when they are supposed to — otherwise a
+battery of uniformly broken tools would score as perfectly contained.
+
+The machine-readable summary is written to `target/containment-direct.json`, which D4 turns
+into the bridge's committed record.
 
 ## Budgets
 
@@ -286,9 +447,13 @@ answer is real), `2` a budget stopped it, `3` cancelled, `1` anything else. Ctrl
 the **turn**, not the process, so the partial answer, the thread append and the usage records
 all still happen.
 
-`--root` selects the **fixture** tool set (`fs_list`, `fs_read`, `fs_write`, jailed to the
-root with symlink resolution and `..` refused). **D3 replaces it with the real vault tool set
-behind the same trait.**
+`--root` is the **vault**. Additional flags: `--exclude <prefix-or-glob>`,
+`--cold-prefix <prefix>`, `--fetch-allow <host>`, `--qmd` / `--qmd-collection` /
+`--qmd-path`, and `--artifact-dir`. The banner states the index, the write guard, the fetch
+posture and the manifest, so none of those choices is invisible.
+
+The D2 fixture tool set (`fs_list`, `fs_read`, `fs_write`) still exists and is used only by
+tests.
 
 ## Invariants
 
@@ -440,6 +605,11 @@ code believes; only a live endpoint can disagree.
 
 `examples/manifest.rs` prints the manifest a fixture tool set produces at each level, for a
 person to read. What it shows is asserted properly in `tests/loop_conformance.rs`.
+
+`examples/fidelity.rs` runs the real tool set over a real vault, **read-only**, and reports
+counts — how many documents list at depth 2, whether exclusions and cold prefixes bite, and
+how many search hits come from folders that should contribute none. It prints no document
+content, and it makes no `Write`-level call.
 
 ```
 JESSE_AGENT_WIRE=chat \

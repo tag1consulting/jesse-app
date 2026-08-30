@@ -205,6 +205,7 @@ async fn run_with(
         prices,
         thinking: Thinking::Off,
         tools,
+        artifact_dir: None,
     };
     let outcome = run_turn(input, &deps, &sink, cancel).await;
     let messages = threads.load(&outcome.thread_id).unwrap().messages;

@@ -414,8 +414,10 @@ mod tests {
         ToolContext {
             turn_id: "t".into(),
             conversation_id: "c".into(),
+            call_id: "call".into(),
             cancel: CancellationToken::new(),
             clock: Arc::new(SystemClock::new()),
+            artifact_dir: None,
         }
     }
 

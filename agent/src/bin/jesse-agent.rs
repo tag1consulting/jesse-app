@@ -46,9 +46,12 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
+use jesse_agent::index::{GrepIndex, QmdConfig, QmdIndex, SearchIndex};
 use jesse_agent::provider::{build_provider, AuthScheme, ProviderConfig, Wire};
+use jesse_agent::store::{FsVaultStore, NoGuard};
 use jesse_agent::thread::ThreadId;
-use jesse_agent::tools::{fixture::fixture_tool_set, Level, SystemClock, ToolSet};
+use jesse_agent::tools::vault::{vault_tool_set, FetchConfig, VaultContext};
+use jesse_agent::tools::{Level, SystemClock, ToolSet};
 use jesse_agent::turn::{run_turn, EventSink, StopReason, ToolActivity, TurnDeps, TurnInput};
 use jesse_agent::{
     Budget, FileThreadStore, JsonlUsageSink, PriceDeck, Scope, SystemBlock, Thinking,
@@ -93,6 +96,11 @@ impl std::fmt::Debug for Args {
             .field("thread", &self.thread)
             .field("system_files", &self.system_files)
             .field("state_dir", &self.state_dir)
+            .field("excludes", &self.excludes)
+            .field("cold_prefixes", &self.cold_prefixes)
+            .field("fetch_allow", &self.fetch_allow)
+            .field("qmd", &self.qmd)
+            .field("artifact_dir", &self.artifact_dir)
             .field("budget", &self.budget)
             .field("prices", &self.prices)
             .field("thinking", &self.thinking)
@@ -111,10 +119,34 @@ struct Args {
     thread: Option<ThreadId>,
     system_files: Vec<PathBuf>,
     state_dir: PathBuf,
+    /// Extra exclusion rules on top of the always-excluded set.
+    excludes: Vec<String>,
+    /// Component prefixes whose documents are cold.
+    cold_prefixes: Vec<String>,
+    /// Host patterns `fetch_url` may reach. EMPTY unless the operator says otherwise.
+    fetch_allow: Vec<String>,
+    /// Use the `qmd` index rather than the built-in keyword search.
+    qmd: Option<QmdSettings>,
+    /// The per-job artifact staging directory, or `None` to leave the channel off.
+    artifact_dir: Option<PathBuf>,
     budget: Budget,
     prices: PriceDeck,
     thinking: Thinking,
     message: String,
+}
+
+/// How the CLI was told to reach `qmd`.
+#[derive(Debug, Clone)]
+struct QmdSettings {
+    binary: PathBuf,
+    collection: String,
+    /// Directories prepended to the child's `PATH`.
+    ///
+    /// This exists because of a real deployment: `qmd` is commonly an nvm shim that runs
+    /// only under the node it was built against, and under a newer one it aborts with a
+    /// native-module ABI error. Naming the node bin directory here is how an operator gets
+    /// the working one without changing their own shell.
+    path_prepend: Vec<PathBuf>,
 }
 
 const USAGE: &str = "\
@@ -123,6 +155,10 @@ usage: jesse-agent turn --wire <messages|chat> --base-url <url> --model <id>
                         [--token-env <VAR>] [--thread <direct-…>]
                         [--system-file <path>]... [--state-dir <dir>]
                         [--thinking <off|low|medium|high>]
+                        [--exclude <prefix-or-glob>]... [--cold-prefix <prefix>]...
+                        [--fetch-allow <host-or-*.domain>]...
+                        [--qmd [<binary>]] [--qmd-collection <name>] [--qmd-path <dir>]...
+                        [--artifact-dir <dir>]
                         [--budget-iterations <n>] [--budget-tool-calls <n>]
                         [--budget-output-tokens <n>] [--budget-input-tokens <n>]
                         [--budget-wall-secs <n>] [--budget-cost-usd <f>]
@@ -134,7 +170,16 @@ usage: jesse-agent turn --wire <messages|chat> --base-url <url> --model <id>
   Omit it for an endpoint that wants no auth (a loopback mock).
 
   Prices default to zero. A made-up price is worse than a stated zero, so the cost
-  in the outcome line is 0.00 until you supply a deck.";
+  in the outcome line is 0.00 until you supply a deck.
+
+  --fetch-allow is EMPTY by default, so fetch_url appears in the manifest at read level
+  and refuses every URL. That is the deliberate posture: this is the exfiltration
+  channel, and an operator opts in per host.
+
+  --root is the vault. Documents are addressed by vault-relative path. .git and
+  .jesse-artifacts are always excluded; add more with --exclude. --cold-prefix marks
+  folders listable-but-unreadable, and a document is also cold if its front matter
+  says `visibility: cold`.";
 
 /// Hand-rolled rather than `clap`.
 ///
@@ -162,6 +207,13 @@ fn parse(argv: Vec<String>) -> Result<Args, String> {
     let mut state_dir = None;
     let mut thinking = Thinking::Off;
     let mut message = None;
+    let mut excludes: Vec<String> = Vec::new();
+    let mut cold_prefixes: Vec<String> = Vec::new();
+    let mut fetch_allow: Vec<String> = Vec::new();
+    let mut artifact_dir = None;
+    let mut qmd_binary: Option<PathBuf> = None;
+    let mut qmd_collection: Option<String> = None;
+    let mut qmd_path: Vec<PathBuf> = Vec::new();
 
     let mut budget = Budget::with_wall(Duration::from_secs(300));
     let mut prices = PriceDeck::ZERO;
@@ -182,6 +234,15 @@ fn parse(argv: Vec<String>) -> Result<Args, String> {
             "--system-file" => system_files.push(PathBuf::from(value()?)),
             "--state-dir" => state_dir = Some(PathBuf::from(value()?)),
             "--thinking" => thinking = parse_thinking(&value()?)?,
+            "--exclude" => excludes.push(value()?),
+            "--cold-prefix" => cold_prefixes.push(value()?),
+            "--fetch-allow" => fetch_allow.push(value()?),
+            "--artifact-dir" => artifact_dir = Some(PathBuf::from(value()?)),
+            // `--qmd` takes an OPTIONAL binary path: bare, it means "the one on PATH".
+            "--qmd" => qmd_binary = Some(PathBuf::from("qmd")),
+            "--qmd-binary" => qmd_binary = Some(PathBuf::from(value()?)),
+            "--qmd-collection" => qmd_collection = Some(value()?),
+            "--qmd-path" => qmd_path.push(PathBuf::from(value()?)),
             "--budget-iterations" => budget.max_iterations = number(&arg, &value()?)?,
             "--budget-tool-calls" => budget.max_tool_calls = number(&arg, &value()?)?,
             "--budget-output-tokens" => {
@@ -221,6 +282,26 @@ fn parse(argv: Vec<String>) -> Result<Args, String> {
         thread,
         system_files,
         state_dir: state_dir.unwrap_or_else(|| PathBuf::from(DEFAULT_STATE_DIR)),
+        excludes,
+        cold_prefixes,
+        fetch_allow,
+        artifact_dir,
+        qmd: match (qmd_binary, qmd_collection) {
+            (None, None) => None,
+            // The collection is REQUIRED with --qmd and is never guessed: qmd reports a hit
+            // as `qmd://<collection>/<path>`, and stripping the wrong prefix produces ids
+            // that resolve to the wrong documents or to none. The name is a local fact.
+            (Some(_), None) => {
+                return Err(
+                    "--qmd needs --qmd-collection <name> (see `qmd collection list`)".into(),
+                )
+            }
+            (binary, Some(collection)) => Some(QmdSettings {
+                binary: binary.unwrap_or_else(|| PathBuf::from("qmd")),
+                collection,
+                path_prepend: qmd_path,
+            }),
+        },
         budget,
         prices,
         thinking,
@@ -333,8 +414,57 @@ async fn run(args: Args) -> Result<ExitCode, String> {
     let cfg = ProviderConfig::new(args.wire, &args.base_url, &args.model, auth);
     let provider = build_provider(cfg).map_err(|e| e.to_string())?;
 
-    // ---- The tools -------------------------------------------------------
-    let tools = fixture_tool_set(&args.root, args.level)?;
+    // ---- The vault -------------------------------------------------------
+    let store = Arc::new(
+        FsVaultStore::open(&args.root)
+            .map_err(|e| e.to_string())?
+            .excluding(&args.excludes)
+            .cold_prefixes(&args.cold_prefixes),
+    );
+    let index: Arc<dyn SearchIndex> = match &args.qmd {
+        Some(q) => Arc::new(QmdIndex::new(
+            store.clone(),
+            QmdConfig {
+                binary: q.binary.clone(),
+                collection: q.collection.clone(),
+                path_prepend: q.path_prepend.clone(),
+                ..Default::default()
+            },
+        )),
+        None => Arc::new(GrepIndex::new(store.clone())),
+    };
+    let status = index.status();
+    eprintln!(
+        "index={} available={} hybrid={}{}",
+        status.name,
+        status.available,
+        status.supports_hybrid,
+        status
+            .note
+            .as_deref()
+            .map(|n| format!(" note=\"{n}\""))
+            .unwrap_or_default()
+    );
+
+    // THE NO-OP GUARD, AND THE CLI SAYS SO. It is right for a CLI turn against a directory
+    // nobody else is touching, and wrong beside the running bridge — D4 supplies the guard
+    // that speaks to the bridge's lock broker. A choice this consequential is never made
+    // silently.
+    let vault = Arc::new(VaultContext {
+        store: store.clone(),
+        index,
+        guard: Arc::new(NoGuard),
+    });
+    eprintln!("write-guard=none (single-writer; D4 supplies the bridge lock broker)");
+
+    let fetch = FetchConfig::default().allowing(&args.fetch_allow);
+    if fetch.allow_hosts.is_empty() {
+        eprintln!("fetch_url=present-but-denied (no --fetch-allow hosts)");
+    } else {
+        eprintln!("fetch_url=allowed hosts=[{}]", fetch.allow_hosts.join(", "));
+    }
+
+    let tools = vault_tool_set(vault, fetch, args.level)?;
     eprintln!(
         "level={} exposed=[{}] withheld=[{}]",
         args.level,
@@ -345,6 +475,16 @@ async fn run(args: Args) -> Result<ExitCode, String> {
             .collect::<Vec<_>>()
             .join(", "),
         tools.withheld().join(", ")
+    );
+    let excluded: Vec<String> = store
+        .exclusions()
+        .iter()
+        .map(|e| format!("{e:?}"))
+        .collect();
+    eprintln!(
+        "excluded={} cold_prefixes={:?}",
+        excluded.len(),
+        args.cold_prefixes
     );
 
     // ---- The system prefix -----------------------------------------------
@@ -387,6 +527,7 @@ async fn run(args: Args) -> Result<ExitCode, String> {
         prices: args.prices,
         thinking: args.thinking,
         tools: Arc::new(tools),
+        artifact_dir: args.artifact_dir.clone(),
     };
     let deps = TurnDeps {
         provider: provider.as_ref(),

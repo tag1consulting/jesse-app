@@ -52,6 +52,7 @@ use crate::provider::{BoxFuture, ToolSpec};
 use crate::scope::{check_schema_for_scope_arguments, Scope, ScopeShapedArgument};
 
 pub mod fixture;
+pub mod vault;
 
 // ===========================================================================
 // The vocabulary
@@ -271,24 +272,40 @@ impl Clock for TestClock {
 // What a tool is called with, and what it returns
 // ===========================================================================
 
-/// The per-turn context every tool call receives, alongside the [`Scope`].
+/// The context ONE tool call receives, alongside the [`Scope`].
 ///
-/// Carries no configuration and no capabilities — a tool's ability to act comes from
-/// having been constructed and exposed, never from something it reads out of this struct.
-/// What is here is the four things a tool needs in order to be a good citizen of a turn it
-/// does not own: who to attribute work to, how to notice it should stop, and what time it
-/// is.
+/// Carries no configuration and no capabilities — a tool's ability to act comes from having
+/// been constructed and exposed, never from something it reads out of this struct. What is
+/// here is what a tool needs in order to be a good citizen of a turn it does not own: who to
+/// attribute work to, how to notice it should stop, what time it is, and the one directory
+/// a turn is allowed to create files in.
+///
+/// **PER CALL, NOT PER TURN**, since D3. It was per turn in D2, and [`ToolContext::call_id`]
+/// is what changed that: a write takes a lock, and a lock is attributed to the CALL that
+/// holds it so a wedged one can be traced to the thing that wedged it (see
+/// [`crate::store::guard`]). Building one per call costs three string clones against a tool
+/// call that is about to touch a disk or a network.
 pub struct ToolContext {
     /// This turn's id. The same value the usage records and the trace carry.
     pub turn_id: String,
     /// The conversation (thread) this turn belongs to.
     pub conversation_id: String,
+    /// THIS call's id — the provider's `tool_use` id. Used to attribute a write lock.
+    pub call_id: String,
     /// Fires when the turn is cancelled. A long-running tool MUST select on it; a short
     /// one may ignore it, because the loop also checks it between calls.
     pub cancel: CancellationToken,
     /// The turn's clock. `Arc` because tools may run concurrently (see the loop's parallel
     /// dispatch rule) and each needs its own handle to the same clock.
     pub clock: Arc<dyn Clock>,
+    /// The per-job artifact staging directory, when the caller set one up.
+    ///
+    /// **THE ONLY PLACE A TURN MAY CREATE A FILE THAT IS NOT A DOCUMENT**, matching what
+    /// `bridge/src/artifacts.rs` already establishes: a per-job directory inside the working
+    /// directory, carrying a `.gitignore` of `*`, swept when the turn ends. `None` means the
+    /// channel is off, and the artifact tool then REFUSES rather than inventing a location —
+    /// a tool that picked its own directory would be writing somewhere nothing sweeps.
+    pub artifact_dir: Option<std::path::PathBuf>,
 }
 
 impl fmt::Debug for ToolContext {
@@ -298,7 +315,9 @@ impl fmt::Debug for ToolContext {
         f.debug_struct("ToolContext")
             .field("turn_id", &self.turn_id)
             .field("conversation_id", &self.conversation_id)
+            .field("call_id", &self.call_id)
             .field("cancelled", &self.cancel.is_cancelled())
+            .field("artifact_dir", &self.artifact_dir)
             .finish_non_exhaustive()
     }
 }

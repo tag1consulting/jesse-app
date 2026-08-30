@@ -48,8 +48,10 @@
 
 pub mod budget;
 pub mod framing;
+pub mod index;
 pub mod provider;
 pub mod scope;
+pub mod store;
 pub mod thread;
 pub mod timestamp;
 pub mod tools;
@@ -73,7 +75,9 @@ pub use provider::{
 
 pub use budget::{Budget, Ceiling, PriceDeck};
 pub use framing::frame_tool_result;
+pub use index::{GrepIndex, QmdIndex, SearchIndex, SearchMode};
 pub use scope::{Scope, TenantId, UserId, WorkspaceId};
+pub use store::{ContentHash, DocumentId, DocumentStore, FsVaultStore, Visibility};
 pub use thread::{FileThreadStore, MemoryThreadStore, Thread, ThreadId, ThreadStore};
 pub use tools::{
     ActionClass, Clock, ExposedClass, Level, ResultBlock, StaticToolSet, SystemClock, Tool,

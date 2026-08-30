@@ -14,6 +14,175 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [agent 0.3.0] - 2026-08-30
+
+The real tool set. D2's loop ran over a throwaway fixture; this is the typed set the
+product's agent has **instead of a shell** — eight tools over a document store and a search
+index, both traits, with a write-guard seam and a containment battery that scores itself from
+outside the process. Nothing in the bridge changed and the bridge's version is deliberately
+not bumped.
+
+### Added
+
+- **`DocumentStore` and `SearchIndex`, with filesystem implementations.** Phase 1's vault is a
+  directory of markdown; Phase 2 is Postgres, object storage and a hosted index. The thing
+  that must not change when that happens is the TOOLS — a model's view of `vault_read` is part
+  of the product's API and re-teaching it is a migration nobody can stage — so the tools are
+  written against the traits and the swap is a constructor change at one call site.
+
+  Both traits are **async**, which D2's `ThreadStore` deliberately is not, and the contrast is
+  the argument: a thread append has nothing to wait for, while a store write must `await` the
+  write guard (a unix-socket round trip in D4) and the Phase 2 implementation is a database. A
+  sync trait would force every future implementation to block a runtime thread.
+
+  Every method takes the `Scope` and every filesystem implementation ignores it, because the
+  single-tenant bridge binds one scope. The parameter exists so the product implementation
+  keys on it without a signature change, and so no tool is written in a way that would have to
+  grow a tenant argument later.
+
+- **A per-document visibility attribute, because the split vault ships at launch.** A document
+  is `Cold` when its front matter says `visibility: cold` or its path matches a configured
+  prefix. Cold documents are **listable by title, unreadable, unsearchable and unwritable**.
+
+  Listable is the decision worth recording: hiding them entirely would make the assistant
+  confidently tell the owner that a document they can see in their own vault does not exist.
+  Listable-but-refused is the honest posture — the assistant knows it is there and knows it may
+  not read it, and can say exactly that.
+
+  **Excluded folders answer `NotFound`; cold documents answer `Refused`**, and the split is
+  deliberate. The existence of an excluded file is itself information, so it answers exactly as
+  an absent one does. A cold document is the opposite: the owner has been told cold documents
+  stay listable, so hiding it would be a lie the assistant could detect by listing.
+
+- **A path jail built on resolved paths.** Every id is joined to the root, canonicalised
+  (following symlinks) and refused unless the result is inside the canonical root. The classic
+  hole is testing an unresolved path: `root/link-to-etc/passwd` starts with the root and *is*
+  `/etc/passwd`, and no amount of string inspection sees that.
+
+  A write is the harder case, because the file need not exist and so cannot be canonicalised.
+  The **parent** is resolved instead and the last component must be a plain name — which is
+  what stops a write through a symlinked directory, a case that resolving only the whole path
+  misses entirely, since the whole path does not exist and a naive implementation falls back
+  to the unresolved join.
+
+  Listing does not descend a symlinked directory either: following one would enumerate a tree
+  outside the root, which the per-path check never sees because `list` does not resolve leaves.
+
+- **A compare-and-swap on every write.** `expected_hash` is the content hash from the model's
+  most recent read; the check is re-done **under the lock**, because the bytes read before it
+  could be another turn's — checking against a pre-lock read would make the whole thing
+  decorative. `vault_write` additionally refuses a blind overwrite of an existing document,
+  which is policy and therefore lives at the tool boundary where the model can be told about
+  it, not in the store.
+
+  `ContentHash` is **byte-identical to `bridge/src/writelock.rs`'s `hash_file`** — same
+  SHA-256, same `ring`, same hex encoding. D4 feeds these to the broker's per-conversation
+  baseline, and two hashes that disagreed would make every comparison fail, so a turn would
+  either never be allowed to write or would be told its own write was somebody else's.
+
+- **The write-guard seam.** Phase 1 runs the direct loop beside the existing bridge on one
+  git-backed vault with concurrent turns, so the store takes the same locks the CLI children
+  take. `WriteGuard` maps onto the broker's `LockKey::Path`, its per-turn release and its
+  per-conversation baseline; `NoGuard` is the honest name for "there is no lock" and the CLI
+  prints which one it is using.
+
+  **A refusal after the wait timeout is a loud tool failure, never a silent write.** Proceeding
+  without the lock when the broker is unreachable is exactly wrong: the case where the broker
+  is down is the case where another writer is unaccounted for, so "degrade to writing anyway"
+  degrades precisely when the protection was load bearing.
+
+- **Two search implementations, and a filter that is mandatory on one of them.** `GrepIndex`
+  walks *through the store*, so exclusions and cold visibility apply by construction and there
+  is no path in it that could return a hit the store would not open; it always exists, because
+  CI has no `qmd` and a product whose tests do not exercise search is not tested.
+
+  `QmdIndex` shells to the binary with an **argument vector, never a shell** — the query is
+  model-supplied text, and handed to a shell it would be a command — and **filters every hit
+  through the store before returning it**. That filter is not defensive tidiness: `qmd` indexes
+  what its collection pattern matched, which is not the set the store considers visible, so
+  without it a search would return the title and snippet of a document the store refuses to
+  open. It degrades to `GrepIndex` with a logged note rather than failing a turn.
+
+  Both wired live: `qmd search --json` and `qmd query --json` are the lexical and hybrid paths.
+  The binary path and collection name are configuration and never guessed.
+
+- **Eight tools, with descriptions written for the model.** `vault_list`, `vault_search`,
+  `vault_read` (`Read`); `fetch_url` (`Egress`); `vault_write`, `vault_edit`, `vault_move`,
+  `deliver_artifact` (`VaultWrite`). Every schema sets `additionalProperties: false`, because a
+  model that invents an argument is a model that believes it did something it did not.
+
+  A description is the only documentation the model ever reads and changing it changes
+  behaviour for every user at once, so each says what the tool does, **what it refuses**, and
+  that an id is a vault-relative path. `vault_edit` reports the occurrence COUNT when `find`
+  does not match exactly once: "found 4" tells the model to lengthen its anchor and "found 0"
+  tells it the document is not what it thought, where a bare failure tells it to try again.
+
+- **`fetch_url` denies every URL by default.** This is the exfiltration channel, and
+  `ActionClass::Egress` exists so it is nameable apart from an ordinary read. Present-but-denied
+  is preferred over absent: a model that can see the tool and be told "no host is allowed"
+  reports that to the owner, where one that cannot see it invents a reason it could not answer
+  — which is also why the bridge denies its CLI child's fetch tool. The allowlist is re-checked
+  **at every redirect hop**, inside the redirect policy rather than after the fact, because by
+  the time a response has come back from a disallowed host the request has already been sent
+  there.
+
+- **The structural containment battery** (`tests/containment_direct.rs`): 30 adversarial probes
+  × 3 levels = 90, each in its own scratch world with canaries outside the root, in an excluded
+  folder and in a cold document. **The verdict is always out of band** — canary strings scanned
+  across every tool result, provider request body, the thread, the trace, the usage records and
+  the answer; the sibling tree hashed before and after; the root hashed too at `Basic` and
+  `Read`. A `Refused` is recorded and is *not* the verdict, because a boundary that refused and
+  leaked anyway would pass a test that trusted the return value.
+
+  **A probe the loop did not issue is `inconclusive`, and inconclusive fails the test.** A typo
+  in the scripted provider or a renamed tool would otherwise produce a clean sweep of green
+  verdicts for escapes that were never attempted. Two meta-tests guard the scoring itself: one
+  asserts the out-of-band checks detect a real change, and one asserts the tools work when they
+  are supposed to — a battery of uniformly broken tools would otherwise score as perfectly
+  contained. The summary lands in `target/containment-direct.json` for D4 to record.
+
+- **`examples/fidelity.rs`** runs the real tool set over a real vault, read-only, and reports
+  counts only — never a document's content, and never a `Write`-level call.
+
+### Changed
+
+- **`ToolContext` is per CALL, not per turn**, and gains `call_id` and `artifact_dir`. A write
+  takes a lock, and a lock is attributed to the call holding it so a wedged one can be traced
+  to the thing that wedged it. Building one per call costs three string clones against a tool
+  call that is about to touch a disk or a network.
+
+- **A stale-hash write and a path traversal are `Refused`, not `Failed`.** Both were classified
+  as invalid arguments first, and the containment battery is what showed that to be wrong:
+  `InvalidArgs` traces as `failed`, so every prevented blind overwrite and every `../` attempt
+  was being filed under "a tool broke" — understating the one number an operator reads as "the
+  boundary is working". `DocumentId::parse` now distinguishes a containment refusal (traversal,
+  absolute, NUL) from a malformed argument (empty), and the conflict maps to a refusal.
+
+- **`vault_write` decides cold before it decides "already exists".** Checked the other way
+  round, an attempt to overwrite a cold document answered "it already exists, read it first" —
+  advice the model cannot take, because reading it is exactly what it may not do. It would
+  then read, be refused, and try again.
+
+- **`list` validates its prefix** rather than joining it. `root.join("..")` is the parent
+  directory, and a listing of it was only ever saved by id construction failing for paths
+  outside the root — luck rather than a boundary. An absolute prefix is refused rather than
+  quietly reinterpreted, because a model that asked for `/etc` and got an empty page has
+  learned something false about the machine.
+
+- **`ring` added** for the content hash, so it is the same SHA-256 the bridge computes. Already
+  in the workspace lockfile via rustls, so no new compiled code.
+
+### Known deviation
+
+- **The HTML-to-text reduction in `fetch_url` is hand-rolled rather than a library.** It drops
+  `<script>`/`<style>` content, strips tags, decodes the five standard entities and collapses
+  whitespace, and it is not a parser. The reason is proportion: the tool refuses every URL
+  until an operator opts in, so the default deployment never runs a line of it, and an HTML
+  parsing stack is a large dependency and a large parsing surface to carry for a code path that
+  is off. Malformed markup degrades to more text rather than to wrong text, which is the right
+  failure for something whose output is framed as untrusted data anyway. **When the allowlist
+  is used in anger, replacing it with a real parser is the upgrade**, and it is one function.
+
 ## [bridge 0.108.0] - 2026-08-30
 
 ### Added
