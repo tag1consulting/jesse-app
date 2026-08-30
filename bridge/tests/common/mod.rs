@@ -152,6 +152,14 @@ pub fn models_request(auth: Option<&str>) -> Request<Body> {
     }
     b.body(Body::empty()).unwrap()
 }
+/// `GET /jesse/persona` with the given (optional) auth header.
+pub fn persona_request(auth: Option<&str>) -> Request<Body> {
+    let mut b = Request::builder().method("GET").uri("/jesse/persona");
+    if let Some(a) = auth {
+        b = b.header("authorization", a);
+    }
+    b.body(Body::empty()).unwrap()
+}
 /// `POST /jesse/model` with the given (optional) auth header and body.
 pub fn set_model_request(auth: Option<&str>, json: &str) -> Request<Body> {
     let mut b = Request::builder()

@@ -170,6 +170,9 @@ struct TraceInner {
     truncated: bool,
     /// The run limit fired — this turn was cut off rather than finishing.
     cutoff: bool,
+    /// The style checker's verdict, once the harness has one. `None` on every turn that ran
+    /// no check, which is what makes the provenance field absent rather than zero.
+    style: Option<StyleVerdict>,
 }
 
 /// The per-turn observation point. Cheap, lock-per-event, and shared by the turn task and
@@ -222,6 +225,18 @@ impl TurnTrace {
         g.open = false;
         g.tool_calls += 1;
         g.pending = Some((name.to_string(), Instant::now()));
+    }
+
+    /// Record the style checker's verdict for this turn (D6). Two integers; see
+    /// [`StyleVerdict`], which is content free by construction. Last write wins, which is the
+    /// right rule for a value reported once after the answer is final.
+    pub fn note_style(&self, verdict: StyleVerdict) {
+        self.inner.lock_ok().style = Some(verdict);
+    }
+
+    /// The style checker's verdict, or `None` when this turn ran no check.
+    pub fn style(&self) -> Option<StyleVerdict> {
+        self.inner.lock_ok().style
     }
 
     /// Record the turn's aggregate usage and its cost on the active model's deck.

@@ -14,6 +14,79 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [bridge 0.111.0] - 2026-08-30
+
+The persona is now DATA, rendered per wire and CHECKED after the fact. `[persona]` grows the
+pack's keys beside the four it already had, `direct` renders the pack instead of a hardcoded
+sentence, and every reply it produces is measured against the voice it was asked for.
+
+### Added
+
+- **The persona pack reaches the bridge.** `Persona` keeps its four fields and gains
+  `pack: PersonaPack` (the agent crate's, see `agent 0.4.0`) plus `style_policy`. `[persona]`
+  in `jesse.local.toml` accepts `assistant_name`, `assistant_description`, `address_style`,
+  `[persona.style]` (`formality`, `humor`, `verbosity`, `emoji`, `hedging`, `questions`),
+  `[persona.formatting]` (`lists`, `headings`, `dashes`), `banned_patterns_file`,
+  `writing_samples_dir`, `free_text` and `style_policy`. Precedence is unchanged: built-in
+  defaults, then the file, then `JESSE_OWNER_*`.
+
+  **AN EXISTING CONFIG FILE LOADS TO EXACTLY THE BEHAVIOUR IT HAS TODAY**, and a test asserts
+  it by rendering the placeholders: the four legacy keys ARE the pack's owner fields, copied
+  onto it after the environment has had its say, so the two can never name different people.
+  Everything new is optional and every field has a default.
+
+- **The two file-backed keys soft-fail line by line.** `banned_patterns_file` is read in the
+  `draft-lint` format (one regex per line, `#` comments, matched case-insensitively); a line
+  that will not compile is ONE warning naming the line number and the pack takes every line
+  that did. Refusing the file was rejected outright: one typo silently disarming a whole
+  banned list is the failure a checker can least afford, because it looks exactly like a model
+  that complied. `writing_samples_dir` loads `*.md` sorted by name, up to the pack's 16 KiB
+  cap, recording each file as the sample's `source`. Neither path defaults to anything.
+
+- **`direct` renders the pack, per wire.** The persona seam D5 left as one function returning
+  one string is now `persona_blocks`, which calls the agent crate's renderer with the model's
+  own wire. The rendered TEXT is byte-identical on every wire; only where the cache
+  breakpoints fall differs. One sentence stayed behind the pack, deliberately: "you work
+  inside their personal vault of notes" is a statement about the tool set rather than about a
+  personality.
+
+- **The style checker runs on every `direct` reply, and its verdict rides the badge's
+  provenance.** After the loop returns, `check` counts what the answer broke; `apply` decides
+  what to do about it. The default policy is `annotate`: the model's own text is delivered
+  untouched and the provenance gains `"style": "3 hits"`. `regenerate` (or `regenerate:<n>`)
+  spends up to `n` extra assistant turns asking for a rewrite and reports
+  `"style": "regenerated 1"`.
+
+  The verdict is TWO INTEGERS. `StyleVerdict { hits, regenerated }` travels from the harness
+  to the badge on `TurnSink::style_verdict` → `TurnTrace` → `reply_provenance`, which is the
+  channel that is already content free everywhere else. The checker's own report names line
+  numbers and match lengths and never leaves the harness. The provenance field is ABSENT when
+  no check ran and when a checked reply was clean, so a client can tell "not checked" from
+  "checked and clean" without a second field meaning "was it checked".
+
+- **`GET /jesse/persona`** (bearer-protected like every route) returns the pack WITHOUT the
+  writing samples and the free text, with both summarised (count, byte size, source file
+  names) so a settings screen can say they exist. There is no write endpoint: the pack is
+  loaded from a file at startup, and a POST that changed it in memory would produce a persona
+  that disagrees with the file the next restart reads.
+
+### Changed
+
+- `Persona::render` is fed by `jesse_agent::persona::render_placeholders` and gains a fourth
+  placeholder, `{assistant}`. The single-pass scanner itself did NOT move — it is the thing
+  whose doc comment explains a real re-expansion bug it prevents, and a scanner living in two
+  crates for a release would be two scanners. The pack feeds the one that exists, and the
+  existing re-expansion tests pass unchanged.
+
+- **Under `style_policy = "regenerate"`, a `direct` turn no longer streams text.** A
+  regenerated turn discards the text it produced and delivers a different answer, which
+  violates the mid-turn contract's "everything sent as a delta must also appear in the final
+  answer". So a deployment that has asked for rewrites gets the answer whole at the end rather
+  than watching one answer arrive and another replace it. Every other policy streams exactly
+  as before. A rewrite runs on the SAME thread, so the request and both attempts survive in
+  the transcript, and its token bill is folded into the turn's so the cost badge is what the
+  turn actually cost.
+
 ## [bridge 0.110.0] - 2026-08-30
 
 ### Added
@@ -341,6 +414,72 @@ give the future itself a chance to wind down — only the timeout path can, and 
 bounded grace period that mirrors the spawned arm's bounded reap. So an in-process harness must
 be safe to drop mid-turn as well as safe to cancel, or the cancel path has to move from an
 abort to a token before one ships.
+
+## [agent 0.4.0] - 2026-08-30
+
+Personality as data. A long prose system prompt behaves differently on every model and does
+not port; this is the small set of parameters that does, the renderer that turns them into a
+system prefix, and the checker that reads the answer back and says whether the model complied.
+
+### Added
+
+- **`persona::PersonaPack`** — the assistant's identity, the owner's identity and address
+  style, the languages, six style parameters (formality, humour, verbosity, emoji, hedging,
+  questions), three formatting parameters (lists, headings, dashes), a banned-pattern list, a
+  byte-capped set of writing samples, a free-text field carried verbatim, the accumulated
+  corrections, and a schema version. Serialisable both ways through `serde` in TOML and JSON.
+
+  Every field has a default and `PersonaPack::default()` is a complete generic assistant with
+  `dashes: forbidden` and an EMPTY pattern list — a shipped list of banned words would be one
+  deployment's taste baked into everybody's build. `corrections` is empty in Phase 1 and
+  exists anyway, so the correction loop that will write them lands as a writer against a shape
+  that is already rendered and already tested.
+
+- **`persona::render`** — the pack as `SystemBlock`s, in one fixed vocabulary: identity,
+  style, formatting, corrections, writing samples, free text, each parameter mapping to one
+  short imperative sentence. **THE WIRE CHANGES PLACEMENT, NEVER CONTENT**: `Messages` gets one
+  cacheable block per section because caching there is positional, `Chat` and `Responses` get
+  one block because the adapter folds the prefix into a single message anyway, and a test
+  asserts the concatenated text is byte-identical on all three. `render_placeholders` feeds a
+  caller's own substitution scanner, longest name first.
+
+  The writing samples carry a data-not-instructions frame in the same terms this crate frames
+  every tool result in: a sample is prose, prose contains imperatives, and without the frame a
+  model has no way to tell one from a request addressed to it.
+
+  The banned-pattern list is deliberately NOT rendered. It is the pack's largest field, it
+  would be paid for on every request, and a list of forbidden words in a prompt is a
+  peculiarly effective way of putting those words in a model's mouth. It is enforced instead.
+
+- **`persona::check`** — the pack applied to generated text, line by line. Banned patterns
+  case-insensitively, every dash variant when `dashes: forbidden`, bullet and heading lines
+  when the formatting parameters say avoid. Fenced code blocks are exempt and inline code
+  spans are masked before anything is matched, by one rule shared by every check: `--flag` in
+  a shell line is correct code, not a writing tell.
+
+  **THE REPORT IS CONTENT FREE BY CONSTRUCTION.** A hit carries the pattern SOURCE (the
+  owner's own configuration), a line number and a match LENGTH. There is no field an excerpt
+  could go in, because the report rides a provenance channel that is content free everywhere
+  else.
+
+- **`persona::StylePolicy` and `persona::apply`** — `off`, `annotate` (the default) and
+  `regenerate { max_attempts }`. `annotate` delivers the model's text with the report;
+  `regenerate` asks the caller's loop for another assistant turn and re-checks, up to the cap,
+  then annotates what it has. Regeneration DOUBLES the cost of a flagged turn and adds a
+  second turn's latency, which is why it is a deployment's decision rather than a default.
+
+  `regeneration_request` builds that turn's user message. It lists the RULES that were broken,
+  by pattern source and count, and **never quotes the model's own text back** — repeating the
+  offending phrases would put every banned phrase into the prompt for the turn that is
+  supposed to avoid them.
+
+- **`parse_pattern_file`** reads the `draft-lint` format (one regex per line, `#` comments)
+  and returns the patterns that compiled ALONGSIDE a warning per line that did not, so a
+  loader can report the typo without the typo disarming the file.
+
+- **The style eval hook.** `check`, `apply`, `render` and the pack are re-exported at the crate
+  root (`check_style`, `apply_style_policy`, `render_persona`) so an eval suite can assert on a
+  reply's style without reaching into a module path.
 
 ## [agent 0.3.0] - 2026-08-30
 

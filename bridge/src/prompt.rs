@@ -1305,12 +1305,12 @@ mod tests {
     fn persona_renders_owner_name_and_pronoun_into_defaults() {
         // A local jesse.local.toml supplying a named owner must reproduce a named
         // wrapper/floor as pure configuration (no source edit).
-        let persona = Persona {
-            owner_name: "Alex Example".into(),
-            owner_pronoun: "her".into(),
-            languages: vec!["en".into(), "es".into()],
-            diet_keywords_extra: vec![],
-        };
+        let persona = Persona::from_legacy(
+            "Alex Example",
+            "her",
+            vec!["en".into(), "es".into()],
+            vec![],
+        );
         let p = build_prompt_at(
             TEST_CLOCK,
             &TurnPrompt::new("ask", "what is on Today.md"),
@@ -1338,12 +1338,7 @@ mod tests {
 
     // A named owner, as a `jesse.local.toml` would supply one.
     fn named(name: &str, pronoun: &str) -> Persona {
-        Persona {
-            owner_name: name.into(),
-            owner_pronoun: pronoun.into(),
-            languages: vec!["en".into()],
-            diet_keywords_extra: vec![],
-        }
+        Persona::from_legacy(name, pronoun, vec!["en".into()], vec![])
     }
 
     // A fresh Ask carrying `text`, built with `persona` and the fixed test clock.

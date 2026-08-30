@@ -2,6 +2,10 @@ use crate::*;
 
 use jesse_agent::budget::Budget;
 use jesse_agent::index::{GrepIndex, QmdIndex, SearchIndex};
+use jesse_agent::persona::{
+    apply as apply_style_policy, check as check_style, regeneration_request,
+    render as render_persona, StylePolicy,
+};
 use jesse_agent::provider::{
     build_provider, AuthScheme, ContentBlock, Provider, ProviderConfig, SystemBlock, Thinking,
     Wire as AgentWire,
@@ -681,10 +685,23 @@ impl WriteGuard for BrokerGuard {
 /// at all, because the contract says they never reach a phone screen.
 struct DirectSink<'a> {
     inner: &'a dyn TurnSink,
+    /// Whether visible text may be streamed at all.
+    ///
+    /// FALSE UNDER [`StylePolicy::Regenerate`], and it is a correctness fix rather than a
+    /// preference. The mid-turn contract says everything sent as a delta must also appear in
+    /// the final [`TurnOutcome::text`] and must never be sent twice; a regenerated turn
+    /// DISCARDS the text it streamed and delivers a different answer, which breaks the first
+    /// half of that. So a deployment that has asked for rewrites gets the answer whole, at the
+    /// end, instead of watching one answer arrive and a different one replace it. Every other
+    /// policy streams exactly as before.
+    stream_text: bool,
 }
 
 impl EventSink for DirectSink<'_> {
     fn on_text_delta(&self, delta: &str) {
+        if !self.stream_text {
+            return;
+        }
         self.inner.text_delta(delta);
     }
 
@@ -711,17 +728,26 @@ const MANUAL_HEADER: &str = "The following is the owner's operating manual for t
      script, or any program, you cannot follow it — say so plainly in your answer and do the \
      part you can. Never describe having run something you did not run.";
 
-/// The identity template the persona is rendered on.
+/// The persona, as system blocks, rendered from the pack for this turn's WIRE.
 ///
-/// **THE WHOLE PERSONA SEAM, IN ONE FUNCTION.** D6 replaces this with the persona pack; keeping
-/// the seam a single function (rather than three lines spliced into the block assembly below)
-/// is what makes that a replacement rather than an excavation.
-fn persona_block(persona: &Persona) -> String {
-    persona.render(
-        "You are Jesse, {owner}'s assistant. You work inside {owner_pronoun} personal vault of \
-         notes. Answer {owner_pronoun} questions from what is actually in the vault, and say \
-         so when it is not there rather than filling the gap.",
-    )
+/// **THIS IS THE WHOLE PERSONA SEAM.** D5 left it as one function returning one string so
+/// that D6 could be a replacement rather than an excavation; this is that replacement. The
+/// identity, style, formatting, corrections, writing samples and free text all come from
+/// `cfg.persona.pack` through `jesse_agent::persona::render`, which produces byte-identical
+/// text on every wire and differs only in where the block boundaries fall.
+///
+/// What stays here is the one thing that is about THIS HARNESS rather than about the owner:
+/// the sentence saying the assistant works inside a vault of notes and answers from what is
+/// actually in it. That is a statement about the tool set, not about a personality, and it
+/// belongs beside [`TOOL_GUIDANCE`] rather than inside a pack a phone will one day edit.
+fn persona_blocks(persona: &Persona, wire: AgentWire) -> Vec<SystemBlock> {
+    let mut blocks = render_persona(&persona.pack, wire);
+    blocks.push(SystemBlock::cacheable(persona.render(
+        "You work inside {owner_pronoun} personal vault of notes. Answer {owner_pronoun} \
+         questions from what is actually in the vault, and say so when it is not there rather \
+         than filling the gap.",
+    )));
+    blocks
 }
 
 /// What the model needs to know about the tools that is not in their schemas.
@@ -887,13 +913,24 @@ impl Direct {
         let thread_id = req.session_id.and_then(|s| ThreadId::parse(s).ok());
 
         // ---- The system prefix --------------------------------------------
+        //
+        // THE WIRE IS READ FROM THE MODEL'S REGISTRY ENTRY, for the same reason `thinking` is:
+        // it is a property of the model, and the persona renders per wire. A model with no
+        // registry entry cannot have reached this line (the provider lookup above would have
+        // failed first), so the fallback is unreachable and is the Messages wire rather than a
+        // panic.
+        let wire = cfg
+            .model_registry
+            .get(&req.active.id)
+            .map(|m| agent_wire(m.wire))
+            .unwrap_or(AgentWire::Messages);
         let mut system = Vec::new();
         if let Some(manual) = load_operating_manual(&rt.vault, &cfg.home) {
             system.push(SystemBlock::cacheable(format!(
                 "{MANUAL_HEADER}\n\n{manual}"
             )));
         }
-        system.push(SystemBlock::cacheable(persona_block(&cfg.persona)));
+        system.extend(persona_blocks(&cfg.persona, wire));
         system.push(SystemBlock::cacheable(TOOL_GUIDANCE.to_string()));
 
         // ---- The user message ---------------------------------------------
@@ -906,6 +943,15 @@ impl Direct {
         let user_images = attachment_image_blocks(req.attachment_dir);
 
         let budget = direct_budget(cfg, &rt.settings);
+        // An `Arc` because a REGENERATION builds a second `TurnInput` over the same tool set:
+        // the set holds one store over one vault and rebuilding it per attempt would mean two
+        // views of the same documents in one turn.
+        let tools = Arc::new(tools);
+        let policy = cfg.persona.style_policy;
+        // The prefix carries the vault's whole operating manual, so it is cloned ONLY for a
+        // policy that may need to build a second `TurnInput` from it. Every other turn moves
+        // it into the one input it builds, exactly as before.
+        let regen_system = matches!(policy, StylePolicy::Regenerate { .. }).then(|| system.clone());
         let input = TurnInput {
             scope: rt.scope.clone(),
             // The bridge's job id, so a usage record correlates with a turn timing record.
@@ -914,30 +960,96 @@ impl Direct {
             system,
             user_text: req.prompt.to_string(),
             user_images,
-            budget,
+            budget: budget.clone(),
             prices: prices_for_agent(&req.active.price),
-            // From the model's REGISTRY ENTRY rather than from `ActiveModel`, which carries
-            // only what a turn needs on every harness. `thinking` is read by exactly one
-            // harness, so widening the per-turn struct for it would put a direct-only field on
-            // the path every claude-code turn takes.
-            thinking: cfg
-                .model_registry
-                .get(&req.active.id)
-                .and_then(|m| m.thinking)
-                .map(agent_thinking)
-                .unwrap_or_default(),
-            tools: Arc::new(tools),
+            thinking: thinking_for(cfg, &req.active.id),
+            tools: tools.clone(),
             artifact_dir: req.artifact_dir.map(|p| p.to_path_buf()),
         };
 
-        let agent_sink = DirectSink { inner: sink };
+        let agent_sink = DirectSink {
+            inner: sink,
+            // See the field: a policy that may DISCARD what it streamed must not stream.
+            stream_text: !matches!(policy, StylePolicy::Regenerate { .. }),
+        };
         let deps = TurnDeps {
             provider: provider.as_ref(),
             threads: &rt.threads,
             usage: &rt.usage,
             clock: Arc::new(jesse_agent::tools::SystemClock::new()) as Arc<dyn Clock>,
         };
-        let out = agent_run_turn(input, &deps, &agent_sink, cancel).await;
+        let mut out = agent_run_turn(input, &deps, &agent_sink, cancel.clone()).await;
+
+        // ---- The style check -------------------------------------------------
+        //
+        // AFTER THE LOOP, ON THE FINAL TEXT, and that placement is the whole idea. Everything
+        // above asked the model for a voice; this reads what came back and says whether it
+        // complied. A style instruction a model ignored is invisible; a count is not.
+        //
+        // `off` skips it outright rather than checking and discarding, because a regex sweep
+        // over a long reply is not free and a deployment that turned the checker off should
+        // not pay for it. An EMPTY reply is skipped for the same reason it carries no badge:
+        // there is nothing to have a style.
+        //
+        // The report never leaves this function. What leaves is [`StyleVerdict`] — two
+        // integers, on the same content-free channel the trace already uses — because the
+        // report names line numbers in text the provenance channel has no business carrying.
+        if !matches!(policy, StylePolicy::Off) && !out.text.trim().is_empty() {
+            let pack = &cfg.persona.pack;
+            let report = check_style(&out.text, pack);
+            // Every regeneration is a WHOLE extra assistant turn ON THE SAME THREAD, so the
+            // rewrite request and the rewrite both survive in the transcript. That is the
+            // auditable arrangement rather than an untidy one: a reader can see what was asked
+            // for and what came back, instead of an answer that quietly is not the one the
+            // model first produced. Its bill is added to this turn's below.
+            let extra: Mutex<Vec<jesse_agent::TurnOutcome>> = Mutex::new(Vec::new());
+            let thread_id = out.thread_id.clone();
+            let applied = apply_style_policy(policy, pack, out.text.clone(), report, |r| {
+                let input = TurnInput {
+                    scope: rt.scope.clone(),
+                    turn_id: req.turn_id.to_string(),
+                    // The SAME thread, so the model can see the answer it is being asked to
+                    // rewrite. A fresh thread would be asking it to rewrite something it has
+                    // never read.
+                    thread_id: Some(thread_id.clone()),
+                    system: regen_system.clone().unwrap_or_default(),
+                    user_text: regeneration_request(r, pack),
+                    // No images: they are already in the thread, on the message this rewrite
+                    // is a follow-up to, and sending them again would bill for them twice.
+                    user_images: Vec::new(),
+                    budget: budget.clone(),
+                    prices: prices_for_agent(&req.active.price),
+                    thinking: thinking_for(cfg, &req.active.id),
+                    tools: tools.clone(),
+                    artifact_dir: req.artifact_dir.map(|p| p.to_path_buf()),
+                };
+                let deps = &deps;
+                let agent_sink = &agent_sink;
+                let extra = &extra;
+                let cancel = cancel.clone();
+                async move {
+                    let again = agent_run_turn(input, deps, agent_sink, cancel).await;
+                    let text = again.text.clone();
+                    extra.lock_ok().push(again);
+                    // An empty rewrite is a failed rewrite, and `apply` stops on `None` with
+                    // the answer that already exists rather than delivering nothing.
+                    (!text.trim().is_empty()).then_some(text)
+                }
+            })
+            .await;
+            out.text = applied.text;
+            // The rewrites' bills, folded into this turn's, so the badge's cost figure is
+            // what the turn actually cost rather than what its first attempt cost.
+            for again in extra.lock_ok().drain(..) {
+                out.usage = add_usage(out.usage, again.usage);
+                out.cost_usd += again.cost_usd;
+                out.tool_calls += again.tool_calls;
+            }
+            sink.style_verdict(StyleVerdict {
+                hits: applied.final_report.total(),
+                regenerated: applied.attempts,
+            });
+        }
 
         // ---- The outcome ---------------------------------------------------
         //
@@ -978,6 +1090,43 @@ impl Direct {
                 message: format!("the direct turn failed: {other}"),
             }),
         }
+    }
+}
+
+/// One model's thinking setting, from its REGISTRY ENTRY rather than from `ActiveModel`.
+///
+/// `ActiveModel` carries what a turn needs on every harness; `thinking` is read by exactly
+/// one, so widening the per-turn struct for it would put a direct-only field on the path
+/// every claude-code turn takes. A function rather than an inline expression because a
+/// regenerated turn has to be constructed with the SAME setting as the turn it is rewriting.
+fn thinking_for(cfg: &Config, model_id: &str) -> Thinking {
+    cfg.model_registry
+        .get(model_id)
+        .and_then(|m| m.thinking)
+        .map(agent_thinking)
+        .unwrap_or_default()
+}
+
+/// Add two token counts, field by field, keeping `None` where NEITHER side reported.
+///
+/// A missing count is not a zero: a provider that reports nothing and a provider that reports
+/// zero are different facts, and the badge renders nothing rather than `$0.0000` for the
+/// first. So `None + None` stays `None` and `None + Some(n)` is `Some(n)`.
+fn add_usage(a: jesse_agent::TokenUsage, b: jesse_agent::TokenUsage) -> jesse_agent::TokenUsage {
+    fn add(a: Option<u64>, b: Option<u64>) -> Option<u64> {
+        match (a, b) {
+            (None, None) => None,
+            (x, y) => Some(x.unwrap_or(0) + y.unwrap_or(0)),
+        }
+    }
+    jesse_agent::TokenUsage {
+        input_tokens: add(a.input_tokens, b.input_tokens),
+        output_tokens: add(a.output_tokens, b.output_tokens),
+        cache_read_input_tokens: add(a.cache_read_input_tokens, b.cache_read_input_tokens),
+        cache_creation_input_tokens: add(
+            a.cache_creation_input_tokens,
+            b.cache_creation_input_tokens,
+        ),
     }
 }
 
@@ -1222,3 +1371,72 @@ fn prune_direct_threads(dir: &Path, conversations: &ConversationStore) {
 
 /// The most thread files one startup prune will remove. See [`prune_direct_threads`].
 pub const DIRECT_PRUNE_MAX_REMOVALS: usize = 500;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn joined(blocks: &[SystemBlock]) -> String {
+        blocks
+            .iter()
+            .map(|b| b.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
+
+    /// The persona seam renders FROM THE PACK, and what it renders does not depend on the
+    /// wire — only where the block boundaries fall does. That is the property that makes a
+    /// backend swap a change of model rather than a change of voice.
+    #[test]
+    fn the_persona_blocks_render_from_the_pack_and_say_the_same_thing_on_every_wire() {
+        let mut persona = Persona::from_legacy("Alex Example", "her", vec!["en".into()], vec![]);
+        persona.pack.assistant.name = "Ada".into();
+        persona.sync_pack_owner();
+
+        let messages = persona_blocks(&persona, AgentWire::Messages);
+        let chat = persona_blocks(&persona, AgentWire::Chat);
+        assert_eq!(joined(&messages), joined(&chat));
+        assert!(messages.len() > chat.len(), "the wire moves the boundaries");
+        assert!(messages.iter().all(|b| b.cacheable));
+
+        let text = joined(&messages);
+        assert!(text.starts_with("You are Ada, Alex Example's assistant."));
+        // The harness's own sentence about the vault is still there, and still rendered
+        // through the placeholder scanner.
+        assert!(text.contains("You work inside her personal vault of notes."));
+    }
+
+    /// A fresh clone with no `jesse.local.toml` renders the generic assistant, names nobody,
+    /// and still carries the vault sentence.
+    #[test]
+    fn the_default_persona_renders_generically() {
+        let text = joined(&persona_blocks(&Persona::default(), AgentWire::Messages));
+        assert!(text.starts_with("You are Jesse, the user's assistant."));
+        assert!(text.contains("You work inside their personal vault of notes."));
+        assert!(!text.contains("{owner"));
+    }
+
+    /// `None + None` stays `None`, so a provider that reported nothing keeps reporting
+    /// nothing after a rewrite is folded in and the badge renders no cost rather than zero.
+    #[test]
+    fn folding_a_rewrites_bill_in_keeps_an_absent_count_absent() {
+        use jesse_agent::TokenUsage;
+        let a = TokenUsage {
+            input_tokens: Some(10),
+            output_tokens: None,
+            cache_read_input_tokens: None,
+            cache_creation_input_tokens: Some(3),
+        };
+        let b = TokenUsage {
+            input_tokens: Some(5),
+            output_tokens: Some(7),
+            cache_read_input_tokens: None,
+            cache_creation_input_tokens: None,
+        };
+        let sum = add_usage(a, b);
+        assert_eq!(sum.input_tokens, Some(15));
+        assert_eq!(sum.output_tokens, Some(7));
+        assert_eq!(sum.cache_read_input_tokens, None);
+        assert_eq!(sum.cache_creation_input_tokens, Some(3));
+    }
+}

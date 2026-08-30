@@ -1,6 +1,6 @@
 [package]
 name = "jesse-agent"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "Provider-neutral agent layer for Jesse: one request/response model, one streaming event vocabulary, per-wire adapters (Anthropic Messages, OpenAI Chat Completions), and the tool-calling turn loop that runs on top of them."
@@ -79,6 +79,12 @@ scripted = []
 # that a turn produces IDENTICAL thread contents on all three providers could not be
 # asserted in one function. `cargo build` is unaffected: dev-dependencies are not built.
 jesse-agent = { path = ".", features = ["scripted"] }
+# TOML round trip for the persona pack, TESTS ONLY. The pack is serialised with `serde` and
+# the library itself needs no TOML: the bridge already carries a TOML parser for the config
+# file it loads the pack from, and adding a second one to this crate would put a parser in
+# every consumer's binary to satisfy one assertion. `default-features = false` plus the two
+# halves of the round trip keeps even the test build narrow. Same 0.8 the bridge pins.
+toml = { version = "0.8", default-features = false, features = ["parse", "display"] }
 # The conformance suite binds real loopback sockets and speaks HTTP/1.1 by hand, the
 # same way `bridge/tests/integration.rs` stands up its mock `/v1/messages` helper. That
 # needs the full runtime (`net`, `io-util`, `rt-multi-thread`).

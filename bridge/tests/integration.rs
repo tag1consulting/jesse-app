@@ -9704,3 +9704,60 @@ async fn the_diet_default_date_follows_the_client_zone_when_the_vault_names_none
     );
     let _ = std::fs::remove_dir_all(&vault);
 }
+
+// ---- D6: GET /jesse/persona -------------------------------------------------
+
+#[tokio::test]
+async fn persona_endpoint_requires_auth() {
+    let st = test_state();
+    let resp = app(st).oneshot(persona_request(None)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// The endpoint returns the pack's SETTINGS and summarises the two content fields — it never
+/// returns the writing samples' text or the owner's free text, because those are the owner's
+/// own prose rather than a description of how the assistant is configured to sound.
+#[tokio::test]
+async fn persona_endpoint_returns_the_pack_without_its_content() {
+    let mut cfg = test_config();
+    let pack = &mut cfg.persona.pack;
+    pack.assistant.name = "Ada".into();
+    pack.owner.name = "Alex Example".into();
+    pack.free_text = Some("Answer the question I asked.".into());
+    pack.writing_samples
+        .push(jesse_agent::persona::WritingSample {
+            title: "A note".into(),
+            text: "SAMPLE-BODY-THAT-MUST-NOT-SHIP".into(),
+            source: Some("2026-01-01-note.md".into()),
+        });
+    pack.banned_patterns = vec![jesse_agent::persona::Pattern::new("\\bdelve\\b").unwrap()];
+
+    let resp = app(AppState::new(cfg))
+        .oneshot(persona_request(Some("Bearer test-token")))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let raw = body_string(resp).await;
+    let v: Value = serde_json::from_str(&raw).unwrap();
+
+    assert_eq!(v["pack"]["assistant"]["name"], "Ada");
+    assert_eq!(v["pack"]["owner"]["name"], "Alex Example");
+    assert_eq!(v["pack"]["formatting"]["dashes"], "forbidden");
+    assert_eq!(v["style_policy"], "annotate");
+    assert_eq!(v["banned_patterns"], 1);
+
+    // THE CONTENT IS SUMMARISED, NEVER RETURNED.
+    assert_eq!(v["pack"]["writing_samples"].as_array().unwrap().len(), 0);
+    assert!(v["pack"]["free_text"].is_null());
+    assert_eq!(v["writing_samples"]["count"], 1);
+    assert_eq!(v["writing_samples"]["sources"][0], "2026-01-01-note.md");
+    assert_eq!(v["free_text"]["present"], true);
+    assert!(
+        !raw.contains("SAMPLE-BODY-THAT-MUST-NOT-SHIP"),
+        "a writing sample's text must never leave this endpoint: {raw}"
+    );
+    assert!(
+        !raw.contains("Answer the question I asked."),
+        "the free text must never leave this endpoint: {raw}"
+    );
+}
