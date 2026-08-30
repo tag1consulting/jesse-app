@@ -124,6 +124,73 @@ public struct OpsView: View {
         }
     }
 
+
+    // MARK: - Release notes
+
+    /// What is running, and what a deploy would bring in — between the `origin/main` row and
+    /// the button, which is the order the question is asked in: what have I got, what would I
+    /// get, do I press it.
+    ///
+    /// Plain `Text`, not markdown: the sentinel already reduced each release to a title and a
+    /// handful of one-sentence claims, and this module has no markdown renderer.
+    @ViewBuilder
+    private func releaseNotes(_ releases: DeployStatusDocument.Releases) -> some View {
+        if let deployed = releases.deployed {
+            releaseBlock(deployed, label: "Running release")
+        }
+        if !releases.undeployed.isEmpty {
+            Text("Not yet deployed (\(releases.undeployed.count))")
+                .font(.caption).fontWeight(.semibold).foregroundStyle(.secondary)
+            // The newest few in full; the rest folded away, because a Studio twelve releases
+            // behind would otherwise push the Deploy button off the screen.
+            ForEach(releases.undeployed.prefix(Self.expandedReleases)) { r in
+                releaseBlock(r, label: nil)
+            }
+            let rest = Array(releases.undeployed.dropFirst(Self.expandedReleases))
+            if !rest.isEmpty {
+                DisclosureGroup("\(rest.count) older release\(rest.count == 1 ? "" : "s")") {
+                    ForEach(rest) { r in releaseBlock(r, label: nil) }
+                }
+                .font(.caption)
+            }
+            // Silent truncation reads as completeness, so it is said out loud.
+            if releases.truncated > 0 {
+                Text("\(releases.truncated) older release\(releases.truncated == 1 ? " is" : "s are") not shown.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+        } else if let why = releases.reason {
+            // The list is empty AND it is not simply "already current" — say which case.
+            Text("No release list: \(why).")
+                .font(.caption).foregroundStyle(.secondary)
+        } else if releases.deployed != nil {
+            Text("origin/main is already what is running.")
+                .font(.caption).foregroundStyle(.secondary)
+        }
+    }
+
+    /// How many undeployed releases are shown expanded before the rest are folded away.
+    static let expandedReleases = 3
+
+    /// One release: its title, then its claims, one `Text` each so they wrap independently.
+    @ViewBuilder
+    private func releaseBlock(_ r: DeployStatusDocument.Release, label: String?) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            if let label {
+                Text(label).font(.caption).fontWeight(.semibold).foregroundStyle(.secondary)
+            }
+            Text(r.title).font(.body)
+            Text(r.subtitle).font(.caption2).foregroundStyle(.tertiary)
+            ForEach(Array(r.lines.enumerated()), id: \.offset) { _, line in
+                Text(line).font(.caption).foregroundStyle(.secondary)
+            }
+            if r.more > 0 {
+                Text("+\(r.more) more change\(r.more == 1 ? "" : "s")")
+                    .font(.caption2).foregroundStyle(.tertiary)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
     /// `running · pid 15818 · 7 runs`, or the reason there is no such line.
     static func serviceStateLine(_ row: ServiceRow) -> String {
         var parts: [String] = [row.state ?? "unknown"]
@@ -324,6 +391,9 @@ public struct OpsView: View {
                 if doc.originMain.isStale, let why = doc.originMain.staleReason {
                     Text("This view is stale: \(why)").font(.caption).foregroundStyle(.orange)
                 }
+
+                if let releases = doc.releases { releaseNotes(releases) }
+
 
                 let availability = DeployAvailability.decide(doc)
                 Button("Deploy origin/main") {

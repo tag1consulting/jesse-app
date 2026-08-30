@@ -14,6 +14,82 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [bridge 0.108.0] - 2026-08-30
+
+### Added
+
+- **The deploy card says what each commit actually changed.** `GET
+  /sentinel/deploy/status` grew a fourth key, `releases`: a summary of the running commit's
+  own release, and one for every commit between it and `origin/main`, newest first. The card
+  showed two version strings and two commit hashes and nothing about what a deploy would
+  bring in, so deciding whether to press the button meant leaving the app for the commit log.
+
+  Nothing here is written prose and no model is involved. Each release is the commit subject
+  with its version parenthetical and pull request number removed — subjects in this
+  repository already read as release titles — plus the **bold lead sentence** of every
+  `CHANGELOG.md` bullet that commit added. The bullet bodies, which is to say the paragraphs
+  you are reading now, are exactly what the card must not show and are dropped. A commit that
+  added no bullet is its title alone; the commit body is never a fallback.
+
+  This makes the changelog's own convention load-bearing. The bold lead is parsed, so a
+  bullet written without one contributes no line, and one whose lead never closes its bold
+  span is dropped rather than guessed at. The lead regularly wraps across source lines and is
+  rejoined; anything reading only the bullet's first line would publish half a sentence.
+
+- **The summaries are capped server side, and every cap reports what it dropped.** Four lines
+  per release, 200 characters per line (cut on a character boundary — these sentences are
+  full of em dashes, and a byte cut would land inside one), ten undeployed releases. What is
+  beyond each cap comes back as a count, `more` per release and `truncated` for the list,
+  because a card that silently showed four of nine would read as a complete summary. The
+  phone cannot be handed a wall of text by a Studio that is twenty releases behind.
+
+### Fixed
+
+- **The release summaries ride the `origin/main` cache entry rather than being recomputed
+  beside it.** They are several `git` calls per release, and computing them fresh on every
+  request next to a five-minute-old commit hash would recreate the bug 0.106.0 fixed: an
+  answer presented as current that describes a state that has moved. They are built where
+  `read_origin_main` builds the rest, stored on the same structure, and **keyed on both
+  commits** — the undeployed set is a function of the running commit as well as
+  `origin/main`, so a deploy invalidates the entry even though `origin/main` has not moved.
+  Serving it anyway would report a just-deployed release as "not yet deployed".
+
+- **A range that cannot be computed is stated, never guessed.** Four cases return an empty
+  list and a reason rather than a plausible list: no recorded deploy yet, a running commit
+  that is not an ancestor of `origin/main` (a force push, or a deploy of something that was
+  not `main`), a running commit absent from the deploy clone, and a malformed one. The first
+  is the dangerous one — treating "no deploy on record" as "everything on main is undeployed"
+  would show a wall of releases to somebody whose Studio may be running all of them already.
+  Already-current is the one empty list with no reason, and the view says so in a line of its
+  own.
+
+- **A view served because a refresh was already in flight is marked stale.** The lost-lock
+  path returned the cached value unmarked, which is the bug 0.106.0 fixed on the TTL path
+  surviving on a rarer route: the app documents an absent `stale` as "this was just read", so
+  a `green` verdict from before CI went red would light the Deploy button. Found while
+  extending that same cache to carry the release summaries.
+
+- **A summary that cannot be built never takes the card down with it.** Missing `git`, a
+  failed call, a timeout: the whole `releases` block is absent from the response and the
+  version rows, the CI dot and the button behave exactly as before. `merge-base
+  --is-ancestor` is read by exit code, keeping "not an ancestor" (a fact about the history,
+  and reportable) apart from "git broke" (a fact about the probe, and not).
+
+## [App 1.0 (122)] - 2026-08-30
+
+### Added
+
+- **The Ops deploy card renders the release summaries, between the `origin/main` row and the
+  button.** The running release first, then `Not yet deployed (N)`: each release its title,
+  its component and commit, and its one-sentence claims. The newest three are expanded and
+  the rest fold into a disclosure, so a Studio a dozen releases behind does not push the
+  Deploy button off the screen, and a `truncated` count is printed rather than swallowed.
+
+- **The block decodes optionally, and its absence is the ordinary case.** A deploy replaces
+  the bridge, not the sentinel — the sentinel is reinstalled by hand — so a phone on the
+  newest build routinely talks to a sentinel that predates this key. A document without it
+  decodes to exactly the card that shipped before, which is asserted rather than assumed.
+
 ## [App 1.0 (121)] - 2026-08-30
 
 ### Fixed

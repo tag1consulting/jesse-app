@@ -184,6 +184,21 @@ pub const MAX_JOB_LOOKUPS: usize = 5;
 /// the second, and the refresh costs a `git fetch` and two API calls.
 pub const ORIGIN_MAIN_TTL_MS: u64 = 5 * 60 * 1000;
 
+/// How many changelog bullets one release contributes to the card. The card answers "is this
+/// deploy worth running", in about ten seconds, on a phone — four one-sentence claims is
+/// already the outer edge of that, and what a release drops is REPORTED (`more`) rather than
+/// silently cut.
+pub const MAX_RELEASE_LINES: usize = 4;
+
+/// The longest one summary line may be. Bold lead sentences run long in this changelog, and a
+/// line that wraps to five lines on a phone defeats the point of the block.
+pub const MAX_RELEASE_LINE_CHARS: usize = 200;
+
+/// How many undeployed releases the card is handed. Ten is far more than the one-or-two the
+/// Studio is usually behind; the surplus is reported as `truncated` rather than dropped
+/// quietly, because silent truncation reads as completeness.
+pub const MAX_UNDEPLOYED_RELEASES: usize = 10;
+
 /// Built SHAs kept under `<bin dir>/jesse-bridge.d/`. Three is the one running, the one before
 /// it, and one more — enough to roll back twice by hand, small enough that a release build
 /// (~100 MB of binaries) does not silently eat the disk the watchdog is guarding.
@@ -247,6 +262,71 @@ pub struct OriginMain {
     /// Why, in one line. `green` carries the run that vouched for it.
     pub ci_detail: Option<String>,
     pub checked_ms: u64,
+    /// What each commit between the running build and this one actually changed, derived from
+    /// the repository rather than written by hand. Rides this cache entry deliberately: it is
+    /// several `git` calls per release, and a summary recomputed on every request beside a
+    /// cached commit hash is the same class of bug as a cache hit rendered as a fresh read.
+    ///
+    /// `None` means the summaries could not be produced (git missing, a call that failed or
+    /// timed out). The card then renders exactly as it did before this block existed — a
+    /// summary that cannot be built must never take the version and commit rows down with it.
+    pub releases: Option<ReleaseSummaries>,
+    /// The running commit `releases` was computed against. **With `sha` above, this IS the
+    /// cache key**: the undeployed set is a function of BOTH commits, so a deploy that moves
+    /// the running commit invalidates the entry even though `origin/main` has not moved.
+    pub releases_for: Option<String>,
+}
+
+/// The release-notes block of `GET /sentinel/deploy/status`: what is running, and what a
+/// deploy would bring in.
+///
+/// Present only when it could be built. Every field is derived from the deploy clone — commit
+/// subjects and the `CHANGELOG.md` bullets each commit added — because a deploy card that
+/// invented its own prose would be describing a release nobody wrote.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct ReleaseSummaries {
+    /// The running commit's own release. `None` when there is no running commit, or when it
+    /// is not readable in the clone.
+    pub deployed: Option<ReleaseSummary>,
+    /// Everything reachable from `origin/main` but not from the running commit, NEWEST FIRST.
+    pub undeployed: Vec<ReleaseSummary>,
+    /// How many undeployed releases were dropped past [`MAX_UNDEPLOYED_RELEASES`]. Zero means
+    /// the list is complete, which is why it is a count and not an `Option<bool>`.
+    pub truncated: usize,
+    /// Why the undeployed list is empty when emptiness is not simply "already current" — a
+    /// force-pushed branch, a deploy of something that is not `main`, a sentinel that has
+    /// never deployed. **The list is never a guess**: when the range cannot be computed the
+    /// answer is an empty list and this sentence, never "everything is undeployed".
+    pub reason: Option<String>,
+}
+
+/// One release, as the card shows it: a title and up to [`MAX_RELEASE_LINES`] one-sentence
+/// claims. The reader is deciding in ten seconds whether a deploy is worth running, so the
+/// bullet BODIES — the paragraphs of detail this changelog carries under every bold lead — are
+/// exactly what is thrown away here.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct ReleaseSummary {
+    pub sha: String,
+    /// The component and version this release carried (`bridge 0.106.0`, `App 1.0 (121)`),
+    /// from the changelog heading it added or, failing that, its subject's parenthetical.
+    ///
+    /// COMPONENT-QUALIFIED, not a bare semver, because the list mixes components: an app-only
+    /// release has no bridge version at all, and a bare `1.0` sitting under a bare `0.106.0`
+    /// would read as a version going backwards. `None` when neither source states one —
+    /// nothing here is guessed from the working tree.
+    pub version: Option<String>,
+    /// The commit subject with its version parenthetical and pull request number removed.
+    /// Subjects in this repository already read as release titles.
+    pub title: String,
+    /// The commit date, so the card can say how old a release is.
+    pub date_ms: u64,
+    /// The bold lead sentence of each changelog bullet this commit added. Empty when it added
+    /// none — the title alone is then the summary, and the commit BODY is never a fallback.
+    pub lines: Vec<String>,
+    /// How many lines were dropped past [`MAX_RELEASE_LINES`].
+    pub more: usize,
 }
 
 /// The verdict on one commit's CI, shared by the `ci` phase and the status card so the app can
@@ -1806,15 +1886,31 @@ pub async fn deploy_status_document(sen: &Arc<Sentinel>) -> Value {
             .map(str::to_string),
         _ => None,
     };
-    json!({
+    let (origin_main, releases) = origin_main_view(sen, running_sha.as_deref()).await;
+    let mut doc = json!({
         "deploy": deploy,
         "running": { "version": running_version, "sha": running_sha },
-        "origin_main": origin_main_view(sen).await,
-    })
+        "origin_main": origin_main,
+    });
+    // ABSENT, not null, when the summaries could not be built — the app treats a missing key
+    // as "this sentinel does not send them", which is also what an older sentinel looks like.
+    if let Some(r) = releases {
+        doc["releases"] = r;
+    }
+    doc
 }
 
-/// The cached-or-refreshed view of `origin/main`.
-async fn origin_main_view(sen: &Arc<Sentinel>) -> Value {
+/// The cached-or-refreshed view of `origin/main`, and the release block that rides the same
+/// cache entry.
+///
+/// Returns the two separately because they are two keys of the document: the summaries are
+/// CACHED with `origin/main` — they are several `git` calls, and recomputing them fresh beside
+/// a cached commit hash would be the same lie as an unmarked cache hit — but they are
+/// PUBLISHED beside it, not inside it.
+async fn origin_main_view(
+    sen: &Arc<Sentinel>,
+    running_sha: Option<&str>,
+) -> (Value, Option<Value>) {
     let cached = sen.state.lock_ok().origin_main.clone();
     let now = now_ms();
     if let Some(c) = &cached {
@@ -1830,8 +1926,12 @@ async fn origin_main_view(sen: &Arc<Sentinel>) -> Value {
         // somebody actually wants the current answer. The card is only refreshed on appear
         // and on pull-to-refresh (the three-second poll runs during a deploy, and a deploy
         // short-circuits below), so this is not a hot loop.
-        if age < ORIGIN_MAIN_TTL_MS && c.ci != "pending" {
-            return cached_view(c, age);
+        // The release block is a function of BOTH commits, so the running one is part of the
+        // cache key: after a deploy the cached summaries describe a range that no longer
+        // exists, and serving them would say "not yet deployed" about what was just deployed.
+        if age < ORIGIN_MAIN_TTL_MS && c.ci != "pending" && c.releases_for.as_deref() == running_sha
+        {
+            return (cached_view(c, age), releases_wire(c, running_sha));
         }
     }
     // A deploy owns the clone while it runs — it leaves a detached head in it and a `cargo`
@@ -1840,23 +1940,54 @@ async fn origin_main_view(sen: &Arc<Sentinel>) -> Value {
         return stale_view(
             cached,
             "a deploy is in flight, so origin/main was not re-read",
+            running_sha,
         );
     }
     // One refresh at a time. A second caller arriving mid-refresh gets the cache rather than a
     // second `git fetch` in the same clone.
     let Ok(_permit) = sen.origin_refresh.try_lock() else {
-        return cached.map(|c| json!(c)).unwrap_or_else(|| {
-            stale_view(None, "origin/main is being read now; nothing cached yet")
-        });
+        // MARKED, like every other answer that is not a fresh read. This path returned the
+        // cached value unmarked — the same "a cache hit rendered as current" bug 0.106.0 fixed
+        // on the TTL path, surviving on the rarer one, and with the same consequence: the app
+        // documents an absent `stale` as "this was just read", so a `green` verdict from
+        // before CI went red would light the Deploy button.
+        let why = if cached.is_some() {
+            "origin/main is being read right now; this is the previous answer"
+        } else {
+            "origin/main is being read now; nothing cached yet"
+        };
+        return stale_view(cached, why, running_sha);
     };
-    match read_origin_main(sen).await {
+    match read_origin_main(sen, running_sha).await {
         Ok(fresh) => {
             sen.state.lock_ok().origin_main = Some(fresh.clone());
             sen.persist_state();
-            json!(fresh)
+            (origin_main_wire(&fresh), releases_wire(&fresh, running_sha))
         }
-        Err(e) => stale_view(cached, &e),
+        Err(e) => stale_view(cached, &e, running_sha),
     }
+}
+
+/// The `origin_main` block as the app sees it: the cached struct MINUS the release summaries,
+/// which share its cache entry but are published under the document's own `releases` key.
+/// One place, so the two never drift into being sent twice.
+fn origin_main_wire(c: &OriginMain) -> Value {
+    let mut v = json!(c);
+    if let Some(obj) = v.as_object_mut() {
+        obj.remove("releases");
+        obj.remove("releases_for");
+    }
+    v
+}
+
+/// The cached release block, but ONLY when it was computed against the commit that is running
+/// now. A key mismatch yields no block at all rather than a stale range: "not yet deployed"
+/// about a release that was just deployed is worse than saying nothing.
+fn releases_wire(c: &OriginMain, running_sha: Option<&str>) -> Option<Value> {
+    if c.releases_for.as_deref() != running_sha {
+        return None;
+    }
+    c.releases.as_ref().map(|r| json!(r))
 }
 
 /// A cache hit inside the TTL, marked with its own age.
@@ -1875,7 +2006,7 @@ async fn origin_main_view(sen: &Arc<Sentinel>) -> Value {
 /// renders `stale_reason` verbatim, so this reaches a phone with no app change and no
 /// TestFlight build.
 fn cached_view(c: &OriginMain, age_ms: u64) -> Value {
-    let mut v = json!(c);
+    let mut v = origin_main_wire(c);
     v["stale"] = json!(true);
     v["stale_reason"] = json!(format!(
         "read {}, and re-read at most every {}s — pull to refresh for the current answer",
@@ -1901,21 +2032,26 @@ fn approx_age(ms: u64) -> String {
 /// why. NEVER a silently old value — a card that cannot tell "green five minutes ago" from
 /// "green, checked just now" is a card that will eventually offer a deploy of a commit whose
 /// CI has since gone red.
-fn stale_view(cached: Option<OriginMain>, why: &str) -> Value {
-    let mut v = match cached {
-        Some(c) => json!(c),
-        None => json!(OriginMain {
+fn stale_view(
+    cached: Option<OriginMain>,
+    why: &str,
+    running_sha: Option<&str>,
+) -> (Value, Option<Value>) {
+    let releases = cached.as_ref().and_then(|c| releases_wire(c, running_sha));
+    let mut v = match &cached {
+        Some(c) => origin_main_wire(c),
+        None => origin_main_wire(&OriginMain {
             ci: "none".to_string(),
             ..Default::default()
         }),
     };
     v["stale"] = json!(true);
     v["stale_reason"] = json!(why);
-    v
+    (v, releases)
 }
 
 /// Read `origin/main` and its CI, for the card.
-async fn read_origin_main(sen: &Sentinel) -> Result<OriginMain, String> {
+async fn read_origin_main(sen: &Sentinel, running_sha: Option<&str>) -> Result<OriginMain, String> {
     if !sen.cfg.deploy_clone.join(".git").exists() {
         return Err(format!(
             "no deploy clone at {}",
@@ -1940,6 +2076,9 @@ async fn read_origin_main(sen: &Sentinel) -> Result<OriginMain, String> {
         return Err(format!("origin/main resolved to {sha:?}"));
     }
     let version = version_at(sen, &sha).await.ok();
+    // Built HERE, on the one path that already holds a fetched clone, so the summaries and the
+    // commit hash they describe enter the cache together.
+    let releases = read_releases(sen, &sha, running_sha).await;
     let ci = check_ci(sen, &sha).await?;
     Ok(OriginMain {
         sha: Some(sha),
@@ -1947,6 +2086,378 @@ async fn read_origin_main(sen: &Sentinel) -> Result<OriginMain, String> {
         ci: ci.state.to_string(),
         ci_detail: Some(ci.detail),
         checked_ms: now_ms(),
+        releases,
+        // Recorded even when `releases` is None: it records what was ATTEMPTED, so a failed
+        // build is not retried on every request while the entry is warm.
+        releases_for: running_sha.map(str::to_string),
+    })
+}
+
+// ---- release summaries ------------------------------------------------------------------
+//
+// Everything below derives the card's release notes from what the repository already records.
+// It is deliberately all parsing and no invention: the summaries are the commit subjects and
+// the bold lead sentences of the changelog bullets each commit added, and nothing else. The
+// pure functions are split out from the `git` calls so the parsing — which is where the sharp
+// edges are — is testable without a repository.
+
+/// The content of a trailing balanced parenthetical, and the subject with it removed.
+///
+/// Balanced, scanning from the end, because the version parenthetical NESTS: the subject
+/// `… (bridge 0.107.0, App 1.0 (121)) (#140)` ends in two of them and the inner `(121)` is
+/// part of the app's version. Taking the last `(` would strip `(121))` and leave a subject
+/// with an unclosed bracket in it.
+fn split_trailing_paren(subject: &str) -> Option<(&str, &str)> {
+    let s = subject.trim_end();
+    if !s.ends_with(')') {
+        return None;
+    }
+    let bytes = s.as_bytes();
+    let mut depth = 0usize;
+    for (i, b) in bytes.iter().enumerate().rev() {
+        match b {
+            b')' => depth += 1,
+            b'(' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((s[..i].trim_end(), &s[i + 1..s.len() - 1]));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Whether a trailing parenthetical states the versions this release carried, rather than
+/// being part of the title.
+///
+/// Every comma-separated part must be a component name followed by something starting with a
+/// digit: `bridge 0.106.0`, `App 1.0 (121)`, `jesse-agent 0.1.0`. A title that legitimately
+/// ends in brackets — `… (and why the old one hung)` — has no digit after a component name
+/// and is left alone, which is the only reason this is a test rather than "strip the last
+/// parenthetical".
+fn is_version_parenthetical(inner: &str) -> bool {
+    let mut any = false;
+    for part in inner.split(',') {
+        let part = part.trim();
+        let Some((name, rest)) = part.split_once(char::is_whitespace) else {
+            return false;
+        };
+        if name.is_empty() || !name.starts_with(|c: char| c.is_ascii_alphabetic()) {
+            return false;
+        }
+        let rest = rest.trim_start().trim_start_matches('v');
+        if !rest.starts_with(|c: char| c.is_ascii_digit()) {
+            return false;
+        }
+        any = true;
+    }
+    any
+}
+
+/// Whether a trailing parenthetical is a pull request reference: `(#140)`.
+fn is_pr_ref(inner: &str) -> bool {
+    inner
+        .strip_prefix('#')
+        .is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
+}
+
+/// A release title, and the versions its subject states.
+///
+/// `Stop the deploy card showing a cached answer as a current one (bridge 0.106.0) (#139)`
+/// becomes `Stop the deploy card showing a cached answer as a current one` plus
+/// `bridge 0.106.0`. Both trailing parentheticals are optional and either may be absent.
+fn split_subject(subject: &str) -> (String, Option<String>) {
+    let mut rest = subject.trim();
+    let mut version = None;
+    // At most two: the pull request reference, then the versions. Ordered as the repository
+    // writes them, and a second pass is not attempted — a title is allowed to end in brackets.
+    if let Some((head, inner)) = split_trailing_paren(rest) {
+        if is_pr_ref(inner) {
+            rest = head;
+        }
+    }
+    if let Some((head, inner)) = split_trailing_paren(rest) {
+        if is_version_parenthetical(inner) {
+            version = Some(inner.trim().to_string());
+            rest = head;
+        }
+    }
+    (rest.trim().to_string(), version)
+}
+
+/// The versions a `CHANGELOG.md` diff declares, from the headings it ADDED: `## [bridge
+/// 0.106.0] - 2026-08-30` gives `bridge 0.106.0`. A commit that bumps two components adds two
+/// headings and gets both.
+///
+/// Preferred over the subject's parenthetical because the changelog heading is the
+/// repository's own record of what the release was, while the subject is prose.
+fn changelog_versions(diff: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in added_lines(diff) {
+        let line = line.trim();
+        let Some(rest) = line.strip_prefix("## [") else {
+            continue;
+        };
+        let Some(end) = rest.find(']') else { continue };
+        let name = rest[..end].trim();
+        if !name.is_empty() {
+            out.push(name.to_string());
+        }
+    }
+    out
+}
+
+/// The added lines of a unified diff, without their `+`, and without the `+++` file header
+/// that shares the prefix.
+fn added_lines(diff: &str) -> impl Iterator<Item = &str> {
+    diff.lines()
+        .filter(|l| !l.starts_with("+++"))
+        .filter_map(|l| l.strip_prefix('+'))
+}
+
+/// The bold lead sentence of every changelog bullet a diff ADDED.
+///
+/// The convention this reads is `- **One sentence.** followed by paragraphs of detail`, and
+/// the detail is precisely what the card must not show. Two things make it more than a
+/// `starts_with`:
+///
+///   * **the bold span wraps.** A lead sentence regularly runs past the column limit and
+///     closes two lines below the `- **` that opened it, so the span is accumulated across
+///     continuation lines until `**` closes it;
+///   * **a bullet may have no bold span at all**, in which case it contributes nothing rather
+///     than contributing its first line.
+///
+/// A span that never closes before the bullet's first blank line is dropped, not guessed at.
+fn bullet_leads(diff: &str) -> Vec<String> {
+    let mut leads: Vec<String> = Vec::new();
+    // The bold span of the bullet currently being read, if it has not closed yet.
+    let mut open: Option<String> = None;
+
+    let push = |text: &str, leads: &mut Vec<String>| {
+        let one = collapse_ws(text);
+        if !one.is_empty() {
+            leads.push(one);
+        }
+    };
+
+    for line in added_lines(diff) {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("- ") {
+            open = None;
+            let Some(after) = rest.trim_start().strip_prefix("**") else {
+                continue; // a bullet with no bold lead contributes no line
+            };
+            match after.find("**") {
+                Some(i) => push(&after[..i], &mut leads),
+                None => open = Some(after.to_string()),
+            }
+            continue;
+        }
+        let Some(acc) = open.as_mut() else { continue };
+        if trimmed.is_empty() {
+            open = None; // the bullet's first paragraph ended with the span still open
+            continue;
+        }
+        match trimmed.find("**") {
+            Some(i) => {
+                acc.push(' ');
+                acc.push_str(&trimmed[..i]);
+                let done = std::mem::take(acc);
+                open = None;
+                push(&done, &mut leads);
+            }
+            None => {
+                acc.push(' ');
+                acc.push_str(trimmed);
+            }
+        }
+    }
+    leads
+}
+
+/// One line of whitespace, from text that was wrapped across source lines.
+fn collapse_ws(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// One summary line, cut to [`MAX_RELEASE_LINE_CHARS`] on a CHARACTER boundary.
+///
+/// Characters rather than bytes: these sentences contain em dashes and curly quotes, and
+/// slicing a `String` at byte 200 would panic in the middle of one. The mark is a single `…`
+/// rather than three dots, and it counts toward the cap.
+fn cap_line(line: &str) -> String {
+    if line.chars().count() <= MAX_RELEASE_LINE_CHARS {
+        return line.to_string();
+    }
+    let mut out: String = line.chars().take(MAX_RELEASE_LINE_CHARS - 1).collect();
+    out.push('…');
+    out
+}
+
+/// The lines one release shows, and how many it dropped.
+fn cap_lines(lines: Vec<String>) -> (Vec<String>, usize) {
+    let more = lines.len().saturating_sub(MAX_RELEASE_LINES);
+    let kept = lines
+        .into_iter()
+        .take(MAX_RELEASE_LINES)
+        .map(|l| cap_line(&l))
+        .collect();
+    (kept, more)
+}
+
+/// One release, assembled from a commit's subject, its date and its `CHANGELOG.md` diff.
+///
+/// Split from [`summarize_release`] so every rule above is tested against real text without a
+/// repository to build first.
+fn build_summary(sha: &str, subject: &str, date_ms: u64, changelog_diff: &str) -> ReleaseSummary {
+    let (title, subject_version) = split_subject(subject);
+    let heading_versions = changelog_versions(changelog_diff);
+    let version = if heading_versions.is_empty() {
+        subject_version
+    } else {
+        Some(heading_versions.join(", "))
+    };
+    let (lines, more) = cap_lines(bullet_leads(changelog_diff));
+    ReleaseSummary {
+        sha: sha.to_string(),
+        version,
+        title,
+        date_ms,
+        lines,
+        more,
+    }
+}
+
+/// Read one commit and summarise it. `None` when git could not read it at all.
+async fn summarize_release(sen: &Sentinel, sha: &str) -> Option<ReleaseSummary> {
+    // `%ct%n%s`: the commit date and the subject in one call rather than two.
+    let meta = qgit(
+        sen,
+        &["show", "-s", "--format=%ct%n%s", sha],
+        STATUS_GIT_TIMEOUT,
+    )
+    .await;
+    if !meta.ok() {
+        return None;
+    }
+    let mut lines = meta.stdout.lines();
+    let date_ms = lines.next()?.trim().parse::<u64>().ok()? * 1000;
+    let subject = lines.next().unwrap_or("").trim().to_string();
+    // `--unified=0`: only the added bullets are wanted, never the surrounding entries. A
+    // failure here is not fatal — the title alone is a perfectly good summary.
+    let diff = qgit(
+        sen,
+        &[
+            "show",
+            "--format=",
+            "--unified=0",
+            sha,
+            "--",
+            "CHANGELOG.md",
+        ],
+        STATUS_GIT_TIMEOUT,
+    )
+    .await;
+    let diff = if diff.ok() {
+        diff.stdout
+    } else {
+        String::new()
+    };
+    Some(build_summary(sha, &subject, date_ms, &diff))
+}
+
+/// The release block: the running commit's own release, and every release between it and
+/// `origin/main`.
+///
+/// `None` means "could not be built", which the caller turns into an ABSENT block rather than
+/// an empty one — the deploy card's version and commit rows must keep working when git does
+/// not. The cases that return `Some` with an empty list and a `reason` are the ones where the
+/// range is genuinely not computable, and **each of them is stated rather than guessed at**:
+/// treating "no running commit recorded" as "everything on main is undeployed" would offer a
+/// wall of releases to somebody whose Studio may be running all of them already.
+async fn read_releases(
+    sen: &Sentinel,
+    origin_sha: &str,
+    running: Option<&str>,
+) -> Option<ReleaseSummaries> {
+    let stated = |deployed, why: &str| {
+        Some(ReleaseSummaries {
+            deployed,
+            undeployed: Vec::new(),
+            truncated: 0,
+            reason: Some(why.to_string()),
+        })
+    };
+
+    // Nothing has ever been deployed. There is no range, and the absence of a record is not
+    // evidence about what the Studio is running.
+    let Some(running) = running else {
+        return stated(None, "the sentinel has not recorded a deployed commit yet");
+    };
+    // The closed alphabet this module gives git, applied before the value becomes an argument.
+    // A malformed record is not a commit in the clone, which is exactly what it is reported as.
+    let present = is_full_sha(running)
+        && qgit(
+            sen,
+            &["cat-file", "-e", &format!("{running}^{{commit}}")],
+            STATUS_GIT_TIMEOUT,
+        )
+        .await
+        .ok();
+    if !present {
+        return stated(None, "the running commit is not in the deploy clone");
+    }
+
+    let deployed = summarize_release(sen, running).await;
+
+    // `merge-base --is-ancestor` answers in its exit code: 0 yes, 1 no, anything else is git
+    // failing. The three are kept apart because "not an ancestor" is a fact about the history
+    // and reportable, while "git broke" is a fact about the probe and must not be dressed up
+    // as one.
+    let anc = qgit(
+        sen,
+        &["merge-base", "--is-ancestor", running, origin_sha],
+        STATUS_GIT_TIMEOUT,
+    )
+    .await;
+    match anc.code {
+        Some(0) => {}
+        // A force push to main, or a deploy of a commit that was never on main.
+        Some(1) => return stated(deployed, "the running commit is not on origin/main"),
+        _ => return None,
+    }
+
+    let list = qgit(
+        sen,
+        &["rev-list", &format!("{running}..{origin_sha}")],
+        STATUS_GIT_TIMEOUT,
+    )
+    .await;
+    if !list.ok() {
+        return None;
+    }
+    // `rev-list` is newest first already, which is the order the card asks the question in.
+    let shas: Vec<&str> = list
+        .stdout
+        .lines()
+        .map(str::trim)
+        .filter(|s| is_full_sha(s))
+        .collect();
+    let truncated = shas.len().saturating_sub(MAX_UNDEPLOYED_RELEASES);
+    let mut undeployed = Vec::new();
+    for sha in shas.into_iter().take(MAX_UNDEPLOYED_RELEASES) {
+        if let Some(r) = summarize_release(sen, sha).await {
+            undeployed.push(r);
+        }
+    }
+    Some(ReleaseSummaries {
+        deployed,
+        undeployed,
+        truncated,
+        // Already current says so in one short line in the view, not with a reason string.
+        reason: None,
     })
 }
 
@@ -1981,6 +2492,7 @@ mod tests {
             ci: "green".to_string(),
             ci_detail: Some("run 1 (CI) passed the \"bridge\" job".to_string()),
             checked_ms: 0,
+            ..Default::default()
         };
         let v = cached_view(&c, 4 * 60 * 1000);
         assert_eq!(v["stale"], json!(true), "a cache hit is not a fresh read");
@@ -1995,6 +2507,41 @@ mod tests {
         assert_eq!(v["ci"], json!("green"));
         assert_eq!(v["version"], json!("0.105.0"));
         assert_eq!(v["sha"], json!("a".repeat(40)));
+    }
+
+    /// **Every answer that is not a fresh read says so — including the one served because a
+    /// refresh was already in flight.** That path returned the cached view unmarked, which is
+    /// the TTL bug of 0.106.0 on a rarer route: `stale` absent means "just read" to the app,
+    /// so a `green` from before CI went red would enable the Deploy button.
+    #[test]
+    fn a_view_served_because_a_refresh_was_in_flight_is_marked_stale() {
+        let c = OriginMain {
+            sha: Some("a".repeat(40)),
+            ci: "green".to_string(),
+            checked_ms: 0,
+            ..Default::default()
+        };
+        let (v, _) = stale_view(
+            Some(c),
+            "origin/main is being read right now; this is the previous answer",
+            None,
+        );
+        assert_eq!(
+            v["stale"],
+            json!(true),
+            "a lost refresh lock is not a fresh read"
+        );
+        assert!(v["stale_reason"]
+            .as_str()
+            .unwrap()
+            .contains("being read right now"));
+        assert_eq!(v["ci"], json!("green"), "the verdict itself is untouched");
+
+        // And with nothing cached at all, the empty view still says why.
+        let (empty, releases) = stale_view(None, "nothing cached yet", None);
+        assert_eq!(empty["stale"], json!(true));
+        assert_eq!(empty["ci"], json!("none"));
+        assert!(releases.is_none(), "no cache, no release block");
     }
 
     /// The age reads as a person would say it, because it is rendered verbatim on a phone.
@@ -2028,6 +2575,7 @@ mod tests {
                 ci: ci.to_string(),
                 ci_detail: None,
                 checked_ms: 0,
+                ..Default::default()
             };
             // The predicate `origin_main_view` applies, stated here so the reason a
             // `pending` card refreshes cannot be edited away without a failing test.
@@ -2039,6 +2587,356 @@ mod tests {
                 if cacheable { "" } else { "NOT" }
             );
         }
+    }
+
+    // ---- release summaries ----------------------------------------------------------
+
+    /// A real bullet from this changelog, wrapped exactly as the file wraps it.
+    const REAL_DIFF: &str = "\
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -15,0 +16,12 @@ CI both run it).
++## [bridge 0.106.0] - 2026-08-30
++
++### Fixed
++
++- **The deploy card no longer shows a cached answer as a current one.** `GET
++  /sentinel/deploy/status` serves its view of `origin/main` from a five-minute cache, and the
++  TTL path returned that value unmarked.
++
++  A cache hit is now marked with its own age.
++
++- **A `pending` CI verdict is never served from the cache.** It is the one state that is known
++  to be about to change.
+";
+
+    /// **The bold lead sentence is the whole summary, and it wraps.** The convention is
+    /// `- **One sentence.** paragraphs of detail`, and the detail is exactly the verbosity
+    /// this card exists not to show. A lead that runs past the column limit closes two lines
+    /// below the `- **` that opened it, so anything that reads only the bullet's first line
+    /// would publish half a sentence.
+    #[test]
+    fn a_bullet_contributes_its_bold_lead_and_never_its_body() {
+        let leads = bullet_leads(REAL_DIFF);
+        assert_eq!(
+            leads,
+            vec![
+                "The deploy card no longer shows a cached answer as a current one.",
+                "A `pending` CI verdict is never served from the cache.",
+            ],
+            "the paragraphs under each bullet are not summary"
+        );
+    }
+
+    /// A lead sentence that wraps across three source lines comes back as one line.
+    #[test]
+    fn a_bold_lead_that_wraps_is_rejoined() {
+        let diff = "\
++- **The location channel takes the interim fixes CoreLocation already computed, instead
++  of throwing them away and reporting nothing.** `LocationContextProvider` bounded one
++  fix at a 2-second `fixTimeout`.
+";
+        assert_eq!(
+            bullet_leads(diff),
+            vec![
+                "The location channel takes the interim fixes CoreLocation already computed, \
+                 instead of throwing them away and reporting nothing."
+            ]
+        );
+    }
+
+    /// **A bullet with no bold span contributes nothing**, rather than contributing its first
+    /// line. A card built from arbitrary first lines is a card that prints half-sentences.
+    #[test]
+    fn a_bullet_with_no_bold_span_is_skipped() {
+        let diff = "\
++- Just a plain bullet with no bold claim at all.
++- **A proper one.** With detail.
++- **An unclosed one that never finishes
++
++  and whose paragraph ended.
+";
+        assert_eq!(bullet_leads(diff), vec!["A proper one."]);
+    }
+
+    /// Removed and context lines are not the release. Only what the commit ADDED counts —
+    /// otherwise a commit that reformats the changelog would republish every old entry.
+    #[test]
+    fn only_added_lines_are_read() {
+        let diff = "\
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
++- **Added.** detail
+-- **Removed.** detail
+ - **Context.** detail
+";
+        assert_eq!(bullet_leads(diff), vec!["Added."]);
+    }
+
+    /// **A commit that added no changelog bullet is its title and nothing else.** The commit
+    /// BODY is never a fallback: bodies here run to paragraphs, which is the one thing this
+    /// card must not become.
+    #[test]
+    fn a_commit_with_no_changelog_change_is_title_only() {
+        let r = build_summary(
+            &"c".repeat(40),
+            "Fix the location request never coming back (App 1.0 (119))",
+            1_756_000_000_000,
+            "",
+        );
+        assert_eq!(r.title, "Fix the location request never coming back");
+        assert!(r.lines.is_empty(), "no bullets, no lines");
+        assert_eq!(r.more, 0);
+        // The subject's parenthetical still states the version.
+        assert_eq!(r.version.as_deref(), Some("App 1.0 (119)"));
+    }
+
+    /// The title is the subject minus its version parenthetical and its pull request number.
+    /// **The version parenthetical NESTS** — `(bridge 0.107.0, App 1.0 (121))` — so a stripper
+    /// that took the last `(` would leave an unbalanced bracket in the title.
+    #[test]
+    fn a_title_is_the_subject_without_its_version_and_pull_request_tails() {
+        for (subject, title, version) in [
+            (
+                "Stop the deploy card showing a cached answer as a current one (bridge 0.106.0) (#139)",
+                "Stop the deploy card showing a cached answer as a current one",
+                Some("bridge 0.106.0"),
+            ),
+            (
+                "Take the interim fixes, and stop asking for the one that fails (bridge 0.107.0, App 1.0 (121)) (#140)",
+                "Take the interim fixes, and stop asking for the one that fails",
+                Some("bridge 0.107.0, App 1.0 (121)"),
+            ),
+            (
+                "Provider-neutral agent layer: new `agent/` crate (jesse-agent 0.1.0) (#136)",
+                "Provider-neutral agent layer: new `agent/` crate",
+                Some("jesse-agent 0.1.0"),
+            ),
+            // No tails at all.
+            ("A plain subject", "A plain subject", None),
+            // A title that legitimately ends in brackets keeps them: the parenthetical is only
+            // stripped when it states a component and a version.
+            (
+                "Fix the thing (and say why it hung)",
+                "Fix the thing (and say why it hung)",
+                None,
+            ),
+        ] {
+            let (got_title, got_version) = split_subject(subject);
+            assert_eq!(got_title, title, "title of {subject:?}");
+            assert_eq!(got_version.as_deref(), version, "version of {subject:?}");
+        }
+    }
+
+    /// The changelog heading the commit added beats the subject's parenthetical, because the
+    /// heading is the repository's own record of the release and the subject is prose.
+    #[test]
+    fn the_changelog_heading_states_the_version() {
+        let r = build_summary(
+            &"d".repeat(40),
+            "Something (bridge 9.9.9) (#1)",
+            0,
+            REAL_DIFF,
+        );
+        assert_eq!(r.version.as_deref(), Some("bridge 0.106.0"));
+        assert_eq!(r.title, "Something");
+    }
+
+    /// **What is dropped is reported.** Four lines is the outer edge of a ten-second read, and
+    /// a release that silently showed four of nine would read as a complete summary.
+    #[test]
+    fn the_line_cap_keeps_the_first_four_and_counts_the_rest() {
+        let diff: String = (1..=9)
+            .map(|i| format!("+- **Claim {i}.** detail\n"))
+            .collect();
+        let r = build_summary(&"e".repeat(40), "Subject", 0, &diff);
+        assert_eq!(r.lines.len(), MAX_RELEASE_LINES);
+        assert_eq!(r.lines.first().unwrap(), "Claim 1.");
+        assert_eq!(r.lines.last().unwrap(), "Claim 4.");
+        assert_eq!(r.more, 5, "the five it did not show are counted");
+    }
+
+    /// The character cap cuts on a CHARACTER boundary and marks the cut with one `…`.
+    /// Byte-slicing would panic mid-em-dash, and these sentences are full of them.
+    #[test]
+    fn a_long_line_is_cut_on_a_character_boundary_with_one_ellipsis() {
+        let short = "already short enough";
+        assert_eq!(cap_line(short), short);
+
+        // Multi-byte throughout, so a byte cut would panic rather than merely mislead.
+        let long: String = "é—".repeat(200);
+        let cut = cap_line(&long);
+        assert_eq!(cut.chars().count(), MAX_RELEASE_LINE_CHARS);
+        assert!(
+            cut.ends_with('…'),
+            "one ellipsis character, never three dots"
+        );
+        assert!(!cut.ends_with("..."));
+        assert_eq!(
+            cut.chars()
+                .take(MAX_RELEASE_LINE_CHARS - 1)
+                .collect::<String>(),
+            long.chars()
+                .take(MAX_RELEASE_LINE_CHARS - 1)
+                .collect::<String>(),
+        );
+
+        // Exactly at the cap is not truncated.
+        let exact: String = "x".repeat(MAX_RELEASE_LINE_CHARS);
+        assert_eq!(cap_line(&exact), exact);
+    }
+
+    /// The undeployed cap, and its `truncated` count. Stated as the arithmetic
+    /// `read_releases` applies, so the count cannot be edited away without a failing test.
+    #[test]
+    fn the_undeployed_cap_reports_what_it_dropped() {
+        for (found, kept, truncated) in [(0, 0, 0), (3, 3, 0), (10, 10, 0), (14, 10, 4)] {
+            let shown = std::cmp::min(found, MAX_UNDEPLOYED_RELEASES);
+            assert_eq!(shown, kept, "{found} found");
+            assert_eq!(
+                found.saturating_sub(MAX_UNDEPLOYED_RELEASES),
+                truncated,
+                "{found} found"
+            );
+        }
+    }
+
+    /// **The three cases where the range cannot be computed are STATED, never guessed.**
+    /// Each returns an empty undeployed list and a reason, and the one that matters most is
+    /// the first: a sentinel with no recorded deploy must not be told that every commit on
+    /// main is undeployed, because it may be running all of them.
+    #[test]
+    fn a_range_that_cannot_be_computed_is_stated_rather_than_guessed() {
+        for (reason, deployed) in [
+            ("the sentinel has not recorded a deployed commit yet", None),
+            ("the running commit is not in the deploy clone", None),
+            (
+                "the running commit is not on origin/main",
+                Some(ReleaseSummary {
+                    sha: "f".repeat(40),
+                    title: "Something that was deployed".to_string(),
+                    ..Default::default()
+                }),
+            ),
+        ] {
+            let r = ReleaseSummaries {
+                deployed,
+                undeployed: Vec::new(),
+                truncated: 0,
+                reason: Some(reason.to_string()),
+            };
+            let v = json!(r);
+            assert_eq!(v["undeployed"], json!([]), "{reason}");
+            assert_eq!(v["truncated"], json!(0), "{reason}");
+            assert_eq!(v["reason"], json!(reason));
+        }
+
+        // Already current is the one empty list with NO reason: the view says so in a short
+        // line of its own rather than borrowing the failure wording.
+        let current = ReleaseSummaries::default();
+        assert_eq!(json!(current)["reason"], Value::Null);
+    }
+
+    /// **The summaries ride the `origin/main` cache entry, keyed on BOTH commits.** Computing
+    /// them fresh beside a cached commit hash is the bug the freshness rule above exists to
+    /// prevent; serving them after a deploy has moved the running commit is the same bug
+    /// mirrored, and would report a just-deployed release as "not yet deployed".
+    #[test]
+    fn the_release_cache_is_keyed_on_the_running_commit_as_well_as_origin_main() {
+        let running = "a".repeat(40);
+        let c = OriginMain {
+            sha: Some("b".repeat(40)),
+            ci: "green".to_string(),
+            releases: Some(ReleaseSummaries {
+                undeployed: vec![ReleaseSummary {
+                    sha: "b".repeat(40),
+                    title: "Not yet deployed".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            releases_for: Some(running.clone()),
+            ..Default::default()
+        };
+
+        // Same running commit: served.
+        let served = releases_wire(&c, Some(&running)).expect("the key matches");
+        assert_eq!(served["undeployed"][0]["title"], json!("Not yet deployed"));
+
+        // A deploy moved the running commit: the entry describes a range that no longer
+        // exists, so there is no block at all rather than a stale one.
+        assert!(releases_wire(&c, Some(&"c".repeat(40))).is_none());
+        assert!(releases_wire(&c, None).is_none());
+
+        // A change to origin/main invalidates the whole entry, summaries with it: the TTL
+        // path in `origin_main_view` only ever consults an entry whose `sha` IS origin/main,
+        // and a fresh read rebuilds both together.
+        let stale_origin = OriginMain {
+            sha: Some("z".repeat(40)),
+            ..c.clone()
+        };
+        assert_ne!(
+            stale_origin.sha, c.sha,
+            "a different origin/main is a different entry"
+        );
+    }
+
+    /// The release block is published beside `origin_main`, never inside it. One cache entry,
+    /// two document keys — and never the same bytes twice on the wire.
+    #[test]
+    fn the_origin_main_block_never_carries_the_summaries() {
+        let c = OriginMain {
+            sha: Some("a".repeat(40)),
+            ci: "green".to_string(),
+            releases: Some(ReleaseSummaries::default()),
+            releases_for: Some("a".repeat(40)),
+            ..Default::default()
+        };
+        for v in [origin_main_wire(&c), cached_view(&c, 1000)] {
+            let obj = v.as_object().unwrap();
+            assert!(!obj.contains_key("releases"), "not inside origin_main");
+            assert!(!obj.contains_key("releases_for"), "nor its cache key");
+            assert_eq!(v["ci"], json!("green"), "the rest is untouched");
+        }
+    }
+
+    /// The document the app decodes, pinned. **This exact JSON is the fixture the Swift
+    /// decoding tests use**, so the two sides cannot drift without one of them failing.
+    #[test]
+    fn the_release_block_is_shaped_as_the_app_decodes_it() {
+        let r = ReleaseSummaries {
+            deployed: Some(ReleaseSummary {
+                sha: "23f03ce0000000000000000000000000000000aa".to_string(),
+                version: Some("bridge 0.106.0".to_string()),
+                title: "Stop the deploy card showing a cached answer as a current one".to_string(),
+                date_ms: 1_756_500_000_000,
+                lines: vec![
+                    "The deploy card no longer shows a cached answer as a current one.".to_string(),
+                    "A `pending` CI verdict is never served from the cache.".to_string(),
+                ],
+                more: 0,
+            }),
+            undeployed: vec![ReleaseSummary {
+                sha: "3407550000000000000000000000000000000bb".to_string(),
+                version: Some("bridge 0.107.0, App 1.0 (121)".to_string()),
+                title: "Take the interim fixes".to_string(),
+                date_ms: 1_756_600_000_000,
+                lines: vec!["The location channel takes the interim fixes.".to_string()],
+                more: 3,
+            }],
+            truncated: 2,
+            reason: None,
+        };
+        let v = json!(r);
+        assert_eq!(v["deployed"]["version"], json!("bridge 0.106.0"));
+        assert_eq!(v["deployed"]["lines"].as_array().unwrap().len(), 2);
+        assert_eq!(v["deployed"]["more"], json!(0));
+        assert_eq!(v["undeployed"][0]["more"], json!(3));
+        assert_eq!(v["truncated"], json!(2));
+        assert_eq!(v["reason"], Value::Null);
+        // Snake case on the wire, as every other key of this document is.
+        assert!(v["deployed"].as_object().unwrap().contains_key("date_ms"));
     }
 
     #[test]

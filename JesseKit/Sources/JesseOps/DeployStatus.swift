@@ -16,8 +16,107 @@ public struct DeployStatusDocument: Decodable, Sendable {
     public var running: RunningBuild
     public var originMain: OriginMain
 
+    /// What each commit actually changed: the running release, and everything a deploy would
+    /// bring in. Derived by the sentinel from commit subjects and the `CHANGELOG.md` bullets
+    /// each commit added, never written by hand and never generated.
+    ///
+    /// **Absent from an older sentinel**, and that is the ordinary case rather than an error:
+    /// a deploy replaces the bridge, not the sentinel, so a phone on a new build routinely
+    /// talks to a sentinel that predates this block. The card renders exactly as it did
+    /// before when it is missing.
+    public var releases: Releases?
+
+    /// The release-notes block. `deployed` is nil when there is no running commit or it is not
+    /// readable; `undeployed` is newest first and is EMPTY rather than a guess whenever the
+    /// range could not be computed, with `reason` saying which case that was.
+    public struct Releases: Decodable, Sendable, Equatable {
+        public var deployed: Release?
+        public var undeployed: [Release]
+        /// Undeployed releases the sentinel dropped past its own cap. Zero means the list is
+        /// complete — a count, not a flag, because the card says how many it is not showing.
+        public var truncated: Int
+        /// Why `undeployed` is empty when emptiness is not simply "already current": no
+        /// recorded deploy yet, a running commit that is not on `origin/main`, or one that is
+        /// not in the deploy clone at all.
+        public var reason: String?
+
+        public init(deployed: Release?, undeployed: [Release], truncated: Int, reason: String?) {
+            self.deployed = deployed
+            self.undeployed = undeployed
+            self.truncated = truncated
+            self.reason = reason
+        }
+
+        public init(from decoder: any Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            deployed = try? c.decodeIfPresent(Release.self, forKey: .deployed)
+            undeployed = (try? c.decodeIfPresent([Release].self, forKey: .undeployed)) ?? []
+            truncated = (try? c.decodeIfPresent(Int.self, forKey: .truncated)) ?? 0
+            reason = try? c.decodeIfPresent(String.self, forKey: .reason)
+            // Positional identity, assigned here: two releases can carry the same version
+            // string (a re-tag, an app-only pair), so nothing in the payload is an identity.
+            for i in undeployed.indices { undeployed[i].id = i }
+        }
+
+        enum CodingKeys: String, CodingKey { case deployed, undeployed, truncated, reason }
+    }
+
+    /// One release: a title, and up to a handful of one-sentence claims. The bullet BODIES the
+    /// changelog carries under each claim are dropped by the sentinel on purpose — this card
+    /// is read in ten seconds to decide whether a deploy is worth running.
+    public struct Release: Decodable, Sendable, Equatable, Identifiable {
+        public var sha: String
+        /// Component-qualified (`bridge 0.106.0`, `App 1.0 (121)`), because the list mixes
+        /// components. Nil when neither the changelog heading nor the subject stated one.
+        public var version: String?
+        public var title: String
+        public var dateMs: UInt64
+        /// The bold lead sentence of each changelog bullet the commit added. Empty when it
+        /// added none, in which case the title alone is the summary.
+        public var lines: [String]
+        /// Lines beyond the sentinel's per-release cap. Shown, never swallowed.
+        public var more: Int
+
+        /// Positional, assigned by the enclosing document — see `LedgerRow.id` for the same
+        /// reasoning: two releases can share every visible field.
+        public var id: Int = 0
+
+        enum CodingKeys: String, CodingKey {
+            case sha, version, title, lines, more
+            case dateMs = "date_ms"
+        }
+
+        public init(sha: String, version: String?, title: String, dateMs: UInt64,
+                    lines: [String], more: Int, id: Int = 0) {
+            self.sha = sha
+            self.version = version
+            self.title = title
+            self.dateMs = dateMs
+            self.lines = lines
+            self.more = more
+            self.id = id
+        }
+
+        public init(from decoder: any Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            sha = (try? c.decodeIfPresent(String.self, forKey: .sha)) ?? ""
+            version = try? c.decodeIfPresent(String.self, forKey: .version)
+            title = (try? c.decodeIfPresent(String.self, forKey: .title)) ?? ""
+            dateMs = (try? c.decodeIfPresent(UInt64.self, forKey: .dateMs)) ?? 0
+            lines = (try? c.decodeIfPresent([String].self, forKey: .lines)) ?? []
+            more = (try? c.decodeIfPresent(Int.self, forKey: .more)) ?? 0
+        }
+
+        /// `bridge 0.106.0 · 23f03ce`, or just the short sha when no version was stated.
+        public var subtitle: String {
+            let short = String(sha.prefix(7))
+            guard let version, !version.isEmpty else { return short }
+            return "\(version) · \(short)"
+        }
+    }
+
     enum CodingKeys: String, CodingKey {
-        case deploy, running
+        case deploy, running, releases
         case originMain = "origin_main"
     }
 
@@ -29,6 +128,9 @@ public struct DeployStatusDocument: Decodable, Sendable {
         originMain = (try? c.decode(OriginMain.self, forKey: .originMain))
             ?? OriginMain(sha: nil, version: nil, ci: "none", ciDetail: nil, checkedMs: 0,
                           stale: true, staleReason: "the sentinel sent no origin/main view")
+        // Absent on any sentinel older than the release-summaries change, which a deploy does
+        // NOT update — so nil here is routine, not a decode failure.
+        releases = try? c.decodeIfPresent(Releases.self, forKey: .releases)
     }
 
     public static func decode(_ data: Data) throws -> DeployStatusDocument {
