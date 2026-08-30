@@ -130,6 +130,40 @@ final class ToolActivityRenderingTests: XCTestCase {
         XCTAssertEqual(ToolActivity(name: "mcp__").displayLabel, "Using mcp__…")
     }
 
+    /// **THE `direct` HARNESS'S EIGHT TOOLS RENDER AS PROSE TOO.**
+    ///
+    /// A third vocabulary, and the one most in need of a table: its tool names are function
+    /// names (`vault_read`, `deliver_artifact`), so without a case each every direct turn
+    /// would spend its whole run showing the user an identifier. Grouped by what is happening
+    /// rather than one line per tool — three read tools are one activity, and two write tools
+    /// are one act of editing.
+    func testTheDirectVocabularyRendersAsProse() {
+        XCTAssertEqual(ToolActivity(name: "vault_search").displayLabel, "Searching the vault…")
+        XCTAssertEqual(ToolActivity(name: "vault_read").displayLabel, "Reading the vault…")
+        XCTAssertEqual(ToolActivity(name: "vault_list").displayLabel, "Browsing the vault…")
+        XCTAssertEqual(ToolActivity(name: "vault_write").displayLabel, "Editing a note…")
+        XCTAssertEqual(ToolActivity(name: "vault_edit").displayLabel, "Editing a note…")
+        XCTAssertEqual(ToolActivity(name: "vault_move").displayLabel, "Moving a note…")
+        XCTAssertEqual(ToolActivity(name: "deliver_artifact").displayLabel, "Preparing a file…")
+        // Deliberately the same line `WebFetch` gets: from the user's side it is the same act,
+        // whichever harness performs it.
+        XCTAssertEqual(ToolActivity(name: "fetch_url").displayLabel, "Searching the web…")
+        XCTAssertEqual(ToolActivity(name: "fetch_url").displayLabel,
+                       ToolActivity(name: "WebFetch").displayLabel)
+    }
+
+    /// A refused direct WRITE reads as a boundary, exactly as a refused claude-code `Write`
+    /// does. This harness's refusals are the ones a user is most likely to see: it is the
+    /// only harness whose read-level turns carry write tools in the manifest at all.
+    func testARefusedDirectWriteReadsAsTheBoundaryNotAsAnError() {
+        for tool in ["vault_write", "vault_edit", "vault_move"] {
+            XCTAssertEqual(ToolActivity(name: tool, refused: true).displayLabel,
+                           "Blocked from writing a file…")
+            XCTAssertNotEqual(ToolActivity(name: tool, refused: true).displayLabel,
+                              ToolActivity(name: tool).displayLabel)
+        }
+    }
+
     /// A REFUSED call must never render as the thing it failed to do. "Writing a file…"
     /// while the sandbox refuses every write states something that did not happen.
     func testARefusedCallNeverReadsAsTheActionSucceeding() {

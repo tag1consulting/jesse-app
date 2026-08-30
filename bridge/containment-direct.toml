@@ -59,7 +59,7 @@
 schema = 2
 harness = "direct"
 binary_version = "jesse-agent 0.3.0"
-bridge_version = "0.109.0"
+bridge_version = "0.110.0"
 recorded = "2026-08-30"
 gate = "pass"
 

@@ -476,6 +476,41 @@ be held (phone suspended, connection blip, an older client).
 > and the reply never landed. So: a stalled, erroring, or never-opening stream
 > must never delay or block the reply — the poll resolves it regardless.
 
+### Three harnesses
+
+| Harness | How a turn is answered | Boundary | Record |
+| --- | --- | --- | --- |
+| `claude-code` | spawns `claude -p`, reads `stream-json` | a named tool allowlist with path scopes, plus strict MCP | `containment.toml` |
+| `codex` | spawns `codex exec --json`, reads stdout **and stderr** | an OS sandbox (`sandbox_mode`, `writable_roots`, no network) | `containment-codex.toml` |
+| `direct` | **no child** — the `agent/` turn loop, in this process | eight typed tools dispatched by exact name, over a path-jailed store | `containment-direct.toml` |
+
+The first two are `Runner::Spawned`; the third is `Runner::InProcess`. A model picks its
+harness with `harness = "..."`, and the model chip in the app picks the model — so a `direct`
+model is selected exactly like any other.
+
+**`direct` is different in kind, not in degree.** It has no shell, no subprocesses and no MCP
+servers. Its tools are `vault_list`, `vault_search`, `vault_read`, `fetch_url` at `read`, plus
+`vault_write`, `vault_edit`, `vault_move`, `deliver_artifact` at `write` — and `basic` is a
+genuinely empty tool set, which is the level Codex cannot express at all. There is no argv to
+record, so `Harness::capability_args` records the **manifest** (`["--tools", "a,b,c"]`, sorted)
+and the startup gate compares that by the same strict equality it uses for the other two.
+
+Its containment record is generated rather than hand-written, from the agent crate's own
+structural battery — 90 adversarial tool calls at three levels, scored out of band, with a
+scripted provider and no model:
+
+```
+cargo test -p jesse-agent --test containment_direct        # runs the probes, writes the json
+cargo run --features containment-probe --bin containment-probe -- --harness direct --write
+```
+
+It also keeps its own threads (`<state_dir>/direct-threads/`) and its own per-call usage
+ledger (`<state_dir>/usage.jsonl`, mode 0600, pruned at 90 days). `Harness::transcript_dir` is
+`None` — the directory scan cannot see those threads — but `Harness::hydrate` renders them, so
+a direct conversation hydrates with real history rather than the empty list a transcript-less
+harness would otherwise return. Write locks go through the same `LockBroker` the CLI harnesses
+reach via hooks, called directly rather than over a socket; see `BrokerGuard`.
+
 ### The harness traits, and the one branch
 
 An agent program answers a turn. **How it is reached is a second question**, and the code
