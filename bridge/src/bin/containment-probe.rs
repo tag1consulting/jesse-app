@@ -35,6 +35,13 @@ use jesse_bridge::{
 /// record with `include_str!` and validating config against it at startup) names one path.
 const RESULTS_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/containment.toml");
 const CODEX_RESULTS_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/containment-codex.toml");
+const DIRECT_RESULTS_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/containment-direct.toml");
+/// Where the agent crate's structural battery leaves its machine-readable summary. See
+/// [`jesse_bridge::direct_results_from_battery`] for the two-command chain.
+const DIRECT_SUMMARY_PATH: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../target/containment-direct.json"
+);
 
 /// The record file for a harness. ONE FILE PER HARNESS, because a containment verdict
 /// describes a (harness, capability, MCP set) triple: nothing recorded for one harness says
@@ -43,6 +50,7 @@ const CODEX_RESULTS_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/containme
 fn results_path(harness: &str) -> &'static str {
     match harness {
         jesse_bridge::CODEX_ID => CODEX_RESULTS_PATH,
+        jesse_bridge::DIRECT_ID => DIRECT_RESULTS_PATH,
         _ => RESULTS_PATH,
     }
 }
@@ -61,7 +69,7 @@ fn usage() -> ! {
          \x20 --probes <id,...>  only these probes. Never with --write.\n\
          \x20 --timeout <secs>   per-probe timeout (default 300)\n\
          \x20 --keep             keep the scratch trees for inspection\n\
-         \x20 --harness <id>     which harness to probe (claude-code | codex)\n\
+         \x20 --harness <id>     which harness to probe (claude-code | codex | direct)\n\
          \x20 --model <id>       probe AS this registry model (default: the ambient one)\n"
     );
     std::process::exit(2)
@@ -134,6 +142,73 @@ async fn main() {
                 std::process::exit(1);
             }
         }
+        return;
+    }
+
+    // ---- THE DIRECT HARNESS TAKES A DIFFERENT ROUTE ENTIRELY ------------
+    //
+    // Everything below this block is about driving a CHILD PROCESS: resolving a binary,
+    // planting a credential, spawning per row, scoring what came back. None of it applies to
+    // a harness that spawns nothing. Its battery lives in the agent crate (where the tools
+    // are) and runs with a scripted provider and no model at all, so this mode reads that
+    // battery's out-of-band summary and renders the record from it.
+    //
+    // Handled here, before the model/binary resolution, rather than by threading a second
+    // shape through the run loop: the two have almost nothing in common beyond the file they
+    // write, and pretending otherwise would mean a `--model` flag that silently means nothing
+    // and a `--rows` flag with nothing to select.
+    if opts.harness == jesse_bridge::DIRECT_ID {
+        if model_id.is_some() {
+            eprintln!(
+                "containment-probe: --model means nothing for harness 'direct' — its battery \
+                 runs with a scripted provider and no model, which is what makes every escape \
+                 definitely attempted. Drop --model."
+            );
+            std::process::exit(2);
+        }
+        let cfg = Config::from_env();
+        let fresh = match jesse_bridge::direct_results_from_battery(
+            &cfg,
+            std::path::Path::new(DIRECT_SUMMARY_PATH),
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("containment-probe: {e}");
+                std::process::exit(1);
+            }
+        };
+        print_record(&render_results(&fresh));
+        if !write {
+            eprintln!(
+                "\ncontainment-probe: nothing written (add --write to record {})",
+                results_path
+            );
+            return;
+        }
+        let mut fresh = fresh;
+        // Carry the committed acceptances across, exactly as the spawned path does: a fresh
+        // run knows what the boundary did and cannot know who agreed to ship it.
+        if let Some(prev) = recorded_text.as_deref().and_then(|t| parse_results(t).ok()) {
+            fresh.accepted = prev.accepted.clone();
+            let drift = compare_results(&prev, &fresh);
+            if drift.is_empty() {
+                eprintln!(
+                    "\ncontainment-probe: re-recording — nothing moved since {}.",
+                    prev.recorded
+                );
+            } else {
+                eprintln!("\nRE-RECORDING, {} probe(s) moved:", drift.len());
+                for d in &drift {
+                    eprintln!("  ~ {d}");
+                }
+            }
+        }
+        let text = render_results(&fresh);
+        if let Err(e) = std::fs::write(results_path, &text) {
+            eprintln!("containment-probe: could not write {results_path}: {e}");
+            std::process::exit(1);
+        }
+        eprintln!("\ncontainment-probe: recorded {results_path}");
         return;
     }
 
