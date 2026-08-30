@@ -144,9 +144,6 @@ final class LocationRelevanceClassifierTests: XCTestCase {
         var readingToReturn: LocationReading
         private(set) var authorizationChecks = 0
         private(set) var readings: [(LocationPrecision, Int, Bool)] = []
-        /// The budget each call was given, so the tests can assert that the two call
-        /// sites really do spend different ones rather than sharing a constant.
-        private(set) var budgets: [LocationFixBudget] = []
 
         init(authorized: Bool, reading: LocationReading = .empty) {
             self.authorized = authorized
@@ -162,7 +159,6 @@ final class LocationRelevanceClassifierTests: XCTestCase {
                      wantsPlacemark: Bool,
                      budget: LocationFixBudget) async -> LocationReadingResult {
             readings.append((precision, maxAgeSeconds, wantsPlacemark))
-            budgets.append(budget)
             return .got(readingToReturn)
         }
     }
