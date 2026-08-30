@@ -737,6 +737,7 @@ public struct JesseBridgeClient: BridgeClientProtocol {
                                    locationContext: String? = nil,
                                    locationContextRequested: Bool? = nil,
                                    locationContextUnavailable: Bool? = nil,
+                                   locationContextUnavailableReason: String? = nil,
                                    mealCorrectionsAck: Int? = nil,
                                    requestId: String? = nil,
                                    model: String? = nil) -> JesseRequest {
@@ -768,6 +769,11 @@ public struct JesseBridgeClient: BridgeClientProtocol {
             locationContext: nonBlank(locationContext),
             locationContextRequested: locationContextRequested == true ? true : nil,
             locationContextUnavailable: locationContextUnavailable == true ? true : nil,
+            // The reason rides ONLY with the flag it explains. A reason on a turn that
+            // is not marked unavailable would be a contradiction on the wire, and a
+            // blank one is the same as none.
+            locationContextUnavailableReason: locationContextUnavailable == true
+                ? nonBlank(locationContextUnavailableReason) : nil,
             // Only a positive seq is meaningful (0/absent → nothing acked yet).
             mealCorrectionsAck: (mealCorrectionsAck ?? 0) > 0 ? mealCorrectionsAck : nil,
             // The outbox idempotency key; nil drops the field.

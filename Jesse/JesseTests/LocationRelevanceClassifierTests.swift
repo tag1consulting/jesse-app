@@ -144,21 +144,26 @@ final class LocationRelevanceClassifierTests: XCTestCase {
         var readingToReturn: LocationReading
         private(set) var authorizationChecks = 0
         private(set) var readings: [(LocationPrecision, Int, Bool)] = []
+        /// The budget each call was given, so the tests can assert that the two call
+        /// sites really do spend different ones rather than sharing a constant.
+        private(set) var budgets: [LocationFixBudget] = []
 
         init(authorized: Bool, reading: LocationReading = .empty) {
             self.authorized = authorized
             self.readingToReturn = reading
         }
 
-        func isAuthorized() async -> Bool {
+        func authorizationState() async -> LocationAuthorizationState {
             authorizationChecks += 1
-            return authorized
+            return authorized ? .authorized : .unauthorized
         }
 
         func reading(precision: LocationPrecision, maxAgeSeconds: Int,
-                     wantsPlacemark: Bool) async -> LocationReading {
+                     wantsPlacemark: Bool,
+                     budget: LocationFixBudget) async -> LocationReadingResult {
             readings.append((precision, maxAgeSeconds, wantsPlacemark))
-            return readingToReturn
+            budgets.append(budget)
+            return .got(readingToReturn)
         }
     }
 

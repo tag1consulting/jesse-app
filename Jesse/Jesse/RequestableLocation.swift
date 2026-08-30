@@ -120,6 +120,22 @@ nonisolated enum LocationRequestFulfiller {
     static let coarseDecimals = 3
     static let preciseDecimals = 5
 
+    /// The accuracy radius at or under which a fix is rendered as PRECISE.
+    ///
+    /// The rounding used to be chosen from the precision the request ASKED for, which
+    /// meant a `precise` request answered by a 3 km fix printed five decimal places —
+    /// about a metre — of a position known to within a town. That is not a rounding
+    /// nicety: the agent reads the block and decides from it whether it can say "you are
+    /// on Fountainbridge" or only "you are in Edinburgh", and false precision makes it
+    /// say the first about the second.
+    ///
+    /// 100 m is a city block: at that radius a coordinate to five places is still
+    /// describing something real. It is deliberately looser than
+    /// `LocationFixBudget.fulfilment.targetAccuracyMeters` (65 m, the radius good enough
+    /// to STOP waiting) — a fix that arrives at the deadline at 80 m is a perfectly good
+    /// street-level answer that simply never met the early-exit bar.
+    static let preciseRenderingCeilingMeters: Double = 100
+
     /// Hard clamp on the rendered placemark, applied BEFORE the whole-block cap.
     ///
     /// The block cap truncates on whole-line boundaries, so a single line longer than
@@ -145,8 +161,12 @@ nonisolated enum LocationRequestFulfiller {
         }
         if request.fields.contains(.coordinates),
            let lat = reading.latitude, let lon = reading.longitude {
-            let places = request.precision == .precise ? preciseDecimals : coarseDecimals
-            lines.append("Coordinates (\(request.precision.rawValue)): "
+            // Rendered at the precision ACHIEVED, not the precision requested — a
+            // precise request answered by a coarse fix must read as a coarse fix, so
+            // the agent can tell it only has a town and says so.
+            let achieved = achievedPrecision(reading, requested: request.precision)
+            let places = achieved == .precise ? preciseDecimals : coarseDecimals
+            lines.append("Coordinates (\(achieved.rawValue)): "
                          + "\(round(lat, places)), \(round(lon, places))")
         }
         if request.fields.contains(.accuracy), let acc = reading.accuracyMeters, acc >= 0 {
@@ -164,6 +184,23 @@ nonisolated enum LocationRequestFulfiller {
         let capped = HealthRequestFulfiller.capWholeLines(lines.joined(separator: "\n"),
                                                           maxBytes: maxBytes)
         return capped.isEmpty ? nil : capped
+    }
+
+    /// What a reading ACTUALLY achieved, which is what the block is rendered at.
+    ///
+    /// Never better than what was asked for: a `coarse` request answered by a 5 m fix
+    /// still renders coarse, because the request declined that precision and the block
+    /// should not quietly hand it over anyway.
+    ///
+    /// A reading with no accuracy figure at all counts as coarse. That is the
+    /// conservative direction — an unquantified fix is one whose precision nothing
+    /// vouches for.
+    static func achievedPrecision(_ reading: LocationReading,
+                                  requested: LocationPrecision) -> LocationPrecision {
+        guard requested == .precise else { return .coarse }
+        guard let accuracy = reading.accuracyMeters, accuracy > 0,
+              accuracy <= preciseRenderingCeilingMeters else { return .coarse }
+        return .precise
     }
 
     /// A coordinate rounded to `places` decimals, rendered without exponent notation.

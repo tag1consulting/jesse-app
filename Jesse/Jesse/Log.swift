@@ -22,6 +22,28 @@ struct AppLog: Sendable {
     nonisolated func debug(_ message: String) { logger.debug("\(message, privacy: .public)") }
 }
 
+/// `OSSignposter` wrapped the way `AppLog` wraps `Logger`: plain-`String` methods, so
+/// call sites do not each need `import os` for the interpolation overloads. Every
+/// message is `.public` for the same reason `AppLog`'s are — these are our own
+/// diagnostic strings, and the whole point of them is being readable in Instruments.
+///
+/// A signpost INTERVAL rather than a log line because the question being asked of it is
+/// "how long did this take, by condition" — a duration distribution, which is what
+/// Instruments renders from these and what a `notice` cannot give you.
+struct FixSignpost: Sendable {
+    let signposter: OSSignposter
+
+    /// Open an interval. The returned state must be handed back to `end` exactly once.
+    nonisolated func begin(_ name: StaticString) -> OSSignpostIntervalState {
+        signposter.beginInterval(name, id: signposter.makeSignpostID())
+    }
+
+    nonisolated func end(_ name: StaticString, _ state: OSSignpostIntervalState,
+                         _ message: String) {
+        signposter.endInterval(name, state, "\(message, privacy: .public)")
+    }
+}
+
 enum Log {
     private nonisolated static let subsystem = "com.tag1.jesse"
 
@@ -44,4 +66,11 @@ enum Log {
     /// swallowed to an empty reading (no block attached) and never surfaced to the UI.
     /// It logs statuses and failures only — never a coordinate or a place name.
     nonisolated static let location = AppLog(logger: Logger(subsystem: subsystem, category: "location"))
+    /// Duration signposts around each location fix attempt, so the deadlines in
+    /// `LocationFixBudget` can be chosen from a measured distribution rather than
+    /// guessed — which is how the 2-second one that broke the channel was arrived at.
+    /// Each interval carries elapsed time, achieved accuracy and outcome, and — like
+    /// every other line in this category — **no coordinate and no place name**.
+    nonisolated static let locationFix = FixSignpost(
+        signposter: OSSignposter(subsystem: subsystem, category: "location"))
 }
