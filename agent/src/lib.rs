@@ -45,10 +45,23 @@
 //!
 //! The boundary statement, in one place: **dispatch is by exact manifest name; scope never
 //! comes from arguments; external writes are exposed at no level.**
+//!
+//! ---- D6: THE PERSONA PACK ---------------------------------------------------
+//!
+//! [`persona`] is personality as DATA. A long prose system prompt behaves differently on
+//! every model and does not port, so what this crate carries is a [`PersonaPack`] — named
+//! parameters, a banned-pattern list, a few writing samples and one free-text field — which
+//! [`fn@persona::render`] turns into system blocks in ONE FIXED VOCABULARY, byte-identical on
+//! every [`Wire`].
+//!
+//! And because an instruction a model ignored is invisible, [`fn@persona::check`] reads the
+//! answer back and counts what it broke. Its report is content free the same way [`TurnTrace`]
+//! is: pattern sources, line numbers and lengths, with no field an excerpt could go in.
 
 pub mod budget;
 pub mod framing;
 pub mod index;
+pub mod persona;
 pub mod provider;
 pub mod scope;
 pub mod store;
@@ -74,8 +87,18 @@ pub use provider::{
 };
 
 pub use budget::{Budget, Ceiling, PriceDeck};
+// THE STYLE EVAL HOOK. `check` and the pack it checks against are re-exported at the crate
+// root so an eval suite can assert on a reply's style without reaching into a module path:
+// the checker is a property of the crate, not an implementation detail of the persona
+// module.
 pub use framing::frame_tool_result;
 pub use index::{GrepIndex, QmdIndex, SearchIndex, SearchMode};
+pub use persona::{
+    apply as apply_style_policy, check as check_style, parse_pattern_file, regeneration_request,
+    render as render_persona, render_placeholders, Applied, Correction, Dashes, FormattingParams,
+    Headings, Hit, Lists, Pattern, PersonaPack, StyleParams, StylePolicy, StyleReport,
+    WritingSample,
+};
 pub use scope::{Scope, TenantId, UserId, WorkspaceId};
 pub use store::{ContentHash, DocumentId, DocumentStore, FsVaultStore, Visibility};
 pub use thread::{FileThreadStore, MemoryThreadStore, Thread, ThreadId, ThreadStore};

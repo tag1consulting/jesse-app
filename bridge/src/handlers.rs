@@ -1732,6 +1732,11 @@ pub async fn start_turn(
             m_model.clone(),
             &hosted_badge,
             m_citations_unverified,
+            // The style checker's verdict for this turn, read back off the same content-free
+            // trace the partial answer and the timing record come from. `None` on every route
+            // and every harness that ran no check, which is what makes the provenance field
+            // absent rather than a zero on every reply.
+            trace.style(),
         );
         // Shadow comparison (JESSE_SHADOW_*): capture the eligible turn's inputs from
         // the PRE-BADGE outcome so a later mirror is judged on the same answer text the
@@ -2426,6 +2431,50 @@ pub async fn jesse_models(
     })))
 }
 
+/// `GET /jesse/persona` — what the assistant knows about how to talk to the owner.
+///
+/// **READ ONLY, AND WITHOUT THE TWO CONTENT FIELDS.** The pack is returned through
+/// `PersonaPack::without_content`, which drops the writing samples and the free text: those
+/// are the owner's own prose, and this endpoint exists to render a settings screen rather than
+/// a document viewer. What is left describes how the assistant is CONFIGURED to sound, which
+/// is exactly what "what your assistant knows about how to talk to you" means.
+///
+/// The two omitted fields are still SUMMARISED — how many samples are loaded, which files they
+/// came from, whether free text is set and how long it is — because a screen that silently
+/// omitted them would leave an owner unable to tell a pack with no samples from a pack whose
+/// samples this endpoint will not show.
+///
+/// There is NO WRITE ENDPOINT in this step. The pack is loaded from `jesse.local.toml` at
+/// startup, and a POST that changed it in memory would produce a persona that disagrees with
+/// the file the next restart reads. Same bearer auth as `/jesse`.
+pub async fn jesse_persona(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    check_auth(&headers, &st.cfg.token)?;
+    let persona = &st.cfg.persona;
+    let pack = &persona.pack;
+    let sources: Vec<&str> = pack
+        .writing_samples
+        .iter()
+        .filter_map(|s| s.source.as_deref())
+        .collect();
+    Ok(Json(json!({
+        "pack": pack.without_content(),
+        "style_policy": persona.style_policy.to_string(),
+        "banned_patterns": pack.banned_patterns.len(),
+        "writing_samples": {
+            "count": pack.writing_samples.len(),
+            "bytes": pack.writing_sample_bytes(),
+            "sources": sources,
+        },
+        "free_text": {
+            "present": pack.free_text.is_some(),
+            "bytes": pack.free_text.as_deref().map(str::len).unwrap_or(0),
+        },
+    })))
+}
+
 /// `POST /jesse/model` — set the active model. Rejects an unknown id (400) or one that is
 /// unconfigured OR unhealthy (409) so the conversation never switches onto a model the
 /// bridge cannot actually reach: a hosted model whose token is unset, or a configured model
@@ -2522,6 +2571,7 @@ pub fn app(state: AppState) -> Router {
         // The global model switch: read the selectable models + active selection, set the
         // active model, and set a model's write permission (Phase 2 wires the effect).
         .route("/jesse/models", get(jesse_models))
+        .route("/jesse/persona", get(jesse_persona))
         .route("/jesse/model", post(jesse_set_model))
         // THE AWAY PROFILE: bridge state the phone can set and that expires by itself. It
         // moves the zone every date is derived in, takes the `profiles`-excluded jobs out of

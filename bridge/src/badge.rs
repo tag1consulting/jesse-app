@@ -140,6 +140,44 @@ pub fn append_badge(text: &str, badge: &str) -> String {
     format!("{text}\n\n{badge}")
 }
 
+/// **The style checker's verdict on one turn**, in the only shape that leaves this process:
+/// two numbers.
+///
+/// D6 added a post-generation style check to the `direct` harness
+/// (`jesse_agent::persona::check`). Its report is content free by construction — pattern
+/// sources, line numbers and lengths, never an excerpt — and this is content free by
+/// construction too: how many things the checker counted, and how many extra assistant turns
+/// were spent rewriting. Nothing about WHAT the model wrote crosses this boundary, which is
+/// what lets it ride the provenance channel out to a phone, a log line and an eval assertion
+/// without any of them having to decide what is safe to render.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StyleVerdict {
+    /// What the checker counted in the DELIVERED text: banned-pattern matches plus the dash,
+    /// list and heading counts. Zero means the reply was clean.
+    pub hits: usize,
+    /// How many EXTRA assistant turns were spent rewriting. Zero under the default
+    /// `annotate` policy, which never regenerates.
+    pub regenerated: u8,
+}
+
+impl StyleVerdict {
+    /// The provenance fragment, or `None` when there is nothing to report.
+    ///
+    /// `"3 hits"`, `"regenerated 1"`, or `"regenerated 1, 2 hits"` when a rewrite was spent
+    /// and the result was still not clean. A clean reply from a policy that did not
+    /// regenerate says nothing at all: an absent field is how a client tells "checked and
+    /// clean" from "not checked", and a `0 hits` on every reply would be noise on the one
+    /// place the number matters.
+    pub fn label(&self) -> Option<String> {
+        match (self.regenerated, self.hits) {
+            (0, 0) => None,
+            (0, n) => Some(format!("{n} hits")),
+            (k, 0) => Some(format!("regenerated {k}")),
+            (k, n) => Some(format!("regenerated {k}, {n} hits")),
+        }
+    }
+}
+
 /// Structured, display-only **provenance** for a delivered reply — the machine-readable
 /// sibling of the text [`model_badge_line`]. Delivered alongside the text badge in BOTH
 /// the poll result and the SSE `done` frame (never in the metrics log, never written to a
@@ -172,6 +210,13 @@ pub struct Provenance {
     /// The exact text badge appended to the reply — byte-identical, so a client strips it
     /// from the display text by matching this string.
     pub badge: String,
+    /// The style checker's verdict, as [`StyleVerdict::label`] renders it (`"3 hits"`,
+    /// `"regenerated 1"`). Absent on every route that ran no check — which today is every
+    /// harness but `direct`, and `direct` under `style_policy = "off"` — so a client can tell
+    /// "checked and clean" (absent) from "checked and flagged" (present) without a second
+    /// field to mean "was it checked".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub style: Option<String>,
     /// The flags the badge (and the emergency warning) encode.
     pub flags: ProvenanceFlags,
 }
@@ -221,6 +266,7 @@ pub fn reply_provenance(
     model: Option<String>,
     hosted: &HostedBadge,
     citations_unverified: bool,
+    style: Option<StyleVerdict>,
 ) -> Option<Provenance> {
     // Present iff the badge is appended: an `Ok` reply with non-empty trimmed text AND
     // badges on. An empty (directive-only) reply and every error pass through with no
@@ -243,6 +289,7 @@ pub fn reply_provenance(
         model,
         cost_usd,
         badge,
+        style: style.and_then(|v| v.label()),
         flags: ProvenanceFlags::from_source(source, citations_unverified),
     })
 }
@@ -610,6 +657,7 @@ mod tests {
                 c.model.map(String::from),
                 &c.hosted,
                 cu,
+                None,
             )
             .expect("provenance present for a non-empty reply with badges on");
             assert_eq!(p.route, c.route);
@@ -652,6 +700,7 @@ mod tests {
             Some("local-oss".into()),
             &HostedBadge::opus(),
             /* citations_unverified */ true,
+            None,
         )
         .unwrap();
         assert!(
@@ -677,7 +726,8 @@ mod tests {
             BadgeSource::Hosted,
             None,
             &HostedBadge::opus(),
-            false
+            false,
+            None,
         )
         .is_none());
 
@@ -692,7 +742,8 @@ mod tests {
             BadgeSource::Hosted,
             None,
             &HostedBadge::opus(),
-            false
+            false,
+            None,
         )
         .is_none());
         assert!(reply_provenance(
@@ -703,7 +754,8 @@ mod tests {
             BadgeSource::Hosted,
             None,
             &HostedBadge::opus(),
-            false
+            false,
+            None,
         )
         .is_none());
         // Error outcome → no badge, so no provenance.
@@ -717,9 +769,83 @@ mod tests {
             BadgeSource::Hosted,
             None,
             &HostedBadge::opus(),
-            false
+            false,
+            None,
         )
         .is_none());
+    }
+
+    /// The two integers, and the four shapes they render as. A clean reply from a policy that
+    /// did not regenerate says NOTHING — an absent field is how a client tells "checked and
+    /// clean" from "not checked".
+    #[test]
+    fn the_style_verdict_renders_only_when_there_is_something_to_say() {
+        let v = |hits, regenerated| StyleVerdict { hits, regenerated }.label();
+        assert_eq!(v(0, 0), None);
+        assert_eq!(v(3, 0), Some("3 hits".to_string()));
+        assert_eq!(v(0, 1), Some("regenerated 1".to_string()));
+        assert_eq!(v(2, 1), Some("regenerated 1, 2 hits".to_string()));
+        assert_eq!(StyleVerdict::default().label(), None);
+    }
+
+    /// The style verdict rides the provenance, and is ABSENT on every turn that ran no check
+    /// — which is every harness but `direct`, and `direct` under `style_policy = "off"`.
+    #[test]
+    fn the_style_verdict_rides_the_provenance_and_is_absent_when_unchecked() {
+        let cfg = cfg_on();
+        let health = HealthStore::new();
+        let checked = reply_provenance(
+            &ok("Body."),
+            &cfg,
+            &health,
+            MetricsRoute::Hosted,
+            BadgeSource::Hosted,
+            Some("opus".into()),
+            &HostedBadge::opus(),
+            false,
+            Some(StyleVerdict {
+                hits: 2,
+                regenerated: 1,
+            }),
+        )
+        .unwrap();
+        assert_eq!(checked.style.as_deref(), Some("regenerated 1, 2 hits"));
+        assert_eq!(
+            provenance_to_value(Some(&checked))["style"],
+            "regenerated 1, 2 hits"
+        );
+
+        // No check ran → the key is not on the wire at all.
+        let unchecked = reply_provenance(
+            &ok("Body."),
+            &cfg,
+            &health,
+            MetricsRoute::Hosted,
+            BadgeSource::Hosted,
+            Some("opus".into()),
+            &HostedBadge::opus(),
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(unchecked.style, None);
+        let v = provenance_to_value(Some(&unchecked));
+        assert!(v.get("style").is_none(), "absent, not null: {v}");
+
+        // A CLEAN checked reply says nothing either, for the same reason.
+        let clean = reply_provenance(
+            &ok("Body."),
+            &cfg,
+            &health,
+            MetricsRoute::Hosted,
+            BadgeSource::Hosted,
+            Some("opus".into()),
+            &HostedBadge::opus(),
+            false,
+            Some(StyleVerdict::default()),
+        )
+        .unwrap();
+        assert_eq!(clean.style, None);
     }
 
     #[test]
@@ -735,6 +861,7 @@ mod tests {
             Some("local-oss".into()),
             &HostedBadge::opus(),
             true,
+            None,
         )
         .unwrap();
         let v = provenance_to_value(Some(&p));
@@ -761,6 +888,7 @@ mod tests {
             Some("glm-5.2".into()),
             &hb("glm-5.2", false, Some(0.0021)),
             false,
+            None,
         )
         .unwrap();
         let hv = provenance_to_value(Some(&hosted));

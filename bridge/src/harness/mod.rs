@@ -795,6 +795,20 @@ pub trait TurnSink: Send + Sync {
     /// it — same one vocabulary across harnesses, same `refused` bit, and the same
     /// prohibition on tool RESULTS, tool INPUTS, token counts and per-tool timing.
     fn tool_activity(&self, activity: ToolActivity);
+
+    /// The post-generation style check's verdict for this turn (D6), reported ONCE, after the
+    /// answer is final.
+    ///
+    /// Not a mid-turn event and not part of the two-event contract above: it says nothing
+    /// about progress and it arrives after the last delta. It is on this trait rather than on
+    /// [`TurnOutcome`] because it is PROVENANCE — the driver reduces the outcome to a `Done`
+    /// frame and hands nothing else to the badge, whereas the trace this sink already feeds is
+    /// exactly the content-free per-turn channel the badge reads. Widening the outcome would
+    /// have put a field on the one path every harness takes for a thing one harness produces.
+    ///
+    /// DEFAULTED TO A NO-OP, so a harness that runs no check and a sink that reports nowhere
+    /// are both silent by writing nothing. See [`StyleVerdict`], which is two integers.
+    fn style_verdict(&self, _verdict: StyleVerdict) {}
 }
 
 /// What an in-process turn hands back when it succeeds: exactly what the driver needs to

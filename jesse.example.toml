@@ -50,6 +50,69 @@ diet_keywords_extra = [
   "peso",       # weight
 ]
 
+# -----------------------------------------------------------------------------
+# THE PERSONA PACK (D6) — how your assistant SOUNDS, as parameters
+# -----------------------------------------------------------------------------
+#
+# Everything below is optional and additive. A [persona] table with only the four
+# keys above behaves exactly as it did before these keys existed.
+#
+# Why parameters instead of a paragraph: a long personality prompt behaves
+# differently on every model and does not port, so swapping the backend silently
+# changes the voice. These render to the same sentences on every wire.
+
+# What your assistant is called, and one sentence about what it is for.
+# Defaults: "Jesse", and no description at all (rather than a generic one).
+assistant_name = "Jesse"
+assistant_description = "an assistant for a personal vault of notes"
+
+# How it addresses you:
+#   by_name  — use your name where it reads naturally (default)
+#   neutral  — say "you"; never use your name
+#   formal   — formal and impersonal, and never your name
+address_style = "by_name"
+
+# What to do about a reply that breaks the rules below:
+#   off               — do not check at all
+#   annotate          — check and report; deliver the model's text (DEFAULT)
+#   regenerate        — ask for ONE rewrite, then report
+#   regenerate:<n>    — up to n rewrites
+# Regeneration DOUBLES the cost of a flagged turn and adds a second turn's wait,
+# so it is off by default. It also turns live streaming off for that deployment:
+# a rewrite discards the text already streamed, and watching one answer arrive
+# and another replace it is worse than waiting for the final one.
+style_policy = "annotate"
+
+# Your own words about how you want it to behave, carried into the prompt
+# verbatim and checked like everything else. Optional; use it for the one or two
+# things the parameters below cannot say.
+free_text = """
+Answer the question I asked, not the one you wish I had asked.
+"""
+
+# A banned-vocabulary list, in the `draft-lint` format: one regex per line,
+# `#` comments, blank lines ignored, matched case-insensitively. A line that will
+# not compile is one startup warning naming the line number; the rest still load.
+#
+# No list ships in the source — a shipped list of banned words would be one
+# person's taste in everybody's build — so point this at your own. If you keep a
+# vault with the `draft-lint` skill in it, its list is already in this format:
+#   banned_patterns_file = "~/jesse/.claude/skills/draft-lint/banned-patterns.txt"
+# Optional; default: no patterns at all.
+# banned_patterns_file = "~/writing/banned-patterns.txt"
+
+# A directory of markdown files that are EXAMPLES OF YOUR OWN VOICE. Loaded
+# oldest-first by file name, up to a total of 16 KiB, and framed in the prompt as
+# data to imitate rather than instructions to follow. Optional.
+#   writing_samples_dir = "~/jesse/vault/Knowledge/Writing-Voice/samples"
+# writing_samples_dir = "~/writing/samples"
+
+# The `style` and `formatting` sub-tables live at the very END of this file, and
+# that is deliberate rather than untidy: a TOML sub-table swallows every bare key
+# written after it, so `[persona.style]` here would turn the next top-level key
+# you uncomment (`offload_order`, say) into `persona.style.offload_order` and
+# silently do nothing. Everything between here and there is top-level.
+
 # =============================================================================
 # offload_order — which models serve work you did NOT choose a model for
 # =============================================================================
@@ -868,3 +931,46 @@ diet_keywords_extra = [
 # [models.quirks]
 # reasoning_effort_supported = false           # already the default off api.openai.com
 # strict_tools = false                         # ditto; spelled out because this host rejects it
+
+# =============================================================================
+# [persona.style] and [persona.formatting] — THE END OF THE FILE, on purpose
+# =============================================================================
+#
+# A TOML sub-table takes every bare key written after it, so these two go last:
+# anything you add or uncomment above them stays top-level, which is what every
+# other key in this file needs to be. They belong to the [persona] table at the
+# top of the file.
+
+[persona.style]
+# formality  : low | medium | high
+# humor      : none | light | dry | frequent
+# verbosity  : terse | normal | long
+# emoji      : never | sparingly | freely
+# hedging    : minimal | normal
+# questions  : ask_before_assuming | assume_and_state
+#
+# Shown here with the shipped defaults. A mistyped value is one warning naming
+# the key, and the default stands.
+formality = "medium"
+humor = "light"
+verbosity = "normal"
+emoji = "never"
+hedging = "normal"
+questions = "ask_before_assuming"
+
+[persona.formatting]
+# lists     : avoid | when_asked | freely
+# headings  : avoid | when_long | freely
+# dashes    : forbidden | allowed
+#
+# These three are also CHECKED after the answer is generated, which is what makes
+# them different from the style parameters above: a model that ignores them is
+# counted rather than merely asked again.
+#
+# `dashes = "forbidden"` is the default and it is the one default that takes a
+# side: an em dash, an en dash or a double hyphen is the single most reliable
+# machine-writing tell there is, and it is trivially checkable. Code is exempt —
+# fenced blocks entirely, and inline `--flag` spans are masked before matching.
+lists = "when_asked"
+headings = "when_long"
+dashes = "forbidden"

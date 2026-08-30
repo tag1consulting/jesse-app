@@ -1020,6 +1020,14 @@ impl TurnSink for JobStoreSink<'_> {
         self.trace.note_tool(&activity.name);
         self.jobs.stream_push_activity(self.job_id, activity);
     }
+
+    /// Onto the trace, and nowhere else. The verdict is provenance rather than a live event:
+    /// nothing is pushed onto the stream, because the client has already seen the text and a
+    /// frame saying "and it broke two rules" is not something a reader can act on mid-turn.
+    /// The handler reads it back off the trace when it builds the reply's provenance.
+    fn style_verdict(&self, verdict: StyleVerdict) {
+        self.trace.note_style(verdict);
+    }
 }
 
 /// **THE IN-PROCESS ARM** — await the harness's own turn, with no child anywhere.

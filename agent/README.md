@@ -9,6 +9,8 @@ vocabulary, per-wire adapters, and **the tool-calling turn loop that runs on top
   framing, and the usage ledger seam.
 * **D3** built the real tool set — the document store and search index traits, the vault
   tools, the write-guard seam, and the structural containment battery.
+* **D6** built the persona pack — personality as parameters, rendered per wire, and the
+  post-generation style checker that makes voice a checked property.
 
 No dependency on `bridge/` in either direction.
 
@@ -423,6 +425,115 @@ same way — by there being no field that could hold content.
 **`refused` and `failed` are not folded together.** A refusal is the boundary working,
 possibly under attack; a failure is the boundary not being what happened. They look the same
 to the model and are opposite to an operator.
+
+## The persona pack
+
+`src/persona/` — three files, three jobs: `mod.rs` is the pack, `render.rs` turns it into a
+system prefix, `check.rs` reads the answer back.
+
+**Why it is not prose.** A long personality paragraph in a system prompt behaves differently
+on every model, and the only way to find out how is to ship it. When the backend is swapped
+the assistant's voice changes with it, silently, and nothing anywhere reports that it did. So
+what the product carries per user is a `PersonaPack`: named parameters, a banned-pattern list,
+a few writing samples, and one free-text field. The prose is generated from it, here, in one
+fixed vocabulary.
+
+### The pack
+
+| Field | What it is |
+|---|---|
+| `assistant` | Its name, and one optional sentence about what it is for. |
+| `owner` | Name, possessive pronoun, and how directly to address them. |
+| `languages` | Most-used first; rendered into the identity block. |
+| `style` | `formality`, `humor`, `verbosity`, `emoji`, `hedging`, `questions`. |
+| `formatting` | `lists`, `headings`, `dashes` — the three that are also CHECKABLE. |
+| `banned_patterns` | Compiled regex plus the source line it was written as. |
+| `writing_samples` | Title, text, source. Bounded by `WRITING_SAMPLES_BYTE_CAP` (16 KiB). |
+| `free_text` | The owner's own words, carried verbatim. Never trusted, always checked. |
+| `corrections` | The standing rules a correction loop accumulates. Empty in Phase 1. |
+| `version` | The schema version, so an old pack can be told apart on sight. |
+
+Every field has a default; `PersonaPack::default()` is a complete generic assistant with
+`dashes: Forbidden` and an **empty** pattern list. A shipped list of banned words would be one
+deployment's taste in everybody's build; a deployment points `banned_patterns_file` at its own.
+
+Field ORDER in the struct is load-bearing: a TOML document may not put a bare value after a
+table, and serde emits fields in declaration order, so the scalars come first and the
+arrays-of-tables last. That is what makes `toml::to_string(&pack)` produce a document that
+parses back.
+
+### The rendering contract
+
+`render(&pack, wire) -> Vec<SystemBlock>`, sections in order: identity, style, formatting,
+corrections, writing samples, free text. The last three are omitted entirely when empty —
+"here are the owner's writing samples" followed by nothing is a worse prompt than silence.
+
+**The wire changes placement, never content.** `Wire::Messages` gets one cacheable block per
+section, because prompt caching there is positional and an owner editing their free text
+should not invalidate the entry covering their identity. `Wire::Chat` and `Wire::Responses`
+get one block, because the adapter folds the prefix into a single leading system message
+anyway. Concatenating the blocks with a blank line between them produces byte-identical text
+on all three, and `the_rendered_text_is_byte_identical_across_wires` asserts it on both the
+default pack and a fully populated one.
+
+**Samples are DATA, and the frame says so.** A sample is a paragraph of somebody's prose, and
+prose contains sentences in the imperative. Without a frame, a model has no way to tell "the
+archive is not a museum" (a sample) from "answer in Italian" (an instruction). The header
+therefore says plainly what these are and what they are not, in the same terms `framing.rs`
+frames every tool result in. The free text gets the same treatment from the other direction:
+it is framed as the owner speaking, and it is checked like any other input to the answer.
+
+**The banned-pattern list is not rendered.** It is the pack's largest field, it would be paid
+for on every request, and a list of forbidden words in a prompt is a peculiarly effective way
+of putting those words in a model's mouth. The patterns are enforced after the fact instead,
+where the answer is a count rather than a hope. The only time a pattern's source reaches a
+model is `regeneration_request`, which lists the handful actually violated.
+
+`render_placeholders(&pack)` returns `{owner_pronoun}`, `{assistant}`, `{Owner}`, `{owner}`
+with their values, LONGEST NAME FIRST, for a caller's own substitution scanner. The bridge's
+single-pass scanner was fed rather than moved: it is the thing whose doc comment explains a
+real re-expansion bug it prevents, and one scanner in two crates is two scanners.
+
+### The checker
+
+`check(text, &pack) -> StyleReport`. Line by line, 1-based: banned patterns
+case-insensitively, every dash variant when `dashes: Forbidden`, bullet and heading lines when
+the formatting parameters say avoid.
+
+**Where it looks: the prose.** Fenced code blocks are exempt and inline code spans are masked
+before anything is matched — `--flag` in a shell line and `a--b` in a C snippet are correct
+code, not writing tells, and a checker that flagged them would be turned off within a week.
+One rule, shared by every check the module makes.
+
+**The report is content free by construction.** A `Hit` carries the pattern SOURCE (which came
+from the owner's own configuration), the LINE NUMBER, and the LENGTH of what matched. There is
+no field an excerpt could go in. The report rides a provenance channel that is content free
+everywhere else, and one field carrying a fragment of the answer would put it in all of them.
+
+### The policies
+
+| Policy | What happens |
+|---|---|
+| `Off` | No check at all. |
+| `Annotate` (default) | Check and report. The model's text is delivered exactly as written. |
+| `Regenerate { max_attempts }` | Ask the loop for a rewrite, re-check, up to the cap, then annotate. |
+
+`apply(policy, &pack, text, report, regenerate)` drives it. The `regenerate` closure returns
+`Option<String>` rather than `String`, and `None` stops the loop with what is already in hand:
+a regeneration that failed must never erase an answer that exists.
+
+**`Regenerate` doubles the cost of a flagged turn** and adds a second turn's latency to
+somebody who is waiting for the first. That is a real bill, so it is a deployment's decision
+rather than a default it discovers. `regeneration_request` builds the follow-up user message
+and **never quotes the model's own text back** — repeating the offending phrases would put
+every banned phrase into the prompt for the turn that is supposed to avoid them. It names the
+rules, by the pattern source the owner wrote, with a count each.
+
+### The eval hook
+
+`check`, `apply`, `render` and the pack are re-exported at the crate root as `check_style`,
+`apply_style_policy` and `render_persona`, so an eval suite asserts on a reply's style without
+reaching into a module path.
 
 ## The CLI
 

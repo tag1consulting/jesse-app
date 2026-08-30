@@ -15,8 +15,33 @@
 //! addresses "the user" and the diet gate ships an English-only baseline. The
 //! original author's setup is reproduced by DATA alone (a `jesse.local.toml`),
 //! never by editing this file — so `git push` can never leak it.
+//!
+//! ---- D6: THE PERSONA PACK ----------------------------------------------------
+//!
+//! The four fields above are the whole of what the bridge could personalize for as long as
+//! personality lived in prose wrappers. It now carries a [`PersonaPack`] as well
+//! ([`Persona::pack`]) — the agent crate's parameterised personality, rendered per wire by
+//! `jesse_agent::persona::render` and CHECKED after the fact by
+//! `jesse_agent::persona::check`.
+//!
+//! **THE FOUR LEGACY KEYS ARE THE PACK'S OWNER FIELDS.** `owner_name`, `owner_pronoun` and
+//! `languages` are resolved exactly as they always were, through exactly the same
+//! precedence, and then COPIED onto the pack. An existing `jesse.local.toml` therefore loads
+//! to the same rendered placeholders it did before this module knew what a pack was, and a
+//! test asserts precisely that. The new keys are additive and every one of them is optional.
+//!
+//! **THE TWO FILE-BACKED KEYS SOFT-FAIL LINE BY LINE.** `banned_patterns_file` is read in the
+//! `draft-lint` format (one pattern per line, `#` comments); a line that will not compile is
+//! ONE startup warning naming the line number, and the pack proceeds with the rest.
+//! `writing_samples_dir` loads `.md` files oldest-first by name up to the pack's byte cap.
+//! Neither path defaults to anything: a deployment that wants the vault's own list points at
+//! it in the config file, and a fresh clone has neither.
 
 use crate::*;
+use jesse_agent::persona::{
+    parse_pattern_file, render_placeholders, Pattern, PersonaPack, StylePolicy, WritingSample,
+    WRITING_SAMPLES_BYTE_CAP,
+};
 
 /// The generic default owner label rendered into the prompt wrappers when nothing
 /// is configured. A fresh clone addresses "the user".
@@ -46,6 +71,19 @@ pub struct Persona {
     /// (lowercased whole tokens). This is where a non-English or personal food
     /// vocabulary lives, so the tracked gate stays an English-only baseline.
     pub diet_keywords_extra: Vec<String>,
+    /// **The persona pack** — everything above plus the assistant's own identity, the style
+    /// and formatting parameters, the banned patterns, the writing samples, the free text and
+    /// the accumulated corrections.
+    ///
+    /// Its `owner` fields are kept EQUAL to the three legacy fields above by
+    /// [`Persona::sync_pack_owner`], which every construction path runs. Two places that
+    /// could disagree about the owner's name is exactly the bug the single-pass renderer
+    /// exists to prevent, arrived at from the config side instead.
+    pub pack: PersonaPack,
+    /// What to do about a reply the style checker flags. `annotate` by default: check and
+    /// report, deliver the model's own text, and never spend a second turn without being
+    /// told to. See `jesse_agent::persona::StylePolicy`.
+    pub style_policy: StylePolicy,
 }
 
 impl Default for Persona {
@@ -55,6 +93,8 @@ impl Default for Persona {
             owner_pronoun: DEFAULT_OWNER_PRONOUN.to_string(),
             languages: vec![DEFAULT_LANGUAGE.to_string()],
             diet_keywords_extra: Vec::new(),
+            pack: PersonaPack::default(),
+            style_policy: StylePolicy::default(),
         }
     }
 }
@@ -64,7 +104,14 @@ impl Persona {
     ///   * `{Owner}` → the owner name with its first letter capitalized (sentence
     ///     starts — `"the user"` → `"The user"`, a real name is unchanged);
     ///   * `{owner}` → the owner name verbatim (mid-sentence);
-    ///   * `{owner_pronoun}` → the possessive pronoun.
+    ///   * `{owner_pronoun}` → the possessive pronoun;
+    ///   * `{assistant}` → the assistant's own name (D6; `"Jesse"` by default).
+    ///
+    /// **THE VALUES COME FROM THE PACK, THE SCANNER STAYS HERE.** D6 moved the four
+    /// substitutions into `jesse_agent::persona::render_placeholders`, which returns them
+    /// longest-name-first; it did NOT move this loop, because this loop is the thing whose
+    /// doc comment below explains a real bug it prevents, and a scanner that lived in two
+    /// crates for a release would be two scanners. The pack feeds the one that exists.
     ///
     /// A template with no placeholders is returned unchanged. This is the ONLY
     /// substitution machinery — the wrappers stay plain strings, not `format!` call
@@ -80,15 +127,10 @@ impl Persona {
     /// value is never itself scanned — whatever a name contains, braces included, is
     /// what the agent reads. An unmatched `{` is literal and is copied through.
     pub fn render(&self, template: &str) -> String {
-        // Longest first, so a shorter placeholder can never shadow a longer one that
-        // starts with it. (None of the three does today; the ordering keeps that true
-        // if a fourth is ever added.)
-        let owner_capitalized = capitalize_first(&self.owner_name);
-        let placeholders: [(&str, &str); 3] = [
-            ("{owner_pronoun}", self.owner_pronoun.as_str()),
-            ("{Owner}", owner_capitalized.as_str()),
-            ("{owner}", self.owner_name.as_str()),
-        ];
+        // Longest first, so a shorter placeholder can never shadow a longer one that starts
+        // with it — `render_placeholders` sorts them that way and says so, which is what
+        // keeps the property true now that there are four rather than three.
+        let placeholders = render_placeholders(&self.pack);
         let mut out = String::with_capacity(template.len());
         let mut rest = template;
         while let Some(open) = rest.find('{') {
@@ -111,13 +153,53 @@ impl Persona {
         out
     }
 
+    /// A persona built from the four legacy fields alone, with the pack derived from them.
+    ///
+    /// The constructor tests and callers use instead of a struct literal, so that the
+    /// pack-owner invariant holds by construction rather than by everyone remembering.
+    pub fn from_legacy(
+        owner_name: impl Into<String>,
+        owner_pronoun: impl Into<String>,
+        languages: Vec<String>,
+        diet_keywords_extra: Vec<String>,
+    ) -> Self {
+        let mut p = Persona {
+            owner_name: owner_name.into(),
+            owner_pronoun: owner_pronoun.into(),
+            languages,
+            diet_keywords_extra,
+            ..Persona::default()
+        };
+        p.sync_pack_owner();
+        p
+    }
+
+    /// Copy the resolved legacy fields onto the pack.
+    ///
+    /// Called at the END of every construction path, after the file and the environment have
+    /// had their say, so the pack the renderer reads and the fields the rest of the bridge
+    /// reads can never name two different owners. The direction is one way on purpose:
+    /// `owner_name` is the key an operator has been setting since the first release, and a
+    /// pack field that could silently win over it is how an upgrade changes somebody's
+    /// prompts without them touching their config.
+    pub(crate) fn sync_pack_owner(&mut self) {
+        self.pack.owner.name = self.owner_name.clone();
+        self.pack.owner.pronoun = self.owner_pronoun.clone();
+        self.pack.languages = self.languages.clone();
+    }
+
     /// Load the persona: generic defaults → `jesse.local.toml` `[persona]` → env.
     /// `home` is the captured `Config.home` (used to resolve the state-dir config
     /// location). Never fails: a missing file is the default, a malformed file logs
     /// one warning and falls back to the default.
+    ///
+    /// The D6 pack keys are read from the same table in the same pass, and every one of them
+    /// soft-fails the same way the rest of this module does: a value that does not parse is
+    /// one stderr warning naming the key and the value, and the default stands.
     pub fn load(home: &str) -> Self {
         let mut p = Persona::default();
         if let Some(t) = load_local_persona(home) {
+            p.apply_pack_toml(&t, home);
             if let Some(v) = trimmed_nonempty(t.owner_name) {
                 p.owner_name = v;
             }
@@ -151,19 +233,164 @@ impl Persona {
         if let Some(v) = env_string("JESSE_DIET_KEYWORDS_EXTRA") {
             p.diet_keywords_extra = clean_keywords(split_csv(&v));
         }
+        // LAST, after the file and the environment: the pack's owner is whatever the
+        // precedence chain settled on, never a third opinion.
+        p.sync_pack_owner();
         p
+    }
+
+    /// Overlay the D6 `[persona]` keys onto the pack. Every key optional, every bad value one
+    /// warning and a default.
+    fn apply_pack_toml(&mut self, t: &PersonaToml, home: &str) {
+        if let Some(v) = trimmed_nonempty(t.assistant_name.clone()) {
+            self.pack.assistant.name = v;
+        }
+        self.pack.assistant.self_description = trimmed_nonempty(t.assistant_description.clone());
+        if let Some(v) = parse_key("address_style", t.address_style.as_deref()) {
+            self.pack.owner.address_style = v;
+        }
+        if let Some(st) = &t.style {
+            let s = &mut self.pack.style;
+            set_param(&mut s.formality, "style.formality", st.formality.as_deref());
+            set_param(&mut s.humor, "style.humor", st.humor.as_deref());
+            set_param(&mut s.verbosity, "style.verbosity", st.verbosity.as_deref());
+            set_param(&mut s.emoji, "style.emoji", st.emoji.as_deref());
+            set_param(&mut s.hedging, "style.hedging", st.hedging.as_deref());
+            set_param(&mut s.questions, "style.questions", st.questions.as_deref());
+        }
+        if let Some(ft) = &t.formatting {
+            let f = &mut self.pack.formatting;
+            set_param(&mut f.lists, "formatting.lists", ft.lists.as_deref());
+            set_param(
+                &mut f.headings,
+                "formatting.headings",
+                ft.headings.as_deref(),
+            );
+            set_param(&mut f.dashes, "formatting.dashes", ft.dashes.as_deref());
+        }
+        if let Some(path) = trimmed_nonempty(t.banned_patterns_file.clone()) {
+            self.pack.banned_patterns = load_banned_patterns(&expand_tilde(&path, home));
+        }
+        if let Some(dir) = trimmed_nonempty(t.writing_samples_dir.clone()) {
+            for sample in load_writing_samples(&expand_tilde(&dir, home)) {
+                if !self.pack.push_writing_sample(sample) {
+                    eprintln!(
+                        "jesse-bridge: WARNING writing_samples_dir {dir} exceeds the {WRITING_SAMPLES_BYTE_CAP}-byte cap; \
+                         the samples past it were not loaded."
+                    );
+                    break;
+                }
+            }
+        }
+        self.pack.free_text = trimmed_nonempty(t.free_text.clone());
+        if let Some(v) = parse_key("style_policy", t.style_policy.as_deref()) {
+            self.style_policy = v;
+        }
     }
 }
 
-/// Uppercase the first character of `s` (leaving the rest untouched), so a
-/// lowercase generic label reads correctly at a sentence start. A real name is
-/// already capitalized, so this is a no-op on it.
-fn capitalize_first(s: &str) -> String {
-    let mut chars = s.chars();
-    match chars.next() {
-        Some(c) => c.to_uppercase().collect::<String>() + chars.as_str(),
-        None => String::new(),
+/// Parse one optional `[persona]` value, warning by KEY and value when it will not parse.
+///
+/// `None` (absent, blank, or unparseable) means "leave the default alone" — the same
+/// soft-fail every other key in this module has, so one mistyped word never takes a
+/// deployment's whole persona down with it.
+fn parse_key<T: std::str::FromStr<Err = String>>(key: &str, raw: Option<&str>) -> Option<T> {
+    let raw = raw.map(str::trim).filter(|s| !s.is_empty())?;
+    match raw.parse::<T>() {
+        Ok(v) => Some(v),
+        Err(e) => {
+            eprintln!("jesse-bridge: WARNING [persona] {key}: {e}; using the default.");
+            None
+        }
     }
+}
+
+/// [`parse_key`] straight onto a field.
+fn set_param<T: std::str::FromStr<Err = String>>(field: &mut T, key: &str, raw: Option<&str>) {
+    if let Some(v) = parse_key(key, raw) {
+        *field = v;
+    }
+}
+
+/// Read a `draft-lint`-format banned-pattern file.
+///
+/// **A LINE THAT WILL NOT COMPILE IS A WARNING, NOT A FAILURE.** One warning per bad line,
+/// naming the line number and what was wrong, and the pack takes every line that did parse.
+/// Refusing the whole file would mean one typo silently disarming every rule in it, which is
+/// the failure mode a checker can least afford: it looks exactly like a model that complied.
+/// An unreadable file is one warning and an empty list.
+fn load_banned_patterns(path: &str) -> Vec<Pattern> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!(
+                "jesse-bridge: WARNING could not read banned_patterns_file {path} ({e}); \
+                 no banned patterns are loaded."
+            );
+            return Vec::new();
+        }
+    };
+    let (patterns, warnings) = parse_pattern_file(&text);
+    for w in &warnings {
+        eprintln!("jesse-bridge: WARNING banned_patterns_file {path} {w}");
+    }
+    patterns
+}
+
+/// Read the writing samples from a directory: `*.md`, sorted by name (oldest first, which is
+/// what a dated file name gives), each one's title taken from its first markdown heading and
+/// falling back to its file stem.
+///
+/// The byte cap is the PACK's, enforced by [`PersonaPack::push_writing_sample`] at the call
+/// site above rather than here, so there is one place that decides what fits.
+fn load_writing_samples(dir: &str) -> Vec<WritingSample> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!(
+                "jesse-bridge: WARNING could not read writing_samples_dir {dir} ({e}); \
+                 no writing samples are loaded."
+            );
+            return Vec::new();
+        }
+    };
+    let mut names: Vec<String> = entries
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_file())
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|n| n.to_ascii_lowercase().ends_with(".md"))
+        .collect();
+    names.sort();
+    let mut out = Vec::new();
+    for name in names {
+        let Ok(text) = std::fs::read_to_string(Path::new(dir).join(&name)) else {
+            eprintln!("jesse-bridge: WARNING writing sample {name} could not be read; skipped.");
+            continue;
+        };
+        if text.trim().is_empty() {
+            continue;
+        }
+        let title = first_heading(&text).unwrap_or_else(|| {
+            name.trim_end_matches(".md")
+                .trim_end_matches(".MD")
+                .to_string()
+        });
+        out.push(WritingSample {
+            title,
+            text: text.trim().to_string(),
+            source: Some(name),
+        });
+    }
+    out
+}
+
+/// The text of the first ATX heading in a markdown document, or `None`.
+fn first_heading(text: &str) -> Option<String> {
+    text.lines()
+        .map(str::trim)
+        .find(|l| l.starts_with('#'))
+        .map(|l| l.trim_start_matches('#').trim().to_string())
+        .filter(|t| !t.is_empty())
 }
 
 /// `Some(trimmed)` when the value is present and non-blank, else `None` — so a
@@ -205,6 +432,46 @@ struct PersonaToml {
     owner_pronoun: Option<String>,
     languages: Option<Vec<String>>,
     diet_keywords_extra: Option<Vec<String>>,
+    // ---- D6: the pack keys. Every one optional, every one additive. ------------------
+    /// What the assistant is called. Default `"Jesse"`.
+    assistant_name: Option<String>,
+    /// One sentence about what this assistant is for. Rendered only when set.
+    assistant_description: Option<String>,
+    /// `by_name` | `neutral` | `formal`.
+    address_style: Option<String>,
+    /// The `[persona.style]` sub-table.
+    style: Option<StyleToml>,
+    /// The `[persona.formatting]` sub-table.
+    formatting: Option<FormattingToml>,
+    /// A path to a banned-pattern list in the `draft-lint` format. `~` expands.
+    banned_patterns_file: Option<String>,
+    /// A directory of `.md` writing samples. `~` expands.
+    writing_samples_dir: Option<String>,
+    /// The owner's own words about how they want the assistant to behave.
+    free_text: Option<String>,
+    /// `off` | `annotate` | `regenerate` | `regenerate:<n>`.
+    style_policy: Option<String>,
+}
+
+/// `[persona.style]`. Values stay UNTYPED here for the same reason `[concurrency]`'s do: a
+/// mistyped word must be reportable by name, and a typed field would fail the parse of the
+/// whole overlay file and take the schedule and the model registry down with the persona.
+#[derive(Deserialize, Default)]
+struct StyleToml {
+    formality: Option<String>,
+    humor: Option<String>,
+    verbosity: Option<String>,
+    emoji: Option<String>,
+    hedging: Option<String>,
+    questions: Option<String>,
+}
+
+/// `[persona.formatting]`. Untyped for the same reason as [`StyleToml`].
+#[derive(Deserialize, Default)]
+struct FormattingToml {
+    lists: Option<String>,
+    headings: Option<String>,
+    dashes: Option<String>,
 }
 
 /// The whole local overlay file. `[persona]` supplies the personalization; the declarative
@@ -459,6 +726,10 @@ fn load_local_config(home: &str) -> Option<LocalConfig> {
 mod tests {
     use super::*;
     use crate::testutil::*;
+    use jesse_agent::persona::{
+        AddressStyle, Dashes, Emoji, Formality, Headings, Hedging, Humor, Lists, Questions,
+        Verbosity,
+    };
 
     #[test]
     fn default_is_generic() {
@@ -471,12 +742,7 @@ mod tests {
 
     #[test]
     fn render_substitutes_all_placeholders() {
-        let p = Persona {
-            owner_name: "Alex".into(),
-            owner_pronoun: "her".into(),
-            languages: vec!["en".into(), "es".into()],
-            diet_keywords_extra: vec![],
-        };
+        let p = Persona::from_legacy("Alex", "her", vec!["en".into(), "es".into()], vec![]);
         assert_eq!(
             p.render("{Owner} asks from {owner_pronoun} phone; {owner} waits."),
             "Alex asks from her phone; Alex waits."
@@ -505,12 +771,7 @@ mod tests {
     /// called "her". One pass over the template fixes it by construction.
     #[test]
     fn render_never_re_expands_a_substituted_value() {
-        let p = Persona {
-            owner_name: "{owner_pronoun}".into(),
-            owner_pronoun: "her".into(),
-            languages: vec!["en".into()],
-            diet_keywords_extra: vec![],
-        };
+        let p = Persona::from_legacy("{owner_pronoun}", "her", vec!["en".into()], vec![]);
         assert_eq!(p.render("{Owner} asks."), "{owner_pronoun} asks.");
         assert_eq!(p.render("{owner} asks."), "{owner_pronoun} asks.");
         // The genuine pronoun placeholder still renders — only the SUBSTITUTED text is
@@ -521,21 +782,11 @@ mod tests {
         );
 
         // The other direction: a pronoun that spells the name placeholder.
-        let q = Persona {
-            owner_name: "Alex".into(),
-            owner_pronoun: "{Owner}".into(),
-            languages: vec!["en".into()],
-            diet_keywords_extra: vec![],
-        };
+        let q = Persona::from_legacy("Alex", "{Owner}", vec!["en".into()], vec![]);
         assert_eq!(q.render("{owner_pronoun} phone"), "{Owner} phone");
 
         // And a name that would recurse forever under any rescanning scheme.
-        let r = Persona {
-            owner_name: "{owner}".into(),
-            owner_pronoun: "their".into(),
-            languages: vec!["en".into()],
-            diet_keywords_extra: vec![],
-        };
+        let r = Persona::from_legacy("{owner}", "their", vec!["en".into()], vec![]);
         assert_eq!(r.render("{owner} and {owner}"), "{owner} and {owner}");
     }
 
@@ -544,12 +795,7 @@ mod tests {
     /// byte for byte, including a lone `{` at the very end of the text.
     #[test]
     fn render_passes_unknown_braces_through_unchanged() {
-        let p = Persona {
-            owner_name: "Alex".into(),
-            owner_pronoun: "her".into(),
-            languages: vec!["en".into()],
-            diet_keywords_extra: vec![],
-        };
+        let p = Persona::from_legacy("Alex", "her", vec!["en".into()], vec![]);
         for template in [
             "{}",
             "{ owner }",
@@ -755,6 +1001,289 @@ catchup_secs = 60
         let s = validate_schedule(&[]);
         assert!(s.jobs.is_empty() && s.invalid.is_empty() && !s.is_fatal());
         std::env::remove_var("JESSE_CONFIG");
+    }
+
+    // ---- D6: the pack --------------------------------------------------------
+
+    /// **THE COMPATIBILITY ASSERTION.** A `jesse.local.toml` written before the pack existed
+    /// renders exactly the placeholders it always did, because the four legacy keys ARE the
+    /// pack's owner fields and nothing else in the pack touches them.
+    #[test]
+    fn a_legacy_persona_file_renders_the_same_placeholders_as_before() {
+        let _g = ENV_LOCK.lock_ok();
+        for k in ["JESSE_CONFIG", "JESSE_OWNER_NAME", "JESSE_STATE_DIR"] {
+            std::env::remove_var(k);
+        }
+        let dir = std::env::temp_dir().join(format!("jesse-persona-legacy-{}", random_hex()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("jesse.local.toml");
+        std::fs::write(
+            &file,
+            "[persona]\nowner_name = \"Alex Example\"\nowner_pronoun = \"her\"\nlanguages = [\"en\", \"es\"]\n",
+        )
+        .unwrap();
+        std::env::set_var("JESSE_CONFIG", &file);
+
+        let loaded = Persona::load("");
+        // Byte for byte what a pre-pack build rendered from the same file.
+        let template = "{Owner} asks from {owner_pronoun} phone; {owner} waits.";
+        assert_eq!(
+            loaded.render(template),
+            "Alex Example asks from her phone; Alex Example waits."
+        );
+        // And the pack agrees with the legacy fields rather than holding a second opinion.
+        assert_eq!(loaded.pack.owner.name, "Alex Example");
+        assert_eq!(loaded.pack.owner.pronoun, "her");
+        assert_eq!(
+            loaded.pack.languages,
+            vec!["en".to_string(), "es".to_string()]
+        );
+        // Nothing else was configured, so the rest of the pack is the shipped default.
+        assert_eq!(loaded.pack.assistant.name, "Jesse");
+        assert!(loaded.pack.banned_patterns.is_empty());
+        assert_eq!(loaded.style_policy, StylePolicy::Annotate);
+
+        std::env::remove_var("JESSE_CONFIG");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The `{assistant}` placeholder is fed from the pack, and the scanner that renders it is
+    /// the same single-pass one the other three go through.
+    #[test]
+    fn the_assistant_placeholder_renders_from_the_pack() {
+        let mut p = Persona::default();
+        assert_eq!(p.render("Hello, {assistant}."), "Hello, Jesse.");
+        p.pack.assistant.name = "Ada".into();
+        assert_eq!(p.render("Hello, {assistant}."), "Hello, Ada.");
+        // A value that spells another placeholder is still never re-expanded.
+        p.pack.assistant.name = "{owner}".into();
+        assert_eq!(p.render("{assistant} and {owner}"), "{owner} and the user");
+    }
+
+    #[test]
+    fn every_new_pack_key_loads_from_the_persona_table() {
+        let _g = ENV_LOCK.lock_ok();
+        for k in ["JESSE_CONFIG", "JESSE_OWNER_NAME", "JESSE_STATE_DIR"] {
+            std::env::remove_var(k);
+        }
+        let dir = std::env::temp_dir().join(format!("jesse-persona-pack-{}", random_hex()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("patterns.txt"),
+            "# fixture\n\n\\bdelve\\b\n\\btapestry\\b\n",
+        )
+        .unwrap();
+        let samples = dir.join("samples");
+        std::fs::create_dir_all(&samples).unwrap();
+        std::fs::write(
+            samples.join("2026-01-02-second.md"),
+            "# The second one\n\nWritten later.\n",
+        )
+        .unwrap();
+        std::fs::write(samples.join("2026-01-01-first.md"), "No heading here.\n").unwrap();
+        std::fs::write(samples.join("notes.txt"), "not markdown, not loaded").unwrap();
+        let file = dir.join("jesse.local.toml");
+        std::fs::write(
+            &file,
+            format!(
+                r#"
+[persona]
+owner_name = "Alex Example"
+assistant_name = "Ada"
+assistant_description = "a research assistant"
+address_style = "neutral"
+banned_patterns_file = "{patterns}"
+writing_samples_dir = "{samples}"
+free_text = "  Answer the question I asked.  "
+style_policy = "regenerate:2"
+
+[persona.style]
+formality = "low"
+humor = "dry"
+verbosity = "terse"
+emoji = "sparingly"
+hedging = "minimal"
+questions = "assume_and_state"
+
+[persona.formatting]
+lists = "avoid"
+headings = "freely"
+dashes = "allowed"
+"#,
+                patterns = dir.join("patterns.txt").display(),
+                samples = samples.display(),
+            ),
+        )
+        .unwrap();
+        std::env::set_var("JESSE_CONFIG", &file);
+
+        let p = Persona::load("");
+        assert_eq!(p.pack.assistant.name, "Ada");
+        assert_eq!(
+            p.pack.assistant.self_description.as_deref(),
+            Some("a research assistant")
+        );
+        assert_eq!(p.pack.owner.address_style, AddressStyle::Neutral);
+        assert_eq!(p.pack.style.formality, Formality::Low);
+        assert_eq!(p.pack.style.humor, Humor::Dry);
+        assert_eq!(p.pack.style.verbosity, Verbosity::Terse);
+        assert_eq!(p.pack.style.emoji, Emoji::Sparingly);
+        assert_eq!(p.pack.style.hedging, Hedging::Minimal);
+        assert_eq!(p.pack.style.questions, Questions::AssumeAndState);
+        assert_eq!(p.pack.formatting.lists, Lists::Avoid);
+        assert_eq!(p.pack.formatting.headings, Headings::Freely);
+        assert_eq!(p.pack.formatting.dashes, Dashes::Allowed);
+        assert_eq!(p.style_policy, StylePolicy::Regenerate { max_attempts: 2 });
+        // The free text is trimmed but otherwise verbatim.
+        assert_eq!(
+            p.pack.free_text.as_deref(),
+            Some("Answer the question I asked.")
+        );
+        // Patterns, comments and blanks skipped.
+        assert_eq!(
+            p.pack
+                .banned_patterns
+                .iter()
+                .map(|x| x.source())
+                .collect::<Vec<_>>(),
+            vec!["\\bdelve\\b", "\\btapestry\\b"]
+        );
+        // Samples: `.md` only, sorted by name (oldest first), source recorded, title from the
+        // first heading with the file stem as the fallback.
+        assert_eq!(p.pack.writing_samples.len(), 2);
+        assert_eq!(
+            p.pack.writing_samples[0].source.as_deref(),
+            Some("2026-01-01-first.md")
+        );
+        assert_eq!(p.pack.writing_samples[0].title, "2026-01-01-first");
+        assert_eq!(p.pack.writing_samples[1].title, "The second one");
+
+        std::env::remove_var("JESSE_CONFIG");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A patterns file with a line that will not compile keeps every line that DID, because
+    /// one typo silently disarming a whole banned list is the failure a checker can least
+    /// afford: it looks exactly like a model that complied.
+    #[test]
+    fn a_malformed_patterns_file_keeps_what_parsed() {
+        let _g = ENV_LOCK.lock_ok();
+        for k in ["JESSE_CONFIG", "JESSE_OWNER_NAME", "JESSE_STATE_DIR"] {
+            std::env::remove_var(k);
+        }
+        let dir = std::env::temp_dir().join(format!("jesse-persona-badpat-{}", random_hex()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("patterns.txt"),
+            "\\bdelve\\b\n[unclosed\n\\btapestry\\b\n",
+        )
+        .unwrap();
+        let file = dir.join("jesse.local.toml");
+        std::fs::write(
+            &file,
+            format!(
+                "[persona]\nbanned_patterns_file = \"{}\"\n",
+                dir.join("patterns.txt").display()
+            ),
+        )
+        .unwrap();
+        std::env::set_var("JESSE_CONFIG", &file);
+
+        let p = Persona::load("");
+        assert_eq!(
+            p.pack
+                .banned_patterns
+                .iter()
+                .map(|x| x.source())
+                .collect::<Vec<_>>(),
+            vec!["\\bdelve\\b", "\\btapestry\\b"],
+            "the bad line is dropped and warned about; the good ones survive"
+        );
+
+        std::env::remove_var("JESSE_CONFIG");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A mistyped parameter value warns and leaves the default, rather than failing the parse
+    /// of the whole overlay file and taking the schedule and the model registry down with it.
+    #[test]
+    fn a_mistyped_parameter_value_leaves_the_default() {
+        let _g = ENV_LOCK.lock_ok();
+        for k in ["JESSE_CONFIG", "JESSE_OWNER_NAME", "JESSE_STATE_DIR"] {
+            std::env::remove_var(k);
+        }
+        let dir = std::env::temp_dir().join(format!("jesse-persona-typo-{}", random_hex()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("jesse.local.toml");
+        std::fs::write(
+            &file,
+            "[persona]\nowner_name = \"Alex\"\nstyle_policy = \"shout\"\n\n[persona.formatting]\ndashes = \"banned\"\n",
+        )
+        .unwrap();
+        std::env::set_var("JESSE_CONFIG", &file);
+
+        let p = Persona::load("");
+        assert_eq!(p.owner_name, "Alex", "the rest of the table still loaded");
+        assert_eq!(p.style_policy, StylePolicy::Annotate);
+        assert_eq!(p.pack.formatting.dashes, Dashes::Forbidden);
+
+        std::env::remove_var("JESSE_CONFIG");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A missing patterns file or samples directory is a warning and an empty list, never a
+    /// startup failure.
+    #[test]
+    fn missing_pack_files_are_warnings_not_failures() {
+        assert!(load_banned_patterns("/nonexistent/patterns.txt").is_empty());
+        assert!(load_writing_samples("/nonexistent/samples").is_empty());
+    }
+
+    /// **The shipped example config must load through the real loader.**
+    /// `jesse.example.toml` documents every key an operator copies into their own file, so a
+    /// key documented with a value the loader rejects is a broken instruction shipped in the
+    /// repository. A mistyped parameter falls back silently to its default by design (see
+    /// [`parse_key`]), which is exactly why the example needs a test rather than a read.
+    #[test]
+    fn the_shipped_example_config_loads() {
+        let _g = ENV_LOCK.lock_ok();
+        for k in ["JESSE_CONFIG", "JESSE_OWNER_NAME", "JESSE_STATE_DIR"] {
+            std::env::remove_var(k);
+        }
+        let example = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("bridge/ has a parent")
+            .join("jesse.example.toml");
+        std::env::set_var("JESSE_CONFIG", &example);
+        let p = Persona::load("");
+        std::env::remove_var("JESSE_CONFIG");
+
+        // The four legacy keys, as the file documents them.
+        assert_eq!(p.owner_name, "Alex Example");
+        assert_eq!(p.owner_pronoun, "their");
+        assert_eq!(p.languages, vec!["en".to_string(), "es".to_string()]);
+        assert!(!p.diet_keywords_extra.is_empty());
+        // The D6 keys, as the file documents them. Each of these would be the DEFAULT if the
+        // example spelled its value wrong, so every one is asserted against what the file says
+        // rather than against the default.
+        assert_eq!(p.pack.assistant.name, "Jesse");
+        assert!(p.pack.assistant.self_description.is_some());
+        assert_eq!(p.pack.owner.address_style, AddressStyle::ByName);
+        assert_eq!(p.style_policy, StylePolicy::Annotate);
+        assert!(p.pack.free_text.is_some());
+        assert_eq!(p.pack.style.formality, Formality::Medium);
+        assert_eq!(p.pack.style.humor, Humor::Light);
+        assert_eq!(p.pack.style.verbosity, Verbosity::Normal);
+        assert_eq!(p.pack.style.emoji, Emoji::Never);
+        assert_eq!(p.pack.style.hedging, Hedging::Normal);
+        assert_eq!(p.pack.style.questions, Questions::AskBeforeAssuming);
+        assert_eq!(p.pack.formatting.lists, Lists::WhenAsked);
+        assert_eq!(p.pack.formatting.headings, Headings::WhenLong);
+        assert_eq!(p.pack.formatting.dashes, Dashes::Forbidden);
+        // The two file-backed keys are COMMENTED OUT in the example (neither defaults to the
+        // vault), so a fresh copy loads with no patterns and no samples.
+        assert!(p.pack.banned_patterns.is_empty());
+        assert!(p.pack.writing_samples.is_empty());
     }
 
     #[test]

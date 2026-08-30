@@ -49,6 +49,16 @@ Every local file has a committed `*.example` twin; copy it and edit the copy:
    the last is the reliable spot for a launchd-managed service whose working
    directory isn't the repo.
 
+   The same `[persona]` table also carries the **persona pack**: what your
+   assistant is called, how formal it is, whether it may use lists, headings or
+   dashes, a banned-vocabulary list, examples of your own writing, and your own
+   words about how you want to be spoken to. Personality is parameters rather than
+   a paragraph, because a paragraph behaves differently on every model and does not
+   survive a backend swap. `jesse.example.toml` documents every key, and
+   [`bridge/README.md`](bridge/README.md#the-persona-pack-bridge-01110) has the
+   table of values. Nothing has to be set: leave it alone and the assistant is the
+   generic default it always was.
+
 2. **Point at your vault** — `export JESSE_VAULT=/path/to/your/vault` (defaults to
    `~/vault`).
 

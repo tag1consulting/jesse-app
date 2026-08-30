@@ -2507,6 +2507,79 @@ templates rendered from the persona at prompt-build time; the fixed, non-overrid
 safety floor still always leads a turn. `GET /jesse/prompts` returns the
 persona-rendered defaults so the app's cached "default" matches what a turn builds.
 
+### The persona pack (bridge 0.111.0)
+
+`[persona]` also carries a **persona pack** — personality as parameters rather than as prose,
+because a long personality paragraph behaves differently on every model and does not survive a
+backend swap. The pack lives in the `jesse-agent` crate (`agent/src/persona/`, and
+[`../agent/README.md`](../agent/README.md#the-persona-pack) documents its shape and its
+rendering contract); the bridge loads it, feeds it to the `{owner}`/`{Owner}`/`{owner_pronoun}`
+scanner along with a new `{assistant}`, and renders it into the `direct` harness's system
+prefix per wire.
+
+**An existing `[persona]` table behaves exactly as it did before.** The four keys it already
+had ARE the pack's owner fields; everything below is optional and additive.
+
+| Key | Values | Default |
+|---|---|---|
+| `assistant_name` | any string | `Jesse` |
+| `assistant_description` | one sentence, or unset | unset (nothing is rendered) |
+| `address_style` | `by_name` / `neutral` / `formal` | `by_name` |
+| `style.formality` | `low` / `medium` / `high` | `medium` |
+| `style.humor` | `none` / `light` / `dry` / `frequent` | `light` |
+| `style.verbosity` | `terse` / `normal` / `long` | `normal` |
+| `style.emoji` | `never` / `sparingly` / `freely` | `never` |
+| `style.hedging` | `minimal` / `normal` | `normal` |
+| `style.questions` | `ask_before_assuming` / `assume_and_state` | `ask_before_assuming` |
+| `formatting.lists` | `avoid` / `when_asked` / `freely` | `when_asked` |
+| `formatting.headings` | `avoid` / `when_long` / `freely` | `when_long` |
+| `formatting.dashes` | `forbidden` / `allowed` | `forbidden` |
+| `banned_patterns_file` | path (`~` expands) | unset |
+| `writing_samples_dir` | path (`~` expands) | unset |
+| `free_text` | your own words, carried verbatim | unset |
+| `style_policy` | `off` / `annotate` / `regenerate` / `regenerate:<n>` | `annotate` |
+
+A mistyped value is **one startup warning naming the key**, and the default stands — the whole
+overlay file is not failed, because that would take the schedule and the model registry down
+with the persona. `banned_patterns_file` is read in the `draft-lint` format (one regex per
+line, `#` comments, case-insensitive); a line that will not compile is one warning naming the
+line number and every other line still loads. `writing_samples_dir` loads `*.md` sorted by
+name up to 16 KiB total. Neither path defaults to anything.
+
+### The style checker
+
+A `direct` turn's answer is **checked after it is generated**, against the pack: the banned
+patterns, every dash variant when `formatting.dashes = "forbidden"`, and bullet/heading lines
+when the formatting parameters say avoid. Fenced code blocks are exempt and inline code spans
+are masked first, so `--flag` in a shell line is not a finding.
+
+* `style_policy = "annotate"` (the default) delivers the model's own text and reports. The
+  reply's [structured provenance](#structured-provenance-model-badge-v2) gains
+  `"style": "3 hits"`.
+* `style_policy = "regenerate"` (or `regenerate:<n>`) spends up to *n* extra assistant turns
+  asking for a rewrite, then reports `"style": "regenerated 1"`. It **doubles the cost** of a
+  flagged turn, and it turns live text streaming off for that deployment: a rewrite discards
+  the text already streamed, and watching one answer arrive and a different one replace it is
+  worse than waiting for the final one. The rewrite runs on the same thread, so the request
+  and both attempts stay in the transcript, and its token bill is folded into the turn's.
+
+What crosses out of the harness is **two integers** — how many things were counted, and how
+many rewrites were spent. The checker's own report names line numbers and match lengths and
+never leaves the process. The `style` field is **absent** both when no check ran and when a
+checked reply was clean, so a client can tell "not checked" from "checked and clean".
+
+### `GET /jesse/persona`
+
+```bash
+curl -s http://127.0.0.1:8765/jesse/persona -H "Authorization: Bearer $JESSE_TOKEN"
+```
+
+Returns the pack **without the writing samples and the free text** (those are your own prose,
+and this is a settings screen rather than a document viewer), with both summarised — how many,
+how many bytes, which files. Same bearer auth as `/jesse`. **There is no write endpoint:** the
+pack is loaded from `jesse.local.toml` at startup, and a POST that changed it in memory would
+produce a persona that disagrees with the file the next restart reads.
+
 ## Knobs (env vars)
 
 | Var | Default | Purpose |
