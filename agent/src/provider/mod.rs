@@ -4,10 +4,12 @@
 //! THE LAYERING RULE, and it is the one thing this module exists to enforce: nothing
 //! above this layer ever names a wire. No `anthropic`, no `openai`, no `content_block_delta`,
 //! no `finish_reason`, no `cache_control` — those strings live in the adapter modules
-//! ([`anthropic`], [`openai_chat`]) and nowhere else in the tree. A caller builds a
+//! ([`anthropic`], [`openai_chat`], [`openai_responses`]) and nowhere else in the tree. A caller builds a
 //! [`Request`], gets a stream of [`Event`], and cannot tell which wire served it except
 //! by asking [`Provider::wire`]. D2's loop is written against this vocabulary alone,
-//! which is what makes D7's third adapter a new file rather than a new branch in the loop.
+//! which is what made the third adapter a new FILE rather than a new branch in the loop.
+//! D8's whole job was to find out whether that held against a wire the trait was not
+//! shaped around; it did, and everywhere it strained is written down in `agent/LEAKS.md`.
 //!
 //! WHY A NEUTRAL MODEL AT ALL, rather than passing Anthropic-shaped JSON around and
 //! translating at the edge (which is what `bridge/src/vision.rs` does today, with its
@@ -46,6 +48,7 @@ pub mod anthropic;
 pub mod config;
 pub mod http;
 pub mod openai_chat;
+pub mod openai_responses;
 
 /// A `Provider` that plays a fixed script instead of speaking HTTP.
 ///
@@ -59,6 +62,7 @@ pub use anthropic::AnthropicMessages;
 pub use config::{AuthScheme, ProviderConfig, Quirks, Retries, Timeouts};
 pub use http::{CallAudit, EventStream};
 pub use openai_chat::OpenAiChat;
+pub use openai_responses::OpenAiResponses;
 
 // ===========================================================================
 // The request
@@ -327,8 +331,27 @@ pub struct Usage {
     pub cache_read_tokens: Option<u64>,
     /// Prompt tokens written INTO the cache, billed at (or above) the input rate.
     /// `None` on wires that do not report it — the OpenAI Chat wire has no equivalent
-    /// field, which is a genuine absence and not a zero.
+    /// field, which is a genuine absence and not a zero. The Messages and Responses wires
+    /// both report one.
     pub cache_write_tokens: Option<u64>,
+    /// Output tokens the model spent thinking, when the wire reports a breakdown.
+    ///
+    /// **A SUBSET OF `output_tokens`, NOT A FOURTH DISJOINT COUNT**, and it is the one
+    /// field here that breaks the sum-to-the-total rule the other three obey. That is not
+    /// an inconsistency to be tidied away: reasoning tokens ARE output tokens — generated,
+    /// billed at the output rate, already inside `output_tokens` on every wire that
+    /// reports them. Subtracting them out would understate the output bill by exactly the
+    /// thinking, so nothing prices this field and [`crate::budget::PriceDeck::cost_usd`]
+    /// deliberately ignores it.
+    ///
+    /// ADDED IN D8, and it is the ONE additive trait change the third adapter forced. The
+    /// Responses wire reports `usage.output_tokens_details.reasoning_tokens` and the
+    /// neutral model had nowhere to put it, so the question "how much of this turn's bill
+    /// was thinking" — the operational question a reasoning model raises the moment it is
+    /// deployed — could be answered on the wire and not by a caller. `None` on the two
+    /// wires that report no breakdown, which is a genuine absence: a `Some(0)` would claim
+    /// the host measured zero thinking.
+    pub reasoning_tokens: Option<u64>,
     /// The provider's own id for this request, when the wire exposes one, for correlating
     /// with a provider-side dashboard. Never a token, never a URL.
     pub provider_request_id: Option<String>,
@@ -350,6 +373,11 @@ pub struct Usage {
 /// [`Usage::provider_request_id`] is dropped by the conversion. That is not a loss:
 /// `ShadowUsage` is the COST vector and a request id has no price. Widening the bridge's
 /// on-disk shape to carry one was rejected as out of scope for D1.
+///
+/// [`Usage::reasoning_tokens`] is dropped for the SAME reason, restated because it is the
+/// newer field and the temptation is the other way. It has no price — it is already inside
+/// `output_tokens`, which this type carries — so adding it here would widen a shape the
+/// bridge's metrics history is already written in, to record a number that changes no cost.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct TokenUsage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -571,8 +599,18 @@ impl std::error::Error for ProviderError {}
 /// runtime — a `panic!` there takes the process down for a typo in a TOML file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfigError {
-    /// The wire is declared but has no adapter yet. Today this is exactly
-    /// [`Wire::Responses`], which D7 implements.
+    /// The wire is declared but has no adapter yet.
+    ///
+    /// **NO WIRE IS IN THIS STATE TODAY.** D8 implemented [`Wire::Responses`], the last
+    /// declared-and-unimplemented one, so [`build_provider`] currently cannot return this.
+    ///
+    /// KEPT ANYWAY, and deliberately, because the sequence it exists for is the one the
+    /// enum is designed around: a wire is DECLARED first (so every `match` on [`Wire`]
+    /// gains its arm while the shape is still cheap to change) and implemented after. The
+    /// gap between those two commits is exactly when constructing a provider must be a
+    /// typed refusal rather than a panic or a silent fallback to a neighbouring wire.
+    /// Deleting the variant now would mean the next wire's declaration commit has to
+    /// re-invent it, or — much more likely — skip the refusal and fall back.
     UnimplementedWire(Wire),
 }
 
@@ -606,15 +644,15 @@ pub enum Wire {
     Messages,
     /// OpenAI Chat Completions: `POST {base_url}/chat/completions`.
     Chat,
-    /// OpenAI Responses: `POST {base_url}/responses`.
+    /// OpenAI Responses: `POST {base_url}/responses`, where `base_url` is the API ROOT
+    /// (e.g. `https://api.openai.com/v1`) — the segment BEFORE `/responses`, unlike
+    /// [`Wire::Messages`], where the base is a bare host.
     ///
-    /// DECLARED NOW, UNIMPLEMENTED UNTIL D7. It is named here rather than added later
-    /// because it already matters: `codex-cli` speaks only this wire, so anything the
-    /// enum's shape forces (a third arm in every match) is better discovered now than in
-    /// D7. Constructing a provider for it returns
-    /// [`ConfigError::UnimplementedWire`] — a typed error, never a panic, and never a
-    /// silent fallback to [`Wire::Chat`], which would send a Chat body to a Responses
-    /// endpoint and produce a confusing 400 instead of a clear refusal.
+    /// DECLARED IN D1, IMPLEMENTED IN D8 by [`openai_responses`]. It was named a step
+    /// ahead of its adapter because it already mattered — `codex-cli` speaks only this
+    /// wire — so anything the enum's shape forced (a third arm in every match) was
+    /// discovered while the shape was still cheap to change. That decision is what made
+    /// the adapter a new file and not a new branch anywhere else.
     Responses,
 }
 
@@ -684,12 +722,17 @@ pub trait Provider: Send + Sync {
 /// Build the adapter for a configuration's wire.
 ///
 /// The one place that maps [`Wire`] onto a concrete adapter, so a caller never names an
-/// adapter type and D7 adds an arm here rather than at every call site.
+/// adapter type and a new wire adds an arm HERE rather than at every call site. D8 adding
+/// the third arm and touching nothing else is the check on that claim.
+///
+/// It still returns a `Result` though every declared wire now builds: the error arm is the
+/// contract for the window between declaring a wire and implementing it, which is a window
+/// this enum is deliberately designed to have. See [`ConfigError::UnimplementedWire`].
 pub fn build_provider(cfg: ProviderConfig) -> Result<Box<dyn Provider>, ConfigError> {
     match cfg.wire {
         Wire::Messages => Ok(Box::new(AnthropicMessages::new(cfg))),
         Wire::Chat => Ok(Box::new(OpenAiChat::new(cfg))),
-        Wire::Responses => Err(ConfigError::UnimplementedWire(Wire::Responses)),
+        Wire::Responses => Ok(Box::new(OpenAiResponses::new(cfg))),
     }
 }
 
@@ -704,6 +747,7 @@ mod tests {
             output_tokens: Some(20),
             cache_read_tokens: Some(900),
             cache_write_tokens: Some(7),
+            reasoning_tokens: Some(11),
             provider_request_id: Some("req_x".into()),
         };
         let t: TokenUsage = u.into();
@@ -713,6 +757,10 @@ mod tests {
         assert_eq!(t.output_tokens, Some(20));
         assert_eq!(t.cache_read_input_tokens, Some(900));
         assert_eq!(t.cache_creation_input_tokens, Some(7));
+        // The reasoning count is DROPPED, and the output count is untouched by it: those
+        // 11 tokens are already inside the 20, so folding them in would bill them twice
+        // and subtracting them out would bill them never.
+        assert_eq!(t.output_tokens, Some(20));
     }
 
     #[test]
@@ -793,25 +841,26 @@ mod tests {
     }
 
     #[test]
-    fn the_responses_wire_is_a_typed_error_not_a_panic() {
-        let cfg = ProviderConfig::new(
-            Wire::Responses,
-            "http://127.0.0.1:1",
-            "m",
-            AuthScheme::Bearer("t".into()),
-        );
-        assert_eq!(
-            build_provider(cfg).err(),
-            Some(ConfigError::UnimplementedWire(Wire::Responses))
-        );
+    fn every_declared_wire_builds_and_reports_itself() {
+        // The replacement for D1's `the_responses_wire_is_a_typed_error_not_a_panic`. That
+        // test asserted the REFUSAL, which was the contract while the adapter did not
+        // exist; asserting it now would pin the gap open. What survives from it is the
+        // property that mattered — a wire the enum declares is never silently served by a
+        // neighbouring adapter — and it is checked here by `p.wire() == w`.
+        for w in [Wire::Messages, Wire::Chat, Wire::Responses] {
+            let cfg = ProviderConfig::new(w, "http://127.0.0.1:1", "m", AuthScheme::None);
+            let p = build_provider(cfg).expect("every declared wire has an adapter");
+            assert_eq!(p.wire(), w);
+        }
     }
 
     #[test]
-    fn both_implemented_wires_build() {
-        for w in [Wire::Messages, Wire::Chat] {
-            let cfg = ProviderConfig::new(w, "http://127.0.0.1:1", "m", AuthScheme::None);
-            let p = build_provider(cfg).expect("adapter exists");
-            assert_eq!(p.wire(), w);
-        }
+    fn an_unimplemented_wire_is_still_a_typed_error_rather_than_a_panic() {
+        // No wire is in that state today, so this asserts on the TYPE that expresses it:
+        // it displays as a refusal naming the wire, never a fallback and never a panic.
+        // The next declared-before-implemented wire inherits a checked contract instead of
+        // re-deciding one.
+        let e = ConfigError::UnimplementedWire(Wire::Responses);
+        assert_eq!(e.to_string(), "no adapter for the responses wire yet");
     }
 }

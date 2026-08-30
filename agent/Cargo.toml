@@ -1,9 +1,9 @@
 [package]
 name = "jesse-agent"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 license = "Apache-2.0"
-description = "Provider-neutral agent layer for Jesse: one request/response model, one streaming event vocabulary, per-wire adapters (Anthropic Messages, OpenAI Chat Completions), and the tool-calling turn loop that runs on top of them."
+description = "Provider-neutral agent layer for Jesse: one request/response model, one streaming event vocabulary, per-wire adapters (Anthropic Messages, OpenAI Chat Completions, OpenAI Responses), and the tool-calling turn loop that runs on top of them."
 
 # NO DEPENDENCY ON `bridge/` IN EITHER DIRECTION. The bridge is excluded from the root
 # workspace (see the root Cargo.toml) and builds standalone from its own Cargo.lock; a
@@ -76,7 +76,7 @@ scripted = []
 # only way an INTEGRATION test (which links the library as an external crate, without
 # `cfg(test)`) can see a feature-gated module. Without it the loop's scripted-provider
 # cases and its loopback-adapter cases would have to live in different files, and the claim
-# that a turn produces IDENTICAL thread contents on all three providers could not be
+# that a turn produces IDENTICAL thread contents on all four providers could not be
 # asserted in one function. `cargo build` is unaffected: dev-dependencies are not built.
 jesse-agent = { path = ".", features = ["scripted"] }
 # TOML round trip for the persona pack, TESTS ONLY. The pack is serialised with `serde` and

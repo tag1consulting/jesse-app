@@ -440,6 +440,7 @@ pub async fn run_turn(
                 output_tokens: usage.output_tokens,
                 cache_read_tokens: usage.cache_read_tokens,
                 cache_write_tokens: usage.cache_write_tokens,
+                reasoning_tokens: usage.reasoning_tokens,
                 cost_usd: prices.cost_usd(&usage),
                 latency_ms: outcome.latency_ms.unwrap_or(latency_ms),
                 stop_reason: outcome.stop_label(),

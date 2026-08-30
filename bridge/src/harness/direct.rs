@@ -25,7 +25,7 @@ use jesse_agent::{run_turn as agent_run_turn, EventSink, TurnDeps, TurnInput, Tu
 // the bridge spawns and reads; this one is the `agent/` crate's turn loop, running inside the
 // bridge, reached through the [`InProcessHarness`] seam D4 opened.
 //
-// WHAT IT IS NOT: a re-implementation of anything. The loop, the two wire adapters, the vault
+// WHAT IT IS NOT: a re-implementation of anything. The loop, the three wire adapters, the vault
 // tool set with its path jail, the thread store and the usage sink all live in `agent/` and
 // know nothing about jobs, conversations, or a phone. This module is the BINDING — it turns a
 // bridge [`TurnRequest`] into an `agent` `TurnInput`, hands the loop a sink that forwards into
@@ -152,22 +152,28 @@ impl Harness for Direct {
         true
     }
 
-    /// `Messages` and `Chat`; **`Responses` is FALSE until D8 implements it.**
+    /// **ALL THREE.** D8 landed the Responses adapter, and this is the line it changed.
     ///
-    /// This is the one harness whose answer follows a library rather than a CLI:
-    /// `jesse_agent::provider::build_provider` has an adapter for the first two wires and
-    /// returns `ConfigError::UnimplementedWire` for the third. Claiming `Responses` here
-    /// would let a model pass startup validation and then fail every turn at provider
-    /// construction — the same shape of failure the wire gate exists to prevent, arrived at
-    /// from the other direction.
+    /// This is the one harness whose answer follows a LIBRARY rather than a CLI:
+    /// `jesse_agent::provider::build_provider` now has an adapter for every wire the enum
+    /// declares, so this returns `true` for every wire the enum declares. The two must
+    /// agree in that direction and no other — claiming a wire the library refuses would let
+    /// a model pass startup validation and then fail every turn at provider construction,
+    /// which is the same healthy-then-dead shape the wire gate exists to prevent, arrived
+    /// at from the library side.
     ///
-    /// It is stated as an explicit `false` arm rather than a wildcard so that D8 lands as a
-    /// one-line change here, next to a comment saying what it depends on.
+    /// Still an exhaustive `match` rather than a bare `true`, and deliberately: when the
+    /// next wire is DECLARED (which happens a step before its adapter exists, by design —
+    /// see `jesse_agent::provider::ConfigError::UnimplementedWire`), this fails to compile
+    /// and somebody has to answer for it. `true` would silently claim it.
+    ///
+    /// **This is also what makes `direct` the second way to reach an OpenAI-shaped model**,
+    /// beside `codex`. They are not equivalent: a Codex-harness turn reaches the vault
+    /// through a SHELL under an OS sandbox, a direct turn through eight typed tools with no
+    /// subprocess at all. `jesse.example.toml` states which to prefer and why.
     fn supports_wire(&self, wire: Wire) -> bool {
         match wire {
-            Wire::Messages | Wire::Chat => true,
-            // D8. `build_provider` refuses it today, so this must too.
-            Wire::Responses => false,
+            Wire::Messages | Wire::Chat | Wire::Responses => true,
         }
     }
 
@@ -534,9 +540,8 @@ fn provider_config_for(
 /// The bridge's wire, as the agent crate's.
 ///
 /// A fourth conversion that would live in [`crate::agentmap`] if it were needed anywhere else;
-/// it is needed only here, so it is here. `Responses` is mapped rather than refused because
-/// [`Harness::supports_wire`] has already refused it at startup — a `match` arm that cannot be
-/// reached is better than a panic that could be.
+/// it is needed only here, so it is here. Every arm is now reachable: since D8 this harness
+/// answers `supports_wire` yes for all three, so all three arrive here on a real turn.
 fn agent_wire(w: Wire) -> AgentWire {
     match w {
         Wire::Messages => AgentWire::Messages,

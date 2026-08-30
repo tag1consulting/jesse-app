@@ -11,6 +11,8 @@ vocabulary, per-wire adapters, and **the tool-calling turn loop that runs on top
   tools, the write-guard seam, and the structural containment battery.
 * **D6** built the persona pack — personality as parameters, rendered per wire, and the
   post-generation style checker that makes voice a checked property.
+* **D8** built the third adapter — `OpenAiResponses` — as the falsification of the provider
+  trait, and wrote down every place it strained in **[`LEAKS.md`](LEAKS.md)**.
 
 No dependency on `bridge/` in either direction.
 
@@ -39,10 +41,11 @@ make them structurally true rather than rules somebody remembers:
   │  tools  scope  thread  budget  framing  usage              │
   ├────────────────────────────────────────────────────────────┤
   │  provider::{Request, Event, Provider, Usage, ProviderError}│  the neutral vocabulary
-  ├──────────────────────────┬─────────────────────────────────┤
-  │  provider::anthropic     │  provider::openai_chat          │  every wire string
-  │  AnthropicMessages       │  OpenAiChat                     │  lives here
-  ├──────────────────────────┴─────────────────────────────────┤
+  ├───────────────────┬──────────────────┬─────────────────────┤
+  │ provider::        │ provider::       │ provider::          │  every wire string
+  │   anthropic       │   openai_chat    │   openai_responses  │  lives here
+  │ AnthropicMessages │ OpenAiChat       │ OpenAiResponses     │
+  ├───────────────────┴──────────────────┴─────────────────────┤
   │  provider::http                                            │
   │  one client · retries · redaction · audit line · SSE frames│
   ├────────────────────────────────────────────────────────────┤
@@ -584,9 +587,16 @@ Only one wire gives it away free:
 |---|---|---|
 | Messages | `input_tokens` already excluding `cache_read_input_tokens` | takes both verbatim |
 | Chat | `prompt_tokens` **inclusive** of `prompt_tokens_details.cached_tokens` | `input_tokens = prompt_tokens - cached_tokens` |
+| Responses | `input_tokens` **inclusive** of `input_tokens_details.{cached_tokens, cache_write_tokens}` | subtracts **both** |
 
 Get this wrong and every cached turn is billed twice — once at the input rate and once at
 the cache-read rate — and the error reads as "caching made things more expensive".
+
+**`reasoning_tokens` is the exception to the disjointness rule, on purpose.** It is a
+breakdown of `output_tokens`, not a fifth count beside it: reasoning tokens *are* output
+tokens, generated and billed at the output rate. `PriceDeck::cost_usd` has no term for it,
+and adding one would bill every thinking token twice. Only the Responses wire reports it;
+`None` elsewhere is a genuine absence, not a zero. See [`LEAKS.md`](LEAKS.md) L4.
 
 `TokenUsage` is shaped **exactly** like `ShadowUsage`'s four fields, with the same names
 and the same serde attributes, so D4 adopts it as `pub type ShadowUsage =
@@ -598,9 +608,13 @@ No adapter-specific type or string appears outside `src/provider/`. A caller nam
 never a vendor; reads `Event`, never an SSE frame; handles `ProviderError`, never an HTTP
 status. `build_provider` is the single place `Wire` maps onto a concrete adapter.
 
-`Wire::Responses` is declared and unimplemented: constructing it returns
-`ConfigError::UnimplementedWire` — a typed error, never a panic, and never a silent
-fallback to `Wire::Chat`.
+**Every declared wire now has an adapter**, and D8 adding the third one touched
+`build_provider` and nothing else outside its own file. `ConfigError::UnimplementedWire`
+survives with no wire in that state, because the sequence it exists for is deliberate: a
+wire is DECLARED first, so every `match` gains its arm while the shape is cheap to change,
+and implemented after. In that window, constructing a provider must be a typed refusal —
+never a panic, and never a silent fallback to a neighbouring wire, which for `Responses`
+would mean posting a Chat body at a Responses endpoint.
 
 ### 3. Redaction — nothing logs a token, a URL, or a body
 
@@ -669,6 +683,13 @@ a little quality, an unaccepted field costs the whole call.
 When a quirk drops something the caller asked for, one note goes to stderr. Never silent —
 a caller that set `strict` believed the arguments would be schema-constrained.
 
+**The third adapter needed no new quirk**, which is the checklist item worth noticing. Two
+of the three transfer unchanged (`reasoning_effort_supported` gates `reasoning: { effort }`
+here just as it gates `reasoning_effort` on Chat), the third is a Chat-only concept, and the
+one place the wires genuinely differ is not a host difference at all: the Responses schema
+lists `strict` as **required** on a function tool, so the key is always present and the
+quirk governs its VALUE rather than its presence.
+
 ## Testing
 
 ```
@@ -677,11 +698,17 @@ cargo clippy -p jesse-agent --all-targets -- -D warnings
 cargo fmt -p jesse-agent --check
 ```
 
-`tests/loop_conformance.rs` runs **one three-step tool turn three ways** — the Messages
-adapter over a loopback socket, the Chat adapter over a loopback socket, and the scripted
-provider with no wire at all — and asserts the thread each leaves is **identical**. That is
-the property the neutral model was built for, and it is the only test that can fail if the
-loop ever learns something about a wire.
+`tests/loop_conformance.rs` runs **one three-step tool turn four ways** — each of the three
+adapters over a loopback socket, and the scripted provider with no wire at all — and asserts
+the thread each leaves is **identical**. That is the property the neutral model was built
+for, and it is the only test that can fail if the loop ever learns something about a wire.
+
+The fourth way earns its place beyond arithmetic. The Responses wire gives a tool call two
+ids — an item id its stream is keyed by, and a `call_id` a result must be addressed to — and
+only a MULTI-ITERATION turn can prove the adapter round-trips the right one, because the
+failure is silent: emit the wrong id and the turn is well-formed, the model just never sees
+a tool result. `the_responses_wire_addresses_a_tool_result_by_call_id` reads the third
+request's body from the far side of the socket to check it.
 
 `tests/loop_behaviour.rs` is what the loop does when the answer is not "keep going":
 refusal, every budget ceiling, cancellation between tools, dispatch ordering and
@@ -695,12 +722,12 @@ test (which links the library without `cfg(test)`) can see it. `cargo build` is 
 dev-dependencies are not built — so a release build contains no `Provider` that fabricates
 answers.
 
-`tests/provider_conformance.rs` runs **one table of cases against both adapters through
-`&dyn Provider`**. That structure is the point: a per-adapter test file lets a behaviour
-drift between wires and calls it "the OpenAI one works differently". Here a divergence is a
-failing row. Wire-specific expectations live in one `expect_body` hook per case, so
-"cacheable produces `cache_control` on Messages and nothing on Chat" is one row asserting
-both halves.
+`tests/provider_conformance.rs` runs **one table of fifteen cases against all three adapters
+through `&dyn Provider`**. That structure is the point: a per-adapter test file lets a
+behaviour drift between wires and calls it "the OpenAI one works differently". Here a
+divergence is a failing row. Wire-specific expectations live in one `expect_body` hook per
+case, so "cacheable produces `cache_control` on Messages and nothing on the two OpenAI
+wires" is one row asserting all three halves.
 
 No network: each case binds a real loopback socket and speaks HTTP/1.1 by hand, the same
 approach `bridge/tests/integration.rs` takes for its mock helper. The mock is hand-rolled
@@ -712,7 +739,9 @@ client closed the connection.
 
 `examples/smoke.rs` is a live smoke: an example, not a test, so `cargo test` never runs it
 and CI only compiles it. It exists because the conformance mock agrees with whatever this
-code believes; only a live endpoint can disagree.
+code believes; only a live endpoint can disagree. It takes `JESSE_AGENT_WIRE=responses`
+like any other wire — **it has not been run against a live Responses endpoint**, because no
+key for one was present in the environment; see the end of [`LEAKS.md`](LEAKS.md).
 
 `examples/manifest.rs` prints the manifest a fixture tool set produces at each level, for a
 person to read. What it shows is asserted properly in `tests/loop_conformance.rs`.
@@ -734,41 +763,59 @@ cargo run -p jesse-agent --example smoke
 itself is never a value passed on a command line, so it stays out of shell history and
 `ps`. The program prints neither the token nor the base URL.
 
-## Adding a third adapter — the D7 checklist
+## Adding a wire adapter — the checklist, and how it survived contact
 
-Written now, so D7 checks a list rather than guessing. `Wire::Responses` is the next one.
+Written before the third adapter existed, so it could be CHECKED rather than admired. D8
+ran it end to end against `Wire::Responses`; the verdict on each item is recorded below,
+because a checklist nobody has graded is a wish list.
 
-1. **Add the arm to `build_provider`.** It is the only place `Wire` maps to an adapter.
-   Removing `ConfigError::UnimplementedWire` for that wire is the signal the work is done.
-2. **New file under `src/provider/`.** Every string of the new schema lives in it and
-   nowhere else. If a wire word has to appear in `http.rs` or `mod.rs`, the design is wrong
-   — take the detour through `SseDecoder` instead.
-3. **Implement `Provider`:** `wire()`, `capabilities()` (report what *this deployment* can
-   do, not what the schema defines — see `OpenAiChat::capabilities`, whose `thinking`
-   tracks the quirk), and `stream()`, which builds a body string and calls
-   `http::start_call`. Do not open a `reqwest::Client`, do not retry, do not time, do not
-   log — those are shared, and a second copy is how the wires stop agreeing.
-4. **Implement `SseDecoder`:** `on_frame` and `on_eof`. Push errors as `Event::Error`
-   rather than returning them, so text already received still reaches the caller.
-5. **Honour the event ordering guarantees** on `Event`: `ToolUseStart` → `ToolUseArgsDelta*`
-   → `ToolUseEnd`; at most one `Usage` and one `Done`, `Usage` first; exactly one of `Done`
-   or `Error` last.
-6. **Normalise usage to the invariant.** Work out whether the wire's prompt count includes
-   its cached count, and subtract if it does. Document the arithmetic where you do it.
-   Leave a count `None` if the wire does not report it — `None` and `0` mean different
-   things to a cost model.
-7. **`on_eof` must fail loudly.** A stream that ended without the wire's terminator is
-   `Protocol`, not a `Done` with a guessed stop reason.
-8. **Validate tool arguments at block close**, naming the tool on failure. See invariant 6.
-9. **Map the stop reasons** onto `StopReason`, with `Other(String)` for anything unmapped —
-   an unanticipated stop reason is still a completed call.
-10. **Add quirks, not branches**, for host differences, each documented with the host that
-    motivated it and defaulting to the conservative posture.
-11. **Add nothing to the case table — just run it.** Extend `run_case`'s wire list and the
-    `Script` struct with the new wire, then make all existing rows pass. A row that cannot
-    pass is either a genuine wire difference (put it in `expect_body`) or a bug.
-12. **Check the audit line and `Debug` output** carry no token, URL or body for the new
-    adapter, and that any new secret-bearing config field has a hand-written `Debug`.
+| | Item | Held? |
+|---|---|:--:|
+| 1 | **Add the arm to `build_provider`.** The only place `Wire` maps to an adapter. | ✅ one line |
+| 2 | **New file under `src/provider/`.** Every string of the new schema lives in it and nowhere else. If a wire word has to appear in `http.rs` or `mod.rs`, the design is wrong — take the detour through `SseDecoder`. | ✅ zero wire words escaped |
+| 3 | **Implement `Provider`:** `wire()`, `capabilities()` (what *this deployment* can do, not what the schema defines), `stream()` — build a body string, call `http::start_call`. No client, no retry, no timing, no logging: those are shared, and a second copy is how the wires stop agreeing. | ✅ |
+| 4 | **Implement `SseDecoder`:** `on_frame`, `on_eof`. Push errors as `Event::Error` rather than returning them, so text already received still reaches the caller. | ✅ |
+| 5 | **Honour the event ordering guarantees:** `ToolUseStart` → `ToolUseArgsDelta*` → `ToolUseEnd`; at most one `Usage` and one `Done`, `Usage` first; exactly one of `Done`/`Error` last. | ✅ |
+| 6 | **Normalise usage to the invariant.** Work out whether the prompt count includes the cached count, and subtract if it does. | ⚠️ **amended** |
+| 7 | **`on_eof` must fail loudly.** A stream with no terminator is `Protocol`, not a guessed `Done`. | ✅ |
+| 8 | **Validate tool arguments at block close**, naming the tool on failure. | ✅ |
+| 9 | **Map the stop reasons** onto `StopReason`, `Other(String)` for anything unmapped. | ⚠️ **amended** |
+| 10 | **Add quirks, not branches**, each documented with its motivating host. | ✅ **no new quirk needed** |
+| 11 | **Add nothing to the case table — just run it.** Extend `run_case`'s wire list and `Script`, then make every existing row pass. | ✅ 13/13 passed |
+| 12 | **Check the audit line and `Debug`** carry no token, URL or body. | ✅ |
+
+### The three amendments
+
+**Item 6 was too narrow.** It assumed one question ("does the prompt count include the
+cached count") and there were three. This wire also reports a **cache-write** count, which
+must be subtracted as well or the vector stops summing to the prompt total; and it reports
+an **output** breakdown that the neutral `Usage` had no field for at all — the one leak that
+forced a trait change. Item 6 should read: *work out which reported counts are SUBSETS of
+which totals, subtract every subset out of its total, and check the neutral type has
+somewhere to put each remainder.*
+
+**Item 9 assumed a stop reason exists.** On this wire there is no `finish_reason` of any
+kind: a response has a STATUS, and "the model wants a tool called" is not one of the values
+— it is `completed`, indistinguishable from a plain answer. The arm has to be DERIVED from
+the output items. Item 9 should read: *map the stop reason, and if the wire does not report
+one, derive it — a `completed` that silently means `EndTurn` when a tool was requested is a
+turn that never dispatches and never errors.*
+
+**Item 11 was right, and it is the one that mattered.** All thirteen inherited rows passed
+on the third adapter with no trait change. Two rows were then ADDED, for shapes only this
+wire made anyone ask about (`store is off and no response is ever continued`, and
+`interleaved items with reasoning`), and both pass on all three wires — which is the
+strongest evidence in the file that they are properties of the abstraction and not of a
+wire.
+
+### And the rule that is now a rule
+
+**Every place the trait strains gets written down in [`LEAKS.md`](LEAKS.md) before it gets
+fixed, and a refuted candidate is written down too.** Four of the five things this exercise
+looked at turned out not to be leaks; recording the refutation with its evidence is what
+stops the next adapter re-litigating them, and recording the one confirmed non-additive gap
+(L5 — no neutral block can carry an opaque reasoning item back across a tool-use turn, which
+**both older adapters also have**) is what stops it being discovered as a bug.
 
 ## Known external issue (not a defect in this crate)
 

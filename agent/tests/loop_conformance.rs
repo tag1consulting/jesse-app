@@ -1,16 +1,20 @@
-//! **The loop conformance suite** — one three-step turn, run three ways.
+//! **The loop conformance suite** — one three-step turn, run four ways.
 //!
 //! THE CLAIM THIS FILE EXISTS TO MAKE: `run_turn` completes the same tool-calling turn on
-//! the Anthropic Messages adapter, on the OpenAI Chat adapter and on the scripted provider,
-//! and **the thread it leaves behind is identical in all three**. That is the property the
-//! neutral model was built for, and it is the only test that can fail if the loop ever
-//! learns something about a wire.
+//! the Anthropic Messages adapter, on the OpenAI Chat adapter, on the OpenAI Responses
+//! adapter and on the scripted provider, and **the thread it leaves behind is identical in
+//! all four**. That is the property the neutral model was built for, and it is the only
+//! test that can fail if the loop ever learns something about a wire.
+//!
+//! The fourth way was added in D8 and it earns its place beyond arithmetic: the Responses
+//! wire is the one where a tool call has two ids, so a multi-iteration turn is the only
+//! thing that can prove the adapter round-trips the right one. See `responses_script`.
 //!
 //! The turn is a genuine three-iteration one over the fixture tool set: list a directory,
 //! read the file it found, answer. Two tool calls, three provider calls, and a thread that
 //! ends up six messages long (question, ask, result, ask, result, answer).
 //!
-//! NO NETWORK. The two adapter runs bind a real loopback socket and speak HTTP/1.1 by hand,
+//! NO NETWORK. The three adapter runs bind a real loopback socket and speak HTTP/1.1 by hand,
 //! the same approach `tests/provider_conformance.rs` and `bridge/tests/integration.rs` take.
 //! The mock here is a smaller relative of that one — it serves a QUEUE of scripted replies,
 //! one per connection, because a three-iteration turn is three sequential calls and this is
@@ -195,7 +199,7 @@ fn frame(payload: &str) -> String {
 }
 
 // ===========================================================================
-// The three-step script, in three dialects
+// The three-step script, in four dialects
 // ===========================================================================
 
 const LIST_ARGS: &str = r#"{\"path\":\".\"}"#;
@@ -276,6 +280,58 @@ fn chat_script() -> Vec<String> {
     ]
 }
 
+/// The OpenAI Responses SSE for the same three calls.
+///
+/// THE ONE THAT EXERCISES THE SEND PATH, which is why it is worth having here as well as in
+/// `tests/provider_conformance.rs`. This wire gives a tool call TWO ids — an item id the
+/// stream's deltas are keyed by, and a `call_id` a result must be addressed to — and only
+/// a multi-iteration turn can prove the adapter round-trips the right one: the loop takes
+/// the id from `ToolUseStart`, stores it, and sends it back as
+/// `function_call_output.call_id` on the NEXT call. So the fixtures deliberately mint an
+/// item id (`fc_…`) that is not the call id, and
+/// `the_responses_wire_addresses_a_tool_result_by_call_id` reads what the mock received.
+fn responses_script() -> Vec<String> {
+    let tool_call = |id: &str, name: &str, args: &str, input: u32| {
+        [
+            frame(&format!(
+                r#"{{"type":"response.created","response":{{"id":"resp_{id}","status":"in_progress"}}}}"#
+            )),
+            frame(&format!(
+                r#"{{"type":"response.output_item.added","output_index":0,"item":{{"type":"function_call","id":"fc_{id}","call_id":"{id}","name":"{name}","arguments":""}}}}"#
+            )),
+            frame(&format!(
+                r#"{{"type":"response.function_call_arguments.delta","item_id":"fc_{id}","output_index":0,"delta":"{args}"}}"#
+            )),
+            frame(&format!(
+                r#"{{"type":"response.function_call_arguments.done","item_id":"fc_{id}","output_index":0,"arguments":"{args}"}}"#
+            )),
+            frame(&format!(
+                r#"{{"type":"response.completed","response":{{"id":"resp_{id}","status":"completed","usage":{{"input_tokens":{input},"output_tokens":10}}}}}}"#
+            )),
+        ]
+        .concat()
+    };
+    vec![
+        tool_call("call_1", "fs_list", LIST_ARGS, 100),
+        tool_call("call_2", "fs_read", READ_ARGS, 200),
+        [
+            frame(
+                r#"{"type":"response.created","response":{"id":"resp_3","status":"in_progress"}}"#,
+            ),
+            frame(
+                r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"msg_3","role":"assistant","content":[]}}"#,
+            ),
+            frame(&format!(
+                r#"{{"type":"response.output_text.delta","item_id":"msg_3","output_index":0,"content_index":0,"delta":"{ANSWER}"}}"#
+            )),
+            frame(
+                r#"{"type":"response.completed","response":{"id":"resp_3","status":"completed","usage":{"input_tokens":300,"output_tokens":10}}}"#,
+            ),
+        ]
+        .concat(),
+    ]
+}
+
 /// The same three calls as `Event` sequences — no wire at all.
 fn scripted_steps() -> Vec<Step> {
     let usage = |input: u64| Usage {
@@ -283,6 +339,7 @@ fn scripted_steps() -> Vec<Step> {
         output_tokens: Some(10),
         cache_read_tokens: None,
         cache_write_tokens: None,
+        reasoning_tokens: None,
         provider_request_id: None,
     };
     vec![
@@ -554,32 +611,39 @@ fn assert_outcome(what: &str, ran: &Ran) {
 // ===========================================================================
 
 #[tokio::test]
-async fn a_three_step_turn_is_identical_on_both_adapters_and_the_scripted_provider() {
+async fn a_three_step_turn_is_identical_on_every_adapter_and_the_scripted_provider() {
     let ws = Workspace::new("identical");
 
     let (messages_run, messages_mock) = run_over_wire(Wire::Messages, messages_script(), &ws).await;
     let (chat_run, chat_mock) = run_over_wire(Wire::Chat, chat_script(), &ws).await;
+    let (responses_run, responses_mock) =
+        run_over_wire(Wire::Responses, responses_script(), &ws).await;
     let scripted = ScriptedProvider::new(Wire::Chat, "test-model", scripted_steps());
     let scripted_run = run(&scripted, &ws, Level::Read).await;
 
     for (what, ran) in [
         ("messages", &messages_run),
         ("chat", &chat_run),
+        ("responses", &responses_run),
         ("scripted", &scripted_run),
     ] {
         assert_thread_shape(what, &ran.messages);
         assert_outcome(what, ran);
     }
 
-    // THE CLAIM. Not "each is right" but "all three are the same object" — the thread is
-    // byte-identical across the two wires and the wireless provider, which is what makes a
-    // conversation portable between them.
+    // THE CLAIM. Not "each is right" but "all four are the same object" — the thread is
+    // byte-identical across the three wires and the wireless provider, which is what makes
+    // a conversation portable between them.
     assert_eq!(
         messages_run.messages, chat_run.messages,
         "the Messages and Chat wires produced different threads"
     );
     assert_eq!(
-        chat_run.messages, scripted_run.messages,
+        chat_run.messages, responses_run.messages,
+        "the Responses wire produced a different thread"
+    );
+    assert_eq!(
+        responses_run.messages, scripted_run.messages,
         "a wire changed the thread relative to the scripted provider"
     );
 
@@ -594,6 +658,52 @@ async fn a_three_step_turn_is_identical_on_both_adapters_and_the_scripted_provid
         .requests()
         .iter()
         .all(|r| r.path == "/chat/completions"));
+    assert_eq!(responses_mock.requests().len(), 3);
+    assert!(responses_mock
+        .requests()
+        .iter()
+        .all(|r| r.path == "/responses"));
+}
+
+/// The Responses wire's two ids, checked from the far side of the socket.
+///
+/// The fixture streams a call whose ITEM id is `fc_call_1` and whose `call_id` is `call_1`.
+/// If the adapter emitted the item id as the neutral id, the loop would store it, send it
+/// back, and every tool result would address an item the provider has no pairing for —
+/// producing a turn that looks perfectly formed and in which the model never sees a single
+/// tool result. So the assertion is on the LAST request's body, where the whole
+/// round trip has already happened.
+#[tokio::test]
+async fn the_responses_wire_addresses_a_tool_result_by_call_id() {
+    let ws = Workspace::new("callid");
+    let (_, mock) = run_over_wire(Wire::Responses, responses_script(), &ws).await;
+    let requests = mock.requests();
+    let last = &requests[2].body;
+    let input = last["input"].as_array().expect("the items are re-sent");
+
+    let calls: Vec<&str> = input
+        .iter()
+        .filter(|i| i["type"] == "function_call")
+        .map(|i| i["call_id"].as_str().unwrap())
+        .collect();
+    let outputs: Vec<&str> = input
+        .iter()
+        .filter(|i| i["type"] == "function_call_output")
+        .map(|i| i["call_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(calls, ["call_1", "call_2"], "the calls go back by call_id");
+    assert_eq!(outputs, ["call_1", "call_2"], "so do their results");
+    assert!(
+        !serde_json::to_string(last).unwrap().contains("fc_call_1"),
+        "the provider's ITEM id must never leave the adapter: {last}"
+    );
+
+    // …and the privacy posture holds on every iteration of a multi-call turn, not just the
+    // first: a `store: true` on the third request would keep the whole tool loop.
+    for (i, r) in requests.iter().enumerate() {
+        assert_eq!(r.body["store"], json!(false), "request {i}");
+        assert!(r.body.get("previous_response_id").is_none(), "request {i}");
+    }
 }
 
 #[tokio::test]
@@ -630,6 +740,24 @@ async fn a_tool_above_the_granted_level_is_absent_from_the_manifest_the_provider
         .map(|t| t["function"]["name"].as_str().unwrap())
         .collect();
     assert_eq!(chat_names, ["fs_list", "fs_read"]);
+
+    // And on the Responses wire, where the manifest is flat again — a third path in the
+    // body for the same neutral manifest, which is the point of asserting on all three.
+    let (_, responses_mock) = run_over_wire(Wire::Responses, responses_script(), &ws).await;
+    let responses_requests = responses_mock.requests();
+    let responses_names: Vec<&str> = responses_requests[0].body["tools"]
+        .as_array()
+        .expect("the manifest is sent")
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(responses_names, ["fs_list", "fs_read"]);
+    assert!(
+        !serde_json::to_string(&responses_requests[0].body)
+            .unwrap()
+            .contains("fs_write"),
+        "the write tool must not appear ANYWHERE in the request a Read turn sends"
+    );
 
     // The manifest is IDENTICAL on every iteration — a set of tools that changed under the
     // model mid-turn would make dispatch depend on timing.

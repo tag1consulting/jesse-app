@@ -156,6 +156,12 @@ impl PriceDeck {
     /// in the type D4 is meant to adopt. So the approximation is documented, it errs LOW
     /// by about a quarter of the cache-write component only, and the fourth rate belongs in
     /// whichever change is prepared to add it on both sides at once.
+    ///
+    /// **[`Usage::reasoning_tokens`] IS NOT PRICED, AND MUST NOT BE.** It is a breakdown
+    /// of `output_tokens`, not a fifth count beside it, so adding a term for it would bill
+    /// every thinking token twice — and on a high-effort turn the thinking is most of the
+    /// output. It is deliberately absent from this function rather than multiplied by
+    /// zero, because a zero-rate term is a term somebody later "fixes".
     pub fn cost_usd(&self, u: &Usage) -> f64 {
         let input = u.input_tokens.unwrap_or(0) as f64;
         let output = u.output_tokens.unwrap_or(0) as f64;
@@ -257,6 +263,7 @@ mod tests {
             output_tokens: Some(output),
             cache_read_tokens: Some(cache_read),
             cache_write_tokens: Some(cache_write),
+            reasoning_tokens: None,
             provider_request_id: None,
         }
     }

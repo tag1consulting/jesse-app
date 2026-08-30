@@ -158,6 +158,7 @@ fn usage(input: u64, output: u64) -> Usage {
         output_tokens: Some(output),
         cache_read_tokens: None,
         cache_write_tokens: None,
+        reasoning_tokens: None,
         provider_request_id: Some("req_x".into()),
     }
 }

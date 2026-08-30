@@ -344,6 +344,7 @@ impl ScriptUsage {
             output_tokens: Some(self.output),
             cache_read_tokens: Some(self.cache_read),
             cache_write_tokens: Some(self.cache_write),
+            reasoning_tokens: None,
             provider_request_id: None,
         }
     }
