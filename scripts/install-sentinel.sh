@@ -15,11 +15,26 @@
 # and retyping them is how they drift. So this script reads them out of the bridge's own
 # LaunchAgent by default. Every one is overridable by an environment variable.
 #
+# BUILD IT FROM THE DEFAULT BRANCH FIRST. This installs whatever
+# `bridge/target/release/jesse-sentinel` currently holds, and NOTHING downstream ever
+# checks what that was built from: launchd runs it, and a deploy never replaces it — the
+# sentinel is the process that PERFORMS a deploy, so it is deliberately absent from
+# `bridge/deploy-bins.toml`. A checkout left on a feature branch therefore installs
+# unreviewed ops code, and every line this script prints still says success.
+#
+#     git checkout main && git pull
+#     (cd bridge && cargo build --release)
+#     scripts/install-sentinel.sh
+#
+# The check below enforces that rather than trusting it. Override it deliberately with
+# SENTINEL_ALLOW_ANY_REF=1, or aim it elsewhere with SENTINEL_REF=<branch>.
+#
 # Usage:
 #     scripts/install-sentinel.sh                 # render + install, print the bootstrap line
 #     SENTINEL_LABEL=com.example.jesse-sentinel \
 #     SENTINEL_BIND=100.64.0.1 \
 #     scripts/install-sentinel.sh
+#     SENTINEL_ALLOW_ANY_REF=1 scripts/install-sentinel.sh   # a branch build, on purpose
 #
 # bash-3.2 portable: no associative arrays, no mapfile.
 set -euo pipefail
@@ -32,6 +47,46 @@ die() { echo "install-sentinel: $*" >&2; exit 1; }
 note() { echo "install-sentinel: $*"; }
 
 [ -f "$TEMPLATE" ] || die "template not found: $TEMPLATE"
+
+# ---- Which ref this is being built from ----------------------------------------------
+#
+# The failsafe for the header's first instruction, because the cost of ignoring it is
+# invisible: the wrong binary installs cleanly, launchd runs it, and no later step ever
+# compares it against anything. This checks the CHECKOUT, which is a proxy for what
+# `cargo build` last produced and not proof of it — so it also reports a binary older
+# than HEAD further down rather than implying a freshness it cannot verify.
+SENTINEL_REF="${SENTINEL_REF:-main}"
+if [ "${SENTINEL_ALLOW_ANY_REF:-0}" = "1" ]; then
+  note "SENTINEL_ALLOW_ANY_REF=1 — not checking which ref this was built from."
+elif ! git -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1; then
+  note "WARNING: $ROOT is not a git checkout, so the ref could not be checked."
+else
+  # A detached HEAD reports the literal string "HEAD", which is not $SENTINEL_REF and so
+  # fails here — which is correct, and the message names it.
+  ref_now="$(git -C "$ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)"
+  [ "$ref_now" = "$SENTINEL_REF" ] || die "this checkout is on '$ref_now', not '$SENTINEL_REF'.
+The sentinel is ops code that no deploy will ever replace, so it is installed from
+'$SENTINEL_REF' only:
+    git -C '$ROOT' checkout $SENTINEL_REF && git -C '$ROOT' pull
+    (cd '$ROOT/bridge' && cargo build --release)
+Set SENTINEL_ALLOW_ANY_REF=1 to install a '$ref_now' build on purpose."
+
+  # A dirty tree means the binary corresponds to no commit at all, which is strictly
+  # worse than the wrong branch: there is nothing to review and nothing to roll back to.
+  [ -z "$(git -C "$ROOT" status --porcelain --untracked-files=no 2>/dev/null || true)" ] \
+    || die "'$SENTINEL_REF' has uncommitted changes, so a build from it matches no commit.
+Commit or stash them and rebuild, or set SENTINEL_ALLOW_ANY_REF=1 to install anyway."
+
+  # Local refs only. This deliberately does NOT fetch: a script that reaches the network
+  # to answer a question nobody asked is a surprise, so it reports what it can see and
+  # says plainly that it did not look further.
+  if git -C "$ROOT" rev-parse --verify --quiet "origin/$SENTINEL_REF^{commit}" >/dev/null 2>&1
+  then
+    behind="$(git -C "$ROOT" rev-list --count "HEAD..origin/$SENTINEL_REF" 2>/dev/null || echo 0)"
+    [ "$behind" = "0" ] || note "WARNING: $behind commit(s) behind origin/$SENTINEL_REF \
+(no fetch was performed — 'git pull' first if that is stale)."
+  fi
+fi
 
 # ---- Where things go ---------------------------------------------------------------
 
@@ -184,6 +239,19 @@ They must be disjoint — a leak of either one would otherwise grant both."
 
 [ -x "$BUILT" ] || die "no built binary at $BUILT — run:
     cd '$ROOT/bridge' && cargo build --release"
+
+# A binary that EXISTS is not a binary that is CURRENT, and this is the last moment
+# anybody could notice. Not fatal: a deliberate install of an older build is legitimate,
+# and mtime is evidence rather than proof. Said out loud, once, so it cannot pass unseen.
+if git -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1; then
+  head_epoch="$(git -C "$ROOT" log -1 --format=%ct HEAD 2>/dev/null || echo 0)"
+  bin_epoch="$(stat -f %m "$BUILT" 2>/dev/null || echo 0)"
+  if [ "$head_epoch" -gt 0 ] && [ "$bin_epoch" -gt 0 ] && [ "$bin_epoch" -lt "$head_epoch" ]; then
+    note "WARNING: $BUILT is older than the commit checked out here, so it was built from
+    something else. Rebuild with (cd '$ROOT/bridge' && cargo build --release) unless
+    installing an older build is what you meant."
+  fi
+fi
 
 mkdir -p "$BIN_DIR" "$AGENTS_DIR" "$STATE_DIR"
 chmod 700 "$STATE_DIR"
