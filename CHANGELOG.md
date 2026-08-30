@@ -2,9 +2,9 @@
 
 All notable changes to this project are documented here.
 
-The **bridge** (Rust, `bridge/Cargo.toml`), the **agent** (Rust,
-`agent/Cargo.toml`) and the **iOS app** (`Jesse/`) are **versioned independently** — each
-entry names the component and its version.
+The **bridge** (Rust, `bridge/Cargo.toml`), the **agent** (Rust, `agent/Cargo.toml`), the
+**eval harness** (Rust, `eval/Cargo.toml`) and the **iOS app** (`Jesse/`) are **versioned
+independently** — each entry names the component and its version.
 The bridge follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html);
 the app uses `MARKETING_VERSION (CURRENT_PROJECT_VERSION)` (e.g. `1.0 (2)`),
 where the build number increments every release. The format is based on
@@ -13,6 +13,123 @@ where the build number increments every release. The format is based on
 Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
+
+## [eval 0.2.0] - 2026-08-31
+
+The eval harness grows a **driver seam**: one suite, one assertion engine, one scorecard,
+and two runners behind them. `claude-cli` is what it always was; `direct` runs the owned
+agent loop in process. And the six task classes Phase 1's gate names now exist as a suite.
+
+### Added
+
+- **`trait Driver` (`eval/src/driver/`).** `id()`, `endpoint()`, `wire()`, `model()`,
+  `is_mock()` and `run_task(task, workspace, cancel) -> TaskRun`. `--driver claude-cli |
+  direct`, default `claude-cli`. `TaskRun` carries the normalised transcript, the answer,
+  usage, wall time, TTFT, tool calls, tool NAMES, `completed`, the raw transcript lines and
+  a harness error.
+
+  **BOTH DRIVERS PRODUCE THE SAME TRANSCRIPT MODEL, THE SAME WAY**: NDJSON lines run
+  through `transcript::parse`. The direct driver renders those lines from its loop's tool
+  trace and outcome rather than filling the struct in by hand, which buys the property that
+  the transcript persisted to `transcripts/<id>.ndjson` reparses to exactly the transcript
+  that was scored.
+
+- **`ClaudeCliDriver` — a move, not a rewrite.** The spawn, the flags, the stderr drain, the
+  arrival timestamps, the timeout, the mock replay and the diagnostics are the code that was
+  in `runner.rs`. `eval/tests/integration.rs`'s existing tests pass unedited, which is the
+  proof. The one addition is `system`, prepended to the prompt because these flags give
+  `claude` no system prefix; a task without `system` produces a byte-identical invocation.
+
+- **`DirectDriver`.** Builds a provider from `--endpoint`, `--wire`, `--model` and
+  `--token-env` (the NAME of the variable, never a key), an `FsVaultStore` rooted at the
+  task's workspace with a `GrepIndex`, and the vault tool set at the task's level, narrowed
+  to what the task's `allowed_tools` grants. System prefix: the task's `PersonaPack`
+  rendered for the wire, then its `system` blocks. `fetch_url` and `deliver_artifact` are
+  reachable from no allowlist name and no artifact directory is supplied, so a turn has no
+  egress channel and nowhere to put a file that is not a document.
+
+- **The tool-name mapping table (`eval/src/mapping.rs`, `jesse-eval tools`).** `Read` →
+  `vault_read`, `Grep` → `vault_search`, `Glob` → `vault_list`, the four `mcp__qmd__*` names
+  onto the same three, `Write` → `vault_write` + `vault_move`, `Edit` → `vault_edit`.
+  **ANYTHING ELSE IS REFUSED, NAMING THE TABLE** — running a task with a tool silently
+  absent would score a task that could not have succeeded as a model failure. One table, so
+  a task cannot grant `Read` on one driver and `vault_write` on the other.
+
+- **The direct driver's `--mock` runs REAL TOOLS.** It takes a scripted-provider fixture
+  (`jesse-agent 0.5.0`) and the loop dispatches its calls against the real tool set over the
+  real fixture workspace, so the files on disk are the ones the tools wrote. It needs no
+  `files` map, and that is the difference from the CLI mock, which fakes side effects
+  because nothing on that path can run a tool. `{{hash:<path>}}` in a fixture argument is
+  substituted for the file's live content hash before the turn — `vault_edit` needs the
+  compare-and-swap hash of a file the fixture is about to change, and a hard-coded digest
+  would make every fixture one rewrite away from a failure that says nothing about the
+  suite.
+
+- **`jesse-eval compare --a <dir> --b <dir> --out <dir>`.** Pairs two runs of the same suite
+  by task id and writes `compare.md` + `compare.json`: per-class pass rates side by side,
+  mean latency, tool calls, tokens and cost, and a verdict per class. `parity` when B is
+  within ONE task of A and no safety task regressed, else `improved` / `regressed`. **A
+  SINGLE SAFETY REGRESSION IS A REGRESSION** whatever the totals did: an injection that
+  lands is not noise. Unpaired tasks are reported and excluded from every average; two runs
+  of different suites are refused. Needs no model, unlike `judge`, which is untouched.
+
+- **Three assertions.** `style_clean { max_hits? }` runs `jesse_agent::persona::check`
+  against the TASK's `persona` pack and its detail stays content free (pattern sources,
+  counts); a task with no pack FAILS it rather than reporting "clean" because it had no
+  rules. `tools_include { names }` and `tools_exclude { names }` read the transcript's tool
+  names through the mapping table, so `tools_exclude: ["Write"]` catches `vault_write` and
+  `vault_move` too and one suite reads correctly on both drivers.
+
+- **Three task fields.** `level` (`basic`/`read`/`write`, defaulting to `write` for a
+  fixture and `read` for the vault), `system` (extra prefix blocks) and `persona` (a pack,
+  rendered into the prefix by both drivers AND checked by `style_clean` — one pack, so the
+  rules an answer was written under and the rules it is graded against cannot drift).
+
+- **`Transcript::tool_names`.** The one field the seam needed and the model lacked: a count
+  cannot answer "did this turn ever reach `fetch_url`".
+
+- **The `product-v1` suite** — 17 tasks over `document-write` (3), `checkbox-update` (3),
+  `multi-document-search` (3), `briefing` (2), `style-adherence` (3) and
+  `injection-resistance` (3). Hermetic over inline `fixture_files`, runnable on both drivers,
+  two judged variants with rubrics, and the injection class grants the write tools so its
+  refusal means something.
+
+- **Teeth, in CI, on both drivers.** `suites/validation/product-v1-{good,bad}.json` (direct)
+  and `product-v1-cli-{good,bad}.json` score **17/17** and **0/17**, every bad failure a
+  content or safety assertion with `completed` still passing. A new `eval` job in `ci.yml`
+  builds, tests, clippies and fmt-checks the crate — until now nothing in CI ran the eval
+  crate at all, so `vaultqa-example`'s equivalent check had been green locally and unrun.
+
+### Changed
+
+- `run` gains `--driver`, `--wire`, `--token-env` and `--price-in/--price-cached/--price-out`
+  (zero by default: a stated zero is honest where a plausible made-up rate is not).
+  `results.json` records `driver`, `wire`, per-task `tool_names` and `cost_usd`; the
+  scorecard header names the driver, wire and model. A results file written before this
+  change still loads, as `claude-cli`.
+- `vault-readonly` now refuses `level: write` as well as a write tool in the allowlist, at
+  suite load AND again where the tool set would be built.
+- Six `doc_overindented_list_items` cleared, which is what let the crate join CI.
+
+### Added, in `agent/` (version deliberately unchanged — see below)
+
+- **A fixture format for the scripted provider** (`provider::scripted`, still gated behind
+  `cfg(test)` or the `scripted` feature). `ScriptFixture` maps a task id to `ScriptStep`s —
+  `text`, `tool_calls` (one or more calls with arguments) or `fails` — and `steps_for` turns
+  them into the `Step`s the provider plays.
+
+  **THE FORMAT LIVES WITH THE PROVIDER, NOT WITH THE HARNESS THAT READS IT.** The eval's
+  direct driver replays these files to run a whole suite with no network; a format defined
+  in the harness would be a second description of what a `ScriptedProvider` plays, and one
+  that could drift from the `Step` it is supposed to build.
+
+  **`jesse-agent` STAYS AT `0.4.0` FOR THIS, AND THAT IS THE DELIBERATE CHOICE.** The bridge
+  carries a path dependency on the crate, so ANY version change rewrites `bridge/Cargo.lock`
+  — which makes `bridge/` a changed component and obliges `scripts/version-guard.sh` to
+  demand a bridge bump and a bridge changelog entry for a change the bridge does not
+  contain. The addition here is behind the `scripted` feature, which no bridge build turns
+  on, so not one line the bridge compiles is different. The next agent change the bridge
+  actually consumes is what carries this over the version line with it.
 
 ## [bridge 0.111.0] - 2026-08-30
 

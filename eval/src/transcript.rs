@@ -2,15 +2,22 @@
 //!
 //! The stream is newline-delimited JSON objects. We care about three shapes,
 //! confirmed against a live capture:
-//!   * `{"type":"stream_event","event":{"type":"content_block_delta",
-//!      "delta":{"type":"text_delta","text":"…"}}}` — a streamed text chunk;
-//!      the first one marks time-to-first-text.
-//!   * `{"type":"assistant","message":{"content":[{"type":"tool_use",…}]}}` —
-//!      an assistant turn; `tool_use` blocks here are the authoritative tool
-//!      calls (the streamed deltas would double-count).
-//!   * `{"type":"result","subtype":"success","result":"…","usage":{…},
-//!      "ttft_ms":…}` — the terminal line: final answer, token usage, and the
-//!      model-reported time-to-first-token.
+//!
+//! * `{"type":"stream_event","event":{"type":"content_block_delta",
+//!   "delta":{"type":"text_delta","text":"…"}}}` — a streamed text chunk;
+//!   the first one marks time-to-first-text.
+//! * `{"type":"assistant","message":{"content":[{"type":"tool_use",…}]}}` —
+//!   an assistant turn; `tool_use` blocks here are the authoritative tool
+//!   calls (the streamed deltas would double-count).
+//! * `{"type":"result","subtype":"success","result":"…","usage":{…},
+//!   "ttft_ms":…}` — the terminal line: final answer, token usage, and the
+//!   model-reported time-to-first-token.
+//!
+//! **THIS MODEL IS DRIVER-INDEPENDENT.** It is named for the CLI's stream because
+//! that is where it came from, and it is what every driver produces: the direct
+//! driver renders its loop's events and thread into these same lines, so one
+//! parser feeds one assertion engine and the persisted transcript is provably the
+//! one that was scored.
 
 use serde::Serialize;
 
@@ -32,6 +39,14 @@ pub struct Transcript {
     pub completed: bool,
     /// Count of `tool_use` blocks across all `assistant` messages.
     pub tool_calls: u32,
+    /// The NAME of every one of those `tool_use` blocks, in dispatch order.
+    ///
+    /// ADDED IN D7, and the only field the driver seam needed that was missing. The count
+    /// answers "how much did it flail"; a suite that has to prove a turn never reached
+    /// `fetch_url` after reading an instruction telling it to is asking a different
+    /// question, and `tool_calls: 3` cannot answer it. The `tools_include` /
+    /// `tools_exclude` assertions read this.
+    pub tool_names: Vec<String>,
     /// Token usage from the result line, if present.
     pub usage: Option<Usage>,
     /// Model-reported time-to-first-token (`ttft_ms`) from the result line.
@@ -65,6 +80,12 @@ pub fn parse(lines: &[String]) -> Transcript {
                     for block in content {
                         if block.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
                             t.tool_calls += 1;
+                            // A `tool_use` block without a name is a malformed line, not a
+                            // nameless call: it is counted (it happened) and contributes no
+                            // name (nothing is known about which tool it was).
+                            if let Some(n) = block.get("name").and_then(|n| n.as_str()) {
+                                t.tool_names.push(n.to_string());
+                            }
                         }
                     }
                 }
@@ -143,6 +164,7 @@ mod tests {
         ];
         let t = parse(&lines);
         assert_eq!(t.tool_calls, 2);
+        assert_eq!(t.tool_names, ["Grep", "Read"]);
         assert!(t.completed);
     }
 
