@@ -220,16 +220,19 @@ pub const NEEDS_LOCATION_REQUEST: &str = "\n\n(No device location is attached to
 turn. If — and only if — you need to know where he physically is to answer accurately, \
 do NOT guess a city: reply with ONLY a single line, exactly this format and nothing else \
 on the line:\n\
-JESSE_NEEDS_LOCATION v1 {\"fields\":[\"placemark\"],\"precision\":\"precise\",\"max_age_seconds\":0}\n\
+JESSE_NEEDS_LOCATION v1 {\"fields\":[\"placemark\"],\"precision\":\"coarse\",\"max_age_seconds\":300}\n\
 All three keys are required. `fields` is 1–3 of: coordinates, placemark, accuracy. \
-`precision` is precise (an exact, GPS-grade fix) or coarse (a roughly 1–3 km circle). \
-Use `precise` whenever he is asking where he is, how far away something is, or for his \
-exact or precise location — and ALWAYS when he says words like precisely, exactly, or \
-right here. On some devices precise may raise a one-time iOS prompt; ask for it anyway \
-when he is asking about his position. Use `coarse` only for incidental context where a \
-rough neighbourhood is plainly enough and he did not ask about his position directly. \
-`max_age_seconds` is an integer 0–900: a cached fix younger than that may be reused \
-instead of taking a fresh reading, so use 0 when he is asking where he is right now. \
+`precision` is coarse (a roughly 1–3 km circle — the neighbourhood or town) or precise \
+(an exact, GPS-grade fix). ASK FOR coarse UNLESS YOU GENUINELY NEED THE STREET. \"What \
+is near me\", \"what is open around here\" and \"how far is that town\" are all answered \
+perfectly by a town-level fix; coarse is faster, cannot prompt him for anything, and is \
+the right default. Use `precise` only when he actually asks where he is right now, or \
+when a distance turns on which street he is standing on. Precise is slower and on some \
+devices raises a one-time iOS prompt, so it is a deliberate exception rather than the \
+default. `max_age_seconds` is an integer 0–900: a fix younger than that may be reused \
+from memory without waking the GPS, which is instant. A few minutes of staleness is fine \
+for anything except \"where am I right now\", so prefer 300 and use 0 only when the \
+answer changes if he has walked a block. \
 Emit it at most ONCE this turn and nothing else; the app will read the location off the \
 device and re-ask this same question with it attached. If you do not need to know where \
 he is, just answer normally.)";
@@ -2072,27 +2075,41 @@ day, scanners, currency, or cheatsheets, and do not rebuild Today.md."
     }
 
     #[test]
-    fn location_request_instruction_biases_to_precise() {
-        // The guidance must push `precise` for any question about where he is — and
-        // spell out the explicit-precision words that always force it. This is a text
-        // assertion on the instruction we ship, not a claim about model behaviour.
+    fn location_request_instruction_defaults_to_the_cheap_request() {
+        // THE CHEAP REQUEST IS THE DEFAULT AND THE WORKED EXAMPLE. This inverts what
+        // this instruction used to say, and the inversion is the point: the most
+        // expensive request the channel offers was both the example line and the
+        // recommendation, on the path that fails — a precise, max_age 0 fix, which on a
+        // cold indoor device is exactly the request that cannot be served. Meanwhile the
+        // coarse attach answered the same question ("what coffee is open near me") on
+        // its first try.
+        //
+        // A text assertion on the instruction we ship, not a claim about model
+        // behaviour.
         let p = bp("ask", "q", false, false, None, None);
-        // The worked example is the precise, no-cache one: a live "where am I" ask
-        // must not be answered from a stale coarse fix.
-        assert!(p.contains(
-            "JESSE_NEEDS_LOCATION v1 \
-             {\"fields\":[\"placemark\"],\"precision\":\"precise\",\"max_age_seconds\":0}"
-        ));
         assert!(
-            p.contains("Use `precise` whenever he is asking where he is"),
-            "instruction must tell the agent to use precise for where-am-I questions"
+            p.contains(
+                "JESSE_NEEDS_LOCATION v1 \
+                 {\"fields\":[\"placemark\"],\"precision\":\"coarse\",\"max_age_seconds\":300}"
+            ),
+            "the worked example must be the CHEAP request: coarse, non-zero max age"
         );
         assert!(
-            p.contains("ALWAYS when he says words like precisely, exactly, or right here"),
-            "instruction must force precise on explicit precision words"
+            p.contains("ASK FOR coarse UNLESS YOU GENUINELY NEED THE STREET"),
+            "coarse must be stated as the default, not as a narrow exception"
         );
-        // Coarse survives, but only as the narrow incidental-context case.
-        assert!(p.contains("Use `coarse` only for incidental context"));
+        assert!(
+            p.contains("Use `precise` only when he actually asks where he is right now"),
+            "precise must be reserved for where-am-I and street-level distances"
+        );
+        assert!(
+            p.contains("\"how far is that town\" are all answered perfectly by a town-level fix"),
+            "the instruction must say plainly which questions do NOT need precise"
+        );
+        assert!(
+            p.contains("may be reused from memory without waking the GPS"),
+            "a non-zero max age must be described as servable from cache"
+        );
     }
 
     #[test]

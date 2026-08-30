@@ -13,6 +13,137 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [App 1.0 (121)] - 2026-08-30
+
+### Fixed
+
+- **The location channel takes the interim fixes CoreLocation already computed, instead
+  of throwing them away and reporting nothing.** `LocationContextProvider` bounded one
+  fix at a 2-second `fixTimeout` and obtained it with `CLLocationManager.requestLocation()`
+  after setting `kCLLocationAccuracyBest`. `requestLocation()` calls back exactly once,
+  and only once CoreLocation is satisfied it has met the desired accuracy — Apple budgets
+  around ten seconds for that. A best-accuracy fix taken cold, indoors, or inside a
+  building needs more than two seconds far more often than not, so the race was lost, the
+  continuation resumed nil, and the reading came back `.empty`. Three consecutive
+  `precise` requests returned nothing on a phone whose permission and switches were all
+  on; minutes later, same spot, the proactive **coarse** attach returned a 3.2 km fix on
+  its first try. The channel worked, but only on its coarse path.
+
+  The root cause is not the size of the constant, and raising it would not have fixed
+  this: while the outcome is all-or-nothing, EVERY value is wrong — 2 seconds fails
+  constantly and 10 seconds adds ten seconds of dead air and still fails indoors.
+  Acquisition now uses `startUpdatingLocation()`, holds the best usable fix seen so far,
+  returns early the moment a target accuracy is met, and returns the best held fix when
+  the deadline expires. A deadline is a QUALITY bound now, not an all-or-nothing one, and
+  the town-level answer that was always available arrives instead of nothing.
+
+  "Usable" is an explicit test, and it is the trap in this change:
+  `horizontalAccuracy > 0` (CoreLocation's negative sentinel for an invalid fix) AND a
+  timestamp no older than the request's own `max_age_seconds` measured from when the
+  request began (`0` meaning literally "taken after this request began").
+  `startUpdatingLocation()` typically opens with a cached fix that can be hours old and
+  from another city; the `requestLocation()` code was accidentally shielded from that, and
+  adopting interim fixes without the timestamp test would have let the channel
+  confidently report the wrong town — worse than reporting nothing. Updates are stopped
+  on every exit path, including cancellation and error, because a stream left running
+  holds the GPS on in the background.
+
+- **The two call sites no longer share one budget.** `LocationFixBudget` moved the
+  deadline, the target accuracy and the geocode bound off the provider instance and onto
+  the individual call. The proactive attach inside `JesseClient.send` keeps a tight
+  2-second budget because it sits between the owner pressing send and the message leaving
+  the phone; the directive fulfilment in `LocationChannel.block` gets 6 seconds and a 65 m
+  target because it runs as a retry BETWEEN two turns, where the owner is already watching
+  a spinner. The old 2 seconds was reasoned about for the first case — its comment says so
+  — and then inherited by the second, where the reasoning does not apply. Both call sites
+  now carry a comment saying why they differ.
+
+- **The temporary-full-accuracy prompt is awaited before the clock starts.**
+  `requestTemporaryFullAccuracyAuthorization(withPurposeKey:)` was fired and the location
+  request started in the same breath, so on a device granted reduced accuracy the system
+  sheet was still on screen while the budget burned down — making the first precise
+  request on such a device close to guaranteed to fail. The completion handler is now
+  awaited and the seconds spent reading the sheet are charged to nobody. Declining is not
+  a failure: the request carries on at reduced accuracy and returns the coarse fix.
+
+- **The block renders the precision ACHIEVED, not the precision requested.** A `precise`
+  request answered by a 3 km fix printed five decimal places — about a metre — of a
+  position known only to within a town. The agent reads the block to decide whether it can
+  name a street, so a precise request answered by a coarse fix must now read as coarse.
+
+- **A fix is cached under what it achieved, with its placemark.** Storing it under the
+  precision REQUESTED was wrong in both directions: a degraded fix was later served as
+  though it had answered a precise request, and the same fix was refused for the coarse
+  requests it could have answered instantly. The reverse-geocoded placemark is cached
+  alongside and reused within 100 m, so a repeat inside the cache window no longer pays
+  the geocode round trip for an answer that cannot have changed. Worth noting for its own
+  sake: a channel that always fails never populates the cache at all, which is why
+  repeated attempts never got easier on the day this was found.
+
+- **Each failure reason is now distinguished and put on the wire.**
+  `LocationUnavailableReason` (`feature_off`, `services_off`, `unauthorized`,
+  `timed_out`, `no_fix`) rides on the new `location_context_unavailable_reason` field, so
+  the bridge can render one cause instead of listing four. A reason is not a place: no
+  coordinate, no accuracy figure, no place name.
+
+### Added
+
+- **A location diagnostic in Settings.** The Location section now shows the live
+  authorization status, whether full accuracy is granted, and the outcome, accuracy and
+  elapsed time of the last attempt made in this run of the app. In memory only, written
+  nowhere, and it holds no place data — the point is that the next failure is diagnosable
+  from the phone in ten seconds instead of by reading `LocationContextProvider.swift` on
+  another machine, which is what this one took.
+
+- **Duration signposts around every fix attempt** (`os_signpost`, category `location`),
+  carrying elapsed time, achieved accuracy and outcome — and no coordinates and no place
+  name. The deadlines above should be re-checked against a measured distribution on a real
+  device; these are what makes that possible rather than guessing again.
+
+## [bridge 0.107.0] - 2026-08-30
+
+### Fixed
+
+- **The location-request instruction no longer steers the model into the request that
+  fails.** `NEEDS_LOCATION_REQUEST` showed the model
+  `{"fields":["placemark"],"precision":"precise","max_age_seconds":0}` as its worked
+  example, told it to use `precise` whenever the owner asks "how far something is", and
+  told it to use `0` when he asks where he is — so the most expensive request the channel
+  offers was both the example and the recommended default, on the path that fails. It is
+  also usually unnecessary: "what coffee is open near me" is answered perfectly by a
+  town-level fix, and was, by the coarse attach, while three precise requests returned
+  nothing.
+
+  The example line is now coarse with `max_age_seconds: 300`; `precise` is reserved for
+  when the owner actually asks where he is or for a distance that turns on which street he
+  is standing on, and the instruction says plainly that "what is near me" and "how far is
+  that town" do not need it. It also says that a non-zero `max_age_seconds` may be served
+  from memory without waking the GPS. The wire contract is unchanged — all three keys
+  still required, same whitelists, same validation on both sides, and the CI guard still
+  passes.
+
+- **`NEEDS_LOCATION_UNAVAILABLE` no longer names four causes at once.** It told the agent
+  location "could not be read this turn — permission was denied, Location Services are
+  off, the fix timed out, or the feature is off". Those need telling apart: one needs the
+  owner to change a setting, another needs nothing but a few more seconds. That exact
+  conflation sent a reader to the wrong diagnosis and cost an hour — the agent told the
+  owner to check toggles that were already on.
+
+  The app now sends `location_context_unavailable_reason`, validated against the new
+  `NEEDS_LOCATION_UNAVAILABLE_REASONS` whitelist, and each reason renders its own line.
+  The `timed_out` line says in as many words that nothing is misconfigured and that asking
+  again in a moment will usually work, and tells the agent not to send him to any Settings
+  screen. Every line still carries the anti-loop terminator, so an unavailable answer
+  still ends the channel for that turn. An app build that does not send the field gets
+  today's generic line byte for byte, so the change is purely additive on the wire.
+
+### Added
+
+- **`scripts/ci-guards.sh` checks the reason whitelist** against the app's
+  `LocationUnavailableReason` enum, the same way it already checks the field and precision
+  whitelists — a reason that exists on one side only would silently fall back to the
+  generic line, which is the failure this item is about.
+
 ## [bridge 0.106.0] - 2026-08-30
 
 ### Fixed
