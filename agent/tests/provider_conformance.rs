@@ -1,17 +1,25 @@
 //! **The provider conformance suite.**
 //!
-//! ONE TABLE, BOTH ADAPTERS, THROUGH `&dyn Provider`. Every case in [`cases`] is run
-//! against the Anthropic Messages adapter and the OpenAI Chat adapter, and the shared
-//! expectation — the event sequence, the error class, the usage arithmetic — is asserted
-//! identically on both. That structure is the point of the file, not a convenience: a
-//! per-adapter test file lets a behaviour drift between wires and calls it "the OpenAI
-//! one works differently", which is exactly the divergence the neutral layer exists to
-//! prevent. Here a divergence is a failing row.
+//! ONE TABLE, ALL THREE ADAPTERS, THROUGH `&dyn Provider`. Every case in [`cases`] is run
+//! against the Anthropic Messages adapter, the OpenAI Chat adapter and the OpenAI
+//! Responses adapter, and the shared expectation — the event sequence, the error class,
+//! the usage arithmetic — is asserted identically on all three. That structure is the
+//! point of the file, not a convenience: a per-adapter test file lets a behaviour drift
+//! between wires and calls it "the OpenAI one works differently", which is exactly the
+//! divergence the neutral layer exists to prevent. Here a divergence is a failing row.
+//!
+//! **THE THIRD WIRE IS THE FALSIFICATION.** Two adapters written together can agree with
+//! each other by construction. The Responses adapter was written after the trait had
+//! settled, against a wire with a different shape — stateful by default, carrying items
+//! rather than messages, reporting a status rather than a finish reason — and every case
+//! below was made to pass on it with NO change to the trait's request or event types
+//! except one (`Usage::reasoning_tokens`). What that cost, and what was refused, is in
+//! `agent/LEAKS.md`.
 //!
 //! Wire-SPECIFIC expectations have one home: `expect_body`, which receives the wire and
 //! the exact JSON the mock received. So "cacheable produces `cache_control` on Messages
-//! and nothing on Chat" is one row asserting both halves, rather than two tests that
-//! could each be deleted without the other noticing.
+//! and nothing on the two OpenAI wires" is one row asserting all three halves, rather than
+//! three tests that could each be deleted without the others noticing.
 //!
 //! NO NETWORK. Each case binds a real loopback socket and speaks HTTP/1.1 by hand — the
 //! same approach `bridge/tests/integration.rs` takes for its mock `/v1/messages` helper,
@@ -276,6 +284,34 @@ fn frames(payloads: &[&str]) -> String {
     payloads.iter().map(|p| frame(p)).collect()
 }
 
+/// Frame a list of payloads the way the **Responses** wire frames them: an `event:` line
+/// naming the type, then the `data:` line whose JSON repeats it.
+///
+/// The name is read out of the payload's own `type` rather than passed in, so a fixture
+/// cannot drift into an envelope that disagrees with its content — and so this helper
+/// exercises the thing worth exercising, which is that `http::SseFramer` READS PAST the
+/// `event:` line. That is the framer's stated design (one framer for a wire that sends an
+/// event name, a wire that sends none, and now a wire that sends one for every frame), and
+/// until this adapter existed only one half of it was covered by a fixture.
+fn typed_frames(payloads: &[&str]) -> String {
+    payloads
+        .iter()
+        .map(|p| {
+            let kind: Value = serde_json::from_str(p).expect("fixture is JSON");
+            let kind = kind
+                .get("type")
+                .and_then(Value::as_str)
+                .expect("every Responses frame names its type");
+            format!("event: {kind}\ndata: {p}\n\n")
+        })
+        .collect()
+}
+
+/// One Responses frame, as its own write.
+fn typed_frame(payload: &str) -> String {
+    typed_frames(&[payload])
+}
+
 // ===========================================================================
 // The case table
 // ===========================================================================
@@ -284,6 +320,7 @@ fn frames(payloads: &[&str]) -> String {
 struct Script {
     messages: Vec<Reply>,
     chat: Vec<Reply>,
+    responses: Vec<Reply>,
 }
 
 struct Case {
@@ -368,6 +405,15 @@ fn cases() -> Vec<Case> {
                         r#"{"id":"chatcmpl-1","choices":[],"usage":{"prompt_tokens":9,"completion_tokens":4}}"#,
                     ]) + "data: [DONE]\n\n",
                 )],
+                responses: vec![Reply::sse(typed_frames(&[
+                    r#"{"type":"response.created","sequence_number":0,"response":{"id":"resp_1","status":"in_progress"}}"#,
+                    r#"{"type":"response.output_item.added","sequence_number":1,"output_index":0,"item":{"type":"message","id":"msg_1","role":"assistant","content":[]}}"#,
+                    r#"{"type":"response.content_part.added","sequence_number":2,"item_id":"msg_1","output_index":0,"content_index":0,"part":{"type":"output_text","text":""}}"#,
+                    r#"{"type":"response.output_text.delta","sequence_number":3,"item_id":"msg_1","output_index":0,"content_index":0,"delta":"Hello, "}"#,
+                    r#"{"type":"response.output_text.delta","sequence_number":4,"item_id":"msg_1","output_index":0,"content_index":0,"delta":"world."}"#,
+                    r#"{"type":"response.output_item.done","sequence_number":5,"output_index":0,"item":{"type":"message","id":"msg_1","role":"assistant","content":[{"type":"output_text","text":"Hello, world."}]}}"#,
+                    r#"{"type":"response.completed","sequence_number":6,"response":{"id":"resp_1","status":"completed","usage":{"input_tokens":9,"input_tokens_details":{"cached_tokens":0,"cache_write_tokens":0},"output_tokens":4,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":13}}}"#,
+                ]))],
             },
             expect_events: |name, wire, events| {
                 assert_eq!(text_of(events), "Hello, world.", "{name} on {wire}");
@@ -413,7 +459,20 @@ fn cases() -> Vec<Case> {
                             Some(&json!(true))
                         );
                     }
-                    Wire::Responses => unreachable!("no adapter"),
+                    Wire::Responses => {
+                        assert_eq!(body.get("max_output_tokens"), Some(&json!(256)));
+                        // A third field name for the same neutral cap, which is most of
+                        // why the cap is neutral. Usage needs no opt-in here.
+                        assert!(body.get("stream_options").is_none());
+                        assert_eq!(
+                            body.pointer("/input/0/content/0/text"),
+                            Some(&json!("hello"))
+                        );
+                        assert_eq!(
+                            body.pointer("/input/0/content/0/type"),
+                            Some(&json!("input_text"))
+                        );
+                    }
                 }
             },
             expect_requests: |name, wire, reqs| {
@@ -421,7 +480,7 @@ fn cases() -> Vec<Case> {
                 let path = match wire {
                     Wire::Messages => "/v1/messages",
                     Wire::Chat => "/chat/completions",
-                    Wire::Responses => unreachable!(),
+                    Wire::Responses => "/responses",
                 };
                 assert_eq!(reqs[0].path, path, "{name} on {wire}");
                 // The bearer is sent, and the mock is the only place it is ever visible.
@@ -492,6 +551,35 @@ fn cases() -> Vec<Case> {
                         r#"{"id":"chatcmpl-2","choices":[],"usage":{"prompt_tokens":20,"completion_tokens":12}}"#,
                     ),
                     "data: [DONE]\n\n".to_string(),
+                ])],
+                // Delivered as separate writes for the same reason the other two are: the
+                // "arrives in three fragments" property is about the framer reassembling
+                // across TCP boundaries, and one write proves nothing about it.
+                responses: vec![Reply::sse_chunks(vec![
+                    typed_frame(
+                        r#"{"type":"response.created","sequence_number":0,"response":{"id":"resp_2","status":"in_progress"}}"#,
+                    ),
+                    typed_frame(
+                        r#"{"type":"response.output_item.added","sequence_number":1,"output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"add","arguments":""}}"#,
+                    ),
+                    typed_frame(
+                        r#"{"type":"response.function_call_arguments.delta","sequence_number":2,"item_id":"fc_1","output_index":0,"delta":"{\"a\":"}"#,
+                    ),
+                    typed_frame(
+                        r#"{"type":"response.function_call_arguments.delta","sequence_number":3,"item_id":"fc_1","output_index":0,"delta":"2,\"b\":"}"#,
+                    ),
+                    typed_frame(
+                        r#"{"type":"response.function_call_arguments.delta","sequence_number":4,"item_id":"fc_1","output_index":0,"delta":"2}"}"#,
+                    ),
+                    typed_frame(
+                        r#"{"type":"response.function_call_arguments.done","sequence_number":5,"item_id":"fc_1","output_index":0,"arguments":"{\"a\":2,\"b\":2}"}"#,
+                    ),
+                    typed_frame(
+                        r#"{"type":"response.output_item.done","sequence_number":6,"output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"add","arguments":"{\"a\":2,\"b\":2}"}}"#,
+                    ),
+                    typed_frame(
+                        r#"{"type":"response.completed","sequence_number":7,"response":{"id":"resp_2","status":"completed","usage":{"input_tokens":20,"output_tokens":12}}}"#,
+                    ),
                 ])],
             },
             expect_events: |name, wire, events| {
@@ -569,7 +657,29 @@ fn cases() -> Vec<Case> {
                         "{name}"
                     );
                 }
-                Wire::Responses => unreachable!(),
+                Wire::Responses => {
+                    // FLAT, not nested under a `function` object — the same three fields
+                    // in a different arrangement, which is the whole reason the neutral
+                    // `ToolSpec` exists.
+                    assert_eq!(
+                        body.pointer("/tools/0/type"),
+                        Some(&json!("function")),
+                        "{name}"
+                    );
+                    assert_eq!(body.pointer("/tools/0/name"), Some(&json!("add")), "{name}");
+                    assert!(body.pointer("/tools/0/parameters").is_some(), "{name}");
+                    assert!(
+                        body.pointer("/tools/0/function").is_none(),
+                        "{name}: no `function` wrapper on this wire"
+                    );
+                    // `strict` is REQUIRED by this wire's tool schema, so it is present
+                    // even though the case did not ask for it — see `openai_responses`.
+                    assert_eq!(
+                        body.pointer("/tools/0/strict"),
+                        Some(&json!(false)),
+                        "{name}"
+                    );
+                }
             },
             expect_requests: no_request_check,
             cancel_after: None,
@@ -599,6 +709,23 @@ fn cases() -> Vec<Case> {
                         r#"{"id":"chatcmpl-3","choices":[],"usage":{"prompt_tokens":30,"completion_tokens":20}}"#,
                     ]) + "data: [DONE]\n\n",
                 )],
+                // On this wire the two calls are two ITEMS, and their argument deltas are
+                // deliberately INTERLEAVED here — `fc_a`, `fc_b`, `fc_a`, `fc_b`. That is
+                // the shape the neutral event model was doubted over (see LEAKS.md L1):
+                // it needs no ordering key, because every fragment already carries the id
+                // of the call it belongs to.
+                responses: vec![Reply::sse(typed_frames(&[
+                    r#"{"type":"response.created","sequence_number":0,"response":{"id":"resp_3","status":"in_progress"}}"#,
+                    r#"{"type":"response.output_item.added","sequence_number":1,"output_index":0,"item":{"type":"function_call","id":"fc_a","call_id":"call_a","name":"weather","arguments":""}}"#,
+                    r#"{"type":"response.output_item.added","sequence_number":2,"output_index":1,"item":{"type":"function_call","id":"fc_b","call_id":"call_b","name":"time","arguments":""}}"#,
+                    r#"{"type":"response.function_call_arguments.delta","sequence_number":3,"item_id":"fc_a","output_index":0,"delta":"{\"city\":"}"#,
+                    r#"{"type":"response.function_call_arguments.delta","sequence_number":4,"item_id":"fc_b","output_index":1,"delta":"{\"tz\":"}"#,
+                    r#"{"type":"response.function_call_arguments.delta","sequence_number":5,"item_id":"fc_a","output_index":0,"delta":"\"Rome\"}"}"#,
+                    r#"{"type":"response.function_call_arguments.delta","sequence_number":6,"item_id":"fc_b","output_index":1,"delta":"\"UTC\"}"}"#,
+                    r#"{"type":"response.function_call_arguments.done","sequence_number":7,"item_id":"fc_a","output_index":0,"arguments":"{\"city\":\"Rome\"}"}"#,
+                    r#"{"type":"response.function_call_arguments.done","sequence_number":8,"item_id":"fc_b","output_index":1,"arguments":"{\"tz\":\"UTC\"}"}"#,
+                    r#"{"type":"response.completed","sequence_number":9,"response":{"id":"resp_3","status":"completed","usage":{"input_tokens":30,"output_tokens":20}}}"#,
+                ]))],
             },
             expect_events: |name, wire, events| {
                 let mut names: Vec<String> = events
@@ -668,6 +795,13 @@ fn cases() -> Vec<Case> {
                         r#"{"id":"chatcmpl-4","choices":[],"usage":{"prompt_tokens":5,"completion_tokens":256}}"#,
                     ]) + "data: [DONE]\n\n",
                 )],
+                // A THIRD SPELLING of the same fact: not a finish reason at all, but a
+                // response STATUS plus a reason for the incompleteness.
+                responses: vec![Reply::sse(typed_frames(&[
+                    r#"{"type":"response.created","sequence_number":0,"response":{"id":"resp_4","status":"in_progress"}}"#,
+                    r#"{"type":"response.output_text.delta","sequence_number":1,"item_id":"msg_1","output_index":0,"content_index":0,"delta":"trunca"}"#,
+                    r#"{"type":"response.incomplete","sequence_number":2,"response":{"id":"resp_4","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"usage":{"input_tokens":5,"output_tokens":256}}}"#,
+                ]))],
             },
             expect_events: |name, wire, events| {
                 assert_eq!(text_of(events), "trunca", "{name} on {wire}");
@@ -707,7 +841,7 @@ fn cases() -> Vec<Case> {
                         ])),
                     ],
                     chat: vec![
-                        retry,
+                        retry.clone(),
                         Reply::sse(
                             frames(&[
                                 r#"{"id":"chatcmpl-5","choices":[{"index":0,"delta":{"content":"ok"}}]}"#,
@@ -715,6 +849,14 @@ fn cases() -> Vec<Case> {
                                 r#"{"id":"chatcmpl-5","choices":[],"usage":{"prompt_tokens":3,"completion_tokens":1}}"#,
                             ]) + "data: [DONE]\n\n",
                         ),
+                    ],
+                    responses: vec![
+                        retry,
+                        Reply::sse(typed_frames(&[
+                            r#"{"type":"response.created","sequence_number":0,"response":{"id":"resp_5","status":"in_progress"}}"#,
+                            r#"{"type":"response.output_text.delta","sequence_number":1,"item_id":"msg_1","output_index":0,"content_index":0,"delta":"ok"}"#,
+                            r#"{"type":"response.completed","sequence_number":2,"response":{"id":"resp_5","status":"completed","usage":{"input_tokens":3,"output_tokens":1}}}"#,
+                        ])),
                     ],
                 }
             },
@@ -751,7 +893,8 @@ fn cases() -> Vec<Case> {
                 let unauthorized = Reply::status(401, r#"{"error":{"message":"invalid key"}}"#);
                 Script {
                     messages: vec![unauthorized.clone()],
-                    chat: vec![unauthorized],
+                    chat: vec![unauthorized.clone()],
+                    responses: vec![unauthorized],
                 }
             },
             // A 401 fails BEFORE a stream exists, so the harness synthesises a single
@@ -787,6 +930,10 @@ fn cases() -> Vec<Case> {
                 ]))],
                 chat: vec![Reply::sse(frames(&[
                     r#"{"id":"chatcmpl-7","choices":[{"index":0,"delta":{"content":"half an ans"}}]}"#,
+                ]))],
+                responses: vec![Reply::sse(typed_frames(&[
+                    r#"{"type":"response.created","sequence_number":0,"response":{"id":"resp_7","status":"in_progress"}}"#,
+                    r#"{"type":"response.output_text.delta","sequence_number":1,"item_id":"msg_1","output_index":0,"content_index":0,"delta":"half an ans"}"#,
                 ]))],
             },
             expect_events: |name, wire, events| {
@@ -828,6 +975,11 @@ fn cases() -> Vec<Case> {
                     r#"{"id":"chatcmpl-8","choices":[{"index":0,"delta":{"content":"still going"}}]}"#,
                 ]))
                 .holding_open()],
+                responses: vec![Reply::sse(typed_frames(&[
+                    r#"{"type":"response.created","sequence_number":0,"response":{"id":"resp_8","status":"in_progress"}}"#,
+                    r#"{"type":"response.output_text.delta","sequence_number":1,"item_id":"msg_1","output_index":0,"content_index":0,"delta":"still going"}"#,
+                ]))
+                .holding_open()],
             }
             },
             expect_events: |name, wire, events| {
@@ -863,6 +1015,12 @@ fn cases() -> Vec<Case> {
                         r#"{"id":"chatcmpl-9","choices":[],"usage":{"prompt_tokens":1000,"completion_tokens":11,"prompt_tokens_details":{"cached_tokens":900}}}"#,
                     ]) + "data: [DONE]\n\n",
                 )],
+                // Reported inclusive here too, under a third set of field names — and the
+                // details object is deliberately PARTIAL (no `cache_write_tokens`), which
+                // is what a host that reports only what it measures sends.
+                responses: vec![Reply::sse(typed_frames(&[
+                    r#"{"type":"response.completed","sequence_number":0,"response":{"id":"resp_9","status":"completed","usage":{"input_tokens":1000,"input_tokens_details":{"cached_tokens":900},"output_tokens":11,"total_tokens":1011}}}"#,
+                ]))],
             },
             expect_events: |name, wire, events| {
                 let u = usage_of(events).unwrap_or_else(|| panic!("{name} on {wire}: no usage"));
@@ -937,7 +1095,25 @@ fn cases() -> Vec<Case> {
                         Some(&json!("the stable prefix\n\ntoday is Tuesday"))
                     );
                 }
-                Wire::Responses => unreachable!(),
+                Wire::Responses => {
+                    assert!(
+                        !body.to_string().contains("cache_control"),
+                        "{name}: NOTHING cache-shaped may reach a wire without a reachable \
+                         breakpoint"
+                    );
+                    // Folded into `instructions` — one string, BYTE-IDENTICAL to the join
+                    // the Chat adapter performs, which is what makes a persona pack render
+                    // to the same sentences on both OpenAI surfaces.
+                    assert_eq!(
+                        body.get("instructions"),
+                        Some(&json!("the stable prefix\n\ntoday is Tuesday")),
+                        "{name}"
+                    );
+                    // And no tool carries a breakpoint either: this wire has one, on input
+                    // content parts, and `instructions` cannot reach it. See
+                    // `openai_responses::OpenAiResponses::body`.
+                    assert!(body.pointer("/tools/0/cache_control").is_none(), "{name}");
+                }
             },
             expect_requests: no_request_check,
             cancel_after: None,
@@ -986,7 +1162,26 @@ fn cases() -> Vec<Case> {
                         "{name}: the same bytes, as a data URL"
                     );
                 }
-                Wire::Responses => unreachable!(),
+                Wire::Responses => {
+                    // The same data URL as Chat, but the URL is the field's whole value
+                    // rather than an object with a `url` in it — and `detail` is present
+                    // because this wire's schema requires it.
+                    assert_eq!(
+                        body.pointer("/input/0/content/0/image_url"),
+                        Some(&json!("data:image/png;base64,QUJDRA==")),
+                        "{name}"
+                    );
+                    assert_eq!(
+                        body.pointer("/input/0/content/0/type"),
+                        Some(&json!("input_image")),
+                        "{name}"
+                    );
+                    assert_eq!(
+                        body.pointer("/input/0/content/1/text"),
+                        Some(&json!("what is this?")),
+                        "{name}: the text block keeps its position after the image"
+                    );
+                }
             },
             expect_requests: no_request_check,
             cancel_after: None,
@@ -1027,7 +1222,12 @@ fn cases() -> Vec<Case> {
                         "{name}: dropped when the host is not configured for it"
                     );
                 }
-                Wire::Responses => unreachable!(),
+                Wire::Responses => {
+                    assert!(
+                        body.get("reasoning").is_none(),
+                        "{name}: same quirk, same drop, a different field name"
+                    );
+                }
             },
             expect_requests: no_request_check,
             cancel_after: None,
@@ -1072,8 +1272,185 @@ fn cases() -> Vec<Case> {
                     );
                     assert!(body.get("thinking").is_none(), "{name}");
                 }
-                Wire::Responses => unreachable!(),
+                Wire::Responses => {
+                    assert_eq!(
+                        body.pointer("/reasoning/effort"),
+                        Some(&json!("high")),
+                        "{name}: the same enumerated effort, nested under `reasoning`"
+                    );
+                    // NO SUMMARY IS REQUESTED. A reasoning summary is generated text and
+                    // is billed as output tokens, so asking for one on every call would
+                    // spend a caller's money on a display signal. The decoder reads one
+                    // when a host sends it anyway — case 15 proves that half.
+                    assert!(body.pointer("/reasoning/summary").is_none(), "{name}");
+                    assert!(body.get("thinking").is_none(), "{name}");
+                    assert!(body.get("reasoning_effort").is_none(), "{name}");
+                }
             },
+            expect_requests: no_request_check,
+            cancel_after: None,
+        },
+        // ---- 14. `store` is a Responses concept and must not leak onto the others ----
+        //
+        // The row that pins D8's privacy decision. `store` DEFAULTS TO TRUE on the
+        // Responses wire, so an absent field there is not equivalent to a false one — and
+        // on the other two wires the concept does not exist at all, so the field appearing
+        // would mean an adapter had learned a neighbouring wire's vocabulary.
+        Case {
+            name: "store is off and no response is ever continued",
+            quirks: Quirks::default(),
+            request: base_request,
+            script: simple_end_turn_script,
+            expect_events: |name, wire, events| {
+                assert!(
+                    matches!(events.last(), Some(Event::Done { .. })),
+                    "{name} on {wire}"
+                );
+            },
+            expect_body: |name, wire, body| {
+                assert!(
+                    body.get("previous_response_id").is_none(),
+                    "{name} on {wire}: no wire may continue a provider-held conversation"
+                );
+                match wire {
+                    Wire::Messages | Wire::Chat => assert!(
+                        body.get("store").is_none(),
+                        "{name} on {wire}: a Responses field has no business here"
+                    ),
+                    Wire::Responses => assert_eq!(
+                        body.get("store"),
+                        Some(&json!(false)),
+                        "{name}: the loop owns the thread; the provider keeps no copy"
+                    ),
+                }
+            },
+            expect_requests: no_request_check,
+            cancel_after: None,
+        },
+        // ---- 15. Interleaved items, and a reasoning stream --------------------------
+        //
+        // TWO CANDIDATE LEAKS IN ONE ROW, both refuted here rather than asserted away.
+        //
+        //   * "The event model needs a per-item ordering key, because Responses can
+        //     interleave items." It does not: the stream is ordered, text deltas
+        //     concatenate in arrival order, and every tool fragment already carries the id
+        //     of the call it belongs to. This row emits text, then a tool call, then MORE
+        //     text — on all three wires, because all three can do it — and asserts the
+        //     text comes out in one piece and in order.
+        //   * "Thinking has to be requested to be received." It does not: no wire is asked
+        //     for reasoning here (the quirk is off, so nothing is sent), and all three
+        //     deliver `ThinkingDelta` when the host volunteers one.
+        Case {
+            name: "interleaved items with reasoning",
+            quirks: Quirks::default(),
+            request: base_request,
+            script: || Script {
+                messages: vec![Reply::sse(frames(&[
+                    r#"{"type":"message_start","message":{"id":"msg_15","usage":{"input_tokens":8,"output_tokens":0}}}"#,
+                    r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#,
+                    r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"mulling"}}"#,
+                    r#"{"type":"content_block_stop","index":0}"#,
+                    r#"{"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}"#,
+                    r#"{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"before "}}"#,
+                    r#"{"type":"content_block_stop","index":1}"#,
+                    r#"{"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"toolu_i","name":"look"}}"#,
+                    r#"{"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{}"}}"#,
+                    r#"{"type":"content_block_stop","index":2}"#,
+                    r#"{"type":"content_block_start","index":3,"content_block":{"type":"text","text":""}}"#,
+                    r#"{"type":"content_block_delta","index":3,"delta":{"type":"text_delta","text":"after"}}"#,
+                    r#"{"type":"content_block_stop","index":3}"#,
+                    r#"{"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":9}}"#,
+                    r#"{"type":"message_stop"}"#,
+                ]))],
+                chat: vec![Reply::sse(
+                    frames(&[
+                        r#"{"id":"chatcmpl-15","choices":[{"index":0,"delta":{"reasoning_content":"mulling"}}]}"#,
+                        r#"{"id":"chatcmpl-15","choices":[{"index":0,"delta":{"content":"before "}}]}"#,
+                        r#"{"id":"chatcmpl-15","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_i","function":{"name":"look","arguments":"{}"}}]}}]}"#,
+                        r#"{"id":"chatcmpl-15","choices":[{"index":0,"delta":{"content":"after"}}]}"#,
+                        r#"{"id":"chatcmpl-15","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+                        r#"{"id":"chatcmpl-15","choices":[],"usage":{"prompt_tokens":8,"completion_tokens":9}}"#,
+                    ]) + "data: [DONE]\n\n",
+                )],
+                responses: vec![Reply::sse(typed_frames(&[
+                    r#"{"type":"response.created","sequence_number":0,"response":{"id":"resp_15","status":"in_progress"}}"#,
+                    r#"{"type":"response.output_item.added","sequence_number":1,"output_index":0,"item":{"type":"reasoning","id":"rs_1","summary":[]}}"#,
+                    r#"{"type":"response.reasoning_summary_text.delta","sequence_number":2,"item_id":"rs_1","output_index":0,"summary_index":0,"delta":"mulling"}"#,
+                    r#"{"type":"response.output_item.added","sequence_number":3,"output_index":1,"item":{"type":"message","id":"msg_a","role":"assistant","content":[]}}"#,
+                    r#"{"type":"response.output_text.delta","sequence_number":4,"item_id":"msg_a","output_index":1,"content_index":0,"delta":"before "}"#,
+                    r#"{"type":"response.output_item.added","sequence_number":5,"output_index":2,"item":{"type":"function_call","id":"fc_i","call_id":"call_i","name":"look","arguments":""}}"#,
+                    r#"{"type":"response.function_call_arguments.delta","sequence_number":6,"item_id":"fc_i","output_index":2,"delta":"{}"}"#,
+                    r#"{"type":"response.function_call_arguments.done","sequence_number":7,"item_id":"fc_i","output_index":2,"arguments":"{}"}"#,
+                    r#"{"type":"response.output_item.added","sequence_number":8,"output_index":3,"item":{"type":"message","id":"msg_b","role":"assistant","content":[]}}"#,
+                    r#"{"type":"response.output_text.delta","sequence_number":9,"item_id":"msg_b","output_index":3,"content_index":0,"delta":"after"}"#,
+                    r#"{"type":"response.completed","sequence_number":10,"response":{"id":"resp_15","status":"completed","usage":{"input_tokens":8,"output_tokens":9,"output_tokens_details":{"reasoning_tokens":4}}}}"#,
+                ]))],
+            },
+            expect_events: |name, wire, events| {
+                // Text from two separate items, on either side of a tool call, arrives in
+                // ORDER and concatenates — with no ordering key anywhere in `Event`.
+                assert_eq!(text_of(events), "before after", "{name} on {wire}");
+                let thinking: String = events
+                    .iter()
+                    .filter_map(|e| match e {
+                        Event::ThinkingDelta(t) => Some(t.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(
+                    thinking, "mulling",
+                    "{name} on {wire}: reasoning is delivered where a host volunteers it"
+                );
+                // The call is identified by whatever id ITS OWN wire minted — `toolu_…`,
+                // `call_…`, `call_…` from a `fc_…` item — so the assertion is that the
+                // start and the end agree, not that the id looks like anything.
+                let started: Vec<(String, String)> = events
+                    .iter()
+                    .filter_map(|e| match e {
+                        Event::ToolUseStart { id, name } => Some((id.clone(), name.clone())),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(started.len(), 1, "{name} on {wire}: one interleaved call");
+                assert_eq!(started[0].1, "look", "{name} on {wire}");
+                let call_id = started[0].0.clone();
+                assert!(
+                    events
+                        .iter()
+                        .any(|e| matches!(e, Event::ToolUseEnd { id } if *id == call_id)),
+                    "{name} on {wire}: the interleaved tool call still closes"
+                );
+                assert!(
+                    matches!(
+                        events.last(),
+                        Some(Event::Done {
+                            stop_reason: StopReason::ToolUse
+                        })
+                    ),
+                    "{name} on {wire}: got {:?}",
+                    events.last()
+                );
+
+                // ---- The one place the three wires genuinely report different AMOUNTS
+                // of detail about the same call, which is why `Usage::reasoning_tokens`
+                // exists. Asserted here rather than in `expect_body` because it is a
+                // property of the neutral RESPONSE vector, not of the request.
+                let u = usage_of(events).unwrap_or_else(|| panic!("{name} on {wire}: no usage"));
+                match wire {
+                    Wire::Responses => assert_eq!(
+                        u.reasoning_tokens,
+                        Some(4),
+                        "{name}: this wire reports an output breakdown, and it survives"
+                    ),
+                    Wire::Messages | Wire::Chat => assert_eq!(
+                        u.reasoning_tokens, None,
+                        "{name} on {wire}: no breakdown reported is an ABSENCE, not a zero"
+                    ),
+                }
+                // On every wire the reasoning is INSIDE the output count, never beside it.
+                assert_eq!(u.output_tokens, Some(9), "{name} on {wire}");
+            },
+            expect_body: no_body_check,
             expect_requests: no_request_check,
             cancel_after: None,
         },
@@ -1094,6 +1471,9 @@ fn simple_end_turn_script() -> Script {
                 r#"{"id":"chatcmpl-x","choices":[],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#,
             ]) + "data: [DONE]\n\n",
         )],
+        responses: vec![Reply::sse(typed_frames(&[
+            r#"{"type":"response.completed","sequence_number":0,"response":{"id":"resp_x","status":"completed","usage":{"input_tokens":1,"output_tokens":1}}}"#,
+        ]))],
     }
 }
 
@@ -1107,7 +1487,7 @@ async fn run_case(case: &Case, wire: Wire) {
     let replies = match wire {
         Wire::Messages => script.messages,
         Wire::Chat => script.chat,
-        Wire::Responses => unreachable!("no adapter"),
+        Wire::Responses => script.responses,
     };
     let mock = Mock::start(replies).await;
 
@@ -1222,36 +1602,41 @@ async fn run_case(case: &Case, wire: Wire) {
     }
 }
 
-/// EVERY CASE, ON BOTH ADAPTERS. One test so a divergence is one failure with both wires
-/// named, rather than a green suite for one wire and a red one for the other.
+/// EVERY CASE, ON EVERY ADAPTER. One test so a divergence is one failure with the wire
+/// named, rather than a green suite for one wire and a red one for another.
 #[tokio::test(flavor = "multi_thread")]
-async fn every_case_behaves_identically_on_both_adapters() {
+async fn every_case_behaves_identically_on_every_adapter() {
     for case in cases() {
-        for wire in [Wire::Messages, Wire::Chat] {
+        for wire in [Wire::Messages, Wire::Chat, Wire::Responses] {
             run_case(&case, wire).await;
         }
     }
 }
 
-/// The wire that is declared but has no adapter refuses to construct, with a typed error.
+/// Every declared wire has an adapter, and each reports the wire it was asked for.
+///
+/// THE REPLACEMENT FOR `the_responses_wire_refuses_to_construct`, which asserted the
+/// refusal that was correct while the adapter did not exist. What survives from it is the
+/// property that actually mattered — a wire the enum declares is never silently served by
+/// a NEIGHBOURING adapter, which for `Responses` would mean posting a Chat body at a
+/// Responses endpoint — and that is what `p.wire() == w` checks here.
 #[test]
-fn the_responses_wire_refuses_to_construct() {
-    let cfg = ProviderConfig::new(Wire::Responses, "http://127.0.0.1:1", "m", AuthScheme::None);
-    match build_provider(cfg) {
-        Err(jesse_agent::ConfigError::UnimplementedWire(Wire::Responses)) => {}
-        Ok(_) => panic!("the Responses wire must not build until D7"),
-        Err(other) => panic!("unexpected error: {other:?}"),
+fn every_declared_wire_builds_and_serves_itself() {
+    for w in [Wire::Messages, Wire::Chat, Wire::Responses] {
+        let cfg = ProviderConfig::new(w, "http://127.0.0.1:1/v1", "m", AuthScheme::None);
+        let p = build_provider(cfg).unwrap_or_else(|e| panic!("{w} has no adapter: {e}"));
+        assert_eq!(p.wire(), w);
     }
 }
 
-/// Both adapters agree on the parts of [`jesse_agent::Capabilities`] that are true of the
+/// The adapters agree on the parts of [`jesse_agent::Capabilities`] that are true of the
 /// wire itself, and differ only where the wires genuinely differ.
 #[test]
 fn capabilities_differ_only_where_the_wires_do() {
     let mk = |wire: Wire| {
         build_provider(ProviderConfig::new(
             wire,
-            "http://127.0.0.1:1",
+            "http://127.0.0.1:1/v1",
             "m",
             AuthScheme::None,
         ))
@@ -1260,14 +1645,27 @@ fn capabilities_differ_only_where_the_wires_do() {
     };
     let messages = mk(Wire::Messages);
     let chat = mk(Wire::Chat);
-    for (wire, c) in [("messages", &messages), ("chat", &chat)] {
+    let responses = mk(Wire::Responses);
+    for (wire, c) in [
+        ("messages", &messages),
+        ("chat", &chat),
+        ("responses", &responses),
+    ] {
         assert!(c.tool_use, "{wire}");
         assert!(c.streaming, "{wire}");
         assert!(c.vision, "{wire}");
         assert!(c.parallel_tool_calls, "{wire}");
     }
-    // Caller-controllable prompt caching exists on one wire only, and that asymmetry is
-    // the reason the flag exists.
+    // Caller-controllable prompt caching exists on ONE wire, and that asymmetry is the
+    // reason the flag exists. The two OpenAI wires answer `false` for DIFFERENT reasons —
+    // Chat has no breakpoint at all, Responses has one this adapter's `instructions`
+    // mapping cannot reach — and the flag deliberately does not distinguish them, because
+    // the question it answers ("can the caller influence caching") has the same answer.
     assert!(messages.prompt_caching);
     assert!(!chat.prompt_caching);
+    assert!(!responses.prompt_caching);
+    // Thinking tracks the QUIRK on both OpenAI wires, and is native on Messages.
+    assert!(messages.thinking);
+    assert!(!chat.thinking);
+    assert!(!responses.thinking);
 }

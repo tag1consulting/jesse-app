@@ -457,6 +457,7 @@ async fn run_probe(probe: &Probe, level: Level) -> ProbeResult {
         output_tokens: Some(5),
         cache_read_tokens: None,
         cache_write_tokens: None,
+        reasoning_tokens: None,
         provider_request_id: None,
     };
     let provider = ScriptedProvider::new(
@@ -767,6 +768,7 @@ async fn the_tools_actually_work_when_they_are_supposed_to() {
         output_tokens: Some(5),
         cache_read_tokens: None,
         cache_write_tokens: None,
+        reasoning_tokens: None,
         provider_request_id: None,
     };
     let provider = ScriptedProvider::new(

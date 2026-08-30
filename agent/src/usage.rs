@@ -95,7 +95,7 @@ pub struct UsageRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_request_id: Option<String>,
 
-    // The four counts, `None` where the wire did not report one. `None` and `0` are
+    // The counts, `None` where the wire did not report one. `None` and `0` are
     // DIFFERENT and are kept different: a zero is a measurement, an absence is not, and a
     // sink that folded them together would make "this host reports no cache writes"
     // indistinguishable from "this call wrote nothing to cache".
@@ -107,6 +107,18 @@ pub struct UsageRecord {
     pub cache_read_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_write_tokens: Option<u64>,
+    /// Output tokens spent thinking, where the wire reports a breakdown.
+    ///
+    /// **INSIDE `output_tokens`, not beside it** — see [`crate::provider::Usage`]. It has
+    /// no effect on `cost_usd`; it is here because "how much of this bill was thinking" is
+    /// a question about a turn, and a count that reaches no durable record is a count
+    /// nobody can answer it with.
+    ///
+    /// Omitted when absent, like every other optional count, so `v` stays `1`: a reader
+    /// written against the older shape sees exactly what it saw before on the two wires
+    /// that report no breakdown, and an unknown key on the one that does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<u64>,
 
     /// Dollars, from the turn's [`crate::budget::PriceDeck`].
     pub cost_usd: f64,
@@ -149,6 +161,7 @@ impl UsageRecord {
             output_tokens: None,
             cache_read_tokens: None,
             cache_write_tokens: None,
+            reasoning_tokens: None,
             cost_usd: 0.0,
             latency_ms: 0,
             stop_reason: String::new(),

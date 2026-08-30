@@ -145,7 +145,8 @@ impl CallAudit {
         let tok = |v: Option<u64>| v.map(|n| n.to_string()).unwrap_or_else(|| "-".into());
         format!(
             "jesse-agent: call wire={} model={:?} tag={:?} attempt={} latency_ms={} \
-             stop={} in_tok={} out_tok={} cache_read_tok={} cache_write_tok={}{}",
+             stop={} in_tok={} out_tok={} cache_read_tok={} cache_write_tok={} \
+             reason_tok={}{}",
             self.wire,
             self.model,
             self.request_tag,
@@ -159,6 +160,11 @@ impl CallAudit {
             tok(u.output_tokens),
             tok(u.cache_read_tokens),
             tok(u.cache_write_tokens),
+            // A SUBSET of `out_tok`, not a fifth disjoint count — see `Usage`. It is on
+            // the line anyway because "how much of that output was thinking" is the first
+            // thing anyone asks of a reasoning model's audit trail, and a dash where the
+            // wire reports no breakdown says so honestly.
+            tok(u.reasoning_tokens),
             self.error_class
                 .map(|c| format!(" error_class={c}"))
                 .unwrap_or_default(),
@@ -1033,6 +1039,7 @@ mod tests {
                 output_tokens: Some(4),
                 cache_read_tokens: Some(900),
                 cache_write_tokens: None,
+                reasoning_tokens: Some(3),
                 provider_request_id: Some("req_1".into()),
             }),
         };
@@ -1046,6 +1053,7 @@ mod tests {
         // An absent count is a dash, never a zero — `None` and `0` mean different things
         // to a cost model.
         assert!(line.contains("cache_write_tok=-"));
+        assert!(line.contains("reason_tok=3"));
         assert!(!line.contains("http"), "no URL in the audit line: {line}");
     }
 

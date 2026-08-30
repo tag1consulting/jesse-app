@@ -1123,25 +1123,37 @@ mod tests {
         }
     }
 
-    /// **AND IS REFUSED ON THE WIRE THE AGENT LAYER CANNOT SPEAK YET.**
+    /// **AND ON THE RESPONSES WIRE TOO, SINCE D8.**
     ///
-    /// `build_provider` returns `UnimplementedWire` for Responses, so a model declaring it
-    /// would pass startup and then fail at provider construction on its first turn — the same
-    /// healthy-then-dead shape the wire gate exists to prevent, arrived at from the library
-    /// side rather than the endpoint side.
+    /// This test used to assert the opposite — that a `direct` model declaring `responses`
+    /// was REFUSED, because `build_provider` returned `UnimplementedWire` and a model that
+    /// passed startup would have failed at provider construction on its first turn. D8
+    /// wrote the adapter, so the refusal became the wrong answer and the test inverted with
+    /// it.
+    ///
+    /// It is kept, inverted, rather than deleted: the property it guards is the AGREEMENT
+    /// between `Harness::supports_wire` and what the agent library can actually build, and
+    /// that property is exactly as load-bearing now that the answer is yes. Every wire the
+    /// enum declares is checked, so a wire declared without an adapter — the state the enum
+    /// is designed to pass through — fails here rather than in a user's first turn.
     #[test]
-    fn a_direct_model_on_the_responses_wire_is_refused_until_the_adapter_exists() {
-        let mut cfg = cfg_with_model("d", DIRECT_ID, Capability::Read);
-        cfg.harnesses = Arc::new(HarnessRegistry::new(vec![Box::new(Direct)]));
-        if let Some(m) = cfg.model_registry.models.iter_mut().find(|m| m.id == "d") {
-            m.wire = Wire::Responses;
+    fn a_direct_model_starts_on_every_wire_the_agent_library_can_build() {
+        for wire in [Wire::Messages, Wire::Chat, Wire::Responses] {
+            let mut cfg = cfg_with_model("d", DIRECT_ID, Capability::Read);
+            cfg.harnesses = Arc::new(HarnessRegistry::new(vec![Box::new(Direct)]));
+            if let Some(m) = cfg.model_registry.models.iter_mut().find(|m| m.id == "d") {
+                m.wire = wire;
+            }
+            let errors: Vec<_> = validate(&cfg, &[], CONTAINMENT_RECORDS)
+                .into_iter()
+                .filter(|e| e.model.as_deref() == Some("d"))
+                .collect();
+            assert!(
+                errors.is_empty(),
+                "the direct harness drives {}: {errors:?}",
+                wire.as_str()
+            );
         }
-        let e = validate(&cfg, &[], CONTAINMENT_RECORDS)
-            .into_iter()
-            .find(|e| e.model.as_deref() == Some("d"))
-            .expect("the responses wire is not one this harness drives");
-        assert!(e.message.contains("responses"), "{e}");
-        assert!(e.message.contains(DIRECT_ID), "{e}");
     }
 
     /// A harness with no embedded record is a different fault from one whose record has no

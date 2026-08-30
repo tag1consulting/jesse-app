@@ -14,6 +14,129 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [agent 0.5.0, bridge 0.111.1] - 2026-08-31
+
+**A third wire adapter, written to falsify the provider trait rather than to extend it.**
+Two adapters written together can agree with each other by construction. `OpenAiResponses`
+was written after the trait had settled, against a wire with a genuinely different shape —
+stateful by default, carrying *items* rather than messages, reporting a *status* where the
+others report a finish reason — and the question the step exists to ask is whether
+`Provider` is a real abstraction or two adapters wearing one hat. All thirteen inherited
+conformance cases passed on it with **no change to the trait**; the fourteenth thing it
+reported had nowhere to go, and that one field is the whole change. Every candidate leak,
+including the four that turned out not to be leaks, is written down in `agent/LEAKS.md`.
+
+### Added
+
+- **`provider::openai_responses::OpenAiResponses`** — `POST {base_url}/responses`,
+  `stream: true`. System blocks fold into `instructions`; messages become `input` items
+  with tool calls and tool results as TOP-LEVEL siblings (`function_call`,
+  `function_call_output`); tools are flat; `thinking` becomes `reasoning: { effort }` behind
+  the existing quirk; the typed SSE events (`response.created`, `response.output_item.added`,
+  `response.output_text.delta`, `response.function_call_arguments.{delta,done}`,
+  `response.output_item.done`, `response.completed`, `response.incomplete`,
+  `response.failed`, `error`) decode into the neutral event model. Nothing shared was
+  forked: the client, the retry policy, redaction, the audit line and the SSE framer are
+  `provider::http`'s, unchanged.
+- **`store: false` on every request, and `previous_response_id` never sent.** This wire's
+  `store` defaults to **true** — the provider keeps the prompt, the tool calls and the
+  answer, server-side, retrievable by id. That is wrong here for three reasons that point
+  the same way: the loop already owns the thread (`thread.rs`, mode 0600), the content is
+  the owner's vault, and `store: false` is the reversible direction — it costs a re-send the
+  loop performs anyway, where storing costs a copy that cannot be un-made. It is a
+  CONSTANT, not a `Quirks` toggle and not a `Request` field, because a knob whose only
+  defensible value is one value is a way for a later config edit to turn the property off
+  without anyone deciding to. Asserted on the request BODY, on every iteration of a
+  multi-call turn, not just the first.
+- **`Usage::reasoning_tokens`** — the one additive trait change, and the only conformance
+  case that could not pass without it. This wire reports
+  `usage.output_tokens_details.reasoning_tokens`; the neutral vector had four counts and
+  none could hold it, so the question a reasoning model raises the moment it is deployed on
+  a budget ("how much of this bill was thinking") was answerable on the wire and not by a
+  caller. It is a **SUBSET of `output_tokens`**, not a fifth disjoint count — reasoning
+  tokens *are* output tokens, already billed at the output rate — so `PriceDeck::cost_usd`
+  has no term for it and says why, and `From<Usage> for TokenUsage` drops it so the bridge's
+  on-disk metrics shape is unchanged. It reaches `UsageRecord` (optional, omitted when
+  absent, schema version still `1`) and the audit line's new `reason_tok=` field.
+- **`agent/LEAKS.md`**, linked from `agent/README.md`. One confirmed additive leak (the
+  field above), one confirmed NON-additive gap left as a written recommendation, and four
+  candidates examined and refuted with their evidence. The recommendation is the one worth
+  reading: with `store: false` there is no neutral `ContentBlock` that can carry a
+  provider-minted opaque reasoning item back across a tool-use iteration, so a reasoning
+  model re-derives some thinking each turn. **Both older adapters have the same gap** — the
+  Messages wire wants a signed `thinking` block echoed back for exactly the same reason — and
+  it went unseen for two adapters because nothing exercised thinking *and* tool use *and* a
+  second iteration together. Fixing it means a new `ContentBlock` variant, a decision at
+  every match in three adapters and the loop, and an answer to whether an encrypted
+  chain-of-thought blob belongs in a thread file. That is a product decision, so it is
+  recorded rather than taken.
+- **Two conformance cases, passing on all three wires.** `store is off and no response is
+  ever continued` pins the privacy decision from both sides (`false` on Responses, the field
+  ABSENT on the other two, because a Responses concept in a Messages body would mean an
+  adapter had learned a neighbouring wire's vocabulary). `interleaved items with reasoning`
+  emits text, a tool call and more text, and refutes the loudest predicted leak: the event
+  model needs no per-item ordering key, because the stream is ordered and every ambiguous
+  event already carries its own id.
+- **A fourth way through `tests/loop_conformance.rs`**, and it earns its place beyond
+  arithmetic. This wire gives a tool call TWO ids — an item id its deltas are keyed by, and
+  a `call_id` a result must be addressed to — and only a multi-iteration turn can prove the
+  adapter round-trips the right one, because the failure is silent: emit the item id and the
+  turn is perfectly well-formed and the model never sees a single tool result.
+  `the_responses_wire_addresses_a_tool_result_by_call_id` reads the third request's body
+  from the far side of the socket.
+
+### Changed
+
+- **The `direct` harness answers `supports_wire(Responses)` with `true`** (bridge 0.111.1),
+  which is the one-line bridge change this depended on. It is the one harness whose answer
+  follows a LIBRARY rather than a CLI, so the two must agree: claiming a wire
+  `build_provider` refuses would let a model pass startup validation and fail every turn at
+  provider construction. Still an exhaustive `match` rather than a bare `true`, so the next
+  wire's DECLARATION commit fails to compile here and somebody has to answer for it.
+  `levelgate.rs`'s test inverted with it, and was kept rather than deleted: the property it
+  guards — agreement between the gate and the library — is exactly as load-bearing now that
+  the answer is yes.
+- **`direct` is now the preferred way to reach an OpenAI-shaped model for a non-coding
+  turn**, and `jesse.example.toml` says so with the reason. It is not about the wire, which
+  is the same one Codex drives: it is that a direct turn has NO SHELL and no subprocess —
+  eight typed tools dispatched by exact name over a canonicalised root, `strict` passed
+  through so arguments are schema-constrained, `store` off. Prefer `codex` when the turn
+  genuinely needs a shell. A commented `[[models]]` block for a `wire = "responses"` direct
+  model is added beside the two existing ones, with the same `/v1`-on-the-base-url warning
+  the Codex entry carries.
+- **`strict` is always present on a Responses function tool**, unlike Chat where it is
+  omitted on hosts that reject it: this wire's schema lists it as REQUIRED, so the quirk
+  governs its VALUE rather than its presence. Dropping a caller's `true` still logs one
+  note — never silently, because a caller that set it believed the arguments would be
+  schema-constrained. **No new quirk was needed for the whole adapter.**
+- **`agent/README.md`'s third-adapter checklist is now GRADED**, item by item, because a
+  checklist nobody has run is a wish list. Ten of twelve items held as written. Two needed
+  amending and both amendments are recorded: usage normalisation assumed ONE subset question
+  when this wire has three (it reports a cache-WRITE count as well, subtracted so the vector
+  still sums to the prompt total, and an output breakdown the neutral type had no field
+  for); and stop-reason mapping assumed a stop reason EXISTS, where this wire reports only a
+  status and "the model wants a tool called" has to be derived from the output items — a
+  `completed` read as `EndTurn` would produce a turn that never dispatches and never errors.
+
+### Notes
+
+- **The live smoke did not run**, and the mock is therefore the evidence: fifteen cases
+  across three adapters plus a four-way loop turn, all over real loopback sockets. No key
+  for a Responses-serving endpoint was present in the environment. What that does not buy is
+  stated plainly in `LEAKS.md` — a mock agrees with whatever this code believes, and only a
+  live endpoint can disagree.
+- **Facts were checked against the published OpenAI OpenAPI schema** (`openai/openai-openapi`,
+  `info.version: 2.3.0`), fetched on this machine, because the documentation site answers
+  `403` to a non-browser client. Every request field, item shape, event name, usage field
+  and enum in the adapter is present there. **One thing is inferred rather than stated**:
+  whether `input_tokens_details.cache_write_tokens` is a SUBSET of `input_tokens`. The
+  schema calls that object "a detailed breakdown of the input tokens", so it is read as one
+  and subtracted; the arithmetic is in one function with the caveat attached, and a live call
+  against a host that writes to cache would settle it in one reading.
+- **Nothing is armed by this change.** The example `[[models]]` block ships commented out,
+  no deployed model declares `wire = "responses"` on the `direct` harness, and the bridge's
+  containment record for `direct` is untouched — this adds a wire, not a capability.
+
 ## [eval 0.2.0] - 2026-08-31
 
 The eval harness grows a **driver seam**: one suite, one assertion engine, one scorecard,
