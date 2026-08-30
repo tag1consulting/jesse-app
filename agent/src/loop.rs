@@ -275,6 +275,13 @@ pub struct TurnInput {
     pub thinking: Thinking,
     /// What the turn may do. Built at a [`crate::tools::Level`]; see [`ToolSet`].
     pub tools: Arc<dyn ToolSet>,
+    /// The per-job artifact staging directory, or `None` to leave the channel off.
+    ///
+    /// The LOOP does not create, sweep or even look inside it — it hands the path to
+    /// [`ToolContext`] and nothing more. Creating it here would make the loop responsible
+    /// for a lifecycle that belongs to whoever owns the job: `bridge/src/artifacts.rs`
+    /// creates the directory before the turn runs and sweeps it after.
+    pub artifact_dir: Option<std::path::PathBuf>,
 }
 
 /// The collaborators a turn borrows.
@@ -331,6 +338,7 @@ pub async fn run_turn(
         prices,
         thinking,
         tools,
+        artifact_dir,
     } = input;
 
     let clock = deps.clock.clone();
@@ -366,11 +374,15 @@ pub async fn run_turn(
     // against iteration 4's — which is a boundary that depends on timing.
     let manifest: Vec<ToolSpec> = tools.manifest();
     let system = prepare_system(system);
-    let ctx = ToolContext {
+    // The turn-scoped half of every call's context. `call_id` is filled in per call — see
+    // `ToolContext`, which became per-call in D3 so a write lock can be attributed to the
+    // call holding it.
+    let ctx = TurnContext {
         turn_id: turn_id.clone(),
         conversation_id: thread_id.to_string(),
         cancel: cancel.clone(),
         clock: clock.clone(),
+        artifact_dir: artifact_dir.clone(),
     };
 
     let stop = loop {
@@ -686,6 +698,33 @@ async fn run_one_call(
 // Dispatch
 // ===========================================================================
 
+/// The turn-scoped half of a [`ToolContext`], cloned into a per-call one at dispatch.
+///
+/// It exists because `ToolContext` is per CALL and all but one of its fields are per TURN.
+/// Rebuilding the whole thing from the loop's locals at each call site would mean the day a
+/// field is added, one of those sites is missed.
+#[derive(Clone)]
+struct TurnContext {
+    turn_id: String,
+    conversation_id: String,
+    cancel: CancellationToken,
+    clock: Arc<dyn Clock>,
+    artifact_dir: Option<std::path::PathBuf>,
+}
+
+impl TurnContext {
+    fn for_call(&self, call_id: &str) -> ToolContext {
+        ToolContext {
+            turn_id: self.turn_id.clone(),
+            conversation_id: self.conversation_id.clone(),
+            call_id: call_id.to_string(),
+            cancel: self.cancel.clone(),
+            clock: self.clock.clone(),
+            artifact_dir: self.artifact_dir.clone(),
+        }
+    }
+}
+
 /// One dispatched tool call: what goes into the thread, and what goes into the trace.
 struct Dispatched {
     block: ContentBlock,
@@ -699,7 +738,7 @@ async fn dispatch(
     requested: &[ToolUseRequest],
     manifest: &[ToolSpec],
     scope: &Scope,
-    ctx: &ToolContext,
+    ctx: &TurnContext,
     sink: &dyn EventSink,
     clock: &Arc<dyn Clock>,
     cancel: &CancellationToken,
@@ -788,7 +827,7 @@ async fn call_one(
     tools: &Arc<dyn ToolSet>,
     request: &ToolUseRequest,
     scope: &Scope,
-    ctx: &ToolContext,
+    ctx: &TurnContext,
     clock: &Arc<dyn Clock>,
 ) -> Dispatched {
     let started = clock.since_start();
@@ -818,7 +857,10 @@ async fn call_one(
     };
 
     let class = tool.action_class();
-    let result: ToolResult = tool.call(scope, request.arguments.clone(), ctx).await;
+    // The per-call context: the turn's fields plus THIS call's id, which is what a write
+    // lock is attributed to.
+    let call_ctx = ctx.for_call(&request.id);
+    let result: ToolResult = tool.call(scope, request.arguments.clone(), &call_ctx).await;
     let ms = duration_ms(clock.since_start().saturating_sub(started));
 
     let (content, is_error, outcome) = match &result {

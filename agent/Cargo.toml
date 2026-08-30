@@ -1,6 +1,6 @@
 [package]
 name = "jesse-agent"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "Provider-neutral agent layer for Jesse: one request/response model, one streaming event vocabulary, per-wire adapters (Anthropic Messages, OpenAI Chat Completions), and the tool-calling turn loop that runs on top of them."
@@ -55,6 +55,13 @@ regex = "1"
 # handle a stored conversation is fetched by, so it needs the property jitter disclaims.
 # Already in this workspace's lockfile, so it adds no new compiled code to the workspace.
 getrandom = "0.4"
+# SHA-256 for the document content hash, and it must be THE SAME sha256 the bridge's
+# `writelock.rs::hash_file` computes: D4 feeds this store's hashes to the bridge's
+# per-conversation compare-and-swap baseline, and two hashes that disagreed would make every
+# baseline comparison fail. `ring` is what the bridge uses (it is already in its graph for
+# APNs JWT signing) and it is already in this workspace's lockfile via rustls, so this adds
+# no new compiled code. A pure-Rust `sha2` would be a second implementation of one constant.
+ring = "0.17"
 
 [features]
 # The scripted `Provider` (`provider::scripted`) and the `EventStream::scripted`

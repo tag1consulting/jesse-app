@@ -325,6 +325,7 @@ fn input(tools: Arc<dyn ToolSet>) -> TurnInput {
         },
         thinking: Thinking::Off,
         tools,
+        artifact_dir: None,
     }
 }
 
