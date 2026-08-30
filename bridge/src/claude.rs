@@ -231,6 +231,17 @@ pub fn resolve_stream_outcome(
     }
 }
 
+/// A routed one-shot's own turn id.
+///
+/// A one-shot creates no job, so there is no job id to borrow — but it IS a turn, and on an
+/// in-process harness it produces its own usage records. A fresh id per call is what keeps
+/// those attributable: two title children running at once would otherwise file their calls
+/// under one key. The label prefix is there so a human reading `usage.jsonl` can tell a title
+/// turn from a diet extraction without joining anything.
+fn oneshot_turn_id(label: &str) -> String {
+    format!("{label}-{}", uuid::Uuid::new_v4())
+}
+
 /// **THE SPAWNED-ONLY SEAM.** Resolve a harness to its child-process half, or refuse.
 ///
 /// Every call site that needs a [`SpawnedHarness`] method goes through this, and every one
@@ -404,7 +415,8 @@ pub async fn run_claude_oneshot(
     // vault, for a job whose entire output is a handful of words the bridge then validates
     // and truncates. Nothing about the title contract wanted that.
     let ambient = ActiveModel::ambient();
-    let mut cmd = harness.build_turn(cfg, &title_child_request(cfg, prompt, &ambient))?;
+    let turn_id = oneshot_turn_id("title");
+    let mut cmd = harness.build_turn(cfg, &title_child_request(cfg, prompt, &ambient, &turn_id))?;
     // Title-only backend override: point THIS child at the configured
     // base_url/token/model when all three JESSE_TITLE_* vars are set. A no-op
     // otherwise (ambient backend). Main turns never call this.
@@ -433,7 +445,8 @@ pub async fn run_diet_extract(
         "building the diet extract child",
     )?;
     let ambient = ActiveModel::ambient();
-    let mut cmd = harness.build_turn(cfg, &diet_child_request(cfg, prompt, &ambient))?;
+    let turn_id = oneshot_turn_id("diet-extract");
+    let mut cmd = harness.build_turn(cfg, &diet_child_request(cfg, prompt, &ambient, &turn_id))?;
     apply_routed_env(&mut cmd, pick);
     run_stateless_oneshot(cfg, harness, cmd, timeout_secs, "diet extraction").await
 }
@@ -457,7 +470,8 @@ pub async fn run_diet_verify(
         "building the diet verify child",
     )?;
     let ambient = ActiveModel::ambient();
-    let mut cmd = harness.build_turn(cfg, &diet_child_request(cfg, prompt, &ambient))?;
+    let turn_id = oneshot_turn_id("diet-verify");
+    let mut cmd = harness.build_turn(cfg, &diet_child_request(cfg, prompt, &ambient, &turn_id))?;
     apply_routed_env(&mut cmd, pick);
     run_stateless_oneshot(cfg, harness, cmd, timeout_secs, "diet verification").await
 }
@@ -478,7 +492,9 @@ pub async fn run_vaultqa_child(
         "building the vault-QA child",
     )?;
     let ambient = ActiveModel::ambient();
-    let mut cmd = harness.build_turn(cfg, &vaultqa_child_request(cfg, prompt, &ambient))?;
+    let turn_id = oneshot_turn_id("vaultqa");
+    let mut cmd =
+        harness.build_turn(cfg, &vaultqa_child_request(cfg, prompt, &ambient, &turn_id))?;
     apply_routed_env(&mut cmd, pick);
     run_stateless_oneshot(cfg, harness, cmd, timeout_secs, "vault-QA lookup").await
 }
@@ -525,6 +541,7 @@ pub async fn run_claude_streaming(
     spawned: &SpawnedSessions,
     write_lock: Option<&WriteLockChild>,
     attachment_dir: Option<&Path>,
+    artifact_dir: Option<&Path>,
     trace: &TurnTrace,
 ) -> Result<(String, Option<String>, ShadowUsage), ApiError> {
     // Resume-after-sweep safety: if the requested session's transcript no longer
@@ -559,6 +576,7 @@ pub async fn run_claude_streaming(
                 spawned,
                 write_lock,
                 attachment_dir,
+                artifact_dir,
                 trace,
             )
             .await
@@ -575,6 +593,7 @@ pub async fn run_claude_streaming(
                 spawned,
                 write_lock,
                 attachment_dir,
+                artifact_dir,
                 trace,
             )
             .await
@@ -607,6 +626,7 @@ async fn run_spawned_turn(
     spawned: &SpawnedSessions,
     write_lock: Option<&WriteLockChild>,
     attachment_dir: Option<&Path>,
+    artifact_dir: Option<&Path>,
     trace: &TurnTrace,
 ) -> Result<(String, Option<String>, ShadowUsage), ApiError> {
     const MAX_ATTEMPTS: u32 = 3; // 1 try + 2 retries
@@ -634,6 +654,7 @@ async fn run_spawned_turn(
             active,
             turn_capability(active),
             main_mcp_config(cfg, harness),
+            job_id,
         );
         // THE VAULT WRITE LOCK, installed per attempt because the child is rebuilt per
         // attempt. `None` for a turn that cannot write the vault or a deployment where the
@@ -645,6 +666,9 @@ async fn run_spawned_turn(
         // no attachments and on every turn the vision helper serves, which is then
         // byte-for-byte the child 0.60.1 built.
         req.attachment_dir = attachment_dir;
+        // Set for the same reason, and ignored by both spawned harnesses: they learn about the
+        // staging directory from the prompt, so no child's argv changes because this exists.
+        req.artifact_dir = artifact_dir;
         let mut cmd = harness.build_turn(cfg, &req)?;
 
         let mut child = cmd.spawn().map_err(|e| {
@@ -994,6 +1018,7 @@ async fn run_in_process_turn(
     spawned: &SpawnedSessions,
     write_lock: Option<&WriteLockChild>,
     attachment_dir: Option<&Path>,
+    artifact_dir: Option<&Path>,
     trace: &TurnTrace,
 ) -> Result<(String, Option<String>, ShadowUsage), ApiError> {
     /// How long a cancelled in-process turn may take to wind down before the driver stops
@@ -1018,6 +1043,7 @@ async fn run_in_process_turn(
         // as child processes, and inventing a server set for it here would describe a
         // posture nothing spawns.
         cfg.main_mcp_config.as_deref().unwrap_or(EMPTY_MCP_CONFIG),
+        job_id,
     );
     // Set for the same reasons as in the spawned arm, and read by the harness the same way.
     // `write_lock` reaching an in-process harness means the broker is armed and this turn
@@ -1026,6 +1052,10 @@ async fn run_in_process_turn(
     // `Harness::supports_write_lock`.
     req.write_lock = write_lock;
     req.attachment_dir = attachment_dir;
+    // THE ARTIFACT CHANNEL. `None` below `Capability::Write` and on a deployment with the
+    // channel off, in which case the harness's artifact tool has nowhere to write and the
+    // tool set simply does not offer it.
+    req.artifact_dir = artifact_dir;
 
     let sink = JobStoreSink {
         jobs,

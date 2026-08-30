@@ -96,6 +96,9 @@ pub(crate) fn test_config() -> Config {
         // The shipped harness registry: `claude-code` only, exactly as `from_env` builds
         // it. A test that needs a second harness constructs its own `HarnessRegistry`.
         harnesses: Arc::new(HarnessRegistry::claude_code_only()),
+        // No `[direct]` table in the fixture: the direct harness is not registered here, so
+        // every setting is inert and every existing turn assertion is unaffected.
+        direct: DirectSettings::default(),
     }
 }
 pub(crate) fn test_state() -> AppState {

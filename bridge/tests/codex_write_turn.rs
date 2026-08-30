@@ -138,6 +138,7 @@ async fn turn(
         &spawned,
         None,
         None,
+        None,
         &TurnTrace::from_cfg(cfg),
     )
     .await;

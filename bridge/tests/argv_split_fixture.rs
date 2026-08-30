@@ -52,6 +52,11 @@ use serde_json::{json, Value};
 use std::path::PathBuf;
 use tokio::process::Command;
 
+/// A FIXED turn id. `TurnRequest` gained one when the direct harness landed; it reaches no
+/// argv, no env var and no file on either spawned harness, which is exactly what this fixture
+/// proves by still matching the pre-split capture byte for byte.
+const TURN_ID: &str = "fixture-turn";
+
 /// The fixture path, relative to the crate root.
 fn fixture_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/argv-before-split.json")
@@ -128,17 +133,41 @@ fn rows() -> Value {
         // THE ONE MECHANICAL DIFFERENCE ACROSS THE SPLIT, and the reason this file's
         // generator half was rewritten while the fixture was not: building a child is now
         // reached through `runner()`. Everything below it is untouched.
+        //
+        // AN IN-PROCESS HARNESS IS SKIPPED, and the fixture is still exactly as strong. What
+        // it pins is that the two harnesses which existed before the split still build
+        // byte-identical children; a harness added afterwards that spawns nothing has no argv
+        // to have changed and could not appear in a capture taken before it existed. Skipping
+        // is checked rather than assumed — a spawned harness added later WOULD have to be
+        // captured, and would fail the key comparison below until it was.
         let Runner::Spawned(spawned) = harness.runner() else {
-            panic!("'{id}' is a spawned harness; an in-process one builds no child to capture")
+            continue;
         };
         let mcp = main_mcp_config(&cfg, spawned);
         let cases: Vec<(&str, TurnRequest<'_>)> = vec![
-            ("title", title_child_request(&cfg, "PROMPT", &ambient)),
-            ("diet", diet_child_request(&cfg, "PROMPT", &ambient)),
-            ("vaultqa", vaultqa_child_request(&cfg, "PROMPT", &ambient)),
+            (
+                "title",
+                title_child_request(&cfg, "PROMPT", &ambient, TURN_ID),
+            ),
+            (
+                "diet",
+                diet_child_request(&cfg, "PROMPT", &ambient, TURN_ID),
+            ),
+            (
+                "vaultqa",
+                vaultqa_child_request(&cfg, "PROMPT", &ambient, TURN_ID),
+            ),
             (
                 "main-write",
-                main_turn_request(&cfg, "PROMPT", None, &ambient, Capability::Write, mcp),
+                main_turn_request(
+                    &cfg,
+                    "PROMPT",
+                    None,
+                    &ambient,
+                    Capability::Write,
+                    mcp,
+                    TURN_ID,
+                ),
             ),
             (
                 "main-write-resume",
@@ -149,11 +178,20 @@ fn rows() -> Value {
                     &ambient,
                     Capability::Write,
                     mcp,
+                    TURN_ID,
                 ),
             ),
             (
                 "main-read",
-                main_turn_request(&cfg, "PROMPT", None, &ambient, Capability::Read, mcp),
+                main_turn_request(
+                    &cfg,
+                    "PROMPT",
+                    None,
+                    &ambient,
+                    Capability::Read,
+                    mcp,
+                    TURN_ID,
+                ),
             ),
         ];
         let mut per = serde_json::Map::new();

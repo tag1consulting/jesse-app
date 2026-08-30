@@ -6,6 +6,9 @@ pub use claude_code::*;
 mod codex;
 pub use codex::*;
 
+mod direct;
+pub use direct::*;
+
 // ---- The agent program, behind three traits ---------------------------------
 //
 // An agent program answers a turn. HOW it is reached is a second question, and until now
@@ -246,6 +249,29 @@ pub struct TurnRequest<'a> {
     /// for Claude Code, a `hooks.json` in the per-turn home for Codex — which is why this is
     /// a request field the harness reads rather than argv the bridge assembles.
     pub write_lock: Option<&'a WriteLockChild>,
+    /// **THE TURN'S OWN ID** — the bridge's job id.
+    ///
+    /// Spawned harnesses do not read it: a child is identified by its process and its session,
+    /// and the bridge already correlates those. An IN-PROCESS harness has neither, so this is
+    /// the key its usage records, its trace and its write locks are all filed under — which is
+    /// what lets a usage line be matched to a turn timing record afterwards.
+    ///
+    /// It is on the REQUEST rather than derived inside the harness because only the caller
+    /// knows it: a routed job and a main turn are both turns, and both already have a job id
+    /// the rest of the bridge uses.
+    pub turn_id: &'a str,
+    /// The per-job artifact staging directory, when this turn may produce files.
+    ///
+    /// `None` for every turn below [`Capability::Write`] and for every deployment with the
+    /// artifact channel off. Distinct from `attachment_dir` in both direction and lifetime:
+    /// attachments come IN and are swept with the request, artifacts go OUT and are swept by
+    /// the job when the turn ends.
+    ///
+    /// Spawned harnesses learn about it through the PROMPT (`artifact_prompt_suffix` names the
+    /// directory to the model) and need nothing on their argv, which is why this field is
+    /// additive for them — no child's command line changes because it exists. An in-process
+    /// harness hands the path to the tool that writes there.
+    pub artifact_dir: Option<&'a Path>,
     /// The per-request scratch directory this turn's decoded attachments were written to.
     ///
     /// CALL SITE POLICY, exactly like `cwd`: the bridge decided where to write the files, so
@@ -578,6 +604,32 @@ pub trait Harness: Send + Sync {
     /// The bridge converts anything outside `native` before naming a path — see
     /// [`prepare_attachments_for_harness`].
     fn attachment_support(&self) -> &'static AttachmentSupport;
+
+    /// The turns of one of THIS harness's threads, for
+    /// `GET /jesse/conversations/{id}/transcript`.
+    ///
+    /// **The default is `None`, meaning "ask the transcript directory instead"** — which is
+    /// what every harness did before this method existed, and what the two spawned harnesses
+    /// still do. The hydration path reads [`Harness::transcript_dir`], finds the session's
+    /// jsonl file and shapes its lines; a harness that keeps such files needs nothing here.
+    ///
+    /// It exists for the harness that keeps its history somewhere the directory scan cannot
+    /// see. D4 recorded that such a harness returns an EMPTY turn list, accepted deliberately
+    /// because hydrating from the context ledger would be real machinery for a rare case.
+    /// That reasoning held while the only transcript-less harness (Codex) genuinely had no
+    /// readable history. It stops holding for `direct`, which keeps a complete thread log in
+    /// its own store — so rather than degrade, it answers here.
+    ///
+    /// The two rules an implementation owes, both of which exist because this is the one place
+    /// stored history becomes something a phone renders:
+    ///   * the user text is un-wrapped through [`strip_prompt_wrapper`], so the transcript
+    ///     shows what was typed rather than the bridge's assembled prompt;
+    ///   * TOOL MESSAGES ARE NOT RENDERED. The phone has never shown a tool call or its
+    ///     result, and a harness whose tool results are vault content must not be the one that
+    ///     starts.
+    fn hydrate(&self, _cfg: &Config, _session_id: &str) -> Option<Vec<HydratedTurn>> {
+        None
+    }
 
     /// **WHICH RUNNER SHAPE THIS HARNESS IS** — the one branch, asked once per call site.
     ///
@@ -1002,6 +1054,7 @@ pub fn title_child_request<'a>(
     cfg: &'a Config,
     prompt: &'a str,
     ambient: &'a ActiveModel,
+    turn_id: &'a str,
 ) -> TurnRequest<'a> {
     TurnRequest {
         prompt,
@@ -1011,6 +1064,9 @@ pub fn title_child_request<'a>(
         cwd: PathBuf::from(&cfg.vault),
         mcp_config: EMPTY_MCP_CONFIG,
         write_lock: None,
+        turn_id,
+        // A routed one-shot produces no files: its whole output is the text it returns.
+        artifact_dir: None,
         // A single-shot child never carries an attachment.
         attachment_dir: None,
     }
@@ -1025,6 +1081,7 @@ pub fn diet_child_request<'a>(
     cfg: &'a Config,
     prompt: &'a str,
     ambient: &'a ActiveModel,
+    turn_id: &'a str,
 ) -> TurnRequest<'a> {
     TurnRequest {
         prompt,
@@ -1034,6 +1091,9 @@ pub fn diet_child_request<'a>(
         cwd: cfg.scratch_base(), // neutral cwd → no vault CLAUDE.md auto-load
         mcp_config: EMPTY_MCP_CONFIG,
         write_lock: None,
+        turn_id,
+        // A routed one-shot produces no files: its whole output is the text it returns.
+        artifact_dir: None,
         // A single-shot child never carries an attachment.
         attachment_dir: None,
     }
@@ -1048,6 +1108,7 @@ pub fn vaultqa_child_request<'a>(
     cfg: &'a Config,
     prompt: &'a str,
     ambient: &'a ActiveModel,
+    turn_id: &'a str,
 ) -> TurnRequest<'a> {
     TurnRequest {
         prompt,
@@ -1057,6 +1118,9 @@ pub fn vaultqa_child_request<'a>(
         cwd: PathBuf::from(&cfg.vault),
         mcp_config: vaultqa_mcp_config(cfg),
         write_lock: None,
+        turn_id,
+        // A routed one-shot produces no files: its whole output is the text it returns.
+        artifact_dir: None,
         // A single-shot child never carries an attachment.
         attachment_dir: None,
     }
@@ -1067,7 +1131,7 @@ pub fn vaultqa_child_request<'a>(
 /// A model naming an id absent from here is a startup ERROR rather than a silent fallback
 /// to Claude Code: quietly running a Codex-configured model under a different harness is
 /// exactly the sort of "it worked, differently" that a config surface must not do.
-pub const KNOWN_HARNESS_IDS: &[&str] = &[CLAUDE_CODE_ID, CODEX_ID];
+pub const KNOWN_HARNESS_IDS: &[&str] = &[CLAUDE_CODE_ID, CODEX_ID, DIRECT_ID];
 
 /// Look a harness up in a registry by a config-supplied id, for the read paths that hold a
 /// `String` rather than a `&'static str`.
@@ -1085,6 +1149,10 @@ pub fn harness_bin_env(id: &str) -> Option<&'static str> {
     match id {
         CLAUDE_CODE_ID => Some("JESSE_CLAUDE_BIN"),
         CODEX_ID => Some("JESSE_CODEX_BIN"),
+        // `direct` HAS NO BINARY, and the `None` is the answer rather than an omission: it
+        // runs the turn in this process, so there is nothing on `PATH` whose absence could be
+        // fatal and nothing for an operator to point an env var at.
+        DIRECT_ID => None,
         _ => None,
     }
 }
@@ -1094,6 +1162,8 @@ pub fn harness_default_bin(id: &str) -> Option<&'static str> {
     match id {
         CLAUDE_CODE_ID => Some("claude"),
         CODEX_ID => Some("codex"),
+        // See `harness_bin_env`: no binary.
+        DIRECT_ID => None,
         _ => None,
     }
 }
@@ -1146,6 +1216,7 @@ impl HarnessRegistry {
                 // is exhaustive over `KNOWN_HARNESS_IDS` minus the built-in.
                 CLAUDE_CODE_ID => {}
                 CODEX_ID => extra.push(Box::new(Codex)),
+                DIRECT_ID => extra.push(Box::new(Direct)),
                 _ => continue,
             }
         }
@@ -1357,13 +1428,11 @@ mod tests {
     /// the derived `Ord`, so a reordered enum fails here even though the name set is
     /// unchanged.
     ///
-    /// The other half is gated on the `agent-vocabulary` feature, which enables nothing
-    /// today and exists precisely so this assertion is WRITTEN before the dependency is.
-    /// D5 adds `jesse-agent` as an optional dependency of that feature, and the block below
-    /// starts compiling — and starts failing the build if the two enums have drifted. Adding
-    /// the dependency now, only to compare two enums, would put the whole agent crate in the
-    /// bridge's lockfile a step early; leaving the check unwritten is how the mapping ends up
-    /// being derived from two doc comments by whoever happens to write the impls.
+    /// **The other half now runs.** It was gated behind an `agent-vocabulary` feature that
+    /// enabled nothing, written before the dependency existed precisely so the check could
+    /// not be forgotten. D5 adopted `jesse-agent`, so the gate is gone and the cross-crate
+    /// comparison is unconditional — which is what it was written for. The two `From` impls
+    /// it guards live in [`crate::agentmap`].
     #[test]
     fn the_capability_vocabulary_is_the_agent_crates_level_vocabulary() {
         let mut ours = [Capability::Write, Capability::Basic, Capability::Read];
@@ -1376,22 +1445,19 @@ mod tests {
              change with it, in the same order, or D5's mapping stops being the identity"
         );
 
-        #[cfg(feature = "agent-vocabulary")]
-        {
-            let mut theirs = [
-                jesse_agent::tools::Level::Write,
-                jesse_agent::tools::Level::Basic,
-                jesse_agent::tools::Level::Read,
-            ];
-            theirs.sort();
-            let their_names: Vec<String> = theirs.iter().map(|l| format!("{l:?}")).collect();
-            assert_eq!(
-                names, their_names,
-                "the two level vocabularies have drifted — same names, same order, or the \
-                 `From<Capability> for Level` mapping is no longer the identity it is \
-                 documented to be"
-            );
-        }
+        let mut theirs = [
+            jesse_agent::tools::Level::Write,
+            jesse_agent::tools::Level::Basic,
+            jesse_agent::tools::Level::Read,
+        ];
+        theirs.sort();
+        let their_names: Vec<String> = theirs.iter().map(|l| format!("{l:?}")).collect();
+        assert_eq!(
+            names, their_names,
+            "the two level vocabularies have drifted — same names, same order, or the \
+             `From<Capability> for Level` mapping is no longer the identity it is \
+             documented to be"
+        );
     }
 
     /// A whole-answer harness is registered, so the property the old streaming gate asserted

@@ -1820,6 +1820,8 @@ mod tests {
             cwd: std::env::temp_dir(),
             mcp_config: EMPTY_MCP_CONFIG,
             write_lock: None,
+            turn_id: "test-turn",
+            artifact_dir: None,
             attachment_dir: None,
         };
         let with = TurnRequest {
@@ -1832,6 +1834,8 @@ mod tests {
                 cwd: std::env::temp_dir(),
                 mcp_config: EMPTY_MCP_CONFIG,
                 write_lock: None,
+                turn_id: "test-turn",
+                artifact_dir: None,
                 attachment_dir: None,
             }
         };
@@ -1868,6 +1872,8 @@ mod tests {
             cwd: std::env::temp_dir(),
             mcp_config: EMPTY_MCP_CONFIG,
             write_lock: None,
+            turn_id: "test-turn",
+            artifact_dir: None,
             attachment_dir: None,
         };
         let cmd = Codex.build_turn(&cfg, &req).expect("a provider child");

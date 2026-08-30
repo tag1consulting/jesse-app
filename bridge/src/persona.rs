@@ -241,6 +241,13 @@ struct LocalConfig {
     /// registry down with it.
     #[serde(default)]
     schedule: Vec<ScheduleToml>,
+    /// The optional top-level `[direct]` table: the vault settings every `direct` turn runs
+    /// under. A table rather than per-model keys because it describes the VAULT, not a model
+    /// — every direct model on this deployment reads the same documents with the same
+    /// exclusions and the same cold list, and per-model copies would be a way for two models
+    /// to disagree about which documents exist.
+    #[serde(default)]
+    direct: Option<DirectToml>,
     /// The optional top-level `[profile]` table — today just `on_return`. A table rather
     /// than a key on an entry because it is a statement about the schedule as a whole; see
     /// [`crate::schedule::ProfileToml`].
@@ -289,6 +296,48 @@ fn load_local_persona(home: &str) -> Option<PersonaToml> {
 /// loads from (same search order, same soft-fail: a missing/malformed file yields an empty
 /// list and the registry falls back to the env triples + built-in opus). Each entry is
 /// validated in [`registry_model_from_toml`], so a partial entry is skipped there, not here.
+/// The `[direct]` table as written, every field optional.
+#[derive(Deserialize, Debug, Default, Clone)]
+pub struct DirectToml {
+    pub exclude: Option<Vec<String>>,
+    pub cold_prefixes: Option<Vec<String>>,
+    pub fetch_allow: Option<Vec<String>>,
+    pub qmd: Option<bool>,
+    pub qmd_collection: Option<String>,
+    pub max_iterations: Option<u32>,
+    pub max_tool_calls: Option<u32>,
+}
+
+/// Read the `[direct]` table from the overlay file, defaulted.
+///
+/// An ABSENT table is the shipped default and it is deliberately conservative: no extra
+/// exclusions beyond the agent crate's own `ALWAYS_EXCLUDED`, no cold prefixes, **no fetch
+/// allowlist at all** (so `fetch_url` is present in the manifest at `Read` and refuses every
+/// URL), and the built-in grep index. A deployment that configures nothing gets a direct
+/// harness that can read and search its vault and reach nothing outside it.
+pub fn load_direct_settings(home: &str) -> DirectSettings {
+    let mut out = DirectSettings::default();
+    let Some(t) = load_local_config(home).and_then(|c| c.direct) else {
+        return out;
+    };
+    if let Some(v) = t.exclude {
+        out.exclude = clean_list(v);
+    }
+    if let Some(v) = t.cold_prefixes {
+        out.cold_prefixes = clean_list(v);
+    }
+    if let Some(v) = t.fetch_allow {
+        out.fetch_allow = clean_list(v);
+    }
+    out.qmd = t.qmd.unwrap_or(false);
+    out.qmd_collection = trimmed_nonempty(t.qmd_collection);
+    // Zero is refused rather than honoured: a budget of zero iterations is a turn that cannot
+    // answer, and an operator who typed it meant something else.
+    out.max_iterations = t.max_iterations.filter(|n| *n > 0);
+    out.max_tool_calls = t.max_tool_calls.filter(|n| *n > 0);
+    out
+}
+
 pub fn load_local_models(home: &str) -> Vec<ModelToml> {
     load_local_config(home)
         .map(|c| c.models)

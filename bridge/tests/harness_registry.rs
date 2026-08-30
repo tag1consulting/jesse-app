@@ -205,7 +205,7 @@ fn the_registry_holds_both_and_only_the_transcript_bearing_one_contributes_a_dir
         panic!("this double is a spawned-shape harness")
     };
     let err = other_spawned
-        .build_turn(&cfg, &title_child_request(&cfg, "hi", &ambient))
+        .build_turn(&cfg, &title_child_request(&cfg, "hi", &ambient, "t-1"))
         .expect_err("this harness refuses");
     assert_eq!(ApiError::from(err).0, StatusCode::INTERNAL_SERVER_ERROR);
 

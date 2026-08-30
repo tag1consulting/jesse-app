@@ -357,6 +357,62 @@ impl LockBroker {
         }
     }
 
+    // ---- The IN-PROCESS entry points ------------------------------------
+    //
+    // The three methods below are what an in-process harness's `WriteGuard` calls — see
+    // `BrokerGuard` in `harness/direct.rs`. They are the SAME operations `handle` performs for
+    // a hook request, exposed directly because there is no socket to cross: an in-process
+    // guard that serialised a request, opened a unix socket to this same process and parsed
+    // the reply would be a round trip through two extra layers to reach the mutex it is
+    // already holding a pointer to.
+    //
+    // WHAT IS DELIBERATELY NOT EXPOSED IS `check_baseline`. The compare-and-swap for a direct
+    // turn is enforced by the STORE, inside the same critical section as the write, against
+    // the hash the model itself is holding — see `BrokerGuard`'s doc comment for the full
+    // argument. The baselines are still RECORDED here (`note_direct_read`,
+    // `record_baseline_direct`) so a later hook-driven turn in the same conversation is
+    // neither blind to what a direct turn read nor falsely refused by what it wrote.
+
+    /// Take one lock for an in-process turn, waiting up to [`LOCK_WAIT_TIMEOUT`].
+    pub async fn acquire_direct(&self, key: &LockKey, turn: &str, call_id: &str) -> bool {
+        self.acquire(key, turn, call_id).await
+    }
+
+    /// Release every lock one in-process tool call holds.
+    pub fn release_call_direct(&self, turn: &str, call_id: &str) {
+        self.release_call(turn, call_id)
+    }
+
+    /// Re-hash `path` and record it as its conversation's baseline — the `Post` hook's job,
+    /// done inline. Keyed on the conversation the last `note_direct_read` named, which is the
+    /// same conversation the write happened in.
+    pub fn record_baseline_direct(&self, path: &Path) {
+        let conversation = {
+            let g = self.inner.lock_ok();
+            g.baselines
+                .iter()
+                .find(|(_, m)| m.contains_key(path))
+                .map(|(c, _)| c.clone())
+        };
+        if let Some(c) = conversation {
+            self.record_baseline(&c, path);
+        }
+    }
+
+    /// Record that a conversation has seen `path` at `hash`, from a read the STORE performed.
+    ///
+    /// The hash comes from the store rather than being recomputed here, and that is the whole
+    /// difference from [`LockBroker::record_baseline`]: the store hashed the exact bytes it
+    /// returned to the model, under whatever consistency it read them with, and re-hashing the
+    /// file afterwards could record a different version than the one the model actually saw.
+    pub fn note_direct_read(&self, conversation: &str, path: &Path, hash: &str) {
+        let mut g = self.inner.lock_ok();
+        g.baselines
+            .entry(conversation.to_string())
+            .or_default()
+            .insert(path.to_path_buf(), hash.to_string());
+    }
+
     /// Whether any turn currently holds a lock that could be mid-write to `path`.
     ///
     /// [`LockKey::Global`] counts, and that is the point: it is the key every write

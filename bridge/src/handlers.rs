@@ -347,6 +347,11 @@ pub async fn run_ask_hosted_or_emergency(
     spawned: &SpawnedSessions,
     write_lock: Option<&WriteLockChild>,
     attachment_dir: Option<&Path>,
+    // This turn's artifact staging directory, when it has one. Harness-independent: a spawned
+    // harness learns about it from the PROMPT (`artifact_prompt_suffix`, already appended
+    // above) and needs nothing else, while an in-process harness is handed the path so its
+    // artifact tool writes there.
+    artifact_dir: Option<&Path>,
     trace: &TurnTrace,
 ) -> AskResult {
     let now = Instant::now();
@@ -419,6 +424,7 @@ pub async fn run_ask_hosted_or_emergency(
             spawned,
             write_lock,
             attachment_dir,
+            artifact_dir,
             trace,
         )
         .await,
@@ -1345,6 +1351,7 @@ pub async fn start_turn(
                     &spawned,
                     write_lock.as_ref(),
                     attachment_dir.as_deref(),
+                    staging.as_ref().map(|d| d.path.as_path()),
                     &trace,
                 )
                 .await,
@@ -1522,6 +1529,7 @@ pub async fn start_turn(
                         &spawned,
                         write_lock.as_ref(),
                         attachment_dir.as_deref(),
+                        staging.as_ref().map(|d| d.path.as_path()),
                         &trace,
                     )
                     .await;
@@ -1556,6 +1564,7 @@ pub async fn start_turn(
                 &spawned,
                 write_lock.as_ref(),
                 attachment_dir.as_deref(),
+                staging.as_ref().map(|d| d.path.as_path()),
                 &trace,
             )
             .await;

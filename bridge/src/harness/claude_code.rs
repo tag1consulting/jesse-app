@@ -208,6 +208,7 @@ pub fn main_turn_request<'a>(
     active: &'a ActiveModel,
     capability: Capability,
     mcp_config: &'a str,
+    turn_id: &'a str,
 ) -> TurnRequest<'a> {
     TurnRequest {
         prompt,
@@ -216,9 +217,13 @@ pub fn main_turn_request<'a>(
         capability,
         cwd: PathBuf::from(&cfg.vault), // cwd = vault → CLAUDE.md auto-loads
         mcp_config,
+        turn_id,
         // Callers that CAN write the vault set this after the fact (`req.write_lock =
         // Some(&wl)`), so the common request builder stays a five-argument function.
         write_lock: None,
+        // Set after the fact by the driver, for the same reason the write lock is: only the
+        // handler that created the staging directory knows whether this turn has one.
+        artifact_dir: None,
         // Set after the fact by the driver too, and for the same reason: only the handler
         // that decoded the attachments knows whether this turn has any and where they went.
         attachment_dir: None,
@@ -1251,9 +1256,28 @@ pub fn build_claude_command(
 ) -> Command {
     ClaudeCode.command(
         cfg,
-        &main_turn_request(cfg, prompt, session_id, active, capability, mcp_config),
+        // A FIXED turn id, because this builder exists for the containment and isolation
+        // tests and the id is not part of a claude-code child at all — it reaches no argv,
+        // no env var and no file. A constant keeps the golden argv byte-identical.
+        &main_turn_request(
+            cfg,
+            prompt,
+            session_id,
+            active,
+            capability,
+            mcp_config,
+            BUILDER_TURN_ID,
+        ),
     )
 }
+
+/// The turn id the named builders pass.
+///
+/// It is never read on this harness: a claude-code child learns nothing about it, so no argv,
+/// env var or file depends on its value. It exists because [`TurnRequest`] carries a turn id
+/// for the harnesses that DO need one, and a builder written for tests should pass something
+/// obviously fixed rather than mint a fresh uuid the goldens would then have to tolerate.
+const BUILDER_TURN_ID: &str = "builder";
 
 /// Build the base `Command` for a stateless diet CHILD (extract or verify): the same
 /// `stream-json` + `--permission-mode default` posture as every other child, contained at
@@ -1264,7 +1288,10 @@ pub fn build_claude_command(
 /// overrides (callers layer `apply_diet_env` for extract, nothing for the ambient verify).
 pub fn build_diet_child_command(cfg: &Config, prompt: &str) -> Command {
     let ambient = ActiveModel::ambient();
-    ClaudeCode.command(cfg, &diet_child_request(cfg, prompt, &ambient))
+    ClaudeCode.command(
+        cfg,
+        &diet_child_request(cfg, prompt, &ambient, BUILDER_TURN_ID),
+    )
 }
 
 /// Build the base `Command` for the stateless, READ-ONLY vault-QA child: contained at
@@ -1275,7 +1302,10 @@ pub fn build_diet_child_command(cfg: &Config, prompt: &str) -> Command {
 /// layers `apply_vaultqa_env`), and never passes `--resume`.
 pub fn build_vaultqa_child_command(cfg: &Config, prompt: &str) -> Command {
     let ambient = ActiveModel::ambient();
-    ClaudeCode.command(cfg, &vaultqa_child_request(cfg, prompt, &ambient))
+    ClaudeCode.command(
+        cfg,
+        &vaultqa_child_request(cfg, prompt, &ambient, BUILDER_TURN_ID),
+    )
 }
 
 // ---- Per-role backend env ----------------------------------------------------
@@ -2240,6 +2270,9 @@ mod tests {
             configured: true,
             level: Capability::Read,
             harness: CLAUDE_CODE_ID.to_string(),
+            auth_scheme: None,
+            quirks: DirectQuirks::default(),
+            thinking: None,
             price: PriceDeck::ZERO,
             health: HealthConfig::default(),
             vision: Vec::new(),
@@ -2984,6 +3017,7 @@ mod tests {
                 &ambient,
                 capability,
                 main_mcp_config(&cfg, &ClaudeCode),
+                BUILDER_TURN_ID,
             );
             same(
                 &harness
@@ -3002,21 +3036,30 @@ mod tests {
         }
         same(
             &harness
-                .build_turn(&cfg, &diet_child_request(&cfg, "PROMPT", &ambient))
+                .build_turn(
+                    &cfg,
+                    &diet_child_request(&cfg, "PROMPT", &ambient, BUILDER_TURN_ID),
+                )
                 .expect("claude never refuses"),
             &build_diet_child_command(&cfg, "PROMPT"),
             "diet child",
         );
         same(
             &harness
-                .build_turn(&cfg, &vaultqa_child_request(&cfg, "PROMPT", &ambient))
+                .build_turn(
+                    &cfg,
+                    &vaultqa_child_request(&cfg, "PROMPT", &ambient, BUILDER_TURN_ID),
+                )
                 .expect("claude never refuses"),
             &build_vaultqa_child_command(&cfg, "PROMPT"),
             "vault-QA child",
         );
         same(
             &harness
-                .build_turn(&cfg, &title_child_request(&cfg, "PROMPT", &ambient))
+                .build_turn(
+                    &cfg,
+                    &title_child_request(&cfg, "PROMPT", &ambient, BUILDER_TURN_ID),
+                )
                 .expect("claude never refuses"),
             &build_claude_command(
                 &cfg,

@@ -208,6 +208,13 @@ impl AppState {
             scheduler,
             artifacts,
         };
+        // GIVE THE IN-PROCESS HARNESS ITS BROKER. This is the first point in the process where
+        // both exist: the harness registry is built inside `Config::from_env`, and the broker
+        // is created a few lines above. An in-process harness takes its write locks through
+        // this object directly rather than through a child's hooks — see `BrokerGuard` — and
+        // until it is installed a direct turn REFUSES every write rather than performing one
+        // unlocked. Idempotent; a second `AppState` in a test does not disturb the first.
+        install_direct_broker(st.broker.clone());
         st.bootstrap_conversations();
         st
     }
@@ -364,6 +371,9 @@ mod tests {
                     configured: true,
                     level: Capability::Write,
                     harness: CLAUDE_CODE_ID.to_string(),
+                    auth_scheme: None,
+                    quirks: DirectQuirks::default(),
+                    thinking: None,
                     price: PriceDeck::ZERO,
                     health: HealthConfig::default(),
                     vision: Vec::new(),
@@ -379,6 +389,9 @@ mod tests {
                     configured: true,
                     level: Capability::Read,
                     harness: CLAUDE_CODE_ID.to_string(),
+                    auth_scheme: None,
+                    quirks: DirectQuirks::default(),
+                    thinking: None,
                     price: PriceDeck::ZERO,
                     health: HealthConfig::default(),
                     vision: Vec::new(),

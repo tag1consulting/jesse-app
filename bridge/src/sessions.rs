@@ -1049,6 +1049,10 @@ pub fn hydrate_conversation_in(
     dirs: &[PathBuf],
     session_ids: &[String],
     start: (usize, u64),
+    // The harnesses, so a session whose history is NOT a file in `dirs` can still be
+    // rendered. `None` keeps the file-only behaviour, which is what every test that predates
+    // an in-process harness wants and what the single-directory helper passes.
+    cfg: Option<&Config>,
 ) -> std::io::Result<(Vec<HydratedTurn>, String)> {
     let (start_segment, start_offset) = start;
     let mut turns = Vec::new();
@@ -1063,6 +1067,19 @@ pub fn hydrate_conversation_in(
             turns.append(&mut seg_turns);
             cursor_segment = segment;
             cursor_offset = next;
+        } else if let Some(mut seg_turns) = cfg.and_then(|c| harness_hydrated(c, sid)) {
+            // NO FILE, BUT A HARNESS THAT HAS THE HISTORY ANYWAY. An in-process harness keeps
+            // its threads in its own store rather than in a directory the scan reads, so a
+            // missing file is not the same as missing history — see [`Harness::hydrate`].
+            //
+            // It is asked ONLY after the file lookup fails, so a harness that keeps
+            // transcripts is never asked and this path costs a transcript-bearing
+            // conversation nothing. The cursor moves to the end of the segment because a
+            // thread store hands back the whole thread each time: there is no byte offset to
+            // resume from, so the segment is complete once it has been read.
+            turns.append(&mut seg_turns);
+            cursor_segment = segment;
+            cursor_offset = 0;
         } else {
             // The file is gone: nothing to read, and the cursor moves to the start of
             // this segment so a later call skips it again without erroring.
@@ -1100,14 +1117,27 @@ pub fn hydrate_conversation_in(
     Ok((turns, format_hydrate_cursor(cursor_segment, cursor_offset)))
 }
 
-/// [`hydrate_conversation_in`] over a single transcript directory.
+/// The first registered harness that can render `session_id` from its own store.
+///
+/// Asked in [`HarnessRegistry::ordered`] order and stops at the first `Some`, which is
+/// unambiguous in practice: a session id names one harness's thread by its own format (a
+/// direct thread id is `direct-<uuid>`, and `ThreadId::parse` refuses anything else), so at
+/// most one harness ever claims a given id.
+fn harness_hydrated(cfg: &Config, session_id: &str) -> Option<Vec<HydratedTurn>> {
+    cfg.harnesses
+        .ordered()
+        .into_iter()
+        .find_map(|h| h.hydrate(cfg, session_id))
+}
+
+/// [`hydrate_conversation_in`] over a single transcript directory, files only.
 pub fn hydrate_conversation(
     dir: &Path,
     session_ids: &[String],
     start: (usize, u64),
 ) -> std::io::Result<(Vec<HydratedTurn>, String)> {
     let dirs = [dir.to_path_buf()];
-    hydrate_conversation_in(&dirs, session_ids, start)
+    hydrate_conversation_in(&dirs, session_ids, start, None)
 }
 
 /// Query params for `GET /jesse/conversations/{id}/transcript`.
@@ -1212,8 +1242,8 @@ pub async fn jesse_conversation_hydrate(
     let start = parse_hydrate_cursor(params.after.as_deref())
         .map_err(|msg| (StatusCode::BAD_REQUEST, msg))?;
     let dirs = st.transcript_dirs();
-    let (mut turns, next_cursor) = hydrate_conversation_in(&dirs, &rec.session_ids, start)
-        .map_err(|e| {
+    let (mut turns, next_cursor) =
+        hydrate_conversation_in(&dirs, &rec.session_ids, start, Some(&st.cfg)).map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("could not read conversation transcript: {e}"),
