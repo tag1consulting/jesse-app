@@ -205,6 +205,27 @@ impl TurnTrace {
         g.pending = Some((name.to_string(), Instant::now()));
     }
 
+    /// Reconcile the running tool count with a harness that reports its OWN authoritative
+    /// total for the turn — [`TurnOutcome::tool_calls`].
+    ///
+    /// The count here is normally derived: every [`TurnTrace::note_tool`] the driver makes
+    /// while reading mid-turn activity bumps it by one. That is exact for a harness whose
+    /// every tool call is narrated, and the spawned harnesses' are. It is NOT exact in
+    /// general: the mid-turn contract makes activity a garnish on a streaming harness ("a
+    /// missed activity event costs nothing"), so an in-process harness may legitimately
+    /// finish having made more calls than it narrated.
+    ///
+    /// `max`, never assignment, and that is the whole of the rule: a harness that reports a
+    /// SMALLER number than the driver actually watched has not un-made those calls, and
+    /// letting it lower the count would make "43 tool calls and nothing said" — the one
+    /// diagnosis [`TurnTrace::partial`] exists to deliver — quietly wrong. Per-call TIMINGS
+    /// are untouched: the extra calls have no clock of their own, and inventing one would be
+    /// a measurement nobody took.
+    pub fn note_tool_calls(&self, reported: usize) {
+        let mut g = self.inner.lock_ok();
+        g.tool_calls = g.tool_calls.max(reported);
+    }
+
     /// The turn's stream ended (terminal result, EOF, or the kill). Closes any tool call
     /// still in flight so its duration is recorded rather than lost.
     pub fn note_end(&self) {

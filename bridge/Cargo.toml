@@ -1,6 +1,6 @@
 [package]
 name = "jesse-bridge"
-version = "0.108.0"
+version = "0.109.0"
 edition = "2021"
 license = "Apache-2.0"
 
@@ -18,6 +18,23 @@ license = "Apache-2.0"
 #   cargo build   --release                             # the serving binary, without it
 [features]
 containment-probe = []
+
+# NOT A BUILD OPTION — a switch for ONE TEST, and it enables nothing today.
+#
+# `harness::Capability` and `jesse_agent::tools::Level` are the same three-level vocabulary
+# declared twice, because `agent/` depends on the bridge in neither direction (see the note
+# at the top of `agent/Cargo.toml`). D5 adopts the agent crate and writes the two `From`
+# impls; those are correct only while the two enums agree on names AND on order, and the
+# check that says so is written NOW —
+# `the_capability_vocabulary_is_the_agent_crates_level_vocabulary` — with its cross-crate
+# half behind this feature.
+#
+# So: enabling it today does not compile, deliberately. D5 makes `jesse-agent` an optional
+# dependency of this feature, and the assertion starts running. Adding that dependency here
+# just to compare two enums would put the whole agent crate in the bridge's lockfile a step
+# early, and deleting the check until then is how a mapping ends up derived from two doc
+# comments in different crates.
+agent-vocabulary = []
 
 # Declared (rather than auto-discovered) so `required-features` can keep them out of a
 # default build; every other bin under src/bin stays auto-discovered.
@@ -81,6 +98,15 @@ subtle = "2"
 # (a transitive dep of axum), so naming it directly pulls no new compiled code.
 # The live-stream plumbing itself is tokio::sync::broadcast/mpsc + std.
 futures-core = "0.3"
+# `CancellationToken`, the cancellation primitive `InProcessHarness::run_turn` takes.
+# Already in the lock (a transitive dep of reqwest's HTTP/2 stack), so naming it directly
+# pulls no new compiled code. Hand-rolling one over `AtomicBool` + `Notify` was rejected
+# for the reason the agent crate rejected it: cancellation has to COMPOSE — a turn-scoped
+# parent handing child tokens to each provider call — and this is the type that already
+# composes that way. It is also the type `agent/` already takes, so the eventual adoption
+# needs no adapter. Naming it here is NOT a dependency on `agent/`: it is the same
+# third-party crate, chosen twice for the same reason.
+tokio-util = "0.7"
 # APNs (optional push, disabled unless JESSE_APNS_* is set) needs an HTTP/2 client
 # and ES256 JWT signing — the only justification for these two deps.
 #

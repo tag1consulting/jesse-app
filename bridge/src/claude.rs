@@ -3,11 +3,32 @@ use crate::*;
 // ---- What a turn amounts to, and how to drive one ---------------------------
 //
 // This module is the HARNESS-INDEPENDENT half: the outcome vocabulary every harness
-// reports in, and the drivers that spawn a child, read its stdout line by line, stop at the
-// terminal result, reap it under a bound, resolve the outcome, and retry a transient
-// failure. Everything specific to the `claude` CLI — argv, containment flags, per-role env,
-// `stream-json` line parsing — lives in [`crate::harness::claude_code`], behind the
-// [`Harness`] trait.
+// reports in, and the drivers that run a turn. Everything specific to the `claude` CLI —
+// argv, containment flags, per-role env, `stream-json` line parsing — lives in
+// [`crate::harness::claude_code`], behind the [`Harness`] trait.
+//
+// ---- ONE BRANCH, TWO ARMS ---------------------------------------------------
+//
+// [`run_claude_streaming`] asks [`Harness::runner`] ONCE and takes one of two arms:
+//
+//   * [`Runner::Spawned`] — spawn a child, read its stdout line by line through the
+//     harness's parser, drain its stderr through the harness's classifier, stop at the
+//     terminal result, reap under a bound, resolve the outcome, retry a transient failure
+//     up to three attempts with a stream reset between them. Unchanged from before the
+//     split, moved wholesale into [`run_spawned_turn`].
+//   * [`Runner::InProcess`] — await [`InProcessHarness::run_turn`] with a [`TurnSink`] that
+//     forwards into the SAME job-store stream frames, under the same per-turn timeout, with
+//     the same streamed-text safety net, resolving to the same terminal shape. See
+//     [`run_in_process_turn`].
+//
+// WHAT THE TWO ARMS SHARE, and why it is above the branch rather than duplicated in each:
+// the resume-after-sweep resolution, the per-turn timeout value, the streamed-text safety
+// net ([`resolve_stream_outcome`] with the job's snapshot when [`Harness::streams_text`]),
+// the byte-based truncation cap on the stored reply, the cross-turn tool-id guard, and the
+// `(text, session_id, usage)` shape the handler turns into a `Done` frame. What they do NOT
+// share is retry: the driver's three attempts belong to the spawned arm, and an in-process
+// harness owns its own — see [`InProcessHarness::run_turn`] for why that is a contract and
+// not an omission.
 //
 // There are exactly TWO copies of the spawn/read/reap loop here (the retrying turn driver
 // and the no-retry one-shot runner), and there must never be a third: between them they
@@ -210,6 +231,32 @@ pub fn resolve_stream_outcome(
     }
 }
 
+/// **THE SPAWNED-ONLY SEAM.** Resolve a harness to its child-process half, or refuse.
+///
+/// Every call site that needs a [`SpawnedHarness`] method goes through this, and every one
+/// of them names — in `what` — the thing it was about to do. That naming is the whole
+/// point: the alternative is a silent default, and the silent default here is "quietly do
+/// nothing and report success", which is the failure mode this seam exists to make
+/// impossible. A caller that genuinely handles both shapes matches on
+/// [`Harness::runner`] itself and never calls this.
+///
+/// The refusal is a [`HarnessError`], the type that already means "this harness cannot
+/// express what you asked for" and that already renders as a 500 with the harness named.
+/// An in-process harness reaching one of these call sites is a wiring fault, not a user
+/// error, and it reads as one.
+pub fn spawned_only<'a>(
+    harness: &'a dyn Harness,
+    what: &str,
+) -> Result<&'a dyn SpawnedHarness, HarnessError> {
+    match harness.runner() {
+        Runner::Spawned(s) => Ok(s),
+        Runner::InProcess(_) => Err(HarnessError::unsupported(
+            harness.id(),
+            format!("{what} — it answers turns in this process, with no child to build"),
+        )),
+    }
+}
+
 /// Spawn a pre-built stateless one-shot `Command` and return its answer text.
 /// Shared by [`run_claude_oneshot`], [`run_diet_extract`], [`run_diet_verify`] and
 /// [`run_vaultqa_child`]: it reuses the exact same line reading, terminal classification
@@ -221,7 +268,7 @@ pub fn resolve_stream_outcome(
 /// message.
 async fn run_stateless_oneshot(
     cfg: &Config,
-    harness: &dyn Harness,
+    harness: &dyn SpawnedHarness,
     mut cmd: Command,
     timeout_secs: u64,
     label: &str,
@@ -338,7 +385,16 @@ pub async fn run_claude_oneshot(
     timeout_secs: u64,
     pick: &RoutedPick,
 ) -> Result<String, ApiError> {
-    let harness = cfg.harnesses.serving_pick(pick);
+    // ONE-SHOTS ARE SPAWNED-ONLY, and say so rather than defaulting. Every one of the four
+    // below builds a `Command` and hands it to `run_stateless_oneshot`; an in-process
+    // harness has no command to build, and the right answer is a named refusal the caller
+    // degrades from exactly as it degrades from any other non-2xx (each of these paths falls
+    // back to the hosted turn). Adopting the in-process arm here is deliberately D5's, not
+    // this change's: it needs its own sink-less variant of the one-shot runner.
+    let harness = spawned_only(
+        cfg.harnesses.serving_pick(pick),
+        "building the title one-shot's child",
+    )?;
     // The title path is AMBIENT and untouched by the model switch, so it passes the ambient
     // model — the command is byte-for-byte today's, and `apply_title_env` below still layers
     // any title backend on top (the two never mix). BASIC with no MCP servers is stated at
@@ -372,7 +428,10 @@ pub async fn run_diet_extract(
     timeout_secs: u64,
     pick: &RoutedPick,
 ) -> Result<String, ApiError> {
-    let harness = cfg.harnesses.serving_pick(pick);
+    let harness = spawned_only(
+        cfg.harnesses.serving_pick(pick),
+        "building the diet extract child",
+    )?;
     let ambient = ActiveModel::ambient();
     let mut cmd = harness.build_turn(cfg, &diet_child_request(cfg, prompt, &ambient))?;
     apply_routed_env(&mut cmd, pick);
@@ -393,7 +452,10 @@ pub async fn run_diet_verify(
     // The verifier is whatever the routing rule picked at `Write`, with the extractor
     // EXCLUDED — see `RoutedJob::DietVerify`. Ambient when nothing else qualifies, which is
     // exactly the old behavior (the verify child was unconditionally ambient).
-    let harness = cfg.harnesses.serving_pick(pick);
+    let harness = spawned_only(
+        cfg.harnesses.serving_pick(pick),
+        "building the diet verify child",
+    )?;
     let ambient = ActiveModel::ambient();
     let mut cmd = harness.build_turn(cfg, &diet_child_request(cfg, prompt, &ambient))?;
     apply_routed_env(&mut cmd, pick);
@@ -411,7 +473,10 @@ pub async fn run_vaultqa_child(
     timeout_secs: u64,
     pick: &RoutedPick,
 ) -> Result<String, ApiError> {
-    let harness = cfg.harnesses.serving_pick(pick);
+    let harness = spawned_only(
+        cfg.harnesses.serving_pick(pick),
+        "building the vault-QA child",
+    )?;
     let ambient = ActiveModel::ambient();
     let mut cmd = harness.build_turn(cfg, &vaultqa_child_request(cfg, prompt, &ambient))?;
     apply_routed_env(&mut cmd, pick);
@@ -462,12 +527,6 @@ pub async fn run_claude_streaming(
     attachment_dir: Option<&Path>,
     trace: &TurnTrace,
 ) -> Result<(String, Option<String>, ShadowUsage), ApiError> {
-    const MAX_ATTEMPTS: u32 = 3; // 1 try + 2 retries
-
-    // A manual `loop` (not `for attempt in 1..=MAX_ATTEMPTS`) so the terminal
-    // outcome is the loop's `break` value and the function is statically total:
-    // every path breaks or `continue`s, so there is no post-loop `unreachable!()`
-    // the compiler couldn't prove was dead.
     // Resume-after-sweep safety: if the requested session's transcript no longer
     // exists in THIS HARNESS's transcript dir (reclaimed by the GC sweep, or deleted
     // while the phone thread lived on), drop the `--resume` so a resume of a gone
@@ -475,10 +534,87 @@ pub async fn run_claude_streaming(
     // session id (the app keeps its local transcript and stores the new id). A live real
     // id and a synthetic `local-` id pass through unchanged, as does every id under a
     // harness that keeps no transcripts (there is no file whose absence could justify
-    // dropping the resume). Resolved ONCE here (not per attempt) since a mid-turn sweep
-    // can't remove a session the agent is actively holding open.
+    // dropping the resume). Resolved ONCE here (not per attempt, and ABOVE the branch)
+    // since a mid-turn sweep can't remove a session the agent is actively holding open,
+    // and since both arms resume the same way.
     let session_id = resolve_resume_session_for_harness(cfg, harness, session_id);
 
+    // ---- THE ONE BRANCH ------------------------------------------------------
+    //
+    // Asked once, here, and nowhere else on the turn path. Both arms take the same
+    // arguments, push into the same job-store stream, honour the same timeout, and return
+    // the same `(text, session_id, usage)` the handler turns into a `Done` frame — so the
+    // difference between them is entirely how the answer is produced, which is the only
+    // thing the runner shape is supposed to decide.
+    match harness.runner() {
+        Runner::Spawned(h) => {
+            run_spawned_turn(
+                cfg,
+                prompt,
+                session_id,
+                jobs,
+                job_id,
+                active,
+                h,
+                spawned,
+                write_lock,
+                attachment_dir,
+                trace,
+            )
+            .await
+        }
+        Runner::InProcess(h) => {
+            run_in_process_turn(
+                cfg,
+                prompt,
+                session_id,
+                jobs,
+                job_id,
+                active,
+                h,
+                spawned,
+                write_lock,
+                attachment_dir,
+                trace,
+            )
+            .await
+        }
+    }
+}
+
+/// **THE SPAWNED ARM** — spawn a child, read it, reap it, retry a transient failure.
+///
+/// Moved here wholesale from `run_claude_streaming` when the runner branch landed, with NO
+/// behavioural change: same three attempts, same per-attempt fresh `Command` and fresh
+/// parser, same concurrent line-classified stderr drain, same terminal-event completion
+/// rule (never stdout EOF), same bounded reap, same streamed-text safety net, same auth
+/// override, same byte-based truncation cap. The one difference is its `harness` parameter,
+/// which is now the [`SpawnedHarness`] half rather than the whole `&dyn Harness` — so the
+/// arm cannot reach a method that has no meaning for the child it is about to spawn, and
+/// the resume resolution (which reads [`Harness::transcript_dir`]) happens above it.
+// Over the lint's ceiling, and each is a distinct collaborator the turn needs (config,
+// prompt, resume target, job store + id, model, harness, session recorder, write lock,
+// attachment dir, trace). A params struct would only rename the same eleven.
+#[allow(clippy::too_many_arguments)]
+async fn run_spawned_turn(
+    cfg: &Config,
+    prompt: &str,
+    session_id: Option<&str>,
+    jobs: &Arc<JobStore>,
+    job_id: &str,
+    active: &ActiveModel,
+    harness: &dyn SpawnedHarness,
+    spawned: &SpawnedSessions,
+    write_lock: Option<&WriteLockChild>,
+    attachment_dir: Option<&Path>,
+    trace: &TurnTrace,
+) -> Result<(String, Option<String>, ShadowUsage), ApiError> {
+    const MAX_ATTEMPTS: u32 = 3; // 1 try + 2 retries
+
+    // A manual `loop` (not `for attempt in 1..=MAX_ATTEMPTS`) so the terminal
+    // outcome is the loop's `break` value and the function is statically total:
+    // every path breaks or `continue`s, so there is no post-loop `unreachable!()`
+    // the compiler couldn't prove was dead.
     let mut attempt = 0u32;
     loop {
         attempt += 1;
@@ -777,6 +913,236 @@ pub async fn run_claude_streaming(
                 // breaks here and never spins past its budget.
                 break Err((StatusCode::BAD_GATEWAY, message));
             }
+        }
+    }
+}
+
+/// The [`TurnSink`] the in-process arm hands its harness: the SAME two job-store frames the
+/// spawned arm's parser produces, and the same trace notes beside them.
+///
+/// It exists so the two arms are indistinguishable from the client's side. A `TextDelta`
+/// read off a child's stdout and a `TextDelta` handed over by a function call land in
+/// `jobs.stream_push_delta` in exactly the same shape, in exactly the same order relative to
+/// tool activity, and both are noted on the same [`TurnTrace`] — so a cut-off in-process turn
+/// hands back the text it had produced exactly as a cut-off spawned one does.
+///
+/// `Clone`-free and borrow-based: the harness gets `&dyn TurnSink` for the life of the call
+/// and never outlives the turn task that made it.
+struct JobStoreSink<'a> {
+    jobs: &'a Arc<JobStore>,
+    job_id: &'a str,
+    trace: &'a TurnTrace,
+}
+
+impl TurnSink for JobStoreSink<'_> {
+    fn text_delta(&self, delta: &str) {
+        // The trace sees the SAME delta the live stream does — same reasoning as the spawned
+        // arm's `StreamEvent::TextDelta` handler: the stream accumulator dies with the job,
+        // while this bounded ring is what a cut-off turn hands back.
+        self.trace.note_delta(delta);
+        self.jobs.stream_push_delta(self.job_id, delta);
+    }
+
+    fn tool_activity(&self, activity: ToolActivity) {
+        self.trace.note_tool(&activity.name);
+        self.jobs.stream_push_activity(self.job_id, activity);
+    }
+}
+
+/// **THE IN-PROCESS ARM** — await the harness's own turn, with no child anywhere.
+///
+/// Structurally the mirror of [`run_spawned_turn`], and deliberately so: the pieces that
+/// are about the TURN rather than about the child are all still here, in the same order.
+///
+///   * the same [`TurnRequest`], built by the same [`main_turn_request`] with the same
+///     write-lock and attachment fields set after the fact;
+///   * the same per-turn timeout, including the `timeout_secs == 0` debug-only "unlimited"
+///     affordance, and the same `mark_cutoff` before the same GATEWAY_TIMEOUT message —
+///     unchanged in status and wording, because failure classification must not shift with
+///     the runner shape;
+///   * the same streamed-text safety net, taken only when [`Harness::streams_text`] is true;
+///   * the same terminal resolution through [`resolve_stream_outcome`], so an empty answer
+///     is the same `Fatal` naming the same harness;
+///   * the same byte-based truncation cap on the stored reply, and the same cross-turn
+///     tool-id guard for a non-ambient model.
+///
+/// **WHAT IS DELIBERATELY ABSENT: the retry loop.** The driver's three attempts re-run the
+/// WHOLE prompt and call `stream_reset` between them, which is sound only because a killed
+/// child has left nothing behind. An in-process harness holds its own conversation state,
+/// so it owns retrying inside the turn — see [`InProcessHarness::run_turn`]. There is
+/// therefore exactly one attempt here and no `stream_reset`.
+///
+/// **CANCELLATION** is a [`CancellationToken`] rather than a `kill_on_drop` child, and the
+/// wiring has two halves. On the TIMEOUT the token is cancelled and the future is given a
+/// bounded grace period to wind down — the direct analogue of the spawned arm's bounded
+/// reap, and what makes the contract's "leave the thread resumable" clause achievable. On a
+/// task ABORT (what `POST /jesse/cancel` performs) the future is dropped outright, and a
+/// `DropGuard` cancels the token so anything the harness spawned off the future still sees
+/// it. The gap that leaves is written down in the changelog rather than papered over: an
+/// aborted task gives the future no chance to run, so an in-process harness must ALSO be
+/// safe to drop mid-turn.
+// Same eleven collaborators as the spawned arm, for the same reason.
+#[allow(clippy::too_many_arguments)]
+async fn run_in_process_turn(
+    cfg: &Config,
+    prompt: &str,
+    session_id: Option<&str>,
+    jobs: &Arc<JobStore>,
+    job_id: &str,
+    active: &ActiveModel,
+    harness: &dyn InProcessHarness,
+    spawned: &SpawnedSessions,
+    write_lock: Option<&WriteLockChild>,
+    attachment_dir: Option<&Path>,
+    trace: &TurnTrace,
+) -> Result<(String, Option<String>, ShadowUsage), ApiError> {
+    /// How long a cancelled in-process turn may take to wind down before the driver stops
+    /// waiting on it. The same five seconds, and the same reasoning, as the spawned arm's
+    /// `REAP_TIMEOUT`: cleanup must never delay delivery of an answer the turn has already
+    /// decided.
+    const CANCEL_GRACE: Duration = Duration::from_secs(5);
+
+    // The same request the spawned arm builds, from the same builder — the request is a
+    // statement about the TURN (prompt, resume target, model, capability, cwd, servers) and
+    // says nothing about how the harness is reached.
+    let mut req = main_turn_request(
+        cfg,
+        prompt,
+        session_id,
+        active,
+        turn_capability(active),
+        // An in-process harness names no MCP servers of its own (that method is on the
+        // spawned trait), so a main turn under one carries the operator's explicit override
+        // when there is one and NO servers otherwise. It is not a silent default: an
+        // in-process harness's tool set is its own, handed to its loop rather than launched
+        // as child processes, and inventing a server set for it here would describe a
+        // posture nothing spawns.
+        cfg.main_mcp_config.as_deref().unwrap_or(EMPTY_MCP_CONFIG),
+    );
+    // Set for the same reasons as in the spawned arm, and read by the harness the same way.
+    // `write_lock` reaching an in-process harness means the broker is armed and this turn
+    // may write — the harness takes those locks through the broker DIRECTLY rather than
+    // through the hook command string this struct also describes. See
+    // `Harness::supports_write_lock`.
+    req.write_lock = write_lock;
+    req.attachment_dir = attachment_dir;
+
+    let sink = JobStoreSink {
+        jobs,
+        job_id,
+        trace,
+    };
+    let cancel = CancellationToken::new();
+    // Fires the token if this task is ABORTED (the cancel path) rather than timing out.
+    let _cancel_on_drop = cancel.clone().drop_guard();
+    let mut fut = harness.run_turn(cfg, &req, &sink, cancel.clone());
+
+    // "Unlimited" (timeout_secs == 0) is a debug-only affordance and never compiled into a
+    // release build; Config::from_env clamps 0 to the ceiling, so in release timeout_secs is
+    // always >= 1 and bounded. Byte-for-byte the spawned arm's rule.
+    #[cfg(debug_assertions)]
+    let unlimited = cfg.timeout_secs == 0;
+    #[cfg(not(debug_assertions))]
+    let unlimited = false;
+
+    let result = if unlimited {
+        let r = (&mut fut).await;
+        trace.note_end();
+        r
+    } else {
+        match timeout(Duration::from_secs(cfg.timeout_secs), &mut fut).await {
+            Ok(r) => {
+                trace.note_end();
+                r
+            }
+            Err(_) => {
+                // THE GUILLOTINE, in its in-process spelling. Mark the trace cut off FIRST
+                // (the turn task reads the retained text back off it and lands it on the job
+                // beside this error), then cancel and give the harness a bounded moment to
+                // leave its thread resumable — which a killed child never gets and an
+                // in-process harness must.
+                trace.mark_cutoff();
+                cancel.cancel();
+                let _ = timeout(CANCEL_GRACE, &mut fut).await;
+                return Err((
+                    StatusCode::GATEWAY_TIMEOUT,
+                    format!(
+                        "Jesse hit the {}s run limit. Raise JESSE_TIMEOUT to allow longer turns.",
+                        cfg.timeout_secs
+                    ),
+                ));
+            }
+        }
+    };
+
+    // Reduce the harness's own outcome vocabulary to the one every harness is resolved in,
+    // so `resolve_stream_outcome` decides the terminal exactly as it does for a child.
+    let terminal = match result {
+        Ok(out) => {
+            // The harness named its session. Recorded the moment it arrives, exactly as the
+            // spawned arm records `StreamEvent::SessionId`, so a turn that fails after this
+            // point has still said what it owns.
+            if let Some(id) = out.session_id.as_deref() {
+                spawned.record(id);
+            }
+            trace.note_tool_calls(out.tool_calls);
+            Some(ClaudeOutcome::Ok {
+                result: out.text,
+                session_id: out.session_id,
+                usage: out.usage,
+            })
+        }
+        // No `Retryable` arm exists to write: the harness owns its retries, so what reaches
+        // here is a decision.
+        Err(TurnFailure::Fatal { message }) => Some(ClaudeOutcome::Fatal { message }),
+        // The token fired without the driver's timeout firing it — nothing above cancelled
+        // this turn, so the harness ended one nobody asked it to. Surfaced rather than
+        // swallowed: a turn that silently returns no answer is the failure the whole
+        // `resolve_stream_outcome` contract exists to prevent. A turn cancelled the ordinary
+        // way (`POST /jesse/cancel`) never reaches this line — that path aborts the task and
+        // the job store has already written `Cancelled`.
+        Err(TurnFailure::Cancelled) => Some(ClaudeOutcome::Fatal {
+            message: format!("{} ended the turn as cancelled", harness.id()),
+        }),
+    };
+
+    // The snapshot is taken only for a harness that STREAMS text; a whole-answer harness
+    // pushed no deltas, so there is nothing to fall back to and its terminal outcome stands
+    // on its own. Identical rule, identical reasoning, as the spawned arm's.
+    let streamed = if harness.streams_text() {
+        jobs.stream_snapshot(job_id).unwrap_or_default()
+    } else {
+        String::new()
+    };
+    // No stderr: there is no child, so there is no second channel a failure cause could
+    // arrive on. The empty string is the honest argument here rather than a placeholder —
+    // `resolve_stream_outcome` uses it only to build the no-envelope failure message, and an
+    // in-process harness that failed has already put its cause in `TurnFailure::Fatal`.
+    match resolve_stream_outcome(harness.id(), terminal, &streamed, "") {
+        ClaudeOutcome::Ok {
+            result,
+            session_id,
+            usage,
+        } => {
+            // The cross-turn tool-id guard, on the same terms as the spawned arm: non-ambient
+            // models only, never affecting what is returned. A harness that keeps no
+            // transcripts on disk reads as no evidence and the guard returns nothing.
+            if active.is_non_ambient() {
+                if let Some(sid) = session_id.as_deref() {
+                    report_tool_id_collisions(cfg, harness, &active.id, sid);
+                }
+            }
+            Ok((
+                truncate_bytes_on_char_boundary(&result, MAX_OUTPUT_BYTES).to_string(),
+                session_id,
+                usage,
+            ))
+        }
+        // `Retryable` cannot arrive from this arm (nothing constructs one), but the match
+        // stays total rather than `unreachable!()`: a harness that somehow produced one is
+        // surfaced as the failure it is, not a panic on the turn task.
+        ClaudeOutcome::Fatal { message } | ClaudeOutcome::Retryable { message, .. } => {
+            Err((StatusCode::BAD_GATEWAY, message))
         }
     }
 }

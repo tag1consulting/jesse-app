@@ -1838,6 +1838,25 @@ async fn run_row(
                 .harnesses
                 .get(&opts.harness)
                 .unwrap_or_else(|| cfg.harnesses.fallback_harness());
+            // THE BATTERY IS A SPAWNED-HARNESS INSTRUMENT, and says so rather than defaulting.
+            // Every probe below scores a CHILD: it spawns one, plants a secret in its
+            // environment, and reads what came back out. There is no child to probe under an
+            // in-process harness, and the honest verdict for a probe that never ran is
+            // `inconclusive` — the same verdict a refused request already gets, which fails
+            // the gate rather than recording a posture nobody measured. Probing an in-process
+            // harness needs a battery of its own; that is D5's, and inventing a score for it
+            // here would put a passing row in a record that vouches for nothing.
+            let harness = match spawned_only(harness, "recording a containment battery row") {
+                Ok(h) => h,
+                Err(e) => {
+                    eprintln!("[{label}] {}: {e}", probe.id);
+                    attempts.push((
+                        ProbeVerdict::Inconclusive,
+                        one_line(&format!("the harness cannot be probed: {e}"), 240),
+                    ));
+                    break;
+                }
+            };
             let mut cmd = match harness.build_turn(&cfg, &req) {
                 Ok(c) => c,
                 Err(e) => {

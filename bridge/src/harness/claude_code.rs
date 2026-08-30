@@ -94,10 +94,57 @@ impl Harness for ClaudeCode {
         true
     }
 
+    /// **MESSAGES ONLY.** The `claude` CLI drives its child over Anthropic's `/v1/messages`,
+    /// and there is no flag that changes that — the backend triple it is handed becomes
+    /// `ANTHROPIC_BASE_URL`/`ANTHROPIC_AUTH_TOKEN`/`ANTHROPIC_MODEL`. Handing it a base URL
+    /// that answers only an OpenAI surface produces a model the picker shows as healthy
+    /// (its probe hits the OpenAI path and passes) whose every turn 404s, which is exactly
+    /// the failure [`validate_model_config`] refuses at startup.
+    fn supports_wire(&self, wire: Wire) -> bool {
+        matches!(wire, Wire::Messages)
+    }
+
+    fn capability_args(&self, cfg: &Config, capability: Capability) -> Vec<String> {
+        claude_capability_args(cfg, capability)
+    }
+
+    fn shipped_rows(&self) -> &'static [ContainmentRow] {
+        &CLAUDE_CODE_SHIPPED_ROWS
+    }
+
+    /// `~/.claude/projects/<escaped-vault>` — the layout the session code used to hardcode.
+    fn transcript_dir(&self, cfg: &Config) -> Option<PathBuf> {
+        Some(vault_sessions_dir(&cfg.home, &cfg.vault))
+    }
+
+    fn attachment_support(&self) -> &'static AttachmentSupport {
+        &CLAUDE_CODE_ATTACHMENTS
+    }
+
+    /// SPAWNED: a headless `claude -p` child, read line by line off its stdout.
+    fn runner(&self) -> Runner<'_> {
+        Runner::Spawned(self)
+    }
+}
+
+impl SpawnedHarness for ClaudeCode {
+    fn build_turn(&self, cfg: &Config, req: &TurnRequest<'_>) -> Result<Command, HarnessError> {
+        Ok(self.command(cfg, req))
+    }
+
+    fn parser(&self) -> Box<dyn TurnParser> {
+        Box::new(ClaudeCodeParser)
+    }
+
+    /// qmd PLUS the self-hosted read-only Slack server.
+    fn main_mcp_config(&self) -> &'static str {
+        MAIN_CHILD_MCP_CONFIG
+    }
+
     /// Claude Code names its target directly: `tool_input.file_path`, already ABSOLUTE.
     ///
     /// The contrast with Codex is the whole reason this is a trait method — see
-    /// [`Harness::hook_write_target`].
+    /// [`SpawnedHarness::hook_write_target`].
     fn hook_write_target(&self, payload: &HookPayload) -> WriteTarget {
         match payload.tool_name.as_str() {
             "Write" | "Edit" | "NotebookEdit" => payload
@@ -128,36 +175,6 @@ impl Harness for ClaudeCode {
             .then(|| payload.tool_input.get("file_path")?.as_str())
             .flatten()
             .map(|p| resolve_lock_path(Path::new(p), &payload.cwd))
-    }
-
-    fn capability_args(&self, cfg: &Config, capability: Capability) -> Vec<String> {
-        claude_capability_args(cfg, capability)
-    }
-
-    /// qmd PLUS the self-hosted read-only Slack server.
-    fn main_mcp_config(&self) -> &'static str {
-        MAIN_CHILD_MCP_CONFIG
-    }
-
-    fn shipped_rows(&self) -> &'static [ContainmentRow] {
-        &CLAUDE_CODE_SHIPPED_ROWS
-    }
-
-    /// `~/.claude/projects/<escaped-vault>` — the layout the session code used to hardcode.
-    fn transcript_dir(&self, cfg: &Config) -> Option<PathBuf> {
-        Some(vault_sessions_dir(&cfg.home, &cfg.vault))
-    }
-
-    fn build_turn(&self, cfg: &Config, req: &TurnRequest<'_>) -> Result<Command, HarnessError> {
-        Ok(self.command(cfg, req))
-    }
-
-    fn attachment_support(&self) -> &'static AttachmentSupport {
-        &CLAUDE_CODE_ATTACHMENTS
-    }
-
-    fn parser(&self) -> Box<dyn TurnParser> {
-        Box::new(ClaudeCodeParser)
     }
 }
 
@@ -797,8 +814,14 @@ pub fn mcp_args(config: &str) -> Vec<String> {
 /// `JESSE_MAIN_MCP_CONFIG` when set, else **the spawning harness's own** shipped set —
 /// qmd+slack for Claude Code, qmd alone for Codex. It takes the harness rather than
 /// reaching for a single global const precisely so that adding a server to one harness
-/// cannot silently change another's posture; see [`Harness::main_mcp_config`].
-pub fn main_mcp_config<'a>(cfg: &'a Config, harness: &dyn Harness) -> &'a str {
+/// cannot silently change another's posture; see [`SpawnedHarness::main_mcp_config`].
+///
+/// It takes a [`SpawnedHarness`] rather than a `&dyn Harness` because an MCP server set is a
+/// set of CHILD PROCESSES this harness launches, which is a thing only a spawned harness
+/// has. The in-process arm of the driver does not call this — it reads the operator's
+/// explicit override or passes no servers at all, and says so at the call site rather than
+/// inventing a set here.
+pub fn main_mcp_config<'a>(cfg: &'a Config, harness: &dyn SpawnedHarness) -> &'a str {
     cfg.main_mcp_config
         .as_deref()
         .unwrap_or_else(|| harness.main_mcp_config())
@@ -2207,6 +2230,7 @@ mod tests {
             id: "local-oss".to_string(),
             label: "Local OSS".to_string(),
             kind: ModelKind::Local,
+            wire: Wire::default_for_kind(ModelKind::Local),
             backend: Some((
                 "http://routed".to_string(),
                 "routed-tok".to_string(),
@@ -2935,7 +2959,11 @@ mod tests {
     fn build_turn_matches_the_named_builder_at_every_call_site() {
         let cfg = test_config();
         let ambient = ActiveModel::ambient();
-        let harness = cfg.harnesses.fallback_harness();
+        // The trait route is now reached through `runner()`, which is the only mechanical
+        // difference this test carries across the split; every assertion below is untouched.
+        let Runner::Spawned(harness) = cfg.harnesses.fallback_harness().runner() else {
+            panic!("claude-code is a spawned harness")
+        };
         let same = |a: &Command, b: &Command, label: &str| {
             assert_eq!(cmd_argv(a), cmd_argv(b), "{label}: argv");
             assert_eq!(

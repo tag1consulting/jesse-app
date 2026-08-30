@@ -27,9 +27,6 @@ impl Harness for NoTranscriptHarness {
     fn streams_text(&self) -> bool {
         false
     }
-    fn main_mcp_config(&self) -> &'static str {
-        jesse_bridge::EMPTY_MCP_CONFIG
-    }
     fn shipped_rows(&self) -> &'static [jesse_bridge::ContainmentRow] {
         &jesse_bridge::CODEX_SHIPPED_ROWS
     }
@@ -42,6 +39,24 @@ impl Harness for NoTranscriptHarness {
     fn transcript_dir(&self, _cfg: &Config) -> Option<PathBuf> {
         None
     }
+    fn supports_wire(&self, wire: Wire) -> bool {
+        matches!(wire, Wire::Messages)
+    }
+    fn attachment_support(&self) -> &'static AttachmentSupport {
+        // Neither fixture ever spawns, so neither ever shows a file to a model.
+        &CLAUDE_CODE_ATTACHMENTS
+    }
+    fn runner(&self) -> Runner<'_> {
+        Runner::Spawned(self)
+    }
+}
+
+/// Both doubles are spawned-shape harnesses that never actually spawn: the split moved
+/// these three methods onto their own trait, and nothing about what they answer changed.
+impl SpawnedHarness for NoTranscriptHarness {
+    fn main_mcp_config(&self) -> &'static str {
+        jesse_bridge::EMPTY_MCP_CONFIG
+    }
     fn build_turn(&self, _cfg: &Config, _req: &TurnRequest<'_>) -> Result<Command, HarnessError> {
         // Nothing in this test spawns it; refusing rather than returning a half-meant
         // command is exactly what `HarnessError` is for.
@@ -49,10 +64,6 @@ impl Harness for NoTranscriptHarness {
             "test-no-transcript",
             "spawning a child",
         ))
-    }
-    fn attachment_support(&self) -> &'static AttachmentSupport {
-        // Neither fixture ever spawns, so neither ever shows a file to a model.
-        &CLAUDE_CODE_ATTACHMENTS
     }
     fn parser(&self) -> Box<dyn TurnParser> {
         Box::new(NoTranscriptParser)
@@ -71,9 +82,6 @@ impl Harness for FixedDirHarness {
     fn streams_text(&self) -> bool {
         true
     }
-    fn main_mcp_config(&self) -> &'static str {
-        jesse_bridge::EMPTY_MCP_CONFIG
-    }
     fn shipped_rows(&self) -> &'static [jesse_bridge::ContainmentRow] {
         &jesse_bridge::CODEX_SHIPPED_ROWS
     }
@@ -86,15 +94,27 @@ impl Harness for FixedDirHarness {
     fn transcript_dir(&self, _cfg: &Config) -> Option<PathBuf> {
         Some(self.0.clone())
     }
+    fn supports_wire(&self, wire: Wire) -> bool {
+        matches!(wire, Wire::Messages)
+    }
+    fn attachment_support(&self) -> &'static AttachmentSupport {
+        // Neither fixture ever spawns, so neither ever shows a file to a model.
+        &CLAUDE_CODE_ATTACHMENTS
+    }
+    fn runner(&self) -> Runner<'_> {
+        Runner::Spawned(self)
+    }
+}
+
+impl SpawnedHarness for FixedDirHarness {
+    fn main_mcp_config(&self) -> &'static str {
+        jesse_bridge::EMPTY_MCP_CONFIG
+    }
     fn build_turn(&self, _cfg: &Config, _req: &TurnRequest<'_>) -> Result<Command, HarnessError> {
         Err(HarnessError::unsupported(
             "test-fixed-dir",
             "spawning a child",
         ))
-    }
-    fn attachment_support(&self) -> &'static AttachmentSupport {
-        // Neither fixture ever spawns, so neither ever shows a file to a model.
-        &CLAUDE_CODE_ATTACHMENTS
     }
     fn parser(&self) -> Box<dyn TurnParser> {
         Box::new(NoTranscriptParser)
@@ -177,9 +197,14 @@ fn the_registry_holds_both_and_only_the_transcript_bearing_one_contributes_a_dir
     let other = cfg.harnesses.get("test-no-transcript").expect("registered");
     assert!(other.transcript_dir(&cfg).is_none());
     assert!(!other.streams_text(), "it answers whole, not in deltas");
-    // And it refuses a request it cannot express rather than downgrading it.
+    // And it refuses a request it cannot express rather than downgrading it. Reached through
+    // `runner()` now that building a child is the spawned half's method; the assertion is
+    // unchanged.
     let ambient = ActiveModel::ambient();
-    let err = other
+    let Runner::Spawned(other_spawned) = other.runner() else {
+        panic!("this double is a spawned-shape harness")
+    };
+    let err = other_spawned
         .build_turn(&cfg, &title_child_request(&cfg, "hi", &ambient))
         .expect_err("this harness refuses");
     assert_eq!(ApiError::from(err).0, StatusCode::INTERNAL_SERVER_ERROR);

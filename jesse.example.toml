@@ -123,18 +123,50 @@ diet_keywords_extra = [
 # Fields (id, kind, base_url, model are REQUIRED; the rest are optional):
 #   id             stable key the switch persists (e.g. "fireworks", "codex")
 #   label          shown in the app switcher (defaults to id)
-#   kind           WHICH API SURFACE the base_url serves ("ambient" is reserved for the
-#                  built-in opus):
-#                    hosted  an Anthropic `/v1/messages` endpoint, hosted by a provider
-#                    local   an Anthropic-compatible endpoint on this machine
-#                    openai  an OpenAI RESPONSES endpoint (`/v1/responses`), driven by a
-#                            harness that speaks it — today that is `harness = "codex"`.
-#                            Pairing `openai` with a harness that speaks Anthropic is a
-#                            STARTUP ERROR naming the model: it would otherwise probe
-#                            healthy and 404 on every turn.
-#   base_url       the base URL of that surface. For hosted/local, the Anthropic base (the
-#                  bridge appends /v1/messages). For openai, the OpenAI API ROOT — the
-#                  segment BEFORE /responses (e.g. https://api.fireworks.ai/inference/v1).
+#   kind           WHERE THE BACKEND LIVES ("ambient" is reserved for the built-in opus):
+#                    hosted  an endpoint hosted by a provider
+#                    local   an endpoint on this machine
+#                    openai  a provider endpoint on an OpenAI surface — kept because every
+#                            deployed config uses it, and because it is still the shortest
+#                            way to say "provider endpoint, Responses wire". It sets the
+#                            `wire` default to "responses"; see below.
+#
+#                  `kind` NAMES HOSTING ONLY. It used to answer two questions at once —
+#                  where the backend lives AND which contract it speaks — which worked
+#                  while there was exactly one non-Anthropic contract. `wire` now names the
+#                  contract, and every config written before that key existed resolves to
+#                  the wire its `kind` already implied, so nothing has to be edited.
+#   wire           WHICH API SURFACE the base_url serves. Absent means the default for this
+#                  model's `kind`:
+#
+#                      kind      default wire
+#                      -------   ------------
+#                      ambient   messages
+#                      hosted    messages
+#                      local     messages
+#                      openai    responses
+#
+#                    messages   Anthropic `/v1/messages`. Driven by `harness =
+#                               "claude-code"`, and by `harness = "codex"` on its own
+#                               subscription login (which names no provider at all).
+#                    responses  OpenAI `/responses`. Driven by `harness = "codex"` only.
+#                    chat       OpenAI `/chat/completions`. NO harness drives a turn over
+#                               this today; declaring it is a startup error naming the
+#                               harness, which is the honest answer rather than a silent
+#                               downgrade. It is spelled out because the health probe posts
+#                               to that path (see `health.path` below) and because
+#                               "responses" has to mean Responses specifically.
+#
+#                  A model whose wire its harness does not drive is a STARTUP ERROR naming
+#                  the model, the wire and the harness: it would otherwise probe healthy
+#                  (the probe hits the right path) and 404 on every turn.
+#
+#                  The env-triple models take `JESSE_MODEL_<ID>_WIRE` for the same purpose
+#                  (`JESSE_MODEL_GLM_WIRE`, `JESSE_MODEL_KIMI_CODEX_WIRE`, …).
+#   base_url       the base URL of that surface. For the `messages` wire, the Anthropic base
+#                  (the bridge appends /v1/messages). For `responses`, the OpenAI API ROOT —
+#                  the segment BEFORE /responses (e.g.
+#                  https://api.fireworks.ai/inference/v1).
 #   model          the backend model id
 #   subagent_model model for the subagents the turn spawns (defaults to `model`)
 #   auth_token_env the NAME of the env var holding the token — NEVER the token itself.
@@ -217,7 +249,7 @@ diet_keywords_extra = [
 #
 # TWO WAYS TO REACH AN OPENAI-SHAPED MODEL, and they are not interchangeable:
 #
-#   1. `kind = "openai"` + `harness = "codex"` — the model's OWN endpoint, driven by the
+#   1. `kind = "openai"` (i.e. `wire = "responses"`) + `harness = "codex"` — the model's OWN endpoint, driven by the
 #      Codex agent loop. No gateway. This is the direct path and it is what a tool-using
 #      OpenAI-style model needs: driving a tool loop through an Anthropic-compatibility
 #      shim is where those models fail. REQUIRES the provider to serve the OpenAI
@@ -292,7 +324,10 @@ diet_keywords_extra = [
 # [[models]]
 # id = "kimi-k3-codex"
 # label = "Kimi K3 (Codex)"
-# kind = "openai"                              # /v1/responses, not /v1/messages
+# kind = "openai"                              # hosting: a provider endpoint
+# # wire = "responses"                         # implied by kind = "openai"; spell it out
+#                                              # only to say something the kind does not,
+#                                              # e.g. kind = "hosted" + wire = "responses"
 # base_url = "https://api.fireworks.ai/inference/v1"   # the API ROOT, before /responses
 # model = "accounts/fireworks/models/kimi-k3"
 # auth_token_env = "JESSE_MODEL_KIMI_AUTH_TOKEN"

@@ -982,11 +982,28 @@ impl Harness for Codex {
         false
     }
 
-    /// TRUE: Codex speaks the OpenAI Responses API, so a [`ModelKind::OpenAi`] model may name
-    /// it. That does not make every Codex model an OpenAI-kind one — the subscription-OAuth
-    /// posture is `hosted` and names no provider; see [`codex_provider_args`].
-    fn speaks_openai_backend(&self) -> bool {
-        true
+    /// **RESPONSES AND MESSAGES, AND THE ASYMMETRY IS THE POINT.**
+    ///
+    /// [`Wire::Responses`] is what codex-cli 0.146.0 actually speaks: an OpenAI-surface model
+    /// names a provider (see [`codex_provider_args`]) and the child posts to `/responses`. So
+    /// a model on that wire may name this harness, which is what the old
+    /// `speaks_openai_backend` boolean said.
+    ///
+    /// [`Wire::Messages`] is true for the HOSTED-LOGIN CASE, and it is not slack in the
+    /// declaration. A Codex model on its own subscription OAuth login names no provider at
+    /// all, is declared `hosted`, resolves to the `messages` default, and is exactly the
+    /// deployed posture. The old boolean covered that by being read in ONE direction — an
+    /// `openai`-kind model on a harness answering `false` was refused, and the converse was
+    /// deliberately legitimate — and a `supports_wire` that answered `Responses` alone would
+    /// have inverted that reading and refused the one configuration actually in production.
+    /// The asymmetry is preserved verbatim: this harness may be driven either way, and the
+    /// gate still only ever refuses a wire nothing here speaks.
+    ///
+    /// [`Wire::Chat`] is FALSE. Codex has no chat-completions transport — the health probe's
+    /// use of that path is a probe detail, not a turn wire, and claiming it here would let a
+    /// model boot into turns that cannot be spoken.
+    fn supports_wire(&self, wire: Wire) -> bool {
+        matches!(wire, Wire::Responses | Wire::Messages)
     }
 
     /// FALSE at `Basic`, true at `Read` and `Write`.
@@ -1032,6 +1049,119 @@ impl Harness for Codex {
     /// reads this declaration. The containment record is what holds the pair together.
     fn supports_write_lock(&self) -> bool {
         true
+    }
+
+    /// The argv WITH [`WORKSPACE_TOKEN`] still in it — this is the recorded, host-independent
+    /// form the startup gate compares against. [`build_codex_args`] fills the token in when
+    /// it builds a real child, because only a spawn knows its own working directory.
+    fn capability_args(&self, _cfg: &Config, capability: Capability) -> Vec<String> {
+        codex_capability_args(capability)
+    }
+
+    fn attachment_support(&self) -> &'static AttachmentSupport {
+        &CODEX_ATTACHMENTS
+    }
+
+    fn shipped_rows(&self) -> &'static [ContainmentRow] {
+        &CODEX_SHIPPED_ROWS
+    }
+
+    /// `None`: Codex keeps its threads privately, in a layout the bridge does not read.
+    ///
+    /// The consequences are the ones [`Harness::transcript_dir`] already specifies, and they
+    /// are accepted rather than worked around: adoption, the GC sweep and the resume
+    /// existence check all skip this harness, and hydration returns an EMPTY turn list. So a
+    /// Codex conversation on a freshly restored device LISTS but has no server-side history.
+    /// The app's own local transcript remains the user-visible record and the context ledger
+    /// still feeds catch-up into the next turn.
+    fn transcript_dir(&self, _cfg: &Config) -> Option<PathBuf> {
+        None
+    }
+
+    /// SPAWNED: a `codex exec --json` child, read line by line off its stdout and
+    /// stderr — this harness is the reason stderr is in the mid-turn contract at all.
+    fn runner(&self) -> Runner<'_> {
+        Runner::Spawned(self)
+    }
+}
+
+impl SpawnedHarness for Codex {
+    fn build_turn(&self, cfg: &Config, req: &TurnRequest<'_>) -> Result<Command, HarnessError> {
+        self.command(cfg, req)
+    }
+
+    fn parser(&self) -> Box<dyn TurnParser> {
+        Box::new(CodexParser::default())
+    }
+
+    /// The half of a Codex turn that never reaches the event stream.
+    ///
+    /// A sandbox-refused native tool call emits NO item event — no `item.started`, no
+    /// `item.completed`, no error item. Its only trace is a `codex_core::tools` line here. A
+    /// turn where the model tried to write and was refused therefore renders, on stdout alone,
+    /// as a turn where nothing happened; the user sees a spinner, then an answer that quietly
+    /// worked around a boundary they were never shown.
+    ///
+    /// The auth arm is corroboration rather than the primary signal — [`codex_failure`] catches
+    /// the same 401 on the terminal `turn.failed` — and it earns its place because the two
+    /// channels do not always both arrive. A child killed at the driver's timeout has written
+    /// its stderr and no `turn.failed` at all.
+    fn classify_stderr_line(&self, line: &str) -> Option<StderrSignal> {
+        if let Some((tool, _msg)) = codex_refused_tool(line) {
+            // The message is DELIBERATELY dropped: it carries the path or command the child
+            // tried, and this signal reaches the user's screen. What they need is that a tool
+            // call was refused, not which file the model was curious about.
+            return Some(StderrSignal::ToolRefused {
+                activity: ToolActivity::refused(tool),
+            });
+        }
+        if line.contains("codex_api::endpoint") && is_auth_failure(line) {
+            return Some(StderrSignal::AuthFailed {
+                detail: one_line_trimmed(line, 200),
+            });
+        }
+        None
+    }
+
+    fn stderr_classifier(&self) -> Box<dyn StderrClassifier> {
+        Box::new(Codex)
+    }
+
+    /// THE SAME THREE SERVERS CLAUDE CODE CARRIES — qmd, slack, browser — as of 0.66.0.
+    ///
+    /// This method's previous body was `QMD_ONLY_MCP_CONFIG`, and its comment said Codex
+    /// "deliberately does not get the Slack server … giving it one would invalidate this
+    /// harness's record and orphan the operator acceptances keyed to its row labels". The
+    /// second half was true and is exactly what happened: the record was re-run and the two
+    /// acceptances were re-signed under the new row labels. The first half was the gap the
+    /// standing rule now forbids — a capability lands on every harness in the same change.
+    /// Codex stays on the FOURTEEN-server set, deliberately.
+    ///
+    /// Claude Code's main turn gained a fifteenth server (`build`) in 0.86.0; Codex does not
+    /// get it in that change. Giving it one would move Codex's row labels, orphan the two
+    /// operator `[[accepted]]` blocks in `containment-codex.toml` that are keyed by those
+    /// labels, and require a live Codex battery to re-record — and Codex is not armed at
+    /// `write` on this deployment in any case. Naming [`MESSAGES_MCP_CONFIG`] explicitly (rather
+    /// than tracking whatever `MAIN_CHILD_MCP_CONFIG` happens to be) is what keeps this
+    /// harness's recorded posture true as the other harness's set grows.
+    ///
+    /// **`places` (0.100.0) IS THE SECOND SERVER THIS HARNESS DOES NOT GET, and the decision
+    /// was taken rather than inherited.** The argument for adding it is real: unlike `build`,
+    /// it is a plain read capability with no code-execution surface, and the standing rule is
+    /// that a capability lands on every harness in the same change. The argument against won
+    /// on the same three facts that decided `build`, none of which have moved — adding it
+    /// re-keys this harness's row labels from `…+google-perseido` to a new string, which
+    /// orphans BOTH `[[accepted]]` blocks in `containment-codex.toml`, which makes them
+    /// re-signable only after a live Codex battery this change does not run and did not
+    /// budget. Shipping it here without that battery would mean a record vouching for a
+    /// posture nobody probed, which is the one thing this file exists to prevent.
+    ///
+    /// So the asymmetry is now two servers wide and is RECORDED, not accumulated by neglect:
+    /// when a Codex battery is next re-run for any reason, `places` should land in the same
+    /// pass. Until then Codex answers "is it open" exactly as well as it did before, which is
+    /// to say not at all.
+    fn main_mcp_config(&self) -> &'static str {
+        MESSAGES_MCP_CONFIG
     }
 
     /// Codex names nothing directly — see [`apply_patch_targets`].
@@ -1084,116 +1214,11 @@ impl Harness for Codex {
     fn hook_read_target(&self, _payload: &HookPayload) -> Option<PathBuf> {
         None
     }
-
-    /// The argv WITH [`WORKSPACE_TOKEN`] still in it — this is the recorded, host-independent
-    /// form the startup gate compares against. [`build_codex_args`] fills the token in when
-    /// it builds a real child, because only a spawn knows its own working directory.
-    fn capability_args(&self, _cfg: &Config, capability: Capability) -> Vec<String> {
-        codex_capability_args(capability)
-    }
-
-    fn attachment_support(&self) -> &'static AttachmentSupport {
-        &CODEX_ATTACHMENTS
-    }
-
-    /// THE SAME THREE SERVERS CLAUDE CODE CARRIES — qmd, slack, browser — as of 0.66.0.
-    ///
-    /// This method's previous body was `QMD_ONLY_MCP_CONFIG`, and its comment said Codex
-    /// "deliberately does not get the Slack server … giving it one would invalidate this
-    /// harness's record and orphan the operator acceptances keyed to its row labels". The
-    /// second half was true and is exactly what happened: the record was re-run and the two
-    /// acceptances were re-signed under the new row labels. The first half was the gap the
-    /// standing rule now forbids — a capability lands on every harness in the same change.
-    /// Codex stays on the FOURTEEN-server set, deliberately.
-    ///
-    /// Claude Code's main turn gained a fifteenth server (`build`) in 0.86.0; Codex does not
-    /// get it in that change. Giving it one would move Codex's row labels, orphan the two
-    /// operator `[[accepted]]` blocks in `containment-codex.toml` that are keyed by those
-    /// labels, and require a live Codex battery to re-record — and Codex is not armed at
-    /// `write` on this deployment in any case. Naming [`MESSAGES_MCP_CONFIG`] explicitly (rather
-    /// than tracking whatever `MAIN_CHILD_MCP_CONFIG` happens to be) is what keeps this
-    /// harness's recorded posture true as the other harness's set grows.
-    ///
-    /// **`places` (0.100.0) IS THE SECOND SERVER THIS HARNESS DOES NOT GET, and the decision
-    /// was taken rather than inherited.** The argument for adding it is real: unlike `build`,
-    /// it is a plain read capability with no code-execution surface, and the standing rule is
-    /// that a capability lands on every harness in the same change. The argument against won
-    /// on the same three facts that decided `build`, none of which have moved — adding it
-    /// re-keys this harness's row labels from `…+google-perseido` to a new string, which
-    /// orphans BOTH `[[accepted]]` blocks in `containment-codex.toml`, which makes them
-    /// re-signable only after a live Codex battery this change does not run and did not
-    /// budget. Shipping it here without that battery would mean a record vouching for a
-    /// posture nobody probed, which is the one thing this file exists to prevent.
-    ///
-    /// So the asymmetry is now two servers wide and is RECORDED, not accumulated by neglect:
-    /// when a Codex battery is next re-run for any reason, `places` should land in the same
-    /// pass. Until then Codex answers "is it open" exactly as well as it did before, which is
-    /// to say not at all.
-    fn main_mcp_config(&self) -> &'static str {
-        MESSAGES_MCP_CONFIG
-    }
-
-    fn shipped_rows(&self) -> &'static [ContainmentRow] {
-        &CODEX_SHIPPED_ROWS
-    }
-
-    /// `None`: Codex keeps its threads privately, in a layout the bridge does not read.
-    ///
-    /// The consequences are the ones [`Harness::transcript_dir`] already specifies, and they
-    /// are accepted rather than worked around: adoption, the GC sweep and the resume
-    /// existence check all skip this harness, and hydration returns an EMPTY turn list. So a
-    /// Codex conversation on a freshly restored device LISTS but has no server-side history.
-    /// The app's own local transcript remains the user-visible record and the context ledger
-    /// still feeds catch-up into the next turn.
-    fn transcript_dir(&self, _cfg: &Config) -> Option<PathBuf> {
-        None
-    }
-
-    fn build_turn(&self, cfg: &Config, req: &TurnRequest<'_>) -> Result<Command, HarnessError> {
-        self.command(cfg, req)
-    }
-
-    fn parser(&self) -> Box<dyn TurnParser> {
-        Box::new(CodexParser::default())
-    }
-
-    /// The half of a Codex turn that never reaches the event stream.
-    ///
-    /// A sandbox-refused native tool call emits NO item event — no `item.started`, no
-    /// `item.completed`, no error item. Its only trace is a `codex_core::tools` line here. A
-    /// turn where the model tried to write and was refused therefore renders, on stdout alone,
-    /// as a turn where nothing happened; the user sees a spinner, then an answer that quietly
-    /// worked around a boundary they were never shown.
-    ///
-    /// The auth arm is corroboration rather than the primary signal — [`codex_failure`] catches
-    /// the same 401 on the terminal `turn.failed` — and it earns its place because the two
-    /// channels do not always both arrive. A child killed at the driver's timeout has written
-    /// its stderr and no `turn.failed` at all.
-    fn classify_stderr_line(&self, line: &str) -> Option<StderrSignal> {
-        if let Some((tool, _msg)) = codex_refused_tool(line) {
-            // The message is DELIBERATELY dropped: it carries the path or command the child
-            // tried, and this signal reaches the user's screen. What they need is that a tool
-            // call was refused, not which file the model was curious about.
-            return Some(StderrSignal::ToolRefused {
-                activity: ToolActivity::refused(tool),
-            });
-        }
-        if line.contains("codex_api::endpoint") && is_auth_failure(line) {
-            return Some(StderrSignal::AuthFailed {
-                detail: one_line_trimmed(line, 200),
-            });
-        }
-        None
-    }
-
-    fn stderr_classifier(&self) -> Box<dyn StderrClassifier> {
-        Box::new(Codex)
-    }
 }
 
 impl StderrClassifier for Codex {
     fn classify(&self, line: &str) -> Option<StderrSignal> {
-        Harness::classify_stderr_line(self, line)
+        SpawnedHarness::classify_stderr_line(self, line)
     }
 }
 

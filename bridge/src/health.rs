@@ -52,8 +52,8 @@ pub const REASONING_HEALTH_TIMEOUT_SECS: u64 = 15;
 const _: () = assert!(REASONING_HEALTH_TIMEOUT_SECS > DEFAULT_HEALTH_TIMEOUT_SECS);
 /// Default probe endpoint on the model's Anthropic surface: a tiny `/v1/messages` call.
 pub const DEFAULT_HEALTH_PATH: &str = "/v1/messages";
-/// Default probe endpoint for a [`ModelKind::OpenAi`] backend, whose `base_url` is an OpenAI
-/// API ROOT (`…/v1`) rather than an Anthropic surface.
+/// Default probe endpoint for a backend on an OpenAI-style surface, whose `base_url` is an
+/// OpenAI API ROOT (`…/v1`) rather than an Anthropic surface.
 ///
 /// `/chat/completions` rather than `/responses`, and the choice is deliberate: the probe body
 /// is a minimal `{model, max_tokens, messages}`, which is a VALID request on both contracts,
@@ -64,18 +64,33 @@ pub const DEFAULT_HEALTH_PATH: &str = "/v1/messages";
 /// the two share the same host, key and model, so a passing probe still speaks for the turn.
 pub const DEFAULT_OPENAI_HEALTH_PATH: &str = "/chat/completions";
 
-/// The probe path a model gets when its config declares none — [`ModelKind`]-aware, because
+/// The probe path a model gets when its config declares none — **[`Wire`]-aware**, because
 /// the default is a statement about which API the `base_url` serves and that is exactly what
-/// the kind names. An explicit `health.path` still wins over this.
+/// the wire names. An explicit `health.path` still wins over this, under the same key it
+/// always did.
 ///
-/// Without this an operator declaring an OpenAI-surface model and omitting the `health` block
-/// gets `/v1/messages` posted at an OpenAI root, a 404, `unknown-model`, and a model that is
-/// configured, armed, correct — and permanently unselectable, for a reason nothing in their
-/// config file mentions.
-pub fn default_health_path(kind: ModelKind) -> &'static str {
-    match kind {
-        ModelKind::OpenAi => DEFAULT_OPENAI_HEALTH_PATH,
-        _ => DEFAULT_HEALTH_PATH,
+/// It read [`ModelKind`] until the `wire` key existed, and the swap is not cosmetic: the kind
+/// could only say "openai", so a hosted endpoint that happened to speak an OpenAI surface had
+/// no way to ask for the right probe path short of writing one out by hand. The wire says it
+/// directly, and the four kind-derived defaults ([`Wire::default_for_kind`]) mean every
+/// pre-`wire` config resolves to the same path it resolved to before.
+///
+/// **[`Wire::Responses`] probes the CHAT path, and that reasoning is unchanged from 0.53.0**
+/// — see [`DEFAULT_OPENAI_HEALTH_PATH`] above for it in full. In short: the minimal probe body
+/// is valid on both OpenAI contracts, so the chat path returns a real one-token completion
+/// and the green light means tokens were produced, while `/responses` would answer a body it
+/// did not want. The turn still runs on `/responses`; same host, same key, same model, so a
+/// passing probe still speaks for the turn.
+///
+/// Without a wire-aware default an operator declaring an OpenAI-surface model and omitting the
+/// `health` block gets `/v1/messages` posted at an OpenAI root, a 404, `unknown-model`, and a
+/// model that is configured, armed, correct — and permanently unselectable, for a reason
+/// nothing in their config file mentions.
+pub fn default_health_path(wire: Wire) -> &'static str {
+    match wire {
+        // Both OpenAI-style wires probe the chat path — see above for why `Responses` does.
+        Wire::Chat | Wire::Responses => DEFAULT_OPENAI_HEALTH_PATH,
+        Wire::Messages => DEFAULT_HEALTH_PATH,
     }
 }
 
@@ -780,6 +795,7 @@ mod tests {
             id: "glm-5.2".into(),
             label: "GLM".into(),
             kind: ModelKind::Hosted,
+            wire: Wire::default_for_kind(ModelKind::Hosted),
             backend: Some(("http://b".into(), "t".into(), "m".into())),
             configured: true,
             level: Capability::Read,
@@ -822,6 +838,7 @@ mod tests {
             id: "test-unarmed".into(),
             label: "Unarmed".into(),
             kind: ModelKind::Hosted,
+            wire: Wire::default_for_kind(ModelKind::Hosted),
             backend: None,
             configured: false,
             level: Capability::Read,

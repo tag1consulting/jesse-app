@@ -266,6 +266,7 @@ mod tests {
             id: id.to_string(),
             label: id.to_string(),
             kind: ModelKind::Local,
+            wire: Wire::default_for_kind(ModelKind::Local),
             backend: Some((
                 format!("http://{id}.invalid"),
                 "tok".to_string(),

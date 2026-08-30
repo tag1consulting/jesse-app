@@ -70,6 +70,7 @@ pub(crate) use tokio::process::Command;
 pub(crate) use tokio::sync::{broadcast, mpsc, OwnedSemaphorePermit, Semaphore};
 pub(crate) use tokio::task::AbortHandle;
 pub(crate) use tokio::time::timeout;
+pub(crate) use tokio_util::sync::CancellationToken;
 
 // ---- Modules --------------------------------------------------------------
 

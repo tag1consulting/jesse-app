@@ -175,6 +175,21 @@ impl ConfigError {
     }
 }
 
+/// Render a list of names for an error message, or say plainly that there are none.
+///
+/// An empty list is the case worth spelling out: "registered for this wire: " with nothing
+/// after it reads like a truncated message, and the operator's next question ("which
+/// harness should I use, then?") has the answer "none of them, this build cannot drive that
+/// wire at all". Saying so is the difference between a fixable error and a puzzling one.
+fn once_or_none(mut names: Vec<&str>) -> String {
+    names.sort_unstable();
+    if names.is_empty() {
+        "none".to_string()
+    } else {
+        names.join(", ")
+    }
+}
+
 /// Validate the whole model configuration against the embedded containment record. An empty
 /// result means the bridge may start.
 ///
@@ -294,30 +309,46 @@ pub fn validate_model_config_with_env(
             continue; // the level checks below would be meaningless against no harness
         };
 
-        // 2b. A model whose BACKEND SURFACE the harness does not speak. `kind = "openai"`
-        //     means the base_url answers `/v1/responses`, and a harness that speaks
-        //     Anthropic's `/v1/messages` would hand its child that URL as
-        //     `ANTHROPIC_BASE_URL` — producing a model the picker shows as healthy (its
-        //     probe hits the OpenAI path and passes) whose every turn 404s. Refused here
-        //     rather than left to fail per turn, and asked of the HARNESS rather than
-        //     hardcoding an id, for the same reason item 3 asks `expresses`.
-        if matches!(m.kind, ModelKind::OpenAi) && !harness.speaks_openai_backend() {
+        // 2b. A model whose WIRE the harness does not drive. The `wire` key names the API
+        //     surface a turn is spoken on — `responses` means the base_url answers
+        //     `/v1/responses`, and a harness that drives its child over Anthropic's
+        //     `/v1/messages` would hand it that URL as `ANTHROPIC_BASE_URL`, producing a
+        //     model the picker shows as healthy (its probe hits the OpenAI path and passes)
+        //     whose every turn 404s. Refused here rather than left to fail per turn, and
+        //     asked of the HARNESS rather than hardcoding an id, for the same reason item 3
+        //     asks `expresses`.
+        //
+        //     This replaced a `kind == openai && !speaks_openai_backend()` test and covers
+        //     strictly more: the old one could only catch ONE bad pairing, because `kind`
+        //     could name only one non-Anthropic surface. It reads in the same direction it
+        //     always did — a model whose wire nothing here speaks is refused, and a Codex
+        //     model on its own OAuth login (declared `hosted`, defaulting to `messages`) is
+        //     as legitimate as it ever was, because Codex declares that wire too.
+        if !harness.supports_wire(m.wire) {
             errors.push(ConfigError::for_model(
                 &m.id,
                 format!(
-                    "kind 'openai' names a backend on the OpenAI Responses surface, which \
-                     harness '{}' does not speak — it drives its child over Anthropic's \
-                     /v1/messages. Run this model under a harness that speaks the OpenAI \
-                     surface (registered: {}), or declare it 'hosted'/'local' and point \
-                     base_url at an Anthropic-surface endpoint.",
+                    "wire '{}' is not a surface harness '{}' drives a turn over. Run this \
+                     model under a harness that does (registered for this wire: {}), or set \
+                     a wire this harness speaks ({}) and point base_url at an endpoint that \
+                     answers it.",
+                    m.wire.as_str(),
                     m.harness,
-                    cfg.harnesses
-                        .ordered()
-                        .iter()
-                        .filter(|h| h.speaks_openai_backend())
-                        .map(|h| h.id())
-                        .collect::<Vec<_>>()
-                        .join(", "),
+                    once_or_none(
+                        cfg.harnesses
+                            .ordered()
+                            .iter()
+                            .filter(|h| h.supports_wire(m.wire))
+                            .map(|h| h.id())
+                            .collect::<Vec<_>>()
+                    ),
+                    once_or_none(
+                        [Wire::Messages, Wire::Chat, Wire::Responses]
+                            .into_iter()
+                            .filter(|w| harness.supports_wire(*w))
+                            .map(|w| w.as_str())
+                            .collect::<Vec<_>>()
+                    ),
                 ),
             ));
             continue;
@@ -683,6 +714,7 @@ mod tests {
             id: id.to_string(),
             label: id.to_string(),
             kind: ModelKind::Local,
+            wire: Wire::default_for_kind(ModelKind::Local),
             backend: Some(("http://x".into(), "tok".into(), "m".into())),
             subagent_model: None,
             configured: true,
@@ -971,14 +1003,20 @@ mod tests {
 
     /// A MODEL ON A SURFACE ITS HARNESS DOES NOT SPEAK IS REFUSED AT STARTUP.
     ///
-    /// The failure this prevents is the nastiest shape a model config has: `kind = "openai"`
-    /// on the Claude Code harness passes its HEALTH PROBE (the probe posts at the OpenAI path
-    /// and gets a 200), so the picker shows the model green — and then every turn 404s,
-    /// because the child was handed an `ANTHROPIC_BASE_URL` that serves `/v1/responses` and
-    /// nothing else. Green in the switcher, dead on arrival, with nothing tying the two
+    /// The failure this prevents is the nastiest shape a model config has: the Responses
+    /// surface on the Claude Code harness passes its HEALTH PROBE (the probe posts at the
+    /// OpenAI path and gets a 200), so the picker shows the model green — and then every turn
+    /// 404s, because the child was handed an `ANTHROPIC_BASE_URL` that serves `/v1/responses`
+    /// and nothing else. Green in the switcher, dead on arrival, with nothing tying the two
     /// together.
+    ///
+    /// The gate now reads the model's WIRE rather than its kind, so the fixture sets the wire
+    /// the old `kind = "openai"` implied — which is exactly what
+    /// [`Wire::default_for_kind`] resolves a real `kind = "openai"` entry to. Same pairing,
+    /// same refusal, said in the vocabulary that can also express the pairings the kind
+    /// could not.
     #[test]
-    fn an_openai_kind_model_is_refused_on_a_harness_that_speaks_anthropic() {
+    fn a_model_on_a_wire_its_harness_does_not_drive_is_refused() {
         let mut cfg = cfg_with_model("kimi-k3-codex", CLAUDE_CODE_ID, Capability::Read);
         cfg.harnesses = Arc::new(HarnessRegistry::new(vec![Box::new(Codex)]));
         if let Some(m) = cfg
@@ -988,20 +1026,26 @@ mod tests {
             .find(|m| m.id == "kimi-k3-codex")
         {
             m.kind = ModelKind::OpenAi;
+            m.wire = Wire::default_for_kind(ModelKind::OpenAi);
         }
         let errors = validate(&cfg, &[], CONTAINMENT_RECORDS);
         let e = errors
             .iter()
             .find(|e| e.model.as_deref() == Some("kimi-k3-codex"))
-            .expect("an openai-kind model on claude-code must be refused");
-        assert!(e.message.contains("does not speak"), "{e}");
+            .expect("a responses-wire model on claude-code must be refused");
+        assert!(e.message.contains("is not a surface"), "{e}");
+        assert!(e.message.contains("responses"), "{e}");
         assert!(
             e.message.contains(CODEX_ID),
             "the message must name a harness that WOULD serve it: {e}"
         );
+        assert!(
+            e.message.contains("messages"),
+            "and the wire this harness DOES drive, so the fix is in the message: {e}"
+        );
 
-        // The same model on the harness that speaks the surface starts cleanly — the gate
-        // refuses a pairing, not a kind.
+        // The same model on the harness that drives the wire starts cleanly — the gate
+        // refuses a pairing, not a wire.
         let mut ok = cfg_with_codex_model("kimi-k3-codex", Capability::Read);
         if let Some(m) = ok
             .model_registry
@@ -1010,11 +1054,39 @@ mod tests {
             .find(|m| m.id == "kimi-k3-codex")
         {
             m.kind = ModelKind::OpenAi;
+            m.wire = Wire::default_for_kind(ModelKind::OpenAi);
         }
         assert!(
             validate(&ok, &[], CONTAINMENT_RECORDS).is_empty(),
-            "openai-kind on codex is exactly the pairing this change adds"
+            "the responses wire on codex is exactly the pairing this gate allows"
         );
+
+        // AND THE HOSTED-LOGIN ASYMMETRY, which the old boolean carried implicitly and this
+        // one carries by name: a Codex model that names no provider is `hosted`, defaults to
+        // the `messages` wire, and must still start. That is the DEPLOYED posture, so a
+        // `supports_wire` that answered `Responses` alone would have taken production down.
+        let hosted_codex = cfg_with_codex_model("codex-oauth", Capability::Read);
+        assert!(
+            validate(&hosted_codex, &[], CONTAINMENT_RECORDS).is_empty(),
+            "a hosted (subscription-OAuth) Codex model still starts"
+        );
+
+        // A wire NO harness drives is refused too, and the message says so plainly rather
+        // than trailing off after "registered for this wire:".
+        let mut chat = cfg_with_codex_model("codex-chat", Capability::Read);
+        if let Some(m) = chat
+            .model_registry
+            .models
+            .iter_mut()
+            .find(|m| m.id == "codex-chat")
+        {
+            m.wire = Wire::Chat;
+        }
+        let e = validate(&chat, &[], CONTAINMENT_RECORDS)
+            .into_iter()
+            .find(|e| e.model.as_deref() == Some("codex-chat"))
+            .expect("no harness drives a turn over chat completions");
+        assert!(e.message.contains("none"), "{e}");
     }
 
     /// A harness with no embedded record is a different fault from one whose record has no

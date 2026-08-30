@@ -293,6 +293,7 @@ mod tests {
             id: id.to_string(),
             label: id.to_string(),
             kind: ModelKind::Local,
+            wire: Wire::default_for_kind(ModelKind::Local),
             backend: Some(("http://u".into(), "tok".into(), format!("{id}-v1"))),
             subagent_model: None,
             configured: true,
