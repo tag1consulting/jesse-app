@@ -47,6 +47,14 @@ pub mod config;
 pub mod http;
 pub mod openai_chat;
 
+/// A `Provider` that plays a fixed script instead of speaking HTTP.
+///
+/// COMPILED ONLY UNDER `cfg(test)` OR THE `scripted` FEATURE, never in a release build. A
+/// fake provider in the shipped library would be a `Provider` a caller could reach by
+/// accident, and one whose whole job is to return answers nobody generated.
+#[cfg(any(test, feature = "scripted"))]
+pub mod scripted;
+
 pub use anthropic::AnthropicMessages;
 pub use config::{AuthScheme, ProviderConfig, Quirks, Retries, Timeouts};
 pub use http::{CallAudit, EventStream};
@@ -121,8 +129,22 @@ pub enum ToolResultContent {
 /// conversation could hold something no adapter can serialise. Arguments are validated
 /// as JSON when the streaming block closes (see [`ProviderError::Protocol`]), so by the
 /// time a `ToolUse` block exists it is known to be well-formed.
+/// ADJACENTLY TAGGED (`kind` + `value`), NOT INTERNALLY TAGGED, and the difference is not
+/// cosmetic: **serde cannot serialise a newtype variant holding a string under an internal
+/// tag at all.** `#[serde(tag = "kind")]` compiles here and then fails at RUNTIME with
+/// "cannot serialize tagged newtype variant ContentBlock::Text containing a string" — so a
+/// `ContentBlock::Text` could be constructed, matched and sent on either wire (the adapters
+/// build their JSON by hand) but never written to disk. D1 never serialised one, so the
+/// derive was never exercised and the defect was invisible; D2's thread store serialises
+/// every message of every turn and hit it on its first append.
+///
+/// Adjacent tagging is the smallest fix that keeps the type's shape: every variant
+/// round-trips, including the two struct variants, and no call site changes. Rewriting
+/// `Text(String)` as `Text { text: String }` would also have worked and was rejected — it
+/// changes the constructor at every call site in the crate and in the conformance suite,
+/// to buy a marginally flatter JSON shape nothing reads.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum ContentBlock {
     Text(String),
     /// An image, as base64 bytes plus its media type (`image/png`, `image/jpeg`, …).
@@ -714,6 +736,47 @@ mod tests {
         )
         .unwrap();
         assert_eq!(from_disk.cache_creation_input_tokens, Some(4));
+    }
+
+    #[test]
+    fn every_content_block_variant_round_trips_through_serde() {
+        // The regression guard for the defect the adjacent tag fixes. `Text` and the two
+        // struct variants all compiled under an internal tag and then failed at runtime,
+        // which no test caught because nothing in D1 serialised one.
+        let blocks = vec![
+            ContentBlock::Text("hello".into()),
+            ContentBlock::Image {
+                media_type: "image/png".into(),
+                data_base64: "AAAA".into(),
+            },
+            ContentBlock::ToolUse {
+                id: "call_1".into(),
+                name: "fs_read".into(),
+                arguments: serde_json::json!({"path": "a.md"}),
+            },
+            ContentBlock::ToolResult {
+                id: "call_1".into(),
+                content: ToolResultContent::Text("framed".into()),
+                is_error: false,
+            },
+            ContentBlock::ToolResult {
+                id: "call_2".into(),
+                content: ToolResultContent::Blocks(vec![ContentBlock::Text("nested".into())]),
+                is_error: true,
+            },
+        ];
+        for block in &blocks {
+            let json = serde_json::to_string(block).expect("every variant serialises");
+            let back: ContentBlock = serde_json::from_str(&json).expect("and reads back");
+            assert_eq!(&back, block, "round trip differed for {json}");
+        }
+        // And a whole message, which is what the thread store actually writes.
+        let message = Message {
+            role: Role::Assistant,
+            content: blocks,
+        };
+        let json = serde_json::to_string(&message).unwrap();
+        assert_eq!(serde_json::from_str::<Message>(&json).unwrap(), message);
     }
 
     #[test]

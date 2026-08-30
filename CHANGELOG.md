@@ -90,6 +90,197 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
   newest build routinely talks to a sentinel that predates this key. A document without it
   decodes to exactly the card that shipped before, which is asserted rather than assumed.
 
+## [agent 0.2.0] - 2026-08-30
+
+The agent LOOP, on top of D1's provider layer. `run_turn` sends, reads the stream, calls the
+tools the model asked for, frames every result, appends to a thread and iterates until the
+model stops or a budget does. Nothing in the bridge changed and the bridge's version is
+deliberately not bumped — D4 is where the bridge adopts any of this.
+
+### Added
+
+- **`turn::run_turn` — the loop.** Load the thread, append the user's message, then per
+  iteration: check every budget ceiling, build a request from the system blocks and the
+  manifest, stream, forward text deltas to the sink as they arrive, record one usage record,
+  append the assistant message, and — on `tool_use` — dispatch, frame, splice, iterate.
+
+  It returns a `TurnOutcome`, never a `Result`. A failed turn still has a thread id, a
+  partial answer, a bill and a trace; a `Result` would let a caller `?` past all four.
+
+  A batch is dispatched in **manifest order** with the model's order breaking ties, because a
+  fixed key makes a turn reproducible. It runs in **parallel only when every requested tool
+  is `Read`** — the reason is ordering rather than danger: a write and a read of the same
+  document in one batch have no defined order, and the model that asked for both in one
+  breath has no way to say which it meant. `Egress` is not `Read` for this purpose.
+
+- **The tool boundary, made structural.** A `ToolSet` is built AT a `Level` and exposes only
+  the tools that level permits — a withheld tool is not hidden from the manifest, it is not
+  in the set, so `get` cannot return it. Dispatch is by exact name against that same map, so
+  the manifest and the dispatch table cannot disagree; a name that does not resolve is
+  `Refused("tool not granted")`, traced by name, and forwarded nowhere.
+
+  The rejected alternative was one full tool set with a level check inside `call`. Same happy
+  path, much worse: the model is shown every tool, so a read-only turn spends itself being
+  invited to write and refused, and the check lives in each tool rather than in one place, so
+  a tool added later inherits no boundary at all.
+
+  `ExternalWrite` is exposed at no level in Phase 1, **and the type makes that a compile-time
+  fact**: `ToolSetBuilder::add` takes an `ExposedClass`, which has no such arm, so there is no
+  expression a call site can write that adds one. One runtime check closes the half a type
+  cannot — a tool added as `Read` whose `action_class()` says `ExternalWrite` fails the build.
+
+  `Level` is the bridge's `harness::Capability` vocabulary (`Basic` < `Read` < `Write`),
+  redeclared rather than imported because this crate depends on the bridge in neither
+  direction; D4 maps them and the mapping is meant to be the identity.
+
+- **`ActionClass::Egress`, named separately from `Read`.** A read that sends caller-authored
+  bytes off the host. The distinction is the one the injection threat model turns on: the
+  danger of a tool result is not that something was read, it is that a directive hidden in
+  one document can make the model put the contents of another into a URL. Filed under
+  "read", that channel is invisible. It is granted at `Read` today — an assistant that cannot
+  look anything up is not the product — and the separate name is what makes withdrawing it
+  later a one-line policy change rather than an archaeology project.
+
+- **`Scope { tenant, user, workspace }`, passed to every tool by the caller.** Newtypes over
+  opaque strings, constructed once per turn, never read from the model's arguments. A tool
+  schema declaring `tenant`, `tenant_id`, `user`, `user_id`, `workspace` or `workspace_id` —
+  in any casing, at any depth — is **refused at manifest-build time**, not at call time: a
+  runtime check would refuse the call after the model had already been shown a tool inviting
+  it to name a tenant, so the model keeps trying and the operator reads it as a flaky tool.
+  Phase 1 constructs one fixed scope; the type is at the boundary from the first commit
+  because threading a tenant through a hundred call sites later is the change nobody makes
+  correctly.
+
+- **`framing::frame_tool_result` — one function, and every tool result goes through it.** The
+  fourth instance of a discipline the bridge already applies three times (`context.rs` for
+  injected history, `prompt.rs` for device blocks through one seam, `vision.rs` for
+  attachment transcriptions). A header naming the tool and saying the block is data and not
+  instructions; ASCII controls stripped except newline; the frame's own closing token
+  neutralised; a 24 KB cap that truncates on a char boundary and states the untruncated size;
+  structured results pretty-printed inside the frame.
+
+  **It is not a filter.** An "ignore previous instructions" line comes through byte-identical
+  and inert. Deciding a result is malicious and returning something else is undecidable, and
+  the attempt would produce a tool that lies about what it read. Unlike the bridge's
+  neutraliser this one copies the matched run through from the original, so a forged
+  `</TOOL_RESULT_DATA>` keeps its casing and the only change to the body is one inserted
+  space — which is what lets the test assert byte-identity.
+
+- **`ThreadStore`, with a file and a memory implementation.** `FileThreadStore` writes one
+  append-only JSONL per thread (mode 0600, fsync per append) plus a metadata file written
+  temp-and-rename. Two files rather than one because the append is the only file operation
+  that cannot half-destroy existing data, and metadata is the part that has to be rewritten.
+
+  Thread ids are `direct-<uuid v4>`, which can collide with neither the bridge's synthetic
+  `local-` ids nor a bare CLI session id. `ThreadId`'s inner string is private with a
+  validating `parse` as the only way in, because the id is a **filename** — an id containing
+  `..` would be a path traversal handed to the store by whatever passed `--thread`.
+
+  **Tool result content is stored as delivered — framed.** Re-deriving the frame on load
+  would make a stored thread's meaning depend on the version of the code that read it, so
+  improving the framing would silently rewrite history. An audit log that changes when you
+  improve the code is not an audit log.
+
+- **Budgets, enforced before the call and never during one.** Iterations, tool calls, a
+  per-call output cap, whole-turn input tokens, wall clock and an optional dollar ceiling.
+  Aborting mid-call saves nothing — the tokens are bought when the request is accepted — and
+  hands the caller a truncated answer indistinguishable from a provider failure.
+
+  The two ceilings whose next value is unknowable (input tokens, cost) are checked against
+  spend **plus the previous call's own figure as a prediction**, which is sound because a
+  turn's message list only grows: each iteration re-sends the whole thread, so the next
+  prompt is at least as large and at least as expensive. That makes them bounds the loop
+  stops *before* crossing. It is deliberately conservative — a turn can stop one iteration
+  early — which is the right direction for a spend limit to be wrong in.
+
+  `max_wall` has no default: only the caller knows whether it is behind a phone spinner or an
+  overnight batch. `PriceDeck` carries the same three field names as
+  `bridge/src/config.rs`'s so D4 adopts it rather than defining a second deck; cache writes
+  are priced at the input rate, a documented approximation taken to keep that property.
+
+- **`UsageSink` — the seam the per-user ledger and budget enforcement grow from.** One
+  content-free record per provider call, **including calls that failed**: a call that
+  streamed and then errored is billed by every host in this deployment, so a
+  success-only record means a turn can spend 300 k input tokens and leave no trace of it.
+  A retried call is one call — the attempt count rides in the record and the latency is what
+  the caller actually waited. Records carry the scope ids, which is what makes the difference
+  between an audit trail (keyed on turn) and a bill (keyed on tenant). `JsonlUsageSink`
+  writes mode-0600 lines, absorbs its own failures and complains once, because a full disk
+  must not break the product and a line per failure would flood the log that explains it.
+
+- **Cancellation that leaves a resumable thread.** The token cancels the in-flight stream and
+  is checked between tool calls. A cancelled turn appends what it has, records usage for the
+  calls that completed, and returns `Cancelled` with the partial text. A tool call the turn
+  never reached still gets a `tool_result` placeholder, because both wires require every
+  `tool_use` to be answered and a thread holding an unanswered one cannot be resumed on
+  either. The rejected alternative — dropping the unanswered `tool_use` blocks — rewrites
+  what the model actually said, and replaying exactly what the model saw is the thread's job.
+
+- **A content-free `TurnTrace`.** Per tool: a name, an `ActionClass`, a duration and one of
+  `ok` / `refused` / `failed`. The same property `bridge/src/turntrace.rs` documents and
+  tests for its timing log, reached the same way — there is no field that could hold content.
+  **`refused` is not folded into `failed`**: a refusal is the boundary working, possibly
+  under attack, and a failure is the boundary not being what happened; one line in a log for
+  both would make "the boundary held 40 times today" unreadable.
+
+- **`jesse-agent turn` — the CLI.** Runs one turn by hand against a real endpoint or a
+  loopback mock. `--token-env` names the variable the key lives in, so the key is never in
+  shell history or `ps`; nothing prints the token or the base URL. stdout is the streamed
+  answer plus one JSON outcome line; stderr is the activity and the trace. Exit `0` finished,
+  `2` a budget stopped it, `3` cancelled, `1` otherwise. Ctrl-C cancels the **turn**, not the
+  process, so the partial answer, the thread append and the usage records all still happen.
+
+  `--root` selects a **fixture** tool set (`fs_list`, `fs_read`, `fs_write`) jailed to that
+  directory with symlink resolution and `..` refused — a jail built on unresolved
+  `starts_with` is the classic hole, since `root/link-to-etc/passwd` starts with the root and
+  is `/etc/passwd`. **D3 replaces the fixture with the real vault tool set behind the same
+  trait.**
+
+- **Two new test suites.** `tests/loop_conformance.rs` runs one three-step tool turn three
+  ways — both adapters over loopback sockets and the scripted provider with no wire — and
+  asserts the thread each leaves is **identical**; it also asserts from the request body that
+  a tool above the granted level never reaches the model. `tests/loop_behaviour.rs` covers
+  refusal, every budget ceiling, cancellation between tools, dispatch order and parallelism,
+  and the usage ledger.
+
+  `provider::scripted` plays a fixed `Event` sequence and records every `Request` it
+  received. It is compiled only under `cfg(test)` or the `scripted` feature, so a release
+  build holds no `Provider` that fabricates answers; the crate takes a **dev-dependency on
+  itself** with that feature on, which is the only way an integration test can see it.
+
+### Fixed
+
+- **`provider::ContentBlock` could not be serialised at all, and nothing had noticed.** The
+  enum was internally tagged (`#[serde(tag = "kind")]`), and serde cannot serialise a newtype
+  variant holding a string under an internal tag — `ContentBlock::Text` compiled fine and
+  failed at RUNTIME with "cannot serialize tagged newtype variant". D1 never serialised one
+  (the adapters build their JSON by hand), so the derive was never exercised; D2's thread
+  store serialises every message of every turn and hit it on the first append.
+
+  Now adjacently tagged (`kind` + `value`), which is the smallest fix that keeps the type's
+  shape — every variant round-trips and no call site changes. Rewriting `Text(String)` as a
+  struct variant would also have worked and was rejected: it changes the constructor
+  everywhere in the crate and in the conformance suite to buy a flatter JSON shape nothing
+  reads. A round-trip test over all five variant shapes now guards it.
+
+### Changed
+
+- **`EventStream::scripted`** added to `provider::http`, gated to the same `cfg` as its only
+  caller. The alternative — making `EventStream`'s fields `pub(crate)` — would have put the
+  invariant that the receiver and the reader task belong together in a second place where
+  nothing enforces it. It honours the cancellation token between events, so a cancellation
+  test cannot pass on the scripted provider and fail on a wire.
+
+- **`tokio` gains the `signal` feature** for the CLI's Ctrl-C handler. `rt-multi-thread` was
+  deliberately not added: the binary runs on a current-thread runtime, because the loop needs
+  concurrency (a batch of reads awaiting together) and never parallelism, and a library
+  feature added for one binary's convenience is compiled by every consumer of the library.
+
+- **`getrandom` added** for thread ids. `rand` is a large dependency for sixteen bytes, and
+  the crate's own retry jitter says in its doc comment that it is not cryptographic — a
+  thread id is the handle a stored conversation is fetched by, so it needs the property that
+  jitter disclaims. Already in this workspace's lockfile.
+
 ## [App 1.0 (121)] - 2026-08-30
 
 ### Fixed
