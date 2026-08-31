@@ -36,6 +36,7 @@
 //! | Module | Responsible for |
 //! |---|---|
 //! | [`tools`] | The boundary. A set is built AT a [`tools::Level`] and exposes only what that level permits; dispatch is by exact manifest name. |
+//! | [`mcp`] | The SECOND tool source (D10): a stdio MCP client, and the `mcp__<server>__<tool>` tools a named grant exposes from it. Same boundary, same dispatch. |
 //! | [`scope`] | Whom a turn acts for. Passed to every tool by the caller, never read from a model's arguments. |
 //! | [`framing`] | Every tool result the model sees, framed as data by ONE function. |
 //! | [`thread`] | The conversation, in the neutral model, stored as delivered. |
@@ -61,6 +62,7 @@
 pub mod budget;
 pub mod framing;
 pub mod index;
+pub mod mcp;
 pub mod persona;
 pub mod provider;
 pub mod scope;
@@ -93,6 +95,10 @@ pub use budget::{Budget, Ceiling, PriceDeck};
 // module.
 pub use framing::frame_tool_result;
 pub use index::{GrepIndex, QmdIndex, SearchIndex, SearchMode};
+// THE SECOND TOOL SOURCE. Re-exported at the root beside the first one for the reason the
+// vault set is: a caller assembling a turn names `CompositeToolSet` and `ServerGrant` in the
+// same breath as `vault_tool_set`, and a module path for one of the two would be an odd seam.
+pub use mcp::{CompositeToolSet, McpClient, McpError, McpToolSet, ServerGrant};
 pub use persona::{
     apply as apply_style_policy, check as check_style, parse_pattern_file, regeneration_request,
     render as render_persona, render_placeholders, Applied, Correction, Dashes, FormattingParams,

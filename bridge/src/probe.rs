@@ -2111,10 +2111,10 @@ pub async fn run_battery(base: &Config, opts: &BatteryOptions) -> Result<RunOutc
 /// Turn the agent crate's structural battery into this bridge's committed record.
 ///
 /// **THE PROBES ARE NOT RE-IMPLEMENTED HERE, AND THAT IS THE POINT.** `agent/`'s
-/// `tests/containment_direct.rs` runs 90 adversarial tool calls — path traversal, symlink
+/// `tests/containment_direct.rs` runs 102 adversarial tool calls — path traversal, symlink
 /// escapes, cold documents, excluded documents, stale-hash writes, an empty fetch allowlist,
-/// tool names the level does not grant — at all three levels, and scores every one OUT OF
-/// BAND: canary strings must appear in no tool result, no request body, no thread file and no
+/// tool names the level does not grant, and (since D10) four against a real fake MCP server —
+/// at all three levels, and scores every one OUT OF BAND: canary strings must appear in no tool result, no request body, no thread file and no
 /// trace; the sibling tree is hashed before and after; and a probe the loop never actually
 /// issued is `inconclusive`, which FAILS. Re-stating those probes in the bridge would be a
 /// second battery to keep in step with the tool set, and the copy that drifted would be the
@@ -2178,22 +2178,36 @@ pub fn direct_results_from_battery(
         } else {
             "failing"
         };
+        // **THE MCP AXIS COMES FROM CONFIG SINCE D10.** It was hardcoded `none` and `[]` on
+        // the reasoning that this harness starts no processes; `[[direct.mcp]]` ended that,
+        // and a record whose second key could not describe the granted servers would be a
+        // record that says nothing about the thing most likely to change. `row.mcp` is
+        // ignored here for the same reason: `shipped_rows` is a compile-time list and the
+        // grant is a deployment's own.
+        let agent_level = jesse_agent::tools::Level::from(row.capability);
+        let mut root_tools: Vec<String> = jesse_agent::tools::vault::expected_names(agent_level)
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let mut mcp_tools: Vec<String> = cfg
+            .direct
+            .mcp
+            .iter()
+            .flat_map(|g| g.granted_names_at(agent_level))
+            .collect();
+        mcp_tools.sort();
+        mcp_tools.dedup();
+        root_tools.extend(mcp_tools);
         rows.push(RowResult {
             capability: level.to_string(),
-            mcp_set: row.mcp.label().to_string(),
-            // No servers, at any level, ever — see `DIRECT_SHIPPED_ROWS`.
-            mcp_servers: Vec::new(),
+            mcp_set: direct_mcp_label(cfg),
+            mcp_servers: cfg.direct.mcp.iter().map(|g| g.name.clone()).collect(),
             toolset_args: Direct.capability_args(cfg, row.capability),
             // The tools actually at the root: the manifest, which is what `toolset_args`
             // already names. Recorded in both places because the other harnesses record a
             // CHILD'S OWN ACCOUNT here and a bridge-side declaration there, and a reader
             // comparing the two columns across records should find the same shape.
-            root_tools: jesse_agent::tools::vault::expected_names(jesse_agent::tools::Level::from(
-                row.capability,
-            ))
-            .into_iter()
-            .map(str::to_string)
-            .collect(),
+            root_tools,
             status: status.to_string(),
             probes,
         });

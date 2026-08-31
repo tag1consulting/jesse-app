@@ -426,6 +426,15 @@ pub fn validate_model_config_with_env(
         }
     }
 
+    // 6a. The `[[direct.mcp]]` grants, checked without starting anything.
+    //
+    //     A grant that could never expose a tool — a duplicate server name, a composed
+    //     `mcp__<server>__<tool>` name no wire accepts, an `external_write` class that is
+    //     exposed at no level — is a config error, and this is where a config error should be
+    //     found: at boot, where an operator is present, rather than on the first turn that
+    //     needed the server, where a user is. It starts no process and reads no credential.
+    errors.extend(validate_direct_mcp(cfg));
+
     // 6. The posture each record speaks for versus the posture this deployment would run —
     //    every record against ITS OWN harness. A record whose harness this build cannot
     //    construct is skipped rather than compared against a stand-in: nothing can spawn that
@@ -514,6 +523,33 @@ pub fn validate_toolset_argv(
         }
     }
     errors
+}
+
+/// The `[[direct.mcp]]` grants, checked structurally.
+///
+/// **NO PROCESS IS STARTED AND NO CREDENTIAL IS READ.** What is checked is what
+/// `jesse_agent::mcp::validate_grants` can decide from the grant alone; whether a server
+/// actually exists and advertises what it was granted is a per-turn question, answered as a
+/// warning there (a server that will not start costs its tools, never the turn).
+///
+/// It is a GLOBAL error rather than a per-model one because a grant belongs to the
+/// deployment's `[direct]` table, not to a model — every direct model on this bridge runs
+/// under the same one.
+pub fn validate_direct_mcp(cfg: &Config) -> Vec<ConfigError> {
+    match jesse_agent::mcp::validate_grants(&direct_mcp_grants(&cfg.direct.mcp)) {
+        Ok(()) => Vec::new(),
+        Err(e) => vec![ConfigError::global(format!(
+            "the [[direct.mcp]] grants are unusable: {e}\n\
+             \nA grant names a server, a command and the tools it may expose, BY NAME. There \
+             is no wildcard form, `external_write` is exposed at no level, and two grants \
+             cannot name one server. Fix the entry in jesse.local.toml and restart.\n\
+             \nNote that changing a grant also changes this harness's `--tools` token, which \
+             the containment record commits: after fixing this you will need to re-run \
+             `cargo test -p jesse-agent --test containment_direct` and \
+             `cargo run --features containment-probe --bin containment-probe -- --harness \
+             direct --write`, and commit the updated bridge/containment-direct.toml."
+        ))],
+    }
 }
 
 /// The one harness-binary check: consulted only for harnesses some configured model
@@ -874,6 +910,45 @@ mod tests {
             highest_passing_level(&r, &ClaudeCode),
             Some(Capability::Write)
         );
+    }
+
+    /// A grant that could never expose a tool is a BOOT error, not a per-turn surprise. It
+    /// starts nothing and reads nothing: everything checked here is decidable from the grant.
+    #[test]
+    fn an_unusable_direct_mcp_grant_stops_the_bridge_at_boot() {
+        let mut cfg = test_config();
+        assert!(validate_direct_mcp(&cfg).is_empty(), "no grant, no error");
+
+        let ok = crate::DirectMcpGrant {
+            name: "qmd".into(),
+            command: "qmd".into(),
+            args: vec!["mcp".into()],
+            env: std::collections::BTreeMap::new(),
+            tools: vec!["query".into()],
+            class: jesse_agent::tools::ActionClass::Read,
+            per_tool_class: std::collections::BTreeMap::new(),
+        };
+        cfg.direct.mcp = vec![ok.clone()];
+        assert!(validate_direct_mcp(&cfg).is_empty(), "a usable grant boots");
+
+        // Two grants naming one server: the tool name is the dispatch key, so which server
+        // answers `mcp__qmd__query` would be a coin toss.
+        cfg.direct.mcp = vec![ok.clone(), ok.clone()];
+        let errors = validate_direct_mcp(&cfg);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].message.contains("qmd"), "{errors:?}");
+        assert!(
+            errors[0].model.is_none(),
+            "a grant belongs to the deployment"
+        );
+
+        // Exposed at no level, so a grant naming it could never expose a tool.
+        let mut external = ok;
+        external.class = jesse_agent::tools::ActionClass::ExternalWrite;
+        cfg.direct.mcp = vec![external];
+        let errors = validate_direct_mcp(&cfg);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].message.contains("external_write"), "{errors:?}");
     }
 
     #[test]

@@ -13,6 +13,8 @@ vocabulary, per-wire adapters, and **the tool-calling turn loop that runs on top
   post-generation style checker that makes voice a checked property.
 * **D8** built the third adapter — `OpenAiResponses` — as the falsification of the provider
   trait, and wrote down every place it strained in **[`LEAKS.md`](LEAKS.md)**.
+* **D10** built the second tool source — a stdio MCP client, and the `mcp__<server>__<tool>`
+  tools a named grant exposes from it, under the same boundary as the first.
 
 No dependency on `bridge/` in either direction.
 
@@ -38,7 +40,7 @@ make them structurally true rather than rules somebody remembers:
   │  decides · calls tools · frames results · projects to the  │
   │  bridge's two mid-turn events                              │
   │                                                            │
-  │  tools  scope  thread  budget  framing  usage              │
+  │  tools  scope  thread  budget  framing  usage  mcp         │
   ├────────────────────────────────────────────────────────────┤
   │  provider::{Request, Event, Provider, Usage, ProviderError}│  the neutral vocabulary
   ├───────────────────┬──────────────────┬─────────────────────┤
@@ -58,6 +60,7 @@ make them structurally true rather than rules somebody remembers:
 | Layer | Owns | Must never |
 |---|---|---|
 | `tools::vault` | The eight product tools, their descriptions and their refusals. | Frame its own results, or decide policy the store owns (and vice versa). |
+| `mcp` | A stdio MCP client, and the granted tools of a server as `Tool`s under the same boundary. | Expose anything a grant did not name, read its own process environment, or answer a request a server sends it. |
 | `store` | Documents: the jail, exclusions, visibility, the compare-and-swap. | Know what a *tool* is, or take a lock decision the guard owns. |
 | `index` | Search, through the store so visibility cannot be bypassed. | Return a hit the store would not open. |
 | `turn` (loop.rs) | The loop, the trace, and the projection to the bridge's two mid-turn events. | Learn anything about a wire, or let a tool result reach the model unframed. |
@@ -301,12 +304,64 @@ The allowlist is **re-checked at every redirect hop** (at most three), inside th
 policy rather than after the fact — by the time a response has come back from a disallowed
 host, the request has already been sent there.
 
+## MCP: the second tool source
+
+`mcp::McpToolSet` exposes the granted tools of a **stdio MCP server** as ordinary `Tool`s in
+an ordinary `ToolSet`, and `CompositeToolSet` puts that set beside the vault's. The whole
+posture is four sentences: every server is listed; every granted tool is named individually;
+nothing is granted by wildcard, and the config type has no way to express one; a grant change
+costs a containment-record change.
+
+**The client speaks four messages and nothing else** — `initialize`,
+`notifications/initialized`, `tools/list` (following `nextCursor`), `tools/call` — over
+newline-delimited JSON-RPC 2.0, and declares an **empty `capabilities` object**. No sampling,
+no elicitation, no roots, no resources, no prompts, no logging, no subscriptions, no progress.
+Each of those is a channel a server can open *towards* the host, and a request arriving from a
+server is treated as a protocol violation rather than something to answer. Resources are
+omitted for a second reason: they would put content into a turn through a door the manifest
+does not describe.
+
+| Situation | What happens |
+|---|---|
+| granted **and** advertised | a `Tool` named `mcp__<server>__<tool>` |
+| granted, not advertised | nothing, plus a warning naming it |
+| advertised, not granted | nothing at all — not in the manifest, so not in the dispatch table |
+| server will not start | its tools are absent; a warning; the turn continues |
+| protocol violation / timeout | that server is dropped for the rest of the turn |
+| `isError: true` in a result | `ToolError::Failed` — never `Refused`, which is *our* boundary's word |
+| `Level::Basic` | **no server is started at all** |
+
+**The `mcp__<server>__<tool>` name is load bearing twice.** It is the vocabulary the bridge's
+allowlist, activity labels and containment records already use; and it makes an MCP server
+structurally unable to shadow a vault tool, because a server advertising `vault_read` becomes
+`mcp__qmd__vault_read`. The composite's collision check is therefore not for that case — it
+cannot happen — it is for the one the prefix does admit, two grants composing to one name
+because `__` appears inside a server or tool name.
+
+`McpToolSet` is built on `ToolSetBuilder`, so every structural check the vault set gets applies
+unchanged: the level filter, the class-mismatch check, the unusable-name check, the
+non-object-schema check, and the scope-shaped-argument check — which means a server
+advertising a `tenant_id` argument fails the **build**.
+
+**A server's result is untrusted text, exactly like a vault document's body**, and goes through
+the same `frame_tool_result`. Because the tool is named after the server, the frame's header
+names it too.
+
+**`ServerGrant::env` is the child's whole environment**, values already resolved by the caller:
+`McpClient::connect` calls `env_clear()`, and this crate reads nothing from its own process
+environment and nothing off disk. A caller that forwards no `PATH` must give an absolute
+command.
+
+**Not here:** HTTP transport, OAuth, server-initiated anything, tool-list-change notifications.
+The set is stdio-only because that is what a server on the owner's own machine is.
+
 ## The containment battery
 
 `tests/containment_direct.rs` builds a scratch world per probe — visible, excluded and cold
 documents, a canary directory outside the root, a symlink out of the root, and a symlinked
-directory — and drives `run_turn` with the scripted provider issuing 30 adversarial tool
-calls at each of the three levels.
+directory — and drives `run_turn` with the scripted provider issuing 34 adversarial tool
+calls at each of the three levels. Four of them run against a **real fake MCP server** the
+client really spawns (see *MCP* below).
 
 **The verdict is always out of band.** A tool returning `Refused` is recorded and is *not*
 the verdict; a boundary that refused and leaked anyway would pass a test that trusted the
@@ -323,9 +378,11 @@ test.** That rule is what keeps the battery honest: a typo in the scripted provi
 renamed tool, or a loop that silently dropped a call would otherwise produce a clean sweep of
 green verdicts for probes that never ran.
 
-Two meta-tests guard the scoring itself: one asserts the out-of-band checks *detect* a real
-change, and one asserts the tools actually work when they are supposed to — otherwise a
-battery of uniformly broken tools would score as perfectly contained.
+Three meta-tests guard the scoring itself: one asserts the out-of-band checks *detect* a real
+change, one asserts the tools actually work when they are supposed to — otherwise a battery of
+uniformly broken tools would score as perfectly contained — and one calls the *granted* MCP
+tool and asserts the fake server's call log records it, because every ungranted verdict rests
+on that file being empty and an empty file is also what a broken log path produces.
 
 The machine-readable summary is written to `target/containment-direct.json`, which D4 turns
 into the bridge's committed record.

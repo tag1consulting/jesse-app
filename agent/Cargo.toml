@@ -1,9 +1,9 @@
 [package]
 name = "jesse-agent"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 license = "Apache-2.0"
-description = "Provider-neutral agent layer for Jesse: one request/response model, one streaming event vocabulary, per-wire adapters (Anthropic Messages, OpenAI Chat Completions, OpenAI Responses), and the tool-calling turn loop that runs on top of them."
+description = "Provider-neutral agent layer for Jesse: one request/response model, one streaming event vocabulary, per-wire adapters (Anthropic Messages, OpenAI Chat Completions, OpenAI Responses), the tool-calling turn loop that runs on top of them, and a stdio MCP client that supplies a second tool source under the same boundary."
 
 # NO DEPENDENCY ON `bridge/` IN EITHER DIRECTION. The bridge is excluded from the root
 # workspace (see the root Cargo.toml) and builds standalone from its own Cargo.lock; a
@@ -33,7 +33,12 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-
 # runs on a current-thread runtime, because the loop needs concurrency (a batch of reads
 # awaiting together) and never parallelism, and a library dependency added for one
 # binary's convenience is paid for by every consumer of the library.
-tokio = { version = "1", features = ["rt", "sync", "time", "macros", "signal"] }
+# `process` and `io-util` are D10's: the MCP client spawns a stdio server per grant and reads
+# newline-delimited JSON-RPC off its stdout. `process` is the only way to own a child's pipes
+# on this runtime, and `io-util` is `BufReader::lines` plus `write_all` — both used
+# exclusively by `src/mcp/client.rs`. NOT `net`: this client speaks stdio only, and an HTTP
+# transport is deliberately out of scope (see `src/mcp/mod.rs`).
+tokio = { version = "1", features = ["rt", "sync", "time", "macros", "signal", "process", "io-util"] }
 # `CancellationToken` — the cancellation primitive `Provider::stream` takes. Hand-rolling
 # one over `AtomicBool` + `Notify` was rejected: cancellation has to compose (D2's loop
 # will hold a turn-scoped parent and hand child tokens to each provider call), and
@@ -69,6 +74,13 @@ ring = "0.17"
 # `Provider` that fabricates answers; the crate's own tests get it through `cfg(test)`,
 # and the eval driver turns it on explicitly.
 scripted = []
+# The FAKE MCP SERVER the containment battery drives (`src/bin/jesse-mcp-probe-server.rs`).
+# OFF by default, and gating it records the same decision `scripted` does: a release build of
+# this crate must contain no binary that pretends to be a server, and a battery fixture is
+# exactly that. `cargo build -p jesse-agent` therefore does not build it; the dev-dependency
+# below turns it on for TEST builds, which is what makes `CARGO_BIN_EXE_jesse-mcp-probe-server`
+# resolve inside the battery.
+mcp-probe-server = []
 
 [dev-dependencies]
 # THE CRATE, AS A DEV-DEPENDENCY ON ITSELF, to turn the `scripted` feature on for test
@@ -78,7 +90,7 @@ scripted = []
 # cases and its loopback-adapter cases would have to live in different files, and the claim
 # that a turn produces IDENTICAL thread contents on all four providers could not be
 # asserted in one function. `cargo build` is unaffected: dev-dependencies are not built.
-jesse-agent = { path = ".", features = ["scripted"] }
+jesse-agent = { path = ".", features = ["scripted", "mcp-probe-server"] }
 # TOML round trip for the persona pack, TESTS ONLY. The pack is serialised with `serde` and
 # the library itself needs no TOML: the bridge already carries a TOML parser for the config
 # file it loads the pack from, and adding a second one to this crate would put a parser in
@@ -90,3 +102,13 @@ toml = { version = "0.8", default-features = false, features = ["parse", "displa
 # needs the full runtime (`net`, `io-util`, `rt-multi-thread`).
 tokio = { version = "1", features = ["full"] }
 serde_json = "1"
+
+# The battery's fake MCP server. A REAL PROCESS the client really spawns, because a battery
+# that mocked the transport would be proving something about a mock: the ungranted-tool
+# probe's whole evidence is that this binary's own log records no `tools/call` for that name.
+#
+# `required-features` is what keeps it out of a release build; see that feature's comment.
+[[bin]]
+name = "jesse-mcp-probe-server"
+path = "src/bin/jesse-mcp-probe-server.rs"
+required-features = ["mcp-probe-server"]
