@@ -689,7 +689,7 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "jesse-agent"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "futures-core",
  "getrandom 0.4.3",
@@ -704,7 +704,7 @@ dependencies = [
 
 [[package]]
 name = "jesse-bridge"
-version = "0.111.1"
+version = "0.112.0"
 dependencies = [
  "axum",
  "chrono",

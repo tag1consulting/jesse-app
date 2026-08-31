@@ -573,6 +573,36 @@ pub struct DirectToml {
     pub qmd_collection: Option<String>,
     pub max_iterations: Option<u32>,
     pub max_tool_calls: Option<u32>,
+    /// `[[direct.mcp]]` — the stdio MCP servers a direct turn may reach, and the tools each
+    /// one grants. EMPTY BY DEFAULT, which is the shipped posture and the one the committed
+    /// containment record speaks for.
+    #[serde(default)]
+    pub mcp: Vec<DirectMcpToml>,
+}
+
+/// One `[[direct.mcp]]` entry as written.
+///
+/// **`env` HOLDS VARIABLE NAMES, NEVER VALUES**, exactly as `[[models]]`'s `auth_token_env`
+/// does: the key is the name the SERVER expects and the value is the name of a variable in
+/// the bridge's own environment. A literal secret written here would be a secret in a config
+/// file that a deploy copies, a backup keeps and a support request pastes.
+#[derive(Deserialize, Debug, Default, Clone)]
+pub struct DirectMcpToml {
+    pub name: Option<String>,
+    pub command: Option<String>,
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// `{ SERVER_VAR = "HOST_ENV_VAR" }` — names on both sides.
+    #[serde(default)]
+    pub env: std::collections::BTreeMap<String, String>,
+    /// The tools this server may expose, BY NAME. There is no pattern form.
+    #[serde(default)]
+    pub tools: Vec<String>,
+    /// `"read"` (the default), `"vault_write"` or `"egress"`.
+    pub class: Option<String>,
+    /// Per-tool overrides of `class`, keyed by the tool's name on the server.
+    #[serde(default)]
+    pub per_tool_class: std::collections::BTreeMap<String, String>,
 }
 
 /// Read the `[direct]` table from the overlay file, defaulted.
@@ -602,7 +632,77 @@ pub fn load_direct_settings(home: &str) -> DirectSettings {
     // answer, and an operator who typed it meant something else.
     out.max_iterations = t.max_iterations.filter(|n| *n > 0);
     out.max_tool_calls = t.max_tool_calls.filter(|n| *n > 0);
+    out.mcp = t.mcp.into_iter().filter_map(direct_mcp_grant).collect();
     out
+}
+
+/// One `[[direct.mcp]]` entry as the harness's grant, or `None` with a named warning.
+///
+/// **A REJECTED ENTRY IS DROPPED, NOT DEFAULTED**, and the direction is what makes that the
+/// safe answer: a dropped grant means FEWER tools, and the startup gate then compares the
+/// narrower `--tools` token against the committed record and refuses to boot if the record
+/// expected the grant. So a typo cannot quietly widen anything, and it cannot quietly narrow
+/// anything either — it either warns and matches the record, or it stops the bridge.
+///
+/// `external_write` is rejected here as well as in the agent crate. It is exposed at no
+/// level, so accepting it would produce a grant that could never expose a tool while looking
+/// in the config file exactly like one that could.
+fn direct_mcp_grant(t: DirectMcpToml) -> Option<DirectMcpGrant> {
+    let warn = |why: &str| {
+        eprintln!("jesse-bridge: [[direct.mcp]] entry ignored — {why}");
+        None::<DirectMcpGrant>
+    };
+    let name = trimmed_nonempty(t.name)?;
+    let Some(command) = trimmed_nonempty(t.command) else {
+        return warn(&format!("'{name}' names no command"));
+    };
+    let tools = clean_list(t.tools);
+    if tools.is_empty() {
+        return warn(&format!(
+            "'{name}' names no tools, so it could expose nothing"
+        ));
+    }
+    let Some(class) = parse_action_class(t.class.as_deref()) else {
+        return warn(&format!(
+            "'{name}' has class {:?}, which is not one of: read, vault_write, egress",
+            t.class.unwrap_or_default()
+        ));
+    };
+    let mut per_tool_class = std::collections::BTreeMap::new();
+    for (tool, c) in t.per_tool_class {
+        match parse_action_class(Some(&c)) {
+            Some(parsed) => {
+                per_tool_class.insert(tool, parsed);
+            }
+            None => {
+                return warn(&format!(
+                    "'{name}' gives '{tool}' class {c:?}, which is not one of: read,                      vault_write, egress"
+                ))
+            }
+        }
+    }
+    Some(DirectMcpGrant {
+        name,
+        command,
+        args: t.args,
+        env: t.env,
+        tools,
+        class,
+        per_tool_class,
+    })
+}
+
+/// A configured action class, or `None` for anything that is not one a grant may name.
+///
+/// `external_write` is deliberately absent: it is exposed at no level, so a config that named
+/// it would be describing a grant that can never expose anything.
+fn parse_action_class(s: Option<&str>) -> Option<jesse_agent::tools::ActionClass> {
+    match s.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+        None | Some("") | Some("read") => Some(jesse_agent::tools::ActionClass::Read),
+        Some("vault_write") => Some(jesse_agent::tools::ActionClass::VaultWrite),
+        Some("egress") => Some(jesse_agent::tools::ActionClass::Egress),
+        _ => None,
+    }
 }
 
 pub fn load_local_models(home: &str) -> Vec<ModelToml> {
@@ -1202,6 +1302,88 @@ dashes = "allowed"
 
         std::env::remove_var("JESSE_CONFIG");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `[[direct.mcp]]` round-trips: names on both sides of `env`, tools named individually,
+    /// and a per-tool class override.
+    #[test]
+    fn a_direct_mcp_grant_loads_with_names_only() {
+        let _g = ENV_LOCK.lock_ok();
+        for k in ["JESSE_CONFIG", "JESSE_STATE_DIR"] {
+            std::env::remove_var(k);
+        }
+        let dir = std::env::temp_dir().join(format!("jesse-direct-mcp-{}", random_hex()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("jesse.local.toml");
+        std::fs::write(
+            &file,
+            "[direct]\nqmd = true\nqmd_collection = \"vault\"\n\n\
+             [[direct.mcp]]\nname = \"qmd\"\ncommand = \"qmd\"\nargs = [\"mcp\"]\n\
+             tools = [\"query\", \"get\"]\nclass = \"read\"\n\
+             env = { QMD_TOKEN = \"JESSE_QMD_TOKEN\" }\n\
+             per_tool_class = { get = \"egress\" }\n",
+        )
+        .unwrap();
+        std::env::set_var("JESSE_CONFIG", &file);
+
+        let d = load_direct_settings("");
+        std::env::remove_var("JESSE_CONFIG");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(d.qmd, "the rest of the table still loaded");
+        assert_eq!(d.mcp.len(), 1);
+        let g = &d.mcp[0];
+        assert_eq!(g.name, "qmd");
+        assert_eq!(g.command, "qmd");
+        assert_eq!(g.args, ["mcp"]);
+        assert_eq!(g.tools, ["query", "get"]);
+        assert_eq!(g.class, jesse_agent::tools::ActionClass::Read);
+        assert_eq!(
+            g.class_for("get"),
+            jesse_agent::tools::ActionClass::Egress,
+            "the per-tool override wins"
+        );
+        // THE SECRET DISCIPLINE: the config holds the NAME of a variable, never a value.
+        assert_eq!(
+            g.env.get("QMD_TOKEN").map(String::as_str),
+            Some("JESSE_QMD_TOKEN")
+        );
+    }
+
+    /// A grant this loader cannot honour is DROPPED with a warning, never defaulted. Dropping
+    /// narrows the turn, and the startup gate then refuses to boot if the record expected the
+    /// grant — so a typo can neither widen anything nor quietly narrow it.
+    #[test]
+    fn an_unusable_direct_mcp_entry_is_dropped_rather_than_defaulted() {
+        let _g = ENV_LOCK.lock_ok();
+        for k in ["JESSE_CONFIG", "JESSE_STATE_DIR"] {
+            std::env::remove_var(k);
+        }
+        let dir = std::env::temp_dir().join(format!("jesse-direct-mcp-bad-{}", random_hex()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("jesse.local.toml");
+        std::fs::write(
+            &file,
+            "[direct]\n\n\
+             [[direct.mcp]]\nname = \"nocommand\"\ntools = [\"a\"]\n\n\
+             [[direct.mcp]]\nname = \"notools\"\ncommand = \"x\"\ntools = []\n\n\
+             [[direct.mcp]]\nname = \"badclass\"\ncommand = \"x\"\ntools = [\"a\"]\n\
+             class = \"external_write\"\n\n\
+             [[direct.mcp]]\nname = \"good\"\ncommand = \"x\"\ntools = [\"a\"]\n",
+        )
+        .unwrap();
+        std::env::set_var("JESSE_CONFIG", &file);
+
+        let d = load_direct_settings("");
+        std::env::remove_var("JESSE_CONFIG");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let names: Vec<&str> = d.mcp.iter().map(|g| g.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["good"],
+            "three unusable entries are dropped and the usable one survives"
+        );
     }
 
     /// A mistyped parameter value warns and leaves the default, rather than failing the parse

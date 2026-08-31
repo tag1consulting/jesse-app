@@ -255,7 +255,9 @@ Answer the question I asked, not the one you wish I had asked.
 #                  `direct` HAS NO BINARY AND SPAWNS NO CHILD. It answers the turn inside
 #                  the bridge, through the agent loop, with eight typed tools over the vault
 #                  (list / search / read / write / edit / move / deliver a file / fetch a
-#                  URL) — no shell, no MCP servers, no CLI. Its vault settings live in the
+#                  URL) — no shell and no CLI. It reaches an MCP server only where a
+#                  `[[direct.mcp]]` block grants one, tool by tool, which is off by
+#                  default. Its vault settings live in the
 #                  `[direct]` table at the bottom of this file, and its containment record is
 #                  `bridge/containment-direct.toml`. See SECURITY.md for what it can and
 #                  cannot reach compared with a claude-code turn.
@@ -348,7 +350,7 @@ Answer the question I asked, not the one you wish I had asked.
 #
 #   1. `wire = "responses"` + `harness = "direct"` — the model's OWN endpoint, driven by the
 #      bridge's in-process agent loop. **PREFER THIS FOR A NON-CODING TURN**, and the reason
-#      is the boundary, not the wire: there is NO SHELL and no subprocess. The model gets
+#      is the boundary, not the wire: there is NO SHELL and no CLI child. The model gets
 #      eight typed tools dispatched by exact name over a store that resolves every path
 #      inside a canonicalised root, tool arguments are schema-constrained (`strict` is
 #      passed through), and `store = false` goes on every request so the provider keeps no
@@ -905,6 +907,75 @@ Answer the question I asked, not the one you wish I had asked.
 # # user gets a partial answer with a reason rather than a bare 504.
 # max_iterations = 24
 # max_tool_calls = 60
+
+# ---------------------------------------------------------------------------
+# [[direct.mcp]] — stdio MCP servers a `direct` turn may reach
+# ---------------------------------------------------------------------------
+#
+# ABSENT IS THE SHIPPED POSTURE: no servers, which is what bridge/containment-direct.toml
+# records and what the startup gate expects. A direct turn then has the eight typed vault
+# tools and nothing else.
+#
+# WHAT A GRANT COSTS YOU BEFORE IT WORKS. The granted tool names are appended to this
+# harness's `--tools` token, and that token is compared to the committed containment record
+# by STRICT EQUALITY at boot. So adding one of these blocks and restarting REFUSES TO START
+# until the record is re-recorded:
+#
+#     cargo test -p jesse-agent --test containment_direct        # runs the probes
+#     cd bridge && cargo run --features containment-probe \
+#         --bin containment-probe -- --harness direct --write     # re-records
+#
+# That is deliberate and it is the whole mechanism: a grant change costs a record change.
+# Nothing here can be widened by an environment variable.
+#
+# THE RULES A GRANT LIVES UNDER:
+#   * every server is listed, and every tool is named INDIVIDUALLY. There is no wildcard
+#     form — `tools = ["*"]` is a tool called `*`, which no server advertises.
+#   * a granted tool the server does not advertise is a startup warning naming it; an
+#     advertised tool nobody granted is not in the manifest at all, so a call to it is
+#     refused by exact-name dispatch like `Bash` is.
+#   * the tool the model sees is `mcp__<server>__<tool>` — the same vocabulary the CLI
+#     harnesses' allowlist uses. An MCP server therefore CANNOT shadow a vault tool: a
+#     server advertising `vault_read` becomes `mcp__qmd__vault_read`.
+#   * the child gets `env_clear()` plus PATH, HOME, TMPDIR, LANG, TZ and whatever `env`
+#     names below — and NOTHING else. This is stricter than the CLI harnesses' MCP
+#     children, which inherit the bridge's whole environment.
+#   * `env` maps the variable the SERVER wants to the NAME of a variable in the bridge's
+#     environment. Never write a token here.
+#   * a server that will not start costs its tools, not the turn. A server that stops
+#     answering is dropped for the rest of that turn and the turn continues without it.
+#
+# THE WORKED EXAMPLE IS `qmd`, this deployment's vault search server — the same server the
+# claude-code turn already runs, granting the same four read-only tools.
+#
+# [[direct.mcp]]
+# name = "qmd"                                  # the `qmd` in mcp__qmd__query
+# command = "qmd"                               # a bare name, resolved off the forwarded PATH
+# args = ["mcp"]
+# tools = ["query", "get", "multi_get", "status"]
+# class = "read"                                # read | vault_write | egress; default read
+# # per_tool_class = { query = "read" }         # overrides for one tool
+# # env = { QMD_TOKEN = "JESSE_QMD_TOKEN" }     # server var = NAME of a bridge env var
+#
+# WHICH QMD PATH TO PREFER, AND WHY IT IS NOT SIMPLY "THE SERVER".
+#
+# There are two ways to give a direct turn qmd, and they are NOT equivalent:
+#
+#   1. `qmd = true` above (the D3 index path). `vault_search` shells out to qmd and then
+#      FILTERS EVERY HIT THROUGH THE STORE: a match inside `exclude` or under a
+#      `cold_prefixes` entry is dropped before the model sees it, and dropped silently,
+#      because telling the model "there is a match you may not see" leaks exactly what the
+#      exclusion hides.
+#   2. `[[direct.mcp]]` with the block above (the D10 server path). `mcp__qmd__query` and
+#      `mcp__qmd__get` answer from qmd's own index, WITH NO STORE FILTER AT ALL. If the
+#      collection covers your vault, a cold or excluded document is reachable through them.
+#
+# So: PREFER (1) FOR VAULT SEARCH whenever the qmd collection overlaps anything `exclude` or
+# `cold_prefixes` names — it is the only path that honours those two settings. Prefer (2)
+# when the collection is something the vault rules have no opinion about (another corpus,
+# another machine's notes), or when you want qmd's own retrieval verbs rather than the one
+# `vault_search` shape. Setting both is fine and is what a deployment with a private vault
+# and a separate public corpus wants; it is not a fallback arrangement in either direction.
 
 # ---------------------------------------------------------------------------
 # Three `direct` models, one per wire the harness drives

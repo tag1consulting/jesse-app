@@ -678,7 +678,12 @@ impl ToolSetBuilder {
 
 /// A tool name both wires accept. Deliberately narrower than either wire's own rule, since
 /// the intersection is what has to hold.
-fn usable_tool_name(name: &str) -> bool {
+///
+/// `pub(crate)` since D10 so [`crate::mcp`] can check a COMPOSED `mcp__<server>__<tool>` name
+/// before a server is started, and report which server and tool composed it. Discovering the
+/// same fact through [`ToolSetError::UnusableName`] would name only the composite and would
+/// cost a process spawn first.
+pub(crate) fn usable_tool_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 64
         && name

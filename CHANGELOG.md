@@ -14,6 +14,88 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [agent 0.6.0, bridge 0.112.0] - 2026-08-31
+
+**A stdio MCP client as a second `ToolSet`, under the boundary that already existed.** The
+direct harness had eight typed vault tools and nothing else while a claude-code turn had
+sixteen MCP servers. This gives it a second tool source with the same posture the repository
+already applies to MCP — every server listed, every granted tool named individually, nothing
+by wildcard, and the containment record changed when the grant changes — and it is **off
+unless configured**, so the shipped record and the shipped behaviour are unchanged.
+
+### Added
+
+- **`agent/src/mcp/client.rs`** — a minimal stdio MCP client. Newline-delimited JSON-RPC 2.0
+  over a spawned child: `initialize`, `notifications/initialized`, `tools/list` (following
+  `nextCursor`, bounded at 20 pages), `tools/call`. Per-request deadlines covering the whole
+  exchange rather than one read, monotonic request ids, one request at a time behind a mutex.
+  **It declares an EMPTY `capabilities` object and speaks nothing else**: no sampling, no
+  elicitation, no roots, no resources, no prompts, no logging, no subscriptions, no progress.
+  Each of those is a channel a server could open *towards* the host, and a request arriving
+  from a server is a protocol violation rather than something to answer. Resources are out for
+  a second reason: they would put content into a turn through a door the manifest does not
+  describe. Server stderr is drained always (an unread pipe wedges the server and looks like a
+  hang), kept as a bounded 20-line ring for an operator, and reaches the trace only as counts.
+- **`McpToolSet` and `CompositeToolSet`** — a `ServerGrant { name, command, args, env, tools,
+  action_class_default, per_tool_class }` connects, lists, and exposes **only the intersection**
+  of what the server advertises and what the grant names, each as `mcp__<server>__<tool>`.
+  Granted-but-not-advertised is a warning naming it; advertised-but-not-granted is absent from
+  the manifest and therefore from the dispatch table, so a call to it is refused exactly as
+  `Bash` is. `McpToolSet` is built on `ToolSetBuilder`, so the level filter, the class-mismatch
+  check, the unusable-name check and the **scope-shaped-argument check** all apply unchanged —
+  a server advertising a `tenant_id` argument fails the build. `CompositeToolSet` combines the
+  vault set and any MCP sets with a name-collision check at build time.
+- **`[[direct.mcp]]` in the bridge config**, with `[[models]]`'s secret discipline: `env` maps
+  the variable the server wants to the **NAME** of a variable in the bridge's environment, and
+  the value is read at turn time so nothing secret is ever held in `Config`. A malformed entry
+  is dropped with a named warning; a structurally impossible grant (a duplicate server name, an
+  unusable composed tool name, an `external_write` class) is a **startup error**.
+- **A documented `qmd` block** in `jesse.example.toml`, granting the same four read-only tools
+  the claude-code turn already runs.
+- **Four MCP probes in the containment battery** (90 → 102 probes), driving a real fake stdio
+  server (`agent/src/bin/jesse-mcp-probe-server.rs`, a `[[bin]]` behind a feature so no release
+  build contains it): an ungranted tool, a result carrying a forged frame closer and a
+  directive, a server that never answers, and a server claiming a vault tool's name. Two are
+  scored against a file **the server process writes**, one line per `tools/call` it received —
+  and a third meta-test calls the *granted* tool to prove that recorder works, because every
+  ungranted verdict rests on that file being empty and an empty file is also what a broken log
+  path produces.
+
+### Changed
+
+- **The `direct` harness's `capability_args` carries the sorted granted MCP names**, appended
+  to its `--tools` token. That is the whole enforcement: the token is compared to
+  `bridge/containment-direct.toml` by strict equality at boot, so adding a server and
+  restarting **refuses to start** until the battery is re-run and the record re-committed. A
+  deployment with no `[[direct.mcp]]` produces byte-for-byte the token it produced before, which
+  is why the shipped record still matches.
+- **The `direct` record's MCP axis is now populated from config** rather than hardcoded `none`.
+  `DIRECT_SHIPPED_ROWS` used to state that the axis was empty and always would be, on the
+  reasoning that this harness starts no processes; a granted stdio server *is* a process, so
+  that reasoning expired and the doc says so. The row count is unchanged — a deployment grants
+  one set of servers, not a choice of sets.
+- **A granted server's child gets `env_clear()` plus `PATH`, `HOME`, `TMPDIR`, `LANG`, `TZ`**
+  and whatever the grant names. This is **stricter than anything else in this repository**: the
+  CLI harnesses hand their sixteen MCP children the bridge's whole environment, so every
+  credential the bridge holds is visible to every server it starts.
+- `SECURITY.md` gains an MCP subsection under the `direct` harness; `agent/README.md` gains an
+  MCP section; `bridge/containment-direct.toml` re-recorded at 102 probes.
+
+### Found
+
+- **A granted `mcp__qmd__*` does NOT inherit the vault's visibility rules, and the index path
+  does.** `[direct] qmd = true` routes `vault_search` through the qmd binary and then filters
+  every hit through the store, so a match inside `exclude` or under `cold_prefixes` is dropped
+  before the model sees it. A granted `mcp__qmd__query` / `mcp__qmd__get` answers from qmd's own
+  index with **no store filter at all**, so if the collection covers the vault those tools reach
+  documents the vault rules hide. The two qmd paths are therefore not a preference and a
+  fallback — they are different boundaries, and `jesse.example.toml` and `SECURITY.md` both say
+  which to use when.
+- **The `mcp__<server>__<tool>` prefix makes shadowing a vault tool structurally impossible**, so
+  the composite's collision check is not for that case. What it actually catches is the one
+  ambiguity the prefix admits: two grants composing to one name because `__` appears inside a
+  server or tool name (`a` + `b__c` and `a__b` + `c`). Both facts are asserted.
+
 ## [Phase 1 gate report] - 2026-08-31
 
 **No component changed, so no version moved.** This entry records a measurement, because the

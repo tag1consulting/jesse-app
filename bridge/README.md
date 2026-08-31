@@ -488,15 +488,24 @@ The first two are `Runner::Spawned`; the third is `Runner::InProcess`. A model p
 harness with `harness = "..."`, and the model chip in the app picks the model — so a `direct`
 model is selected exactly like any other.
 
-**`direct` is different in kind, not in degree.** It has no shell, no subprocesses and no MCP
-servers. Its tools are `vault_list`, `vault_search`, `vault_read`, `fetch_url` at `read`, plus
+**`direct` is different in kind, not in degree.** It has no shell and no CLI child. Its tools
+are `vault_list`, `vault_search`, `vault_read`, `fetch_url` at `read`, plus
 `vault_write`, `vault_edit`, `vault_move`, `deliver_artifact` at `write` — and `basic` is a
 genuinely empty tool set, which is the level Codex cannot express at all. There is no argv to
 record, so `Harness::capability_args` records the **manifest** (`["--tools", "a,b,c"]`, sorted)
 and the startup gate compares that by the same strict equality it uses for the other two.
 
+Since 0.112.0 it can also be granted **stdio MCP servers** (`[[direct.mcp]]`), which is the one
+place it starts a child process. Off by default and off in the shipped record. Each granted
+tool is named individually — there is no wildcard form — and appears as
+`mcp__<server>__<tool>`, so the granted names join the `--tools` token above and **a grant
+change costs a record change**: add a server and the bridge refuses to start until the battery
+is re-run and `containment-direct.toml` re-committed. Its child gets `env_clear()` plus five
+named variables, which is stricter than the MCP children the two CLI harnesses launch. See
+[`../SECURITY.md`](../SECURITY.md#mcp-servers-on-a-direct-turn-directmcp-01120).
+
 Its containment record is generated rather than hand-written, from the agent crate's own
-structural battery — 90 adversarial tool calls at three levels, scored out of band, with a
+structural battery — 102 adversarial tool calls at three levels, scored out of band, with a
 scripted provider and no model:
 
 ```

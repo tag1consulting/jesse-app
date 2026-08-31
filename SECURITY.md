@@ -17,9 +17,13 @@ boundaries the bridge enforces and the deployment posture it assumes.
 
 ## The `direct` harness (no child process, no shell)
 
-A `harness = "direct"` model is answered by the agent loop **inside the bridge**, with no CLI,
-no subprocess and no MCP servers. Its boundary is therefore a different mechanism from the
-other two harnesses', and this section states what it is, what proves it, and what it gives up.
+A `harness = "direct"` model is answered by the agent loop **inside the bridge**, with no CLI
+and no shell. Its boundary is therefore a different mechanism from the other two harnesses',
+and this section states what it is, what proves it, and what it gives up.
+
+Since bridge 0.112.0 it can also be granted **stdio MCP servers** (`[[direct.mcp]]`), which is
+the one place it starts a child process. That is off by default, it is what the committed
+record speaks for, and its posture has its own subsection below.
 
 ### The boundary
 
@@ -45,8 +49,9 @@ other two harnesses', and this section states what it is, what proves it, and wh
   egress-class tool, but its allowlist is **empty unless configured** (`[direct] fetch_allow`),
   so by default every URL is refused. `file://` and other non-HTTP schemes are refused whatever
   the allowlist says.
-- **No shell.** There is no `Bash`, no `Skill`, no exec of any kind, and nothing that takes a
-  command string.
+- **No shell.** There is no `Bash`, no `Skill`, and nothing that takes a command string. The
+  one exec on this path is an MCP server started from `[[direct.mcp]]`, whose command and
+  arguments are config the model never touches — see the MCP subsection below.
 - **Writes take the same vault lock the CLI harnesses take**, through the same `LockBroker` —
   called directly rather than through a hook subprocess, inside the same critical section as
   the write. The compare-and-swap is the store's: `vault_read` hands the model a content hash
@@ -54,7 +59,7 @@ other two harnesses', and this section states what it is, what proves it, and wh
 
 ### What proves it
 
-`agent/tests/containment_direct.rs` — 90 adversarial tool calls, at all three levels, scored
+`agent/tests/containment_direct.rs` — 102 adversarial tool calls, at all three levels, scored
 **out of band**: canary strings must appear in no tool result, no provider request body, no
 thread file on disk and no trace; the whole sibling tree is hashed before and after and no file
 outside the root may change; at `basic` and `read` no file inside the root may change either.
@@ -67,6 +72,60 @@ than the other two harnesses' batteries (every escape is definitely attempted, r
 attempted if the model thought of it) and silent about model behaviour, which those batteries
 do cover. `bridge/containment-direct.toml` is generated from its summary and gates startup the
 same way the other two records do.
+
+### MCP servers on a direct turn (`[[direct.mcp]]`, 0.112.0)
+
+**Off unless configured, and the shipped posture is off.** `bridge/containment-direct.toml` is
+recorded with `mcp_set = "none"`, and a deployment that grants a server records rows naming it.
+
+- **The grant is a list of names.** `[[direct.mcp]] tools = [...]` names each tool
+  individually. There is no wildcard form, in the config or in the type behind it. This is the
+  same rule `DEFAULT_ALLOWED_TOOLS` follows for the CLI harnesses' sixteen servers, where the
+  two `mcp__build__*` entries are spelled out for exactly this reason.
+- **A granted tool becomes `mcp__<server>__<tool>`**, the vocabulary the rest of this project
+  already uses. One consequence is structural: **an MCP server cannot shadow a vault tool.** A
+  server advertising `vault_read` is exposed as `mcp__qmd__vault_read`, so `vault_read` still
+  resolves to the jailed store tool.
+- **An ungranted tool is unreachable, not merely denied.** It is not in the manifest, so it is
+  not in the dispatch table; a call to it is refused by the same exact-name dispatch that
+  refuses `Bash`. The battery proves the strong half out of band: a fake server records every
+  `tools/call` it receives to a file, and no ungranted name ever appears in it.
+- **A grant change costs a record change.** The sorted granted names are appended to this
+  harness's `--tools` token, which the startup gate compares to the committed record by strict
+  equality. Adding a server and restarting refuses to boot until the battery has been re-run
+  and the record re-committed. No environment variable can widen it.
+- **The child's environment is `env_clear()` plus five named variables** — `PATH`, `HOME`,
+  `TMPDIR`, `LANG`, `TZ` — and whatever the grant names explicitly. **This is stricter than
+  anything else in this repository**: the CLI harnesses hand their MCP children the bridge's
+  whole environment, so every credential the bridge holds is visible to every server it starts.
+  Config holds variable NAMES; values are read at turn time and never stored.
+- **The client speaks four messages and declares no capabilities.** `initialize`,
+  `notifications/initialized`, `tools/list`, `tools/call`. No sampling (a server cannot ask
+  this host to run an inference), no elicitation (it cannot ask this host to put a question to
+  a person), no roots, no resources or prompts (a server cannot put content into a turn through
+  a door the manifest does not describe). A request arriving from a server is a protocol
+  violation and drops the connection.
+- **A misbehaving server costs one tool call, not the turn.** A protocol violation or a timeout
+  drops that server for the rest of the turn; every later call to it fails immediately and the
+  turn continues. A server that will not start at all contributes no tools and warns. The
+  direction is what makes this safe: the live set is always a **subset** of what the record
+  commits, never a superset.
+- **Results are framed like every other tool result**, by the same single function, so a
+  server's answer arrives as data with the server named in the frame header. A result carrying
+  a forged frame closer and a directive is a probe in the battery; the closer is neutralised
+  and the directive is inert.
+- **A server is started per turn and shut down with it.** No server outlives the request that
+  justified it.
+
+**WHAT A GRANT DOES NOT INHERIT: the vault's own visibility rules.** This is the sharp edge and
+it is worth stating on its own. `[direct] qmd = true` routes `vault_search` through the qmd
+binary and then **filters every hit through the store**, so a match inside `exclude` or under
+`cold_prefixes` is dropped before the model sees it. A granted `mcp__qmd__query` /
+`mcp__qmd__get` answers from qmd's own index with **no store filter at all**. If the collection
+covers the vault, those two tools can reach a document the vault rules hide. Prefer the index
+path for vault search whenever the collection overlaps anything `exclude` or `cold_prefixes`
+names; grant the server for corpora those settings have no opinion about. `jesse.example.toml`
+carries the same note beside the block.
 
 ### The accepted asymmetry: this harness has none of the shell surface
 
@@ -84,9 +143,11 @@ cannot, and the gap is the whole point rather than a limitation to close:
   UniFi, Proxmox) and several of which reach correspondence and documents.
 - **`WebSearch` / `WebFetch`** at the root, with no host allowlist.
 
-A `direct` turn has **none** of it. It cannot run a command, invoke a skill, reach the network
-except through an explicitly allowlisted host, touch Home Assistant, read mail, or see anything
-outside the vault root. That means it also cannot do the things those grants exist for — the
+A `direct` turn has **none** of it by default. It cannot run a command, invoke a skill, reach
+the network except through an explicitly allowlisted host, touch Home Assistant, read mail, or
+see anything outside the vault root. `[[direct.mcp]]` narrows that gap by exactly as much as an
+operator writes into it, one named tool at a time, against a record that has to be re-taken
+each time. That means it also cannot do the things those grants exist for — the
 diet scripts, the dashboard regeneration, the morning routine — and a model asked to do them
 should say so rather than pretend. The bridge tells it so explicitly: the operating manual is
 framed with a header stating that instructions requiring a shell or a program cannot be

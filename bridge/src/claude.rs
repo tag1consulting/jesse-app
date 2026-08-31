@@ -1099,6 +1099,11 @@ async fn run_in_process_turn(
         // in-process harness's tool set is its own, handed to its loop rather than launched
         // as child processes, and inventing a server set for it here would describe a
         // posture nothing spawns.
+        //
+        // THIS FIELD IS STILL NOT WHERE A DIRECT TURN'S SERVERS COME FROM, since D10 gave it
+        // some. It carries a `--mcp-config` JSON for a CLI child; `[[direct.mcp]]` carries
+        // grants for a client this process owns, and the direct harness reads that and never
+        // this.
         cfg.main_mcp_config.as_deref().unwrap_or(EMPTY_MCP_CONFIG),
         job_id,
     );
