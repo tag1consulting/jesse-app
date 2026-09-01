@@ -101,6 +101,10 @@ pub struct RunReport {
     /// The wire, when the driver has one of its own.
     #[serde(default)]
     pub wire: Option<String>,
+    /// The search index that answered, when the driver owns one. Absent from every run
+    /// recorded before D12, which is why it defaults rather than being required.
+    #[serde(default)]
+    pub index: Option<String>,
     pub endpoint: Option<String>,
     pub model: Option<String>,
     pub mock: bool,
@@ -223,6 +227,7 @@ pub fn run_suite(suite: &Suite, cfg: &RunConfig) -> Result<RunReport, String> {
         suite: suite.name.clone(),
         driver: cfg.driver.id().to_string(),
         wire: cfg.driver.wire(),
+        index: cfg.driver.index(),
         endpoint: cfg.driver.endpoint(),
         model: cfg.driver.model(),
         mock: cfg.driver.is_mock(),
@@ -285,10 +290,11 @@ pub fn scorecard(report: &RunReport) -> String {
     // only in which driver produced them are the comparison this harness now exists to
     // make, and a scorecard that did not say which is which would be unreadable a week later.
     out.push_str(&format!(
-        "Driver: `{}` · wire: {} · model: {}\n\n",
+        "Driver: `{}` · wire: {} · model: {} · index: {}\n\n",
         report.driver,
         report.wire.as_deref().unwrap_or("n/a"),
         report.model.as_deref().unwrap_or("default"),
+        report.index.as_deref().unwrap_or("n/a"),
     ));
     out.push_str(&format!("Target: {target}\n\n"));
     out.push_str("| Class | Pass rate | Mean latency | Mean tool calls |\n");
@@ -350,6 +356,7 @@ mod tests {
             suite: "s".into(),
             driver: "direct".into(),
             wire: Some("chat".into()),
+            index: Some("grep".into()),
             endpoint: Some("http://example".into()),
             model: Some("m".into()),
             mock: false,

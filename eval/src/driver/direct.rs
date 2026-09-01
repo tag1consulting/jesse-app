@@ -38,7 +38,7 @@ use super::{BoxFuture, Driver, PreparedWorkspace, TaskRun};
 use crate::mapping::map_allowed_tools;
 use crate::suite::Task;
 use crate::transcript::Usage;
-use jesse_agent::index::GrepIndex;
+use jesse_agent::index::{GrepIndex, QmdConfig, QmdIndex, SearchIndex};
 use jesse_agent::provider::scripted::{ScriptFixture, ScriptedProvider};
 use jesse_agent::store::NoGuard;
 use jesse_agent::tools::vault::{vault_tool_set, FetchConfig, VaultContext};
@@ -49,7 +49,7 @@ use jesse_agent::{
     SystemBlock, SystemClock, Thinking, Tool, ToolSet, ToolSpec, TurnStopReason, Wire,
 };
 use std::collections::BTreeSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
@@ -85,6 +85,64 @@ pub struct DirectDriver {
     /// The persona every task inherits when it names none.
     pub persona: PersonaPack,
     pub thinking: Thinking,
+    /// Which index a task's `vault_search` goes through.
+    ///
+    /// **THIS DRIVER USED TO HARDCODE GREP**, which is why D9's F4 could not be measured
+    /// here at all: the deployed bridge selects `QmdIndex` whenever `[direct] qmd = true`
+    /// and a collection is named, so an eval that could only build the other one was
+    /// measuring a configuration nobody runs. See [`EvalIndex`].
+    pub index: EvalIndex,
+}
+
+/// The index an eval run searches with — the same two the bridge chooses between.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum EvalIndex {
+    /// The built-in walk over the store. The default, and the only one CI can run: there is
+    /// no `qmd` binary on a fresh machine, which is the whole reason the fallback exists.
+    #[default]
+    Grep,
+    /// `qmd`, filtered through the store, exactly as `bridge/src/harness/direct.rs` builds
+    /// it. `collection` is required and never guessed, for the reason `QmdConfig` gives.
+    Qmd {
+        collection: String,
+        /// The binary. `None` means the bare name `qmd`, resolved on `PATH`.
+        binary: Option<PathBuf>,
+    },
+}
+
+impl EvalIndex {
+    /// The name the scorecard and `results.json` report, so a run says which index answered.
+    pub fn label(&self) -> &'static str {
+        match self {
+            EvalIndex::Grep => "grep",
+            EvalIndex::Qmd { .. } => "qmd",
+        }
+    }
+
+    /// Build the index over `store`.
+    ///
+    /// MIRRORS `direct_index` IN `bridge/src/harness/direct.rs`, and is a named function for
+    /// the same reason `persona_blocks` is: a test can call it and look at the hits, which
+    /// the run path cannot offer because a transcript records tool CALLS and never tool
+    /// results — those are vault content.
+    pub fn build<S>(&self, store: S) -> Arc<dyn SearchIndex>
+    where
+        S: jesse_agent::DocumentStore + Clone + 'static,
+    {
+        match self {
+            EvalIndex::Grep => Arc::new(GrepIndex::new(store)),
+            EvalIndex::Qmd { collection, binary } => {
+                let mut qc = QmdConfig {
+                    collection: collection.clone(),
+                    ..Default::default()
+                };
+                if let Some(b) = binary {
+                    qc.binary = b.clone();
+                }
+                Arc::new(QmdIndex::new(store, qc))
+            }
+        }
+    }
 }
 
 impl Driver for DirectDriver {
@@ -94,6 +152,10 @@ impl Driver for DirectDriver {
 
     fn endpoint(&self) -> Option<String> {
         self.base_url.clone()
+    }
+
+    fn index(&self) -> Option<String> {
+        Some(self.index.label().to_string())
     }
 
     fn wire(&self) -> Option<String> {
@@ -149,7 +211,9 @@ impl DirectDriver {
             FsVaultStore::open(&workspace.dir)
                 .map_err(|e| format!("could not open {}: {e}", workspace.dir.display()))?,
         );
-        let index = Arc::new(GrepIndex::new(store.clone()));
+        // THE DEPLOYED SELECTION, not a hardcoded one. Mirrors `direct_index` in
+        // `bridge/src/harness/direct.rs`: qmd when a collection is named, grep otherwise.
+        let index: Arc<dyn SearchIndex> = self.index.build(store.clone());
         let vault = Arc::new(VaultContext {
             store,
             index,
@@ -480,5 +544,164 @@ mod tests {
         let mut v = serde_json::json!({"h": "{{hash:nope.md}}"});
         substitute(&mut v, dir.path());
         assert_eq!(v["h"], "{{hash:nope.md}}");
+    }
+
+    // ---- D12: the index the bridge selects, buildable and observable here ---------------
+
+    /// A `qmd` stand-in: prints `canned` for a search, succeeds on `--version`, and TOUCHES
+    /// A MARKER so a caller can prove the binary was actually reached.
+    ///
+    /// `/bin/sh`, and deliberately free of escapes — CI's `/bin/sh` is dash, where the
+    /// `printf '\xNN'` a bash author reaches for emits the literal text instead.
+    fn fake_qmd(dir: &Path, canned: &str) -> std::path::PathBuf {
+        let json = dir.join("hits.json");
+        std::fs::write(&json, canned).unwrap();
+        let bin = dir.join("qmd");
+        std::fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'qmd 0.0.0-fake'; exit 0; fi\n\
+                 : > {marker}\ncat {json}\n",
+                marker = dir.join("was-run").display(),
+                json = json.display(),
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        bin
+    }
+
+    /// Search `store_files` through `index`, returning the hit ids.
+    fn search_ids(index: &EvalIndex, dir: &Path, files: &[(&str, &str)]) -> Vec<String> {
+        for (rel, body) in files {
+            let p = dir.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, body).unwrap();
+        }
+        let store = std::sync::Arc::new(FsVaultStore::open(dir).unwrap());
+        let idx = index.build(store);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(idx.search(
+            &eval_scope(),
+            "launch",
+            10,
+            jesse_agent::SearchMode::Lexical,
+        ))
+        .expect("search returns")
+        .hits
+        .into_iter()
+        .map(|h| h.id.to_string())
+        .collect()
+    }
+
+    /// SELECTION. `--index qmd` reaches the binary, and the hit it invents comes back even
+    /// though the word appears in no document — which is what makes this falsifiable: the
+    /// grep index physically cannot return this id.
+    #[test]
+    fn the_qmd_index_is_the_one_that_answers() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let bin = fake_qmd(
+            home.path(),
+            r#"[{"file":"qmd://vault/notes/only-qmd-knows.md","score":9.5,"line":1,"snippet":"x"}]"#,
+        );
+        let index = EvalIndex::Qmd {
+            collection: "vault".into(),
+            binary: Some(bin),
+        };
+        let ids = search_ids(
+            &index,
+            dir.path(),
+            // The query term is in NO document, so grep returns nothing here.
+            &[("notes/only-qmd-knows.md", "# Only qmd knows\n\nnothing\n")],
+        );
+        assert!(
+            home.path().join("was-run").exists(),
+            "the qmd binary was never spawned"
+        );
+        assert_eq!(ids, vec!["notes/only-qmd-knows.md".to_string()]);
+        assert_eq!(index.label(), "qmd");
+    }
+
+    /// THE CONTROL. The same fixture on the default index returns nothing, so the assertion
+    /// above is about the index and not about the fixture.
+    #[test]
+    fn the_grep_index_cannot_answer_what_only_qmd_knows() {
+        let dir = tempfile::tempdir().unwrap();
+        let ids = search_ids(
+            &EvalIndex::Grep,
+            dir.path(),
+            &[("notes/only-qmd-knows.md", "# Only qmd knows\n\nnothing\n")],
+        );
+        assert!(ids.is_empty(), "grep should find nothing: {ids:?}");
+    }
+
+    /// THE STORE FILTER, on the path the eval now runs. qmd is told about a cold document
+    /// and a document that does not exist; the store is the boundary, so neither comes back
+    /// and the one visible hit does. This is the property D12's one-boundary rewrite is
+    /// about: qmd is an index BEHIND the store, never a second way around it.
+    #[test]
+    fn a_qmd_hit_the_store_will_not_open_is_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let bin = fake_qmd(
+            home.path(),
+            r#"[{"file":"qmd://vault/private/secret.md","score":9.9,"line":1,"snippet":"COLDBODY"},
+                {"file":"qmd://vault/notes/ghost.md","score":9.8,"line":1,"snippet":"x"},
+                {"file":"qmd://vault/notes/real.md","score":1.0,"line":1,"snippet":"x"}]"#,
+        );
+        let ids = search_ids(
+            &EvalIndex::Qmd {
+                collection: "vault".into(),
+                binary: Some(bin),
+            },
+            dir.path(),
+            &[
+                // Cold by its own front matter: `stat` reports Cold and the filter drops it.
+                (
+                    "private/secret.md",
+                    "---\nvisibility: cold\n---\n# Secret\n\nCOLDBODY\n",
+                ),
+                ("notes/real.md", "# Real\n\nthe launch is Tuesday\n"),
+                // `notes/ghost.md` is deliberately never written: a stale index's hit for a
+                // document the store cannot stat must vanish, not fail the search.
+            ],
+        );
+        assert_eq!(
+            ids,
+            vec!["notes/real.md".to_string()],
+            "only the document the store will open may come back"
+        );
+    }
+
+    /// A COLLECTION THAT DOES NOT MATCH IS NOT SILENTLY STRIPPED. qmd reports a hit as
+    /// `qmd://<collection>/<path>`; a mismatched name means the ids in front of us belong to
+    /// some other collection, and guessing at them would resolve to the wrong documents.
+    #[test]
+    fn hits_from_another_collection_are_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let bin = fake_qmd(
+            home.path(),
+            r#"[{"file":"qmd://someone-elses/notes/real.md","score":9.0,"line":1,"snippet":"x"}]"#,
+        );
+        let ids = search_ids(
+            &EvalIndex::Qmd {
+                collection: "vault".into(),
+                binary: Some(bin),
+            },
+            dir.path(),
+            &[("notes/real.md", "# Real\n\nthe launch is Tuesday\n")],
+        );
+        assert!(
+            ids.is_empty(),
+            "wrong collection must yield nothing: {ids:?}"
+        );
     }
 }

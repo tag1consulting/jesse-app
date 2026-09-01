@@ -38,6 +38,8 @@
 //! honest; hiding would be a lie the assistant could detect by listing.
 
 use std::collections::BTreeSet;
+use std::fs::File;
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
 use crate::provider::BoxFuture;
@@ -64,6 +66,72 @@ pub const READ_MAX_BYTES: usize = 20_000;
 
 /// The largest body `write` accepts.
 pub const WRITE_MAX_BYTES: usize = 1_000_000;
+
+/// How much of a document's head is held while its metadata is derived, in bytes.
+///
+/// Metadata needs two things from the content — the first level-one heading in the first 50
+/// lines, and whether the front matter says `visibility: cold` — and both live at the very
+/// top of a file. Before D12 the whole file was read to find them, which is why one large
+/// document in the vault could cost gigabytes during a plain `list`. A head this size holds
+/// 50 lines averaging 1.3 KB each; past that the title falls back to the file stem, which is
+/// the same fallback a document with no heading already gets.
+pub const META_HEAD_BYTES: usize = 64 * 1024;
+
+/// The chunk a streaming read pulls at a time. Fixed, so nothing here is ever proportional
+/// to the size of the file being read.
+const STREAM_CHUNK_BYTES: usize = 64 * 1024;
+
+/// What one streaming pass over a file yields.
+struct FileScan {
+    /// The first [`META_HEAD_BYTES`] of the file, trimmed back to the last complete line
+    /// unless the whole file is shorter than that. Trimmed because a title derived from
+    /// half a line is a wrong title, where no title at all is an honest fallback.
+    head: Vec<u8>,
+    /// SHA-256 of the WHOLE file, computed incrementally. Byte-identical to hashing the
+    /// bytes in one buffer — this is the compare-and-swap's hash and it cannot change.
+    hash: ContentHash,
+}
+
+/// Read a file once, in fixed chunks, keeping only a bounded head and a rolling digest.
+///
+/// **THIS IS THE FUNCTION F4 WAS ABOUT.** Every caller below used to reach the same facts by
+/// materialising the file — often more than once, and then again as lossy UTF-8 — so peak
+/// memory tracked the largest document in the vault. Here the whole file is still *read*,
+/// because a content hash is not derivable from a prefix, but at no point is more than a
+/// chunk plus the head resident.
+fn scan_file(path: &Path) -> std::io::Result<FileScan> {
+    let mut f = File::open(path)?;
+    let mut ctx = ring::digest::Context::new(&ring::digest::SHA256);
+    let mut buf = vec![0u8; STREAM_CHUNK_BYTES];
+    let mut head: Vec<u8> = Vec::new();
+    let mut size = 0u64;
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        let chunk = &buf[..n];
+        ctx.update(chunk);
+        size += n as u64;
+        if head.len() < META_HEAD_BYTES {
+            let want = META_HEAD_BYTES - head.len();
+            head.extend_from_slice(&chunk[..want.min(n)]);
+        }
+    }
+    // A head cut mid-line would hand `title_of` half a heading. Trim to the last complete
+    // line, unless we have the whole file, in which case the last line IS complete enough.
+    let complete = size as usize <= head.len();
+    if !complete {
+        if let Some(cut) = head.iter().rposition(|b| *b == b'\n') {
+            head.truncate(cut + 1);
+        }
+    }
+    let digest = ctx.finish();
+    Ok(FileScan {
+        head,
+        hash: ContentHash::from_digest(digest.as_ref()),
+    })
+}
 
 // ===========================================================================
 // Exclusion patterns
@@ -307,22 +375,29 @@ impl FsVaultStore {
     }
 
     /// Build metadata for a path that is known to be inside the jail and not excluded.
+    ///
+    /// STREAMING SINCE D12. This used to read the file whole and copy it again as lossy
+    /// UTF-8, purely to find a heading in the first 50 lines — so a `list` of 200 documents
+    /// paid the full bytes of all 200 before the caller saw a single title, and one very
+    /// large document in the page cost its own size several times over. It now reads in
+    /// fixed chunks, keeping a bounded head for the title and front matter and a rolling
+    /// digest for the hash.
     fn meta_of(&self, id: &DocumentId, path: &Path) -> Result<DocumentMeta, StoreError> {
-        let bytes = std::fs::read(path).map_err(|e| match e.kind() {
+        let scan = scan_file(path).map_err(|e| match e.kind() {
             std::io::ErrorKind::NotFound => StoreError::NotFound,
             _ => StoreError::Io(format!("cannot read {id}: {e}")),
         })?;
         let md = std::fs::metadata(path).map_err(|e| StoreError::Io(e.to_string()))?;
         // LOSSY, never an error. A document with one invalid byte is still a document, and
         // refusing it would make the model retry the same call forever.
-        let text = String::from_utf8_lossy(&bytes);
-        let visibility = if self.cold_by_path(id) || front_matter_says_cold(&text) {
+        let head = String::from_utf8_lossy(&scan.head);
+        let visibility = if self.cold_by_path(id) || front_matter_says_cold(&head) {
             Visibility::Cold
         } else {
             Visibility::Hot
         };
         Ok(DocumentMeta {
-            title: title_of(&text, id),
+            title: title_of(&head, id),
             kind: kind_of(id),
             size_bytes: md.len(),
             modified_at: md
@@ -330,9 +405,58 @@ impl FsVaultStore {
                 .map(rfc3339_utc)
                 .unwrap_or_else(|_| "1970-01-01T00:00:00Z".into()),
             visibility,
-            content_hash: ContentHash::of(&bytes),
+            content_hash: scan.hash,
             id: id.clone(),
         })
+    }
+
+    /// The bytes of `path` that a read of `range` needs, capped at `cap` bytes.
+    ///
+    /// Streams in fixed chunks and appends only the wanted lines, so the buffer is bounded
+    /// by the cap however large the file or its longest line. Returns the bytes and the
+    /// file's total line count under `str::lines()` semantics.
+    fn ranged_bytes(
+        path: &Path,
+        range: Option<LineRange>,
+        cap: usize,
+    ) -> std::io::Result<(Vec<u8>, usize)> {
+        let mut f = File::open(path)?;
+        let mut buf = vec![0u8; STREAM_CHUNK_BYTES];
+        let mut out: Vec<u8> = Vec::new();
+        let mut line = 1usize;
+        let mut newlines = 0usize;
+        let mut last_byte: Option<u8> = None;
+        // A few bytes of headroom so a multi-byte character straddling the cap is captured
+        // whole; the char-boundary truncation downstream then cuts cleanly.
+        let hard = cap.saturating_add(8);
+        loop {
+            let n = f.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            let chunk = &buf[..n];
+            newlines += chunk.iter().filter(|b| **b == b'\n').count();
+            last_byte = chunk.last().copied().or(last_byte);
+            // Keep reading past the cap: `total_lines` is a fact about the whole file, and
+            // a ranged read that lied about it would make the model ask for a range that
+            // does not exist. Nothing is retained, so this costs time and not memory.
+            if out.len() < hard {
+                for &b in chunk {
+                    let wanted = match range {
+                        None => true,
+                        Some(r) => line >= r.from && line <= r.to,
+                    };
+                    if wanted && out.len() < hard {
+                        out.push(b);
+                    }
+                    if b == b'\n' {
+                        line += 1;
+                    }
+                }
+            }
+        }
+        let total_lines = newlines + usize::from(matches!(last_byte, Some(b) if b != b'\n'));
+        Ok((out, total_lines))
     }
 
     /// Walk the visible documents under a prefix, in sorted order.
@@ -534,19 +658,16 @@ impl DocumentStore for FsVaultStore {
                     "cold document; not readable by the assistant".into(),
                 ));
             }
-            let bytes = std::fs::read(&path).map_err(|e| StoreError::Io(e.to_string()))?;
-            let text = String::from_utf8_lossy(&bytes).to_string();
-            let total_lines = text.lines().count();
-
-            let body = match range {
-                Some(r) => text
-                    .lines()
-                    .skip(r.from - 1)
-                    .take(r.to.saturating_sub(r.from) + 1)
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-                None => text,
-            };
+            // STREAMED, and capped WHILE reading rather than after. The old shape built
+            // the whole file as a `String`, sliced the range out of it and only then
+            // applied `READ_MAX_BYTES`, so a caller asking for three lines of a very large
+            // document still paid for all of it. See `ranged_bytes`.
+            let (bytes, total_lines) = Self::ranged_bytes(&path, range, READ_MAX_BYTES)
+                .map_err(|e| StoreError::Io(e.to_string()))?;
+            let body = String::from_utf8_lossy(&bytes).to_string();
+            // A range's lines arrive with their newlines attached; the old `join` produced
+            // no trailing one, and callers compare against that.
+            let body = body.trim_end_matches('\n').to_string();
             let body = if body.len() > READ_MAX_BYTES {
                 let end = body
                     .char_indices()

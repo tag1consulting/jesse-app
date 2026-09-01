@@ -8,11 +8,12 @@ use jesse_bridge::{
     app, binary_exists, bind_broker, build_apns, detect_binary_drift,
     detect_unresolved_mcp_servers, env_string, env_truthy, export_mcp_server_env, harness_bin_env,
     harness_default_bin, harnesses_in_use, is_bind_allowed, load_local_models,
-    manual_pairing_lines, pairing_payload, prune_direct_state, qr_env_tristate, sentinel_advert,
-    serve_broker, settings_permission_drift, show_qr_opt_in, show_token_opt_in,
-    spawn_eviction_task, spawn_scheduler, spawn_session_gc_task, start_health_prober,
-    validate_model_config, AppState, Config, ConfigError, QrArt, Runner, TokenVisibility,
-    BINARY_DRIFT, CONTAINMENT_RECORDS, SETTINGS_DRIFT, UNRESOLVED_MCP,
+    manual_pairing_lines, pairing_payload, prune_direct_state, qr_env_tristate, search_scale,
+    sentinel_advert, serve_broker, settings_permission_drift, shadowing_direct_mcp_grants,
+    show_qr_opt_in, show_token_opt_in, spawn_eviction_task, spawn_scheduler, spawn_session_gc_task,
+    start_health_prober, validate_model_config, AppState, Config, ConfigError, QrArt, Runner,
+    TokenVisibility, BINARY_DRIFT, CONTAINMENT_RECORDS, DIRECT_ID, SEARCH_SCALE, SETTINGS_DRIFT,
+    SHADOWING_GRANTS, UNRESOLVED_MCP,
 };
 
 #[tokio::main]
@@ -146,6 +147,62 @@ async fn main() {
         );
     }
     let _ = UNRESOLVED_MCP.set(unresolved);
+
+    // ADVISORY, never fatal: has a `[[direct.mcp]]` grant opened a SECOND DOOR onto the vault?
+    //
+    // ONE BOUNDARY: the store. `[direct] qmd = true` puts qmd BEHIND it — every hit is opened
+    // through the store, so an excluded or cold document is dropped before the model sees it.
+    // A grant of the same server puts it BESIDE the store instead: `mcp__qmd__query` answers
+    // from qmd's own index with no store filter, and where the collection covers this vault
+    // that is a way to read what `exclude` and `cold_prefixes` exist to hide. It warns rather
+    // than refuses because a same-named server over a genuinely different corpus is a
+    // legitimate grant and nothing here can tell the two apart.
+    let shadowing = shadowing_direct_mcp_grants(&cfg);
+    for name in &shadowing {
+        eprintln!(
+            "jesse-bridge: WARNING — [[direct.mcp]] grants the server '{name}', whose tools \
+             answer from their own index with NO STORE FILTER. If that index covers this \
+             vault, they are a second way to read documents `exclude` and `cold_prefixes` \
+             refuse, and the looser of the two boundaries is the real one. For fast search \
+             over THIS vault use [direct] qmd = true, which puts the same index behind the \
+             store. Keep the grant only if '{name}' serves a different corpus."
+        );
+    }
+    let _ = SHADOWING_GRANTS.set(shadowing);
+
+    // ADVISORY, never fatal: is the index this deployment searches its vault with the right
+    // one for the size of that vault?
+    //
+    // D9's F4 is the reason this line exists. `GrepIndex` walks the store and stops after
+    // `GREP_SCAN_LIMIT` documents, so on a vault past that count every direct search answers
+    // from an arbitrary prefix of it — a document the owner knows is there is simply not
+    // found — and the only sign is a sentence at the end of a result list. The fix is
+    // `[direct] qmd = true` with a collection name, which needs a binary and a name only the
+    // owner can supply, so this WARNS and serves rather than refusing to start.
+    //
+    // Measured once here, at startup, stat-only: `/jesse/models` reports the flag from this
+    // value rather than walking the vault inside a request.
+    if cfg
+        .model_registry
+        .models
+        .iter()
+        .any(|m| m.harness == DIRECT_ID)
+    {
+        let scale = search_scale(&cfg);
+        if scale.degraded {
+            eprintln!(
+                "jesse-bridge: WARNING — direct turns will search this vault with the \
+                 built-in grep index, and the vault is too large for it: {} documents, {} \
+                 bytes. Grep stops after {} documents, so searches will answer from a \
+                 prefix of the vault and quietly miss the rest. Set [direct] qmd = true and \
+                 [direct] qmd_collection = \"<collection>\" to search with qmd instead.",
+                scale.documents,
+                scale.bytes,
+                jesse_bridge::GREP_SCALE_DOCUMENTS,
+            );
+        }
+        let _ = SEARCH_SCALE.set(scale);
+    }
 
     // The DEPRECATED single-limit key, announced rather than silently applied. An operator who
     // set it to 1 on purpose gets a global ceiling of 1, which is exactly the pre-0.60.0

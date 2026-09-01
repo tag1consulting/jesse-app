@@ -40,7 +40,7 @@ use std::pin::Pin;
 use tokio_util::sync::CancellationToken;
 
 pub use claude_cli::ClaudeCliDriver;
-pub use direct::DirectDriver;
+pub use direct::{DirectDriver, EvalIndex};
 
 /// A future returned by a `dyn`-dispatched driver method.
 ///
@@ -145,6 +145,16 @@ pub trait Driver {
 
     /// Whether this run is replaying a fixture rather than calling anything.
     fn is_mock(&self) -> bool;
+
+    /// Which search index answered `vault_search`, when the driver has a choice.
+    ///
+    /// `None` for a driver that does not own one (`claude-cli`'s child brings its own
+    /// tools). Recorded in `results.json` and on the scorecard because D12's whole point is
+    /// that the eval can now run either index the bridge can — and a run that did not say
+    /// which one it used would leave the reader to guess.
+    fn index(&self) -> Option<String> {
+        None
+    }
 
     /// Run one task in an already-prepared workspace.
     ///

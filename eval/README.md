@@ -64,12 +64,35 @@ JESSE_EVAL_TOKEN_ENV=... jesse-eval run --driver direct \
 `--token-env` names the ENVIRONMENT VARIABLE the key lives in; the binary has no way to
 accept a key as a flag, so nothing ever puts one in shell history or `ps` output.
 
-Per task it builds an `FsVaultStore` rooted at the task's workspace, a `GrepIndex` over it,
-and the vault tool set at the task's `level`, narrowed to the tools the task's
-`allowed_tools` grants (see the mapping table). The system prefix is the task's `persona`
-pack rendered for the wire, followed by its `system` blocks. `fetch_url` and
+Per task it builds an `FsVaultStore` rooted at the task's workspace, **the search index
+`--index` names** over it, and the vault tool set at the task's `level`, narrowed to the
+tools the task's `allowed_tools` grants (see the mapping table). The system prefix is the
+task's `persona` pack rendered for the wire, followed by its `system` blocks. `fetch_url` and
 `deliver_artifact` are reachable from no allowlist name and no artifact directory is
 supplied, so a turn has no egress channel and nowhere to put a file that is not a document.
+
+#### `--index`: the eval runs the index the bridge selects
+
+```
+jesse-eval run --driver direct --index qmd --qmd-collection vault \
+  [--qmd-bin /path/to/qmd] ...
+```
+
+`grep` is the default and is what CI runs, because a fresh machine has no `qmd` binary.
+`qmd` mirrors `direct_index` in `bridge/src/harness/direct.rs`, which selects `QmdIndex`
+whenever `[direct] qmd = true` and a collection is named — so an eval run can now measure the
+configuration a deployment with a large vault actually runs. `--index qmd` without
+`--qmd-collection` is **refused**, never guessed: qmd reports a hit as
+`qmd://<collection>/<path>`, and stripping the wrong prefix produces ids that resolve to the
+wrong documents or to none, which reads as "the vault does not contain it".
+
+**Before D12 this driver constructed `GrepIndex` unconditionally**, so this sentence was
+false for exactly the deployments it mattered most for. `results.json` and the scorecard
+header now record which index answered.
+
+Whichever is selected, **the store is the boundary and the index sits behind it**: a hit the
+store will not open — excluded, cold, or gone since the index was built — never reaches the
+turn. See `SECURITY.md`.
 
 ### The tool-name mapping table
 

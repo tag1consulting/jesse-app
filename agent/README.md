@@ -257,18 +257,47 @@ the trace's refusal count includes every traversal attempt.
 
 ### Search
 
-`GrepIndex` walks **through the store**, so exclusions and cold visibility apply by
-construction — there is no code path in it that could return a hit the store would not open.
-It always exists (CI has no `qmd`), and it stops after 2 000 documents and says so.
+**ONE BOUNDARY: THE STORE. AN INDEX SITS BEHIND IT, NEVER BESIDE IT.** Both implementations
+answer with documents the store agreed to open, and there is no supported third way to search
+vault content. `GrepIndex` gets that by construction — it walks through the store, so an
+excluded document is never a candidate and a cold one is never read. `QmdIndex` has to do it
+explicitly and does: every hit is checked against the store before it is returned, mandatory
+and tested, because `qmd` indexes what its collection pattern matched and that is not the set
+the store considers visible. Granting the same `qmd` server over MCP instead would put it
+*beside* the store — its own index, no store filter — which is why the bridge warns by name
+when a deployment does that. See `SECURITY.md`.
 
-`QmdIndex` shells to the `qmd` binary with an **argument vector, never a shell**, and
-**filters every hit through the store before returning it** — mandatory and tested, because
-`qmd` indexes what its collection pattern matched, which is not the set the store considers
-visible. It degrades to `GrepIndex` with a logged note when the binary is missing or fails,
-because a missing binary is an operational fact and not a reason for a turn to fail. The
-binary path and the collection name are **configuration and never guessed**: `qmd` reports a
-hit as `qmd://<collection>/<path>`, and stripping the wrong prefix produces ids that resolve
-to the wrong documents or to none.
+`QmdIndex` shells to the binary with an **argument vector, never a shell**, and degrades to
+`GrepIndex` with a logged note when it is missing or fails, because a missing binary is an
+operational fact and not a reason for a turn to fail. The binary path and the collection name
+are **configuration and never guessed**: `qmd` reports a hit as `qmd://<collection>/<path>`,
+and stripping the wrong prefix produces ids that resolve to the wrong documents or to none.
+
+#### `GrepIndex` is bounded by construction (D12)
+
+`GrepIndex` always exists — CI has no `qmd`, and a product whose tests cannot exercise search
+is a product without tested search — so it has to survive a real vault rather than only a
+fixture. Before D12 it did not: one search over a 104 GB vault took the eval process past
+**12 GB of resident memory** and never returned, because the whole path was proportional to
+the largest document rather than to a constant.
+
+Three bounds, and each is structural rather than a tuned budget:
+
+| Bound | What it does |
+|---|---|
+| `GREP_SCAN_LIMIT` (2 000 documents) | Stops the walk and **says so** in `Hits::degraded`. |
+| `GREP_MAX_DOC_BYTES` (2 MB) | A document past this is **skipped before it is read**, counted, and named in `Hits::degraded`. The size comes from the listing, so no query can make this index hold a larger document. |
+| Bounded accumulation | Matching documents no longer pile up until the walk ends; the buffer is a constant and the caller's limit is applied at the end, as before. |
+
+The store underneath is streaming too: `FsVaultStore` derives metadata from a bounded head
+plus a rolling digest instead of reading each file whole, and `read` caps at `READ_MAX_BYTES`
+*while* reading rather than after. `agent/tests/grep_index_memory.rs` asserts the contract
+with a counting allocator — peak live bytes over one search, and total bytes allocated —
+against a synthetic store, never the real vault.
+
+**What the caller is told is part of the contract.** A bounded search that reported "no match"
+for a document it never opened would be worse than an unbounded one, because the caller could
+not tell the two apart. Every truncation, skip and degrade is named in `Hits::degraded`.
 
 ## The write-guard seam
 
