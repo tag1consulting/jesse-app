@@ -9,11 +9,29 @@
 //! so a task carrying `system` blocks has them prepended to the prompt, separated by a blank
 //! line. A task without `system` — which is every task in every suite that shipped before
 //! D7 — produces a byte-identical invocation to the one this code always made.
+//!
+//! **D11 changed the invocation twice, and both changes are load-bearing.**
+//!
+//! *The persona* (F2). A task carrying a `persona` pack now has it rendered by the SAME
+//! [`render_persona`] the direct driver calls, on the same wire, and handed to the child as
+//! `--append-system-prompt`. Before this the pack was never read here at all: the CLI child
+//! was graded by `style_clean` against rules it had never been shown, while the direct model
+//! had been. That is a structural bias in the direct driver's favour on every
+//! `style-adherence` task, and it is why D9's baseline scored 0/3 there.
+//!
+//! *The empty MCP world* (F3). The spawn passes `--strict-mcp-config` with an explicit empty
+//! `--mcp-config`, so the child sees ZERO MCP servers whatever the host's user settings
+//! define. Before this a `product-v1` baseline score depended on which machine ran it: in
+//! D9 the child asked for permission to use a note-search MCP tool the suite never granted
+//! and produced no answer at all, and another task's answer volunteered a fact about the
+//! host's real document collection. Runs from before D11 are therefore not comparable with
+//! runs after it; `eval/README.md` says so beside the tracked artifacts.
 
 use super::{BoxFuture, Driver, PreparedWorkspace, TaskRun};
 use crate::mock::MockFile;
 use crate::suite::Task;
 use crate::transcript;
+use jesse_agent::{SystemBlock, Wire};
 use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -88,6 +106,67 @@ fn prompt_for(task: &Task) -> String {
     out
 }
 
+/// The child's MCP world: nothing.
+///
+/// An inline JSON config declaring no servers, paired with `--strict-mcp-config` so the CLI
+/// uses ONLY this and ignores every other MCP configuration it would otherwise find. Both
+/// halves are needed: the strict flag on its own has no config to be strict about.
+const EMPTY_MCP_CONFIG: &str = r#"{"mcpServers":{}}"#;
+
+/// [`SystemBlock`]s as one string, blocks separated by a blank line.
+///
+/// This is the join [`jesse_agent::render_persona`] documents as producing byte-identical
+/// text on all three wires, which is what lets one `--append-system-prompt` string stand in
+/// for the direct driver's block list.
+fn join_blocks(blocks: &[SystemBlock]) -> String {
+    blocks
+        .iter()
+        .map(|b| b.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+/// The persona text this driver prepends for `task`, or `None` when the task names no pack.
+///
+/// ONE PACK, ONE RENDERER, ONE WIRE. The direct driver renders the task's pack with
+/// [`jesse_agent::render_persona`]; so does this, on [`Wire::Messages`] — the wire this path
+/// actually runs on — and the result is handed to the child verbatim. A task with no pack
+/// gets nothing appended, which keeps every pre-D7 suite's invocation unchanged.
+fn persona_prefix(task: &Task) -> Option<String> {
+    task.persona
+        .as_ref()
+        .map(|pack| join_blocks(&super::direct::persona_blocks(pack, Wire::Messages)))
+}
+
+/// The child's full argument vector, as a pure function of the task.
+///
+/// Extracted from the spawn so a test can assert what the child is actually given —
+/// D11's F3 was a missing pair of flags that nothing in the suite could have caught.
+/// `--allowedTools` stays LAST because its value is variadic: anything placed after it
+/// would have to start with `--` to avoid being swallowed as another tool name.
+fn argv_for(task: &Task) -> Vec<String> {
+    let mut argv: Vec<String> = vec![
+        "-p".into(),
+        prompt_for(task),
+        "--output-format".into(),
+        "stream-json".into(),
+        "--verbose".into(),
+        "--include-partial-messages".into(),
+        "--permission-mode".into(),
+        "default".into(),
+        "--mcp-config".into(),
+        EMPTY_MCP_CONFIG.into(),
+        "--strict-mcp-config".into(),
+    ];
+    if let Some(prefix) = persona_prefix(task) {
+        argv.push("--append-system-prompt".into());
+        argv.push(prefix);
+    }
+    argv.push("--allowedTools".into());
+    argv.push(task.allowed_tools_csv());
+    argv
+}
+
 /// Raw output of one task's execution, before parsing.
 struct RawCapture {
     lines: Vec<String>,
@@ -114,16 +193,7 @@ impl From<RawCapture> for TaskRun {
 /// text delta and enforcing the wall-clock timeout.
 fn spawn_claude(task: &Task, cwd: &Path, cfg: &ClaudeCliDriver) -> TaskRun {
     let mut cmd = Command::new(&cfg.claude_bin);
-    cmd.arg("-p")
-        .arg(prompt_for(task))
-        .arg("--output-format")
-        .arg("stream-json")
-        .arg("--verbose")
-        .arg("--include-partial-messages")
-        .arg("--permission-mode")
-        .arg("default")
-        .arg("--allowedTools")
-        .arg(task.allowed_tools_csv())
+    cmd.args(argv_for(task))
         .current_dir(cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -284,22 +354,44 @@ mod tests {
     use crate::suite::{Suite, Workspace};
 
     fn task(system: &[&str]) -> Task {
+        task_json(serde_json::json!({
+            "id": "t", "class": "c", "prompt": "the prompt",
+            "workspace": "fixture",
+            "system": system,
+            "assertions": []
+        }))
+    }
+
+    /// One task, loaded through the real suite parser so the `persona` field under test is
+    /// the one a shipped suite would produce.
+    fn task_json(t: serde_json::Value) -> Task {
         let suite = Suite::from_json(
-            serde_json::json!({
-                "name": "t",
-                "tasks": [{
-                    "id": "t", "class": "c", "prompt": "the prompt",
-                    "workspace": "fixture",
-                    "system": system,
-                    "assertions": []
-                }]
-            })
-            .to_string()
-            .as_bytes(),
+            serde_json::json!({"name": "t", "tasks": [t]})
+                .to_string()
+                .as_bytes(),
         )
         .expect("parses");
         assert_eq!(suite.tasks[0].workspace, Workspace::Fixture);
         suite.tasks[0].clone()
+    }
+
+    /// A task carrying a pack shaped like `product-v1`'s `style-adherence` tasks.
+    fn styled_task() -> Task {
+        task_json(serde_json::json!({
+            "id": "st", "class": "style-adherence", "prompt": "the prompt",
+            "workspace": "fixture",
+            "allowed_tools": ["Read", "Grep"],
+            "assertions": [{"type": "style_clean"}],
+            "persona": {
+                "languages": ["en"],
+                "banned_patterns": ["\\bdelve\\b"],
+                "free_text": "Write the way I would write it: plain sentences, no filler.",
+                "assistant": {"name": "Jesse"},
+                "owner": {"name": "Alex", "pronoun": "their", "address_style": "by_name"},
+                "style": {"verbosity": "terse", "emoji": "never"},
+                "formatting": {"lists": "avoid", "headings": "avoid", "dashes": "forbidden"}
+            }
+        }))
     }
 
     #[test]
@@ -313,5 +405,93 @@ mod tests {
             prompt_for(&task(&["first", "second"])),
             "first\n\nsecond\n\nthe prompt"
         );
+    }
+
+    // ---- F2: one pack, both drivers -------------------------------------------------
+
+    /// THE BYTE-IDENTITY CLAIM, asserted rather than documented.
+    ///
+    /// `eval/README.md` promises the task's pack is rendered into the system prefix by BOTH
+    /// drivers so the rules an answer is written under and the rules it is graded against
+    /// cannot drift. Before D11 that sentence was false here. This compares the exact string
+    /// this driver hands the child with the exact bytes the direct driver prepends, for the
+    /// same pack, on every wire the direct driver can run — `render_persona`'s own contract
+    /// is that the joined text does not vary by wire, so any wire the direct run picks
+    /// produces the same prefix this one sends.
+    #[test]
+    fn both_drivers_prepend_the_same_persona_bytes() {
+        let t = styled_task();
+        let pack = t.persona.clone().expect("the task carries a pack");
+        let cli = persona_prefix(&t).expect("a task with a pack gets a prefix");
+        assert!(!cli.is_empty(), "an empty prefix would pass vacuously");
+        for wire in [Wire::Messages, Wire::Chat, Wire::Responses] {
+            let direct = join_blocks(&super::super::direct::persona_blocks(&pack, wire));
+            assert_eq!(
+                cli, direct,
+                "the two drivers must prepend the same bytes on {wire:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_persona_reaches_the_child_as_append_system_prompt() {
+        let argv = argv_for(&styled_task());
+        let i = argv
+            .iter()
+            .position(|a| a == "--append-system-prompt")
+            .expect("the flag is on the argv");
+        let sent = &argv[i + 1];
+        assert_eq!(
+            sent,
+            &persona_prefix(&styled_task()).unwrap(),
+            "the flag's value is the rendered pack, verbatim"
+        );
+        assert!(sent.contains("Jesse"), "identity section reached the child");
+    }
+
+    #[test]
+    fn a_task_with_no_pack_appends_no_system_prompt() {
+        // Every suite that shipped before D7 is in this case, and its invocation must not
+        // change: no pack, no flag, no new bytes.
+        let argv = argv_for(&task(&[]));
+        assert!(
+            !argv.iter().any(|a| a == "--append-system-prompt"),
+            "{argv:?}"
+        );
+    }
+
+    // ---- F3: an empty MCP world, structurally ---------------------------------------
+
+    /// THE ARGV PROOF. The child is given an explicit empty server set AND told to use only
+    /// it, so the host's user settings cannot bleed in. Both flags, adjacent, with the
+    /// config's value between them, and `--allowedTools` still last so its variadic value
+    /// swallows nothing.
+    #[test]
+    fn the_child_is_spawned_with_an_empty_strict_mcp_world() {
+        let argv = argv_for(&task(&[]));
+        let i = argv
+            .iter()
+            .position(|a| a == "--mcp-config")
+            .expect("--mcp-config is on the argv");
+        assert_eq!(argv[i + 1], EMPTY_MCP_CONFIG);
+        assert_eq!(argv[i + 2], "--strict-mcp-config");
+
+        let parsed: serde_json::Value = serde_json::from_str(EMPTY_MCP_CONFIG).unwrap();
+        assert!(
+            parsed["mcpServers"].as_object().unwrap().is_empty(),
+            "the config must declare no servers at all"
+        );
+        assert_eq!(
+            argv[argv.len() - 2],
+            "--allowedTools",
+            "the variadic flag stays last: {argv:?}"
+        );
+    }
+
+    #[test]
+    fn the_prompt_is_still_the_first_thing_the_child_is_given() {
+        let argv = argv_for(&task(&["first"]));
+        assert_eq!(argv[0], "-p");
+        assert_eq!(argv[1], "first\n\nthe prompt");
     }
 }

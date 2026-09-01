@@ -54,6 +54,16 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
+/// THE PERSONA PORTION OF THIS DRIVER'S SYSTEM PREFIX, as its own named function.
+///
+/// It is one call, and it could have stayed inline. It is a function because the
+/// `claude-cli` driver has to prepend the SAME bytes — D11's F2 was that it prepended none
+/// — and `crate::driver::claude_cli::tests::both_drivers_prepend_the_same_persona_bytes`
+/// asserts byte-identity against this, which it can only do if there is a name to call.
+pub(crate) fn persona_blocks(pack: &PersonaPack, wire: Wire) -> Vec<SystemBlock> {
+    render_persona(pack, wire)
+}
+
 /// The scope every eval turn runs under. Fixed, and spelled out rather than implied.
 fn eval_scope() -> Scope {
     Scope::new("eval", "owner", "default")
@@ -156,7 +166,7 @@ impl DirectDriver {
 
         // ---- The system prefix -------------------------------------------
         let pack = task.persona.clone().unwrap_or_else(|| self.persona.clone());
-        let mut system = render_persona(&pack, self.wire);
+        let mut system = persona_blocks(&pack, self.wire);
         system.extend(task.system.iter().map(|s| SystemBlock::plain(s.clone())));
 
         // ---- The provider -------------------------------------------------

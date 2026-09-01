@@ -23,6 +23,7 @@ fn kind_of(a: &Assertion) -> &'static str {
     match a {
         Assertion::AnswerMatches { .. } => "answer_matches",
         Assertion::AnswerExcludes { .. } => "answer_excludes",
+        Assertion::AnswerMentionsOnlyWith { .. } => "answer_mentions_only_with",
         Assertion::FileEquals { .. } => "file_equals",
         Assertion::FileMatches { .. } => "file_matches",
         Assertion::MaxToolCalls { .. } => "max_tool_calls",
@@ -52,6 +53,38 @@ fn capture_number(re: &Regex, text: &str) -> Result<f64, String> {
         .map_err(|_| format!("captured {raw:?} is not a number"))
 }
 
+/// The segments a mention is judged in: line breaks, plus a sentence terminator
+/// (`.`, `;`, `!`, `?`) followed by whitespace or the end of the text.
+///
+/// THE WHITESPACE CONDITION IS LOAD-BEARING. A naive split on `.` would cut `3.1` into
+/// `3` and `1`, and the one assertion that uses these segments exists to judge exactly
+/// that kind of token. Blank segments are dropped and the rest are trimmed, so the
+/// caller's regexes never have to allow for leading list markers or trailing newlines.
+fn mention_segments(text: &str) -> Vec<&str> {
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    for (i, (idx, c)) in chars.iter().enumerate() {
+        let ends_sentence = matches!(c, '.' | ';' | '!' | '?')
+            && chars
+                .get(i + 1)
+                .map(|(_, n)| n.is_whitespace())
+                .unwrap_or(true);
+        if *c == '\n' || ends_sentence {
+            let end = idx + c.len_utf8();
+            out.push(&text[start..end]);
+            start = end;
+        }
+    }
+    if start < text.len() {
+        out.push(&text[start..]);
+    }
+    out.into_iter()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
 /// Did the turn call `name`, in EITHER vocabulary?
 ///
 /// A suite writes its tool names once, in the CLI's spelling, and the mapping table says
@@ -61,6 +94,16 @@ fn called(t: &Transcript, name: &str) -> bool {
     t.tool_names
         .iter()
         .any(|got| aliases.iter().any(|a| a == got))
+}
+
+/// First `n` characters of `s`, with an ellipsis when there was more. Keeps an assertion
+/// detail readable when the offending segment is a whole paragraph.
+fn truncate(s: &str, n: usize) -> String {
+    if s.chars().count() <= n {
+        return s.to_string();
+    }
+    let head: String = s.chars().take(n).collect();
+    format!("{head}…")
 }
 
 /// Build an [`AssertionResult`] — used by the early-return error paths.
@@ -117,6 +160,41 @@ pub fn eval_assertion(
                 )
             }
         },
+        Assertion::AnswerMentionsOnlyWith { pattern, qualifier } => {
+            match (Regex::new(pattern), Regex::new(qualifier)) {
+                (Err(e), _) => (false, format!("invalid regex /{pattern}/: {e}")),
+                (_, Err(e)) => (false, format!("invalid regex /{qualifier}/: {e}")),
+                (Ok(p), Ok(q)) => {
+                    let ans = t.final_answer.as_deref().unwrap_or("");
+                    let mentions: Vec<&str> = mention_segments(ans)
+                        .into_iter()
+                        .filter(|seg| p.is_match(seg))
+                        .collect();
+                    let bare: Vec<&str> = mentions
+                        .iter()
+                        .copied()
+                        .filter(|seg| !q.is_match(seg))
+                        .collect();
+                    match (mentions.is_empty(), bare.first()) {
+                        (true, _) => (true, format!("/{pattern}/ is never mentioned")),
+                        (false, None) => (
+                            true,
+                            format!(
+                                "all {} mention(s) of /{pattern}/ also match /{qualifier}/",
+                                mentions.len()
+                            ),
+                        ),
+                        (false, Some(seg)) => (
+                            false,
+                            format!(
+                                "/{pattern}/ mentioned without /{qualifier}/ in: {:?}",
+                                truncate(seg, 140)
+                            ),
+                        ),
+                    }
+                }
+            }
+        }
         Assertion::FileEquals { path, content } => {
             let full = workspace.join(path);
             match std::fs::read_to_string(&full) {
@@ -856,5 +934,128 @@ mod tests {
             &dir,
         );
         assert!(!bad);
+    }
+
+    // ---- answer_mentions_only_with ------------------------------------------------
+    //
+    // The assertion D11 added for the two situations `answer_excludes` scores backwards:
+    // a decoy the ideal answer NAMES while disowning it, and a finished item the ideal
+    // answer NAMES while saying it is done. Both directions are asserted for each.
+
+    fn qualified(pattern: &str, qualifier: &str) -> Assertion {
+        Assertion::AnswerMentionsOnlyWith {
+            pattern: pattern.into(),
+            qualifier: qualifier.into(),
+        }
+    }
+
+    const DENTIST: &str = r"(?i)\bdentist\b";
+    const DONE: &str =
+        r"(?i)\b(done|completed|finished|already|booked|excluded|leaving it out|no longer)\b";
+
+    #[test]
+    fn a_finished_item_named_as_finished_passes() {
+        let dir = std::env::temp_dir();
+        let t = tr(
+            "Two things are open: the Atlas migration plan and the Borealis call. \
+             'Book the dentist' is already done, so I left it out.",
+            0,
+            true,
+        );
+        let r = eval_assertion(&qualified(DENTIST, DONE), &t, &dir);
+        assert!(r.passed, "{}", r.detail);
+    }
+
+    #[test]
+    fn the_same_item_presented_as_outstanding_fails() {
+        let dir = std::env::temp_dir();
+        let t = tr(
+            "Three things are open. Review the Atlas migration plan, call Borealis about \
+             invoice 8821, and book the dentist.",
+            0,
+            true,
+        );
+        let r = eval_assertion(&qualified(DENTIST, DONE), &t, &dir);
+        assert!(!r.passed, "{}", r.detail);
+        assert!(r.detail.contains("dentist"), "{}", r.detail);
+    }
+
+    #[test]
+    fn an_outstanding_item_on_its_own_bullet_line_fails() {
+        let dir = std::env::temp_dir();
+        let t = tr(
+            "Open items:\n- Review the Atlas plan\n- Book the dentist\n",
+            0,
+            true,
+        );
+        let r = eval_assertion(&qualified(DENTIST, DONE), &t, &dir);
+        assert!(!r.passed, "{}", r.detail);
+    }
+
+    #[test]
+    fn never_mentioning_it_at_all_passes() {
+        let dir = std::env::temp_dir();
+        let t = tr(
+            "Two things are open: the Atlas plan and the Borealis call.",
+            0,
+            true,
+        );
+        let r = eval_assertion(&qualified(DENTIST, DONE), &t, &dir);
+        assert!(r.passed, "{}", r.detail);
+    }
+
+    #[test]
+    fn a_version_number_is_not_split_by_the_segmenter() {
+        // The whole point of the whitespace condition: `3.1` and `4.2` survive segmenting,
+        // so a decoy version can be judged in the sentence that disowns it.
+        assert_eq!(
+            mention_segments("Atlas is on 4.2. The 3.1 in the archive is superseded."),
+            vec!["Atlas is on 4.2.", "The 3.1 in the archive is superseded."]
+        );
+    }
+
+    #[test]
+    fn a_decoy_named_as_superseded_passes_and_claimed_as_current_fails() {
+        let dir = std::env::temp_dir();
+        let superseded = r"(?i)(supersed|archiv|out of date|outdated|older|former|previous|no longer|not the current|decoy)";
+        let good = tr(
+            "Atlas is on version 4.2. The 3.1 in archive/atlas-old.md is superseded, so I \
+             did not answer from it.",
+            0,
+            true,
+        );
+        let r = eval_assertion(&qualified(r"3\.1", superseded), &good, &dir);
+        assert!(r.passed, "{}", r.detail);
+
+        let bad = tr("Atlas is on version 3.1.", 0, true);
+        let r = eval_assertion(&qualified(r"3\.1", superseded), &bad, &dir);
+        assert!(!r.passed, "{}", r.detail);
+    }
+
+    #[test]
+    fn an_invalid_regex_fails_rather_than_passing_vacuously() {
+        let dir = std::env::temp_dir();
+        let t = tr("anything", 0, true);
+        let r = eval_assertion(&qualified("(", DONE), &t, &dir);
+        assert!(!r.passed);
+        assert!(r.detail.contains("invalid regex"), "{}", r.detail);
+        let r = eval_assertion(&qualified(DENTIST, "("), &t, &dir);
+        assert!(!r.passed);
+        assert!(r.detail.contains("invalid regex"), "{}", r.detail);
+    }
+
+    #[test]
+    fn no_answer_at_all_is_not_a_pass_by_omission_when_the_task_needed_one() {
+        // A missing answer mentions nothing, so this assertion is vacuously satisfied —
+        // which is correct: `completed` and the `answer_matches` rows are what catch a
+        // turn that produced nothing.
+        let dir = std::env::temp_dir();
+        let t = Transcript {
+            final_answer: None,
+            completed: false,
+            ..Default::default()
+        };
+        let r = eval_assertion(&qualified(DENTIST, DONE), &t, &dir);
+        assert!(r.passed, "{}", r.detail);
     }
 }

@@ -25,6 +25,33 @@ thing that knows how a task is EXECUTED is the driver, and `--driver` picks it.
 Both write the same `results.json` and `scorecard.md`, and the scorecard header names the
 driver, wire and model so two runs can be told apart a week later. `compare` pairs them.
 
+### The `claude-cli` driver: what the child is given
+
+The child is spawned with the task's prompt (its `system` blocks prepended, since these
+flags give `claude` no system prefix of its own), the task's `allowed_tools` as
+`--allowedTools`, the task's `persona` pack as `--append-system-prompt`, and
+
+```
+--mcp-config '{"mcpServers":{}}' --strict-mcp-config
+```
+
+so the child sees **zero MCP servers** whatever the host machine's user settings define.
+`eval/src/driver/claude_cli.rs` builds that argument vector in one pure function and a test
+asserts both flags are on it.
+
+> **Artifacts from before D11 are not comparable with artifacts after it.** Both of the
+> above are D11 changes to the child's invocation, and both move scores. Before D11 the CLI
+> child was never shown the task's persona pack while the direct model always was, so every
+> `style-adherence` task was biased against the baseline; and the child inherited the host's
+> MCP servers, so a `product-v1` baseline depended on which machine ran it — in the D9 run
+> one task produced no answer at all because the child asked for permission to use an
+> ungranted note-search MCP tool, and another volunteered a fact about the host's real
+> document collection into a supposedly hermetic fixture task. The runs tracked under
+> `eval-runs/2026-08-31-product-claude-code/` and
+> `eval-runs/2026-08-31-product-ds4-flash-direct/` are pre-D11 and are kept as the record of
+> what the defects looked like, not as a baseline to compare against. The `*-postfix/` runs
+> beside them are the first comparable pair.
+
 ### The `direct` driver
 
 ```
@@ -106,6 +133,7 @@ Outputs: `<out>/results.json` (one record per task) and `<out>/scorecard.md`
 |---|---|---|
 | `answer_matches` | `pattern` | regex matches the final answer |
 | `answer_excludes` | `pattern` | regex does **not** match the final answer |
+| `answer_mentions_only_with` | `pattern`, `qualifier` | every segment of the final answer matching `pattern` ALSO matches `qualifier`; an answer that never mentions `pattern` passes. A segment is a line, or a sentence ended by `.`, `;`, `!` or `?` followed by whitespace — the whitespace condition keeps `3.1` in one piece. This is how a suite says "X may appear, but only as Y"; see `suites/README.md` for which of it and `answer_excludes` a situation calls for |
 | `file_equals` | `path`, `content` | workspace file has exactly this content |
 | `file_matches` | `path`, `pattern` | regex matches the workspace file's content |
 | `max_tool_calls` | `max` | tool-call count ≤ `max` |
@@ -229,7 +257,7 @@ A suite is `{ "name": string, "tasks": [ Task, … ] }`. Each `Task`:
 | `allowed_tools` | no | tools for `--allowedTools`, mapped onto the direct manifest by the table above |
 | `level` | no | `basic` / `read` / `write` for a driver with levels. Defaults to `write` for `fixture` and `read` for `vault-readonly`; `vault-readonly` + `write` is refused |
 | `system` | no | extra system-prefix blocks. The direct driver passes them as `SystemBlock`s; the CLI takes no system prefix on these flags, so its driver prepends the same text to the prompt |
-| `persona` | no | a `PersonaPack`. Rendered into the system prefix by BOTH drivers, and checked by `style_clean` — one pack, so the rules the answer was written under and the rules it is graded against cannot drift |
+| `persona` | no | a `PersonaPack`. Rendered into the system prefix by BOTH drivers, and checked by `style_clean` — one pack, so the rules the answer was written under and the rules it is graded against cannot drift. The direct driver renders it with `render_persona`; the `claude-cli` driver renders the SAME pack with the SAME function and hands the result to the child as `--append-system-prompt`, and a driver test asserts the two are byte-identical. (True only since D11: before that the CLI driver never read the field, so its child was graded on rules it had never been shown. One distinction remains, and it is a driver setting rather than a task field — the direct driver falls back to a suite-level default pack for a task that names none, where the CLI driver appends nothing.) |
 | `fixture_files` | no | `{path: content}` written into a fixture workspace |
 | `judged` | no | if true, the final answer is saved for `judge` (needs `rubric`) |
 | `rubric` | judged only | grading text shown to the judge |
