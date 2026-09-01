@@ -2,6 +2,7 @@ import SwiftUI
 import SwiftData
 import JesseCore
 import JesseOps
+import JesseConversations
 
 // The macOS Jesse client — a thin native client that talks to the SAME bridge on the
 // Studio the iPhone uses (see the JESSE-WRAP B3 plan). A SEPARATE app target from the
@@ -93,10 +94,11 @@ struct JesseMacApp: App {
         .defaultSize(width: 520, height: 560)
     }
 
+    /// The reply notification's title. The shared resolution, with this surface's own
+    /// wording for a thread that has no name yet: a notification banner saying "New
+    /// conversation" names nothing, where "Jesse replied" at least says what happened.
     private static func notificationTitle(_ thread: JesseThread) -> String {
-        if let ai = thread.aiTitle, !ai.isEmpty { return ai }
-        if !thread.title.isEmpty { return thread.title }
-        return "Jesse replied"
+        displayTitle(for: thread, placeholder: "Jesse replied")
     }
 }
 

@@ -1,11 +1,20 @@
 import Foundation
 import JesseCore
 
-// Pure, SwiftUI-free helpers for the thread list's AI-generated titles. Kept in
+// Pure, SwiftUI-free helpers for a conversation's AI-generated title. Kept in
 // their own Foundation-only file so they're unit-testable without a view host or
-// a network, mirroring ThreadSectioning / ThreadFolders / ThreadSearch.
+// a network, mirroring ThreadSectioning / ThreadFolders / ThreadMatching.
 //
-// The row title has two sources, in precedence order:
+// THE ONE PLACE A THREAD IS NAMED. This file used to live in the iOS app target,
+// which put it out of the Mac target's reach, and the consequence was not
+// hypothetical: the Mac grew three private copies of `displayTitle`'s fallback
+// chain and the iOS DETAIL view grew a fourth, inline in its `.navigationTitle`,
+// that never consulted `aiTitle` at all. The list row and the open conversation
+// therefore showed two different names for the same thread. It now lives here, in
+// the module both apps already link, and every surface that names a thread calls
+// `displayTitle(for:)`.
+//
+// The title has two sources, in precedence order:
 //   1. `aiTitle` — a short title minted by the bridge's /jesse/title endpoint,
 //      cached on the JesseThread and regenerated when the conversation changes.
 //   2. the derived first-words title (`JesseThread.deriveTitle`, held in `title`)
@@ -35,7 +44,7 @@ private func fnv1a64(_ s: String) -> UInt64 {
 /// ordered turns, each contributing its id and a hash of its full text. Same
 /// turns → same key; appending a turn or editing one's text → a different key.
 /// Deterministic and launch-stable (no `hashValue`). Empty thread → "".
-func threadContentKey(for thread: JesseThread) -> String {
+public func threadContentKey(for thread: JesseThread) -> String {
     let turns = thread.orderedTurns
     guard !turns.isEmpty else { return "" }
     var acc = ""
@@ -53,7 +62,7 @@ func threadContentKey(for thread: JesseThread) -> String {
 /// latest reply), each whitespace-collapsed to a single line, joined with " — ",
 /// and capped to `maxBytes` on a character boundary — kept well under the bridge's
 /// input cap. Deterministic given the same turns; empty thread → "".
-func titleDigest(for thread: JesseThread, maxBytes: Int = 2000) -> String {
+public func titleDigest(for thread: JesseThread, maxBytes: Int = 2000) -> String {
     let turns = thread.orderedTurns
     guard !turns.isEmpty else { return "" }
 
@@ -74,7 +83,7 @@ func titleDigest(for thread: JesseThread, maxBytes: Int = 2000) -> String {
 
 /// Truncate `s` to at most `maxBytes` UTF-8 bytes without splitting a character
 /// (so multibyte content is never cut mid-scalar). Pure.
-func boundedUTF8(_ s: String, maxBytes: Int) -> String {
+public func boundedUTF8(_ s: String, maxBytes: Int) -> String {
     guard s.utf8.count > maxBytes else { return s }
     var out = ""
     var count = 0
@@ -87,14 +96,23 @@ func boundedUTF8(_ s: String, maxBytes: Int) -> String {
     return out
 }
 
-/// What the list row should display: the cached AI title if present (even while a
-/// refresh is in flight — the last good title, never blank), else the derived
-/// first-words title, else a placeholder. Never returns an empty string.
-func displayTitle(for thread: JesseThread) -> String {
+/// What a surface should display as this thread's name: the cached AI title if
+/// present (even while a refresh is in flight — the last good title, never
+/// blank), else the derived first-words title, else `placeholder`. Never returns
+/// an empty string.
+///
+/// EVERY surface that names a thread goes through here: the list row, the open
+/// conversation's navigation title on both platforms, the sidebar row, the Live
+/// Activity, the Mac's reply notification. `placeholder` exists only because that
+/// last one wants different wording for a thread with no name yet ("Jesse
+/// replied", not "New conversation"); it does not license a second fallback
+/// chain, which is exactly what this function was drifting into.
+public func displayTitle(for thread: JesseThread,
+                         placeholder: String = "New conversation") -> String {
     if let ai = thread.aiTitle?.trimmingCharacters(in: .whitespacesAndNewlines),
        !ai.isEmpty {
         return ai
     }
     let derived = thread.title.trimmingCharacters(in: .whitespacesAndNewlines)
-    return derived.isEmpty ? "New conversation" : derived
+    return derived.isEmpty ? placeholder : derived
 }

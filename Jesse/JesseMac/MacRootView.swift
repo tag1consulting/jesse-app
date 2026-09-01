@@ -485,17 +485,11 @@ struct MacThreadRow: View {
     /// Star / unstar this conversation (the parent persists the context).
     let onToggleFavorite: () -> Void
 
-    private var displayTitle: String {
-        if let ai = thread.aiTitle, !ai.isEmpty { return ai }
-        if !thread.title.isEmpty { return thread.title }
-        return "New conversation"
-    }
-
     var body: some View {
         HStack(spacing: 6) {
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 6) {
-                    Text(displayTitle).font(.body).lineLimit(1)
+                    Text(displayTitle(for: thread)).font(.body).lineLimit(1)
                     if running {
                         ProgressView().controlSize(.small)
                     }

@@ -2,6 +2,7 @@ import SwiftUI
 import SwiftData
 import JesseCore
 import JesseNetworking
+import JesseConversations
 
 // One conversation: the transcript (hydrated from the bridge on open, cache-first) plus
 // the live streaming reply and the composer. Resume is implicit — the thread carries a
@@ -24,18 +25,12 @@ struct MacThreadDetailView: View {
             Divider()
             composer
         }
-        .navigationTitle(displayTitle)
+        .navigationTitle(displayTitle(for: thread))
         .navigationSubtitle(subtitle)
         .onAppear { mode = thread.modeValue }
         .task(id: thread.id) {
             await coordinator.hydrate(thread: thread, context: context)
         }
-    }
-
-    private var displayTitle: String {
-        if let ai = thread.aiTitle, !ai.isEmpty { return ai }
-        if !thread.title.isEmpty { return thread.title }
-        return "New conversation"
     }
 
     /// The window subtitle. This used to read "Not yet started" off `sessionId == nil`, which

@@ -4,6 +4,7 @@ import SwiftUI
 import UIKit
 import JesseCore
 import JesseNetworking
+import JesseConversations
 
 // App-scoped run manager. Lives above the views (owned by `JesseApp`) so a run
 // keeps going while you navigate back to the list and start another. Keyed by
@@ -2362,10 +2363,13 @@ final class RunCoordinator {
     }
 
     /// Attributes for a thread's Live Activity — its id, title, and short mode label.
-    private func liveActivityAttributes(for thread: JesseThread) -> JesseTurnActivityAttributes {
+    /// The title is the shared `displayTitle(for:)`, so the Lock Screen names a thread
+    /// the same way the list and the open conversation do; it used to read `thread.title`
+    /// raw with its own inline fallback and so could never show an AI title either.
+    func liveActivityAttributes(for thread: JesseThread) -> JesseTurnActivityAttributes {
         JesseTurnActivityAttributes(
             threadID: thread.id,
-            threadTitle: thread.title.isEmpty ? "New conversation" : thread.title,
+            threadTitle: displayTitle(for: thread),
             modeLabel: thread.modeValue == .ask ? "Ask" : "Tell")
     }
 

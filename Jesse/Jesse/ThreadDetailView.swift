@@ -6,6 +6,7 @@ import UniformTypeIdentifiers
 import AVFoundation
 import JesseCore
 import JesseNetworking
+import JesseConversations
 
 // One conversation: the full turn transcript with the composer pinned at the
 // bottom. Being inside a thread *is* continuing it — every send auto-resumes the
@@ -100,6 +101,14 @@ struct ThreadDetailView: View {
     // unit-tested `TranscriptScroll` helper.
     @State private var isAtBottom = true
 
+    /// The name this conversation shows in the navigation bar: the shared
+    /// `displayTitle(for:)` resolution, the same one the list row draws, and NOT a
+    /// fallback chain of its own. This modifier used to read `thread.title` raw
+    /// with an inline empty check, so a thread with an `aiTitle` was named one way
+    /// in the list and another the moment it was opened. Extracted as a property so
+    /// the detail view's OWN title is assertable without a view host.
+    var navigationTitleText: String { displayTitle(for: thread) }
+
     var body: some View {
         VStack(spacing: 12) {
             transcript
@@ -121,7 +130,7 @@ struct ThreadDetailView: View {
         .sensoryFeedback(.impact(weight: .light), trigger: sendHaptic)
         .sensoryFeedback(trigger: turns.count, completionFeedback)
         .sensoryFeedback(trigger: coordinator.error(for: thread.id), errorFeedback)
-        .navigationTitle(thread.title.isEmpty ? "New conversation" : thread.title)
+        .navigationTitle(navigationTitleText)
         .navigationBarTitleDisplayMode(.inline)
         // Hide the root TabView's bar while a conversation is open, so the tabs are
         // present on the conversation list and within Health but gone inside a
