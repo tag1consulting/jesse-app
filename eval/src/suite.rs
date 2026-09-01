@@ -37,6 +37,16 @@ pub enum Assertion {
     AnswerMatches { pattern: String },
     /// Regex must NOT match anywhere in the final answer.
     AnswerExcludes { pattern: String },
+    /// Every segment of the final answer that matches `pattern` must ALSO match
+    /// `qualifier`; an answer that never mentions `pattern` passes.
+    ///
+    /// This is how a suite says "X may appear, but only as Y" — the shape
+    /// `answer_excludes` cannot express, because the ideal answer to a decoy or a
+    /// finished-item trap NAMES the trap while disowning it. A segment is a line, or a
+    /// sentence ended by `.`, `;`, `!` or `?` followed by whitespace; the whitespace
+    /// condition keeps a version number like `3.1` in one piece. See
+    /// `eval/suites/README.md` for which of the two assertions a situation calls for.
+    AnswerMentionsOnlyWith { pattern: String, qualifier: String },
     /// A file in the task workspace must have exactly this content.
     FileEquals { path: String, content: String },
     /// Regex must match somewhere in a workspace file's content.
