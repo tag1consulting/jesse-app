@@ -174,6 +174,72 @@ pub enum ContentBlock {
         /// a flagged error differently from a string that happens to start with "Error".
         is_error: bool,
     },
+    /// **A PROVIDER-MINTED REASONING ARTEFACT, OPAQUE TO THIS LAYER.**
+    ///
+    /// D13, implementing `LEAKS.md` L5. Two wires require a reasoning model's own previous
+    /// reasoning to come back on the next request of the same turn, or the chain is lost the
+    /// moment the loop dispatches a tool:
+    ///
+    /// * **Messages** returns `thinking` blocks carrying a `signature`, and its documentation
+    ///   is explicit that the assistant turn must be echoed *complete and unmodified* — that
+    ///   rebuilding the message, or filtering out a `redacted_thinking` block, is a `400`.
+    /// * **Responses**, which this crate always drives with `store: false`, returns
+    ///   `reasoning` items carrying `encrypted_content`, to be echoed in the next `input`.
+    ///
+    /// **NOTHING IN THIS CRATE LOOKS INSIDE `opaque`.** It is the block exactly as it
+    /// arrived, held as its own JSON value so "echo it back verbatim" is the trivial
+    /// operation rather than a re-serialisation that has to be got right. It is not text, it
+    /// is not content, and it is not shown to anyone: it renders as nothing, counts as
+    /// nothing, reaches no transcript, and is dropped at the end of the turn rather than
+    /// persisted (see `crate::r#loop`).
+    Reasoning {
+        /// The provider's own id for the item, where the wire gives one — `rs_…` on
+        /// Responses. `None` on Messages, whose thinking blocks carry no id.
+        id: Option<String>,
+        /// Who minted it. The guard, not decoration: an adapter handed a block minted by a
+        /// different wire or a different model refuses the request as
+        /// [`ProviderError::Protocol`] before any bytes go out, because an opaque artefact
+        /// is meaningful only to the exact model that produced it and replaying one across
+        /// a model switch is a `400` at best.
+        minted_by: ReasoningOrigin,
+        /// The artefact, verbatim.
+        opaque: serde_json::Value,
+    },
+}
+
+/// Which wire and model minted a [`ContentBlock::Reasoning`].
+///
+/// Enough to refuse a cross-provider replay and nothing more. The model is a `String`
+/// because that is what the provider config carries and what a `400` would name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReasoningOrigin {
+    pub wire: Wire,
+    pub model: String,
+}
+
+impl ReasoningOrigin {
+    pub fn new(wire: Wire, model: impl Into<String>) -> Self {
+        ReasoningOrigin {
+            wire,
+            model: model.into(),
+        }
+    }
+
+    /// Refuse anything this (wire, model) did not mint.
+    ///
+    /// **BEFORE ANY BYTES GO OUT.** The failure this prevents is a `400` on the SECOND
+    /// iteration of a turn — the worst place to discover it, which `LEAKS.md` L5 named as
+    /// one of the three costs of making this change.
+    pub fn check(&self, wire: Wire, model: &str) -> Result<(), ProviderError> {
+        if self.wire == wire && self.model == model {
+            return Ok(());
+        }
+        Err(ProviderError::Protocol(format!(
+            "a reasoning block minted by {:?}/{} was handed to {:?}/{}; an opaque reasoning \
+             artefact is meaningful only to the model that produced it",
+            self.wire, self.model, wire, model
+        )))
+    }
 }
 
 /// One message in the conversation.
@@ -462,6 +528,19 @@ pub enum Event {
     /// A loop that needs thinking to make progress is a loop that breaks on every other
     /// host, so this is strictly a display/telemetry signal.
     ThinkingDelta(String),
+    /// **A COMPLETE PROVIDER-MINTED REASONING ARTEFACT**, for the loop to echo back on the
+    /// next request of the same turn. D13; see [`ContentBlock::Reasoning`].
+    ///
+    /// Distinct from [`Event::ThinkingDelta`], and the distinction is the whole point.
+    /// A `ThinkingDelta` is a fragment of readable text for a spinner — display and
+    /// telemetry, never required, and on most hosts absent. This is the opaque artefact the
+    /// wire will want back, is not text, and is never shown to anyone. A wire that streams
+    /// visible reasoning may emit both; a wire that streams neither is not failing.
+    Reasoning {
+        id: Option<String>,
+        minted_by: ReasoningOrigin,
+        opaque: serde_json::Value,
+    },
     Usage(Usage),
     Done {
         stop_reason: StopReason,

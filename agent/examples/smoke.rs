@@ -124,6 +124,18 @@ async fn main() -> Result<(), String> {
             // them and the shape of the sequence is what this run is for.
             Event::TextDelta(t) => text.push_str(&t),
             Event::ThinkingDelta(_) => println!("{n:>3}  ThinkingDelta"),
+            // THE SIZE AND THE ORIGIN, NEVER THE PAYLOAD. This is a diagnostic run against a
+            // live host, and printing an opaque reasoning artefact would put a provider's
+            // encrypted chain of thought on a terminal, in scrollback, for no diagnostic
+            // gain over knowing that one arrived and how big it was.
+            Event::Reasoning {
+                minted_by, opaque, ..
+            } => println!(
+                "{n:>3}  Reasoning {} bytes from {:?}/{}",
+                opaque.to_string().len(),
+                minted_by.wire,
+                minted_by.model
+            ),
             Event::ToolUseStart { id, name } => println!("{n:>3}  ToolUseStart {name} ({id})"),
             Event::ToolUseArgsDelta { json_fragment, .. } => {
                 println!("{n:>3}  ToolUseArgsDelta {} bytes", json_fragment.len())

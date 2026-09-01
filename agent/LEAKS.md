@@ -17,11 +17,11 @@ it and it was not real" is a more useful record than silence.
 
 | | |
 |---|---|
-| Conformance cases run against three adapters | **15** (13 inherited, 2 added) |
+| Conformance cases run against three adapters | **15** (13 inherited, 2 added), plus **5** D13 cases the table's one-request-per-case shape cannot express |
 | Cases that needed a trait change to pass | **1** |
 | Additive trait changes made | **1** (`Usage::reasoning_tokens`) |
-| Non-additive changes made | **0** |
-| Recommendations left for Jeremy | **1** (L5) |
+| Non-additive changes made | **1** (`ContentBlock::Reasoning`) |
+| Recommendations left for Jeremy | **0** |
 | Candidates examined and refuted | **4** (L1, L2, L3, L6) |
 
 ---
@@ -65,7 +65,7 @@ comment, since a zero-rate term is a term somebody later "fixes".
 
 ---
 
-## L5 — no neutral block can carry an opaque reasoning item across a tool-use turn · **CONFIRMED · NOT additive in effect · RECOMMENDATION ONLY**
+## L5 — no neutral block can carry an opaque reasoning item across a tool-use turn · **CONFIRMED · NOT additive in effect · MADE (D13)**
 
 **The case.** None in the suite, because it cannot be written without the change. It is a
 multi-iteration turn with a reasoning model: the loop calls, the model thinks and asks for a
@@ -124,6 +124,64 @@ in `openai_responses::OpenAiResponses::body`'s doc comment so nobody rediscovers
 **Recommendation.** Do this as its own change, on all three adapters at once, with the thread
 store's retention question answered first. It is not a Phase 1 blocker: no model this
 repository deploys today runs high-effort reasoning through a long tool loop.
+
+### MADE, in D13. What it cost.
+
+Taken as its own change, on all three adapters at once, and the retention question answered
+first because the answer decided the shape of everything else.
+
+**The variant, as built.** L5's sketch plus one field it did not have:
+
+```rust
+Reasoning {
+    id: Option<String>,          // `rs_…` on Responses; None on Messages, which has none
+    minted_by: ReasoningOrigin,  // { wire, model } — the guard
+    opaque: serde_json::Value,   // the block exactly as it arrived
+}
+```
+
+`opaque` is a `Value` rather than a `String` because "echo it back verbatim" is then the
+trivial operation instead of a re-serialisation that has to be got right, and because both
+wires want a JSON object back, not a quoted string. `minted_by` is the addition:
+`ReasoningOrigin::check` refuses a block minted by another wire or another model as a
+`Protocol` error **before any bytes go out**, which is what stops a model switch mid-thread
+from turning into a `400` on the second iteration of a turn.
+
+**The retention answer: it is never persisted.** Reasoning blocks ride the in-memory
+conversation so the next request of the same turn echoes them, and `append_all` strips them
+from the copy that goes to the thread store. Two reasons, both written where the drop
+happens: the blob is unreplayable across the model switches threads survive, and nothing
+durable should hold what the owner cannot read. That answers the "new class of stored data"
+objection above by not storing it.
+
+**The match sites the compiler surfaced, and what each decided.** Four, plus one in an
+example:
+
+| Site | Decision |
+|---|---|
+| `provider/anthropic.rs` `encode_block` | **Echo verbatim**, after the origin check. The block that arrived is the value that goes back out; the wire documents that rebuilding it, or filtering a `redacted_thinking` block out of it, is a `400`. |
+| `provider/openai_responses.rs` `encode_message` | **Echo verbatim**, after the origin check, pushed as a top-level `input` item rather than a content part — which is the shape this wire takes — and ahead of the message it belongs to. |
+| `provider/openai_chat.rs` `encode_message` | **Skip silently.** The documented absence case: this wire mints nothing to echo, so there is nothing a following request could carry and nothing omitting one could break. |
+| `loop.rs` `build_user_message` | **Named in the drop log.** A caller cannot mint one — reasoning blocks come from an adapter decoding a response — so the arm is unreachable; it is named rather than lumped in with the others so the line stays honest if one ever arrives. |
+| `examples/smoke.rs` | **Size and origin, never the payload.** A diagnostic run must not print a provider's encrypted chain of thought to a terminal. |
+
+Three more sites did not stop compiling and were checked rather than assumed: `framing.rs`
+renders only `Text` from a tool result's blocks (`_ => None`), so a reasoning block
+contributes no printable text; `persona::check` takes a `&str` and cannot be handed a block
+at all; and the eval assertions read a transcript's final answer, which is built from
+`TextDelta` events. A test asserts the text is byte-identical with and without the block.
+
+**The request-side companions, which L5 warned were the easy thing to get wrong.**
+Responses sends `include: ["reasoning.encrypted_content"]`; Messages sends nothing extra but
+now accumulates `signature_delta`, which the decoder previously discarded as "ignored, not
+fatal" — the signature is precisely what the wire validates when the block comes back.
+
+**The cases that could not be written before.** Five, all against loopback mocks: Messages
+echoes a signed thinking block verbatim and in position; Messages echoes a
+`redacted_thinking` block untouched; Responses echoes the encrypted item verbatim as a
+top-level `input` item and asks for it on the first request; Chat carries no reasoning
+artefact anywhere in the second request; and a foreign block is refused on both echoing
+wires with nothing sent.
 
 ---
 

@@ -628,6 +628,27 @@ async fn run_one_call(
             // some stream an encrypted blob; a client that rendered it would show nothing
             // on three hosts out of four and something unreadable on the fourth.
             Event::ThinkingDelta(_) => {}
+            // THE ARTEFACT RIDES THE IN-TURN HISTORY. It is pushed the moment it arrives,
+            // flushing any pending text first, so it keeps the position it was generated in
+            // — which the Messages wire requires (the thinking block leads the assistant
+            // turn and must accompany the `tool_use` block) and the Responses wire expects
+            // (reasoning items precede the message in `input`). The loop understands nothing
+            // about it beyond where it goes; see `append_all` for where it stops.
+            Event::Reasoning {
+                id,
+                minted_by,
+                opaque,
+            } => {
+                if !pending_text.is_empty() {
+                    out.content
+                        .push(ContentBlock::Text(std::mem::take(&mut pending_text)));
+                }
+                out.content.push(ContentBlock::Reasoning {
+                    id,
+                    minted_by,
+                    opaque,
+                });
+            }
             Event::ToolUseStart { id, name } => {
                 if !pending_text.is_empty() {
                     out.content
@@ -943,6 +964,11 @@ fn build_user_message(text: &str, images: Vec<ContentBlock>) -> Message {
                     ContentBlock::Text(_) => "text",
                     ContentBlock::ToolUse { .. } => "tool_use",
                     ContentBlock::ToolResult { .. } => "tool_result",
+                    // A caller cannot mint one: reasoning blocks are created by an adapter
+                    // decoding a response, never by anything that could reach `user_images`.
+                    // Named rather than lumped into the others so the log line stays honest
+                    // if one ever does arrive.
+                    ContentBlock::Reasoning { .. } => "reasoning",
                     ContentBlock::Image { .. } => unreachable!(),
                 }
             ),
@@ -982,15 +1008,45 @@ fn prepare_system(mut system: Vec<SystemBlock>) -> Vec<SystemBlock> {
 /// Append to the store and to the in-memory conversation together, so the two cannot
 /// diverge. If the store refuses, the in-memory copy is NOT advanced — a turn continuing
 /// with messages the thread does not have would produce an answer that vanishes on resume.
+///
+/// **ONE DELIBERATE ASYMMETRY: reasoning blocks reach the conversation and never the
+/// store.** They ride the in-memory history so the next request of the same turn echoes
+/// them back, and they end with the turn, because `messages` is this turn's own vector and
+/// nothing writes them anywhere else. Two reasons, and both are about the artefact rather
+/// than about disk space:
+///
+/// * **It is unreplayable across a model switch.** The registry lets the phone change
+///   models mid-conversation, and a resumed thread is not guaranteed the model that minted
+///   the blob — which is exactly what [`ReasoningOrigin::check`] refuses. Persisting it
+///   would store something that is either useless on the next turn or a `400`.
+/// * **Nothing durable should hold what the owner cannot read.** An encrypted
+///   chain-of-thought blob written at mode 0600 beside the conversation is larger than the
+///   messages it accompanies, unreadable by the person whose thread it is, and meaningful
+///   only to the provider that minted it. `LEAKS.md` L5 called that a product decision
+///   rather than an adapter one; this is the decision.
 fn append_all(
     store: &dyn ThreadStore,
     id: &ThreadId,
     messages: &mut Vec<Message>,
     new: Vec<Message>,
 ) -> Result<(), ThreadError> {
-    store.append(id, &new)?;
+    let durable: Vec<Message> = new.iter().map(without_reasoning).collect();
+    store.append(id, &durable)?;
     messages.extend(new);
     Ok(())
+}
+
+/// The same message with every [`ContentBlock::Reasoning`] removed. See [`append_all`].
+fn without_reasoning(m: &Message) -> Message {
+    Message {
+        role: m.role,
+        content: m
+            .content
+            .iter()
+            .filter(|b| !matches!(b, ContentBlock::Reasoning { .. }))
+            .cloned()
+            .collect(),
+    }
 }
 
 fn duration_ms(d: Duration) -> u64 {
@@ -1057,4 +1113,117 @@ async fn join_all<T>(futures: Vec<BoxFuture<'_, T>>) -> Vec<T> {
         }
     })
     .await
+}
+
+// ===========================================================================
+// D13 — where reasoning stops
+// ===========================================================================
+
+#[cfg(test)]
+mod reasoning_tests {
+    use super::*;
+    use crate::provider::{ReasoningOrigin, Wire};
+    use crate::thread::{MemoryThreadStore, ThreadStore};
+
+    fn reasoning() -> ContentBlock {
+        ContentBlock::Reasoning {
+            id: Some("rs_1".into()),
+            minted_by: ReasoningOrigin::new(Wire::Responses, "some-model"),
+            opaque: serde_json::json!({
+                "type": "reasoning",
+                "id": "rs_1",
+                "encrypted_content": "ENCRYPTED-CHAIN-OF-THOUGHT"
+            }),
+        }
+    }
+
+    fn assistant_turn() -> Message {
+        Message {
+            role: Role::Assistant,
+            content: vec![
+                reasoning(),
+                ContentBlock::Text("Let me check.".into()),
+                ContentBlock::ToolUse {
+                    id: "t1".into(),
+                    name: "vault_read".into(),
+                    arguments: Value::Object(Default::default()),
+                },
+            ],
+        }
+    }
+
+    /// **THE DROP RULE, ASSERTED ON BOTH SIDES OF IT.** The conversation this turn is still
+    /// running keeps the block, because the next request has to echo it; the thread store
+    /// never sees it, because a resumed turn is not guaranteed the model that minted it and
+    /// nothing durable should hold what the owner cannot read.
+    #[test]
+    fn reasoning_rides_the_turn_and_never_reaches_the_store() {
+        let store = MemoryThreadStore::new();
+        let id = store.create().expect("thread");
+        let mut messages: Vec<Message> = Vec::new();
+
+        append_all(&store, &id, &mut messages, vec![assistant_turn()]).expect("append");
+
+        // In memory: intact, so the echo-back can happen.
+        assert!(
+            matches!(messages[0].content[0], ContentBlock::Reasoning { .. }),
+            "the in-turn conversation keeps the block"
+        );
+        assert_eq!(messages[0].content.len(), 3);
+
+        // On disk: gone, and everything else untouched.
+        let stored = store.load(&id).expect("load").messages;
+        assert_eq!(stored.len(), 1);
+        assert_eq!(
+            stored[0].content.len(),
+            2,
+            "the stored turn is the same turn minus the reasoning block"
+        );
+        assert!(
+            !stored[0]
+                .content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Reasoning { .. })),
+            "no reasoning block reached the store"
+        );
+        assert!(matches!(stored[0].content[0], ContentBlock::Text(_)));
+        assert!(matches!(stored[0].content[1], ContentBlock::ToolUse { .. }));
+
+        // And the payload itself is nowhere in the serialised thread — the assertion is on
+        // the bytes rather than on the type, because the type is what a future refactor
+        // could change without noticing.
+        let serialised = serde_json::to_string(&stored).expect("serialise");
+        assert!(
+            !serialised.contains("ENCRYPTED-CHAIN-OF-THOUGHT"),
+            "the opaque payload reached durable storage: {serialised}"
+        );
+    }
+
+    /// IT IS NOT PRINTABLE TEXT EITHER. `TurnOutcome::text` is built from `TextDelta`
+    /// events and a reasoning block contributes to neither it nor a tool result's rendered
+    /// text, so nothing a transcript or the style checker reads can ever contain one.
+    #[test]
+    fn a_reasoning_block_contributes_no_printable_text() {
+        let stripped = without_reasoning(&assistant_turn());
+        let text: String = stripped
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::Text(t) => Some(t.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "Let me check.");
+        // The style checker takes a `&str` and has no way to be handed a block at all; this
+        // asserts the text it would be handed is the same with and without the block.
+        let full: String = assistant_turn()
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::Text(t) => Some(t.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(full, text);
+    }
 }

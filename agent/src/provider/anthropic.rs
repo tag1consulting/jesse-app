@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 use super::http::{self, EventStream, SseDecoder};
 use super::{
     BoxFuture, Capabilities, ContentBlock, Event, Message, Provider, ProviderConfig, ProviderError,
-    Request, Role, StopReason, Thinking, ToolResultContent, Usage, Wire,
+    ReasoningOrigin, Request, Role, StopReason, Thinking, ToolResultContent, Usage, Wire,
 };
 
 /// The API version header, pinned to the value the bridge sends today.
@@ -85,7 +85,7 @@ impl AnthropicMessages {
 
     /// The request body. Public within the crate so the conformance suite can assert on
     /// the exact JSON without a socket, in addition to asserting on what the mock received.
-    pub(crate) fn body(&self, req: &Request) -> Value {
+    pub(crate) fn body(&self, req: &Request) -> Result<Value, ProviderError> {
         let mut body = Map::new();
         body.insert("model".into(), json!(self.cfg.model));
         body.insert("stream".into(), json!(true));
@@ -115,7 +115,12 @@ impl AnthropicMessages {
 
         body.insert(
             "messages".into(),
-            Value::Array(req.messages.iter().map(encode_message).collect()),
+            Value::Array(
+                req.messages
+                    .iter()
+                    .map(|m| encode_message(m, &self.cfg.model))
+                    .collect::<Result<Vec<_>, _>>()?,
+            ),
         );
 
         // ---- Tools ---------------------------------------------------------
@@ -185,21 +190,29 @@ impl AnthropicMessages {
             }
         }
 
-        Value::Object(body)
+        Ok(Value::Object(body))
     }
 }
 
 /// Encode one neutral message.
-fn encode_message(m: &Message) -> Value {
-    json!({
+///
+/// `Result`, since D13, for one reason: a [`ContentBlock::Reasoning`] minted elsewhere is
+/// refused HERE, while the body is still being built and nothing has gone out.
+fn encode_message(m: &Message, model: &str) -> Result<Value, ProviderError> {
+    let content = m
+        .content
+        .iter()
+        .map(|b| encode_block(b, model))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(json!({
         "role": match m.role { Role::User => "user", Role::Assistant => "assistant" },
-        "content": m.content.iter().map(encode_block).collect::<Vec<_>>(),
-    })
+        "content": content,
+    }))
 }
 
 /// Encode one neutral content block.
-fn encode_block(b: &ContentBlock) -> Value {
-    match b {
+fn encode_block(b: &ContentBlock, model: &str) -> Result<Value, ProviderError> {
+    Ok(match b {
         ContentBlock::Text(t) => json!({"type": "text", "text": t}),
         ContentBlock::Image {
             media_type,
@@ -220,9 +233,11 @@ fn encode_block(b: &ContentBlock) -> Value {
         } => {
             let content = match content {
                 ToolResultContent::Text(t) => json!(t),
-                ToolResultContent::Blocks(bs) => {
-                    Value::Array(bs.iter().map(encode_block).collect())
-                }
+                ToolResultContent::Blocks(bs) => Value::Array(
+                    bs.iter()
+                        .map(|b| encode_block(b, model))
+                        .collect::<Result<Vec<_>, _>>()?,
+                ),
             };
             json!({
                 "type": "tool_result",
@@ -231,7 +246,18 @@ fn encode_block(b: &ContentBlock) -> Value {
                 "is_error": is_error,
             })
         }
-    }
+        // ECHOED BACK VERBATIM, WHICH IS THE ENTIRE CONTRACT. This wire's documentation is
+        // explicit that the assistant turn must come back "complete and unmodified", and
+        // that rebuilding the message — or filtering out a `redacted_thinking` block —
+        // is a 400. So the block is not re-encoded from parts; the value that arrived is
+        // the value that goes back out, and the guard above is what makes that safe.
+        ContentBlock::Reasoning {
+            minted_by, opaque, ..
+        } => {
+            minted_by.check(Wire::Messages, model)?;
+            opaque.clone()
+        }
+    })
 }
 
 impl Provider for AnthropicMessages {
@@ -257,14 +283,15 @@ impl Provider for AnthropicMessages {
         cancel: CancellationToken,
     ) -> BoxFuture<'a, Result<EventStream, ProviderError>> {
         Box::pin(async move {
-            let body = self.body(req).to_string();
+            let body = self.body(req)?.to_string();
+            let model_for_decoder = self.cfg.model.clone();
             http::start_call(
                 &self.cfg,
                 &self.client,
                 MESSAGES_PATH,
                 body,
                 &req.request_tag,
-                || Box::new(MessagesDecoder::default()),
+                || Box::new(MessagesDecoder::new(&model_for_decoder)),
                 cancel,
             )
             .await
@@ -280,7 +307,19 @@ impl Provider for AnthropicMessages {
 #[derive(Debug)]
 enum OpenBlock {
     Text,
-    Thinking,
+    /// A thinking (or `redacted_thinking`) block, accumulating everything needed to hand it
+    /// back BYTE-FOR-BYTE on the next request of this turn.
+    ///
+    /// The stream delivers a thinking block in pieces — the opening block, then
+    /// `thinking_delta` text, then a `signature_delta` — and this wire requires the
+    /// reassembled block back "complete and unmodified". So the opening block is kept as
+    /// the base and the deltas are folded into it, rather than a new object being built
+    /// from a shape this crate believes the block has.
+    Thinking {
+        base: Value,
+        text: String,
+        signature: String,
+    },
     /// A tool call, accumulating its argument fragments.
     ToolUse {
         id: String,
@@ -296,8 +335,10 @@ enum OpenBlock {
 /// `message_delta`, `message_stop`, `error` and `ping`. Anything else is ignored rather
 /// than rejected — the wire adds event types over time, and a decoder that refused unknown
 /// ones would break on a schema addition that does not concern it.
-#[derive(Default)]
 struct MessagesDecoder {
+    /// Who is minting the reasoning blocks this decoder emits. Carried rather than derived
+    /// so `Event::Reasoning` can name its origin at the moment it is created.
+    origin: ReasoningOrigin,
     blocks: std::collections::BTreeMap<u64, OpenBlock>,
     usage: Usage,
     stop_reason: Option<StopReason>,
@@ -308,6 +349,17 @@ struct MessagesDecoder {
 }
 
 impl MessagesDecoder {
+    fn new(model: &str) -> Self {
+        MessagesDecoder {
+            origin: ReasoningOrigin::new(Wire::Messages, model),
+            blocks: Default::default(),
+            usage: Default::default(),
+            stop_reason: None,
+            terminated: false,
+            done: false,
+        }
+    }
+
     fn push_terminal(&mut self, out: &mut Vec<Event>, ev: Event) {
         if !self.done {
             self.done = true;
@@ -375,7 +427,28 @@ impl SseDecoder for MessagesDecoder {
                         );
                     }
                     Some("thinking") | Some("redacted_thinking") => {
-                        self.blocks.insert(index, OpenBlock::Thinking);
+                        let base = block.cloned().unwrap_or_else(|| json!({}));
+                        // Seeded from the opening block rather than assumed empty: the wire
+                        // is free to send a prefix there, and a rebuilt block missing it
+                        // would be a modified block.
+                        let text = base
+                            .get("thinking")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string();
+                        let signature = base
+                            .get("signature")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string();
+                        self.blocks.insert(
+                            index,
+                            OpenBlock::Thinking {
+                                base,
+                                text,
+                                signature,
+                            },
+                        );
                     }
                     _ => {
                         self.blocks.insert(index, OpenBlock::Text);
@@ -400,7 +473,28 @@ impl SseDecoder for MessagesDecoder {
                             .and_then(|d| d.get("thinking"))
                             .and_then(Value::as_str)
                         {
+                            if let Some(OpenBlock::Thinking { text, .. }) =
+                                self.blocks.get_mut(&index)
+                            {
+                                text.push_str(t);
+                            }
                             out.push(Event::ThinkingDelta(t.to_string()));
+                        }
+                    }
+                    // THE SIGNATURE IS THE POINT OF THE WHOLE BLOCK. Ignored before D13
+                    // (the comment below used to say so), it is what the wire validates
+                    // when the block comes back, and a thinking block echoed without it is
+                    // a 400 on the second iteration of the turn.
+                    Some("signature_delta") => {
+                        if let Some(sig) = delta
+                            .and_then(|d| d.get("signature"))
+                            .and_then(Value::as_str)
+                        {
+                            if let Some(OpenBlock::Thinking { signature, .. }) =
+                                self.blocks.get_mut(&index)
+                            {
+                                signature.push_str(sig);
+                            }
                         }
                     }
                     Some("input_json_delta") => {
@@ -427,7 +521,7 @@ impl SseDecoder for MessagesDecoder {
                             }
                         }
                     }
-                    // `signature_delta` and any future delta type: ignored, not fatal.
+                    // Any future delta type: ignored, not fatal.
                     _ => {}
                 }
             }
@@ -436,7 +530,39 @@ impl SseDecoder for MessagesDecoder {
                 let Some(index) = v.get("index").and_then(Value::as_u64) else {
                     return;
                 };
-                if let Some(OpenBlock::ToolUse { id, name, args }) = self.blocks.remove(&index) {
+                let closed = self.blocks.remove(&index);
+                let closed = if let Some(OpenBlock::Thinking {
+                    base,
+                    text,
+                    signature,
+                }) = closed
+                {
+                    // REASSEMBLED FROM THE OPENING BLOCK, not built from scratch. Only the
+                    // two fields the deltas carry are written back into it, and only when
+                    // the wire gave them, so a `redacted_thinking` block (which has `data`
+                    // and neither of these) goes back exactly as it arrived — filtering one
+                    // out, or reshaping it, is a documented 400.
+                    let mut block = base;
+                    if let Some(obj) = block.as_object_mut() {
+                        if obj.contains_key("thinking") {
+                            obj.insert("thinking".into(), json!(text));
+                        }
+                        if !signature.is_empty() {
+                            obj.insert("signature".into(), json!(signature));
+                        }
+                    }
+                    out.push(Event::Reasoning {
+                        // NO ID. A thinking block does not carry one on this wire, and
+                        // inventing one would be a field this layer made up.
+                        id: None,
+                        minted_by: self.origin.clone(),
+                        opaque: block,
+                    });
+                    None
+                } else {
+                    closed
+                };
+                if let Some(OpenBlock::ToolUse { id, name, args }) = closed {
                     // THE VALIDATION THAT MUST NOT BE SKIPPED. An accumulated argument
                     // string that does not parse is a Protocol error NAMING THE TOOL,
                     // never a silently-empty `{}`. Passing `{}` on instead would send
@@ -575,7 +701,7 @@ mod tests {
     }
 
     fn decode(frames: &[&str]) -> Vec<Event> {
-        let mut d = MessagesDecoder::default();
+        let mut d = MessagesDecoder::new("test-model");
         let mut out = Vec::new();
         for f in frames {
             d.on_frame(f, &mut out);
@@ -612,7 +738,7 @@ mod tests {
             messages: vec![Message::user("hi")],
             ..Default::default()
         };
-        let body = p.body(&req);
+        let body = p.body(&req).unwrap();
         assert_eq!(body.pointer("/thinking/budget_tokens"), Some(&json!(4096)));
         assert!(body.get("temperature").is_none());
     }
@@ -628,7 +754,7 @@ mod tests {
             messages: vec![Message::user("hi")],
             ..Default::default()
         };
-        let body = p.body(&req);
+        let body = p.body(&req).unwrap();
         assert_eq!(body.get("temperature"), Some(&json!(0.7)));
         assert!(body.get("thinking").is_none());
     }
@@ -644,7 +770,7 @@ mod tests {
             messages: vec![Message::user("hi")],
             ..Default::default()
         };
-        let body = p.body(&req);
+        let body = p.body(&req).unwrap();
         assert_eq!(
             body.pointer("/system/0/cache_control/type"),
             Some(&json!("ephemeral"))
@@ -667,7 +793,7 @@ mod tests {
             messages: vec![Message::user("hi")],
             ..Default::default()
         };
-        let body = p.body(&req);
+        let body = p.body(&req).unwrap();
         assert!(body.pointer("/tools/0/cache_control").is_none());
         assert_eq!(
             body.pointer("/tools/1/cache_control/type"),
@@ -692,7 +818,11 @@ mod tests {
             messages: vec![Message::user("hi")],
             ..Default::default()
         };
-        assert!(p.body(&req).pointer("/tools/0/cache_control").is_none());
+        assert!(p
+            .body(&req)
+            .unwrap()
+            .pointer("/tools/0/cache_control")
+            .is_none());
     }
 
     #[test]
@@ -709,7 +839,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let body = p.body(&req);
+        let body = p.body(&req).unwrap();
         assert_eq!(
             body.pointer("/messages/0/content/0/tool_use_id"),
             Some(&json!("toolu_1"))
