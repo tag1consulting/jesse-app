@@ -24,9 +24,9 @@ documented is closed to one.
 ### Fixed
 
 - **F4 — `GrepIndex` was proportional to the largest document, not to a constant.** Measured
-  on a synthetic store before anything was changed: **one 32 MB document cost 126 MB of peak
-  live memory and 379 MB of total allocation, a 3.9× and 11.8× multiple of the file.** Three
-  mechanisms, each removed:
+  on a synthetic store before anything was changed: **one 32 MB document cost 67.2 MB of peak
+  live memory and 134 MB of total allocation — 2.1× and 4.2× the file.** Three mechanisms,
+  each removed:
   - **`FsVaultStore::meta_of` read every file whole** — twice, plus a lossy UTF-8 copy — to
     find a heading in the first 50 lines and hash the bytes. A `list` of 200 documents
     therefore paid the full bytes of all 200 before the caller saw a single title. It now
@@ -43,11 +43,17 @@ documented is closed to one.
     past it is skipped **before the read**, from the listing's own size, counted, and named
     in `Hits::degraded`; and bounded hit accumulation, replacing a `Vec<Hit>` that grew until
     the walk ended.
-  - After: the same 32 MB document costs **0 bytes of peak growth and 5.4 MB of total
-    allocation**, and quadrupling a document from 8 MB to 32 MB moves peak from 205 KB to
-    133 KB — i.e. not at all. `agent/tests/grep_index_memory.rs` asserts the contract with a
-    counting global allocator confined to that test binary, and three of its four assertions
-    fail on the old code.
+  - After: the same 32 MB document costs **132,622 bytes of peak growth — a 505× reduction**
+    — and the peak is now genuinely flat: 8 MB and 32 MB documents both measure **132,623
+    bytes, the same number to the byte**, where before they measured 16.8 MB and 67.2 MB.
+    `agent/tests/grep_index_memory.rs` asserts the contract with a counting global allocator
+    confined to that test binary, and its two size assertions fail on the old code. The
+    measurements are serialised behind a mutex, because the counters are process-global while
+    `cargo test` runs the file's tests in parallel — without that a fixture built on one
+    thread lands in another's high-water mark, and the test reports whatever the scheduler
+    did. Total-allocated is printed but not asserted: allocation over time is not memory
+    held, and hashing a large document for its metadata legitimately streams its bytes past
+    the allocator whatever the peak is.
 
 ### Added
 
