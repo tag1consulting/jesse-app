@@ -504,6 +504,19 @@ make a stored thread's meaning depend on the version of the code that read it, s
 the framing would silently rewrite history. An audit log that changes when you improve the
 code is not an audit log.
 
+**Reasoning artefacts are the one thing a turn holds and a thread never does.** A reasoning
+model's own previous reasoning has to come back on the next request of the same turn or the
+chain is lost the moment a tool is dispatched — the Messages wire wants its signed `thinking`
+block echoed complete and unmodified, and the Responses wire (which this crate always drives
+with `store: false`) wants its encrypted `reasoning` item echoed in `input`. So
+`ContentBlock::Reasoning` carries the artefact verbatim, opaque to this layer, and rides the
+in-memory conversation. `append_all` then strips it from the copy that reaches the thread
+store, for two reasons: the blob is unreplayable across the model switches a thread survives
+— the registry lets the phone change models mid-conversation, and an adapter handed a block
+another model minted refuses the request before any bytes go out — and nothing durable should
+hold what the owner cannot read. It is not text, it reaches no transcript and no style check,
+and it ends with the turn. See `LEAKS.md` L5.
+
 ## The trace
 
 Content-free by construction: per tool a name, an `ActionClass`, a duration and one of three

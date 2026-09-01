@@ -42,7 +42,7 @@ use tokio_util::sync::CancellationToken;
 use super::http::{self, EventStream, SseDecoder};
 use super::{
     BoxFuture, Capabilities, ContentBlock, Event, Message, Provider, ProviderConfig, ProviderError,
-    Request, Role, StopReason, Thinking, ToolResultContent, Usage, Wire,
+    ReasoningOrigin, Request, Role, StopReason, Thinking, ToolResultContent, Usage, Wire,
 };
 
 /// The path appended to `base_url`.
@@ -120,19 +120,30 @@ impl OpenAiResponses {
     /// even where it could, it would mean the model's context was assembled from state the
     /// loop cannot see, which is the property `thread.rs` exists to deny.
     ///
-    /// WHAT THIS COSTS, stated because it is real: with `store: false` a reasoning model
-    /// cannot be handed its own previous reasoning items back across a tool-use iteration
-    /// (the wire's mechanism for that is `include: ["reasoning.encrypted_content"]` plus
-    /// echoing the opaque item, and the neutral model has no block that can carry one).
-    /// The turn is correct and safe; a long chain of tool calls will re-derive some
-    /// thinking it already did. That gap is `agent/LEAKS.md`'s L5 and it is deliberately
-    /// left open rather than patched here.
-    pub(crate) fn body(&self, req: &Request) -> Value {
+    /// **WHAT THIS USED TO COST, AND NO LONGER DOES.** `store: false` means there is no
+    /// server-side copy of the reasoning to replay, so until D13 a reasoning model
+    /// re-derived its own thinking on every iteration of a tool loop — the wire's stateless
+    /// mechanism needs a block that can carry an opaque artefact, and the neutral model had
+    /// none. That was `LEAKS.md` L5, and it is now MADE: this request sends
+    /// `include: ["reasoning.encrypted_content"]`, the decoder captures each finished
+    /// `reasoning` item into [`ContentBlock::Reasoning`], and `encode_message` echoes it
+    /// back in `input`. `store: false` is unchanged and is not up for revision — the
+    /// continuity comes from the loop carrying the item, not from the provider keeping it.
+    pub(crate) fn body(&self, req: &Request) -> Result<Value, ProviderError> {
         let mut body = Map::new();
         body.insert("model".into(), json!(self.cfg.model));
         body.insert("stream".into(), json!(true));
         // The whole privacy posture of this adapter, in one line. See the doc above.
         body.insert("store".into(), json!(false));
+        // REASONING CONTINUITY, STATELESSLY. With `store: false` the provider keeps nothing
+        // to replay, so the encrypted reasoning items have to come back to us in order to
+        // go back out on the next iteration of a turn. Current documentation says the items
+        // carry `encrypted_content` by default under `store: false` and that this `include`
+        // value is accepted for backward compatibility rather than required — it is sent
+        // anyway, because a host that predates that change needs it and one that follows it
+        // accepts it, and the failure it prevents is a silent loss of continuity rather
+        // than an error anyone would see.
+        body.insert("include".into(), json!(["reasoning.encrypted_content"]));
         body.insert(
             "max_output_tokens".into(),
             json!(req.sampling.max_output_tokens),
@@ -166,7 +177,7 @@ impl OpenAiResponses {
         // ---- The conversation -> `input` items -----------------------------
         let mut input: Vec<Value> = Vec::new();
         for m in &req.messages {
-            encode_message(m, &mut input);
+            encode_message(m, &mut input, &self.cfg.model)?;
         }
         body.insert("input".into(), Value::Array(input));
 
@@ -248,7 +259,7 @@ impl OpenAiResponses {
             }
         }
 
-        Value::Object(body)
+        Ok(Value::Object(body))
     }
 }
 
@@ -265,7 +276,7 @@ impl OpenAiResponses {
 /// precedes its call, so results are emitted FIRST within their own message — the same
 /// hoist the Chat adapter performs, for the same reason: the neutral model carries the
 /// results as blocks of the user message that follows the assistant's calls.
-fn encode_message(m: &Message, out: &mut Vec<Value>) {
+fn encode_message(m: &Message, out: &mut Vec<Value>, model: &str) -> Result<(), ProviderError> {
     for b in &m.content {
         if let ContentBlock::ToolResult {
             id,
@@ -355,6 +366,24 @@ fn encode_message(m: &Message, out: &mut Vec<Value>) {
                 // this adapter round-trips.
             })),
             ContentBlock::ToolResult { .. } => {}
+            // ECHOED BACK VERBATIM, AND FIRST. This wire's stateless multi-turn mechanism
+            // is exactly this: with `store: false` there is no server-side copy of the
+            // reasoning to replay, so the reasoning items from the previous response's
+            // `output` must be carried back in `input` or the chain is lost the moment a
+            // tool is dispatched. The item goes back as it arrived — `id` and
+            // `encrypted_content` included — because nothing here understands its contents
+            // well enough to rebuild it.
+            //
+            // It is pushed to `out` DIRECTLY rather than into `parts`: a reasoning item is a
+            // top-level input item beside `message` and `function_call`, not a content part
+            // inside a message. Pushing it here also keeps it ahead of the message and the
+            // calls in this turn, which is the order it was generated in.
+            ContentBlock::Reasoning {
+                minted_by, opaque, ..
+            } => {
+                minted_by.check(Wire::Responses, model)?;
+                out.push(opaque.clone());
+            }
         }
     }
 
@@ -384,6 +413,7 @@ fn encode_message(m: &Message, out: &mut Vec<Value>) {
         }
     }
     out.extend(calls);
+    Ok(())
 }
 
 impl Provider for OpenAiResponses {
@@ -418,14 +448,15 @@ impl Provider for OpenAiResponses {
         cancel: CancellationToken,
     ) -> BoxFuture<'a, Result<EventStream, ProviderError>> {
         Box::pin(async move {
-            let body = self.body(req).to_string();
+            let body = self.body(req)?.to_string();
+            let model_for_decoder = self.cfg.model.clone();
             http::start_call(
                 &self.cfg,
                 &self.client,
                 RESPONSES_PATH,
                 body,
                 &req.request_tag,
-                || Box::new(ResponsesDecoder::default()),
+                || Box::new(ResponsesDecoder::new(&model_for_decoder)),
                 cancel,
             )
             .await
@@ -466,8 +497,9 @@ struct PartialCall {
 /// rule the other two adapters apply to a delta for a block they never opened. It cannot
 /// be recovered from: without the `added` event there is no `call_id` and no tool name, so
 /// there is nothing to emit.
-#[derive(Default)]
 struct ResponsesDecoder {
+    /// Who is minting the reasoning items this decoder emits. See `MessagesDecoder`.
+    origin: ReasoningOrigin,
     calls: HashMap<String, PartialCall>,
     usage: Usage,
     /// Any `function_call` item was produced — this wire's only evidence that the model
@@ -480,6 +512,17 @@ struct ResponsesDecoder {
 }
 
 impl ResponsesDecoder {
+    fn new(model: &str) -> Self {
+        ResponsesDecoder {
+            origin: ReasoningOrigin::new(Wire::Responses, model),
+            calls: Default::default(),
+            usage: Default::default(),
+            saw_function_call: false,
+            terminated: false,
+            done: false,
+        }
+    }
+
     fn push_terminal(&mut self, out: &mut Vec<Event>, ev: Event) {
         if !self.done {
             self.done = true;
@@ -741,6 +784,19 @@ impl SseDecoder for ResponsesDecoder {
             // loop can see and cannot call.
             "response.output_item.done" => {
                 let item = v.get("item").unwrap_or(&Value::Null);
+                // THE REASONING ITEM, CAPTURED WHOLE AND CAPTURED HERE. `added` carries the
+                // item before its `encrypted_content` exists; `done` carries the finished
+                // item, which is the thing the next request has to echo. It is taken
+                // verbatim — this adapter does not know what is inside it and must not
+                // rebuild it from fields it believes are there.
+                if item.get("type").and_then(Value::as_str) == Some("reasoning") {
+                    out.push(Event::Reasoning {
+                        id: item.get("id").and_then(Value::as_str).map(str::to_string),
+                        minted_by: self.origin.clone(),
+                        opaque: item.clone(),
+                    });
+                    return;
+                }
                 if item.get("type").and_then(Value::as_str) != Some("function_call") {
                     return;
                 }
@@ -900,7 +956,7 @@ mod tests {
     }
 
     fn decode(frames: &[&str]) -> Vec<Event> {
-        let mut d = ResponsesDecoder::default();
+        let mut d = ResponsesDecoder::new("test-model");
         let mut out = Vec::new();
         for f in frames {
             d.on_frame(f, &mut out);
@@ -914,7 +970,7 @@ mod tests {
         // The privacy property of this adapter, asserted on the body rather than on a
         // comment. `store` defaults to TRUE on this wire, so an absent field is not
         // equivalent and the test checks the value, not the absence.
-        let body = provider().body(&Request::default());
+        let body = provider().body(&Request::default()).unwrap();
         assert_eq!(body.get("store"), Some(&json!(false)));
         assert!(
             body.get("previous_response_id").is_none(),
@@ -936,7 +992,7 @@ mod tests {
             messages: vec![Message::user("hi")],
             ..Default::default()
         };
-        let body = provider().body(&req);
+        let body = provider().body(&req).unwrap();
         assert_eq!(body.get("instructions"), Some(&json!("stable\n\ntoday")));
         // The same join the Chat adapter performs, so a persona renders identically.
         assert!(
@@ -956,12 +1012,13 @@ mod tests {
             thinking: Thinking::High,
             ..Default::default()
         };
-        assert!(provider().body(&req).get("reasoning").is_none());
+        assert!(provider().body(&req).unwrap().get("reasoning").is_none());
         let on = provider_with(Quirks {
             reasoning_effort_supported: true,
             ..Default::default()
         })
-        .body(&req);
+        .body(&req)
+        .unwrap();
         assert_eq!(on.pointer("/reasoning/effort"), Some(&json!("high")));
         // No summary is requested: it is generated text and would be billed.
         assert!(on.pointer("/reasoning/summary").is_none());
@@ -979,7 +1036,7 @@ mod tests {
             ..Default::default()
         };
         // Quirk off: the KEY is still there (the schema requires it), the VALUE is false.
-        let off = provider().body(&req);
+        let off = provider().body(&req).unwrap();
         assert_eq!(off.pointer("/tools/0/strict"), Some(&json!(false)));
         // And the tool is FLAT — no `function` wrapper, unlike the Chat wire.
         assert_eq!(off.pointer("/tools/0/name"), Some(&json!("add")));
@@ -990,7 +1047,8 @@ mod tests {
             strict_tools_supported: true,
             ..Default::default()
         })
-        .body(&req);
+        .body(&req)
+        .unwrap();
         assert_eq!(on.pointer("/tools/0/strict"), Some(&json!(true)));
     }
 
@@ -1003,7 +1061,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let body = provider().body(&req);
+        let body = provider().body(&req).unwrap();
         assert!(body.get("stop").is_none());
         assert!(body.get("stop_sequences").is_none());
         assert!(
@@ -1038,7 +1096,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        let body = provider().body(&req);
+        let body = provider().body(&req).unwrap();
         // The assistant's text is a STRING, not a part list — see `encode_message`.
         assert_eq!(body.pointer("/input/0/role"), Some(&json!("assistant")));
         assert_eq!(body.pointer("/input/0/content"), Some(&json!("calling")));
@@ -1075,7 +1133,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let body = provider().body(&req);
+        let body = provider().body(&req).unwrap();
         assert_eq!(body.pointer("/input/0/output"), Some(&json!("Error: boom")));
     }
 
@@ -1091,7 +1149,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let body = provider().body(&req);
+        let body = provider().body(&req).unwrap();
         assert_eq!(
             body.pointer("/input/0/content/0/image_url"),
             Some(&json!("data:image/png;base64,QUJD"))

@@ -223,6 +223,15 @@ fn encode_message(m: &Message, out: &mut Vec<Value>) {
                 "function": {"name": name, "arguments": arguments.to_string()},
             })),
             ContentBlock::ToolResult { .. } => {}
+            // THE ABSENCE CASE, AND SKIPPING IS THE CORRECT BEHAVIOUR. This wire has no
+            // reasoning artefact to echo: Chat Completions returns no signed thinking block
+            // and no encrypted reasoning item, so there is nothing here that a following
+            // request could carry and nothing that omitting one could break. A reasoning
+            // block reaching this adapter came from a turn that ran on another wire, and the
+            // right response to it is to send the message without it rather than to refuse a
+            // request this wire can serve perfectly well. This adapter never MINTS one
+            // either, so in a turn that stayed on this wire the arm is unreachable.
+            ContentBlock::Reasoning { .. } => {}
         }
     }
 

@@ -14,6 +14,71 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [agent 0.8.0] - 2026-09-01
+
+**Reasoning continuity: `LEAKS.md` L5, implemented across all three adapters.** A reasoning
+model lost its own chain of thought the moment the loop dispatched a tool, on **two** of the
+three wires — not the one the leak was found on. The neutral model had no block that could
+carry an opaque provider-minted artefact, so there was nothing to hold and nothing to send
+back. This is the smallest change that fixes it, made as its own change with the plain
+non-additive accounting L5 promised.
+
+### Added
+
+- **`ContentBlock::Reasoning { id, minted_by, opaque }`** — a provider-minted reasoning
+  artefact, opaque to this layer. `opaque` is the block exactly as it arrived, held as a JSON
+  value so echoing it back verbatim is the trivial operation rather than a re-serialisation
+  that has to be got right. **Nothing in this crate looks inside it.**
+- **`ReasoningOrigin { wire, model }`, and the guard that makes it worth carrying.** An
+  adapter handed a block minted by a different wire or a different model refuses the request
+  as `ProviderError::Protocol` **before any bytes go out**. The registry lets the phone change
+  models mid-conversation, and an opaque artefact is meaningful only to the model that
+  produced it; without the guard the failure surfaces as a `400` on the *second* iteration of
+  a turn, which L5 named as the worst place to discover it.
+- **`Event::Reasoning`**, distinct from `Event::ThinkingDelta` and deliberately so: a
+  `ThinkingDelta` is a fragment of readable text for a spinner, absent on most hosts and never
+  required; this is the artefact the wire will want back, is not text, and is shown to nobody.
+- **Five conformance cases that could not be written before** — L5's own words were "None in
+  the suite, because it cannot be written without the change." Thinking AND a tool call AND a
+  second iteration, together, all against loopback mocks with no credential: Messages echoes a
+  signed thinking block verbatim and in position ahead of the `tool_use` it accompanies;
+  Messages echoes a `redacted_thinking` block untouched; Responses echoes the encrypted item
+  verbatim as a top-level `input` item and asks for it on the first request; Chat carries no
+  reasoning artefact anywhere in its second request; and a foreign block is refused on both
+  echoing wires with the mock proving nothing was sent.
+
+### Changed
+
+- **Messages adapter** — the decoder now reassembles a `thinking` block from its opening
+  block and its deltas, including `signature_delta`, which it previously discarded as
+  "ignored, not fatal". The signature is precisely what the wire validates when the block
+  comes back. The block goes back out as the value that arrived, because this wire documents
+  that rebuilding the assistant message, or filtering a `redacted_thinking` block out of it,
+  is a `400`.
+- **Responses adapter** — sends `include: ["reasoning.encrypted_content"]`, captures each
+  finished `reasoning` item from `response.output_item.done`, and echoes it in `input`.
+  **`store: false` is unchanged and is not up for revision**: the continuity comes from the
+  loop carrying the item, not from the provider keeping it. Current documentation says the
+  item carries `encrypted_content` by default under `store: false` and that this `include`
+  value is now accepted for backward compatibility rather than required; it is sent anyway,
+  because a host predating that change needs it and one following it accepts it.
+- **Chat adapter** — the documented absence case. It never mints the block and, handed one,
+  skips it silently: this wire has nothing to echo, so there is nothing a following request
+  could carry and nothing that omitting one could break.
+- **The loop** — reasoning blocks ride the in-memory conversation so the echo-back happens
+  without the loop understanding them, and **`append_all` strips them from the copy that
+  reaches the thread store**. That is the retention question L5 said had to be answered first,
+  answered by not storing it: the blob is unreplayable across the model switches a thread
+  survives, and nothing durable should hold what the owner cannot read. A test asserts both
+  halves — intact in the conversation, absent from the store, and the payload absent from the
+  serialised thread's bytes.
+- **`LEAKS.md`** — L5 moves from RECOMMENDATION ONLY to **MADE**, keeping its history, with
+  the non-additive accounting: the five match sites the compiler surfaced and what each one
+  decided, plus the three that did not stop compiling and were checked rather than assumed
+  (framing renders only `Text`, the style checker takes a `&str` and cannot be handed a block,
+  and the eval reads a transcript built from `TextDelta`). Scoreboard: non-additive changes
+  made **1**, recommendations left **0**.
+
 ## [agent 0.7.0, bridge 0.113.0, eval 0.4.0] - 2026-09-01
 
 **Search that survives the real vault, and exactly one boundary for it.** D9's F4 — one

@@ -38,8 +38,8 @@ use std::time::{Duration, Instant};
 
 use jesse_agent::provider::{
     build_provider, AuthScheme, ContentBlock, Event, Message, Provider, ProviderConfig,
-    ProviderError, Quirks, Request, Role, Sampling, StopReason, SystemBlock, Thinking, ToolSpec,
-    Wire,
+    ProviderError, Quirks, ReasoningOrigin, Request, Role, Sampling, StopReason, SystemBlock,
+    Thinking, ToolSpec, Wire,
 };
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1668,4 +1668,425 @@ fn capabilities_differ_only_where_the_wires_do() {
     assert!(messages.thinking);
     assert!(!chat.thinking);
     assert!(!responses.thinking);
+}
+
+// ===========================================================================
+// D13 — reasoning continuity across a tool-use iteration
+// ===========================================================================
+//
+// **THE CASE `LEAKS.md` L5 SAID COULD NOT BE WRITTEN.** Its exact words: "None in the
+// suite, because it cannot be written without the change." Thinking, AND a tool call, AND a
+// second iteration — together. Two of the three were each covered; the combination was not,
+// which is why a gap that existed in two adapters went unnoticed until a third was written.
+//
+// These are their own tests rather than rows in `cases()` because every other case is one
+// request against one scripted reply, and the property here is only visible across TWO: what
+// the model minted on the first call has to arrive, byte for byte, in the body of the
+// second. The mock records both bodies, so the assertion is on what actually went out.
+
+/// Drive one wire through a full two-iteration turn and return the two recorded request
+/// bodies, plus the events from the first call.
+///
+/// The assistant message for the second request is assembled the way `r#loop` assembles it —
+/// reasoning blocks and tool calls in the order the events arrived — so this exercises the
+/// real path rather than a hand-built message that happens to contain the right block.
+async fn two_iteration_turn(wire: Wire, first: Reply, second: Reply) -> (Vec<Value>, Vec<Event>) {
+    let mock = Mock::start(vec![first, second]).await;
+    let cfg = ProviderConfig::new(
+        wire,
+        &mock.base_url,
+        "test-model",
+        AuthScheme::Bearer("mock-token-not-a-real-credential".into()),
+    );
+    let provider: Box<dyn Provider> = build_provider(cfg).expect("adapter exists");
+
+    let tool = ToolSpec {
+        name: "get_weather".into(),
+        description: "Get the weather".into(),
+        input_schema: json!({"type": "object", "properties": {}}),
+        strict: false,
+    };
+    let mut req = Request {
+        messages: vec![Message::user("what is the weather?")],
+        tools: vec![tool.clone()],
+        thinking: Thinking::High,
+        sampling: Sampling {
+            max_output_tokens: 256,
+            ..Default::default()
+        },
+        request_tag: "d13".into(),
+        ..Default::default()
+    };
+
+    let mut events: Vec<Event> = Vec::new();
+    let mut stream = provider
+        .stream(&req, CancellationToken::new())
+        .await
+        .expect("first call starts");
+    while let Some(ev) = stream.recv().await {
+        events.push(ev);
+    }
+
+    // ---- Assemble the assistant turn, as the loop does -------------------
+    let mut content: Vec<ContentBlock> = Vec::new();
+    let mut text = String::new();
+    let mut open: Vec<(String, String, String)> = Vec::new();
+    for ev in &events {
+        match ev {
+            Event::TextDelta(t) => text.push_str(t),
+            Event::Reasoning {
+                id,
+                minted_by,
+                opaque,
+            } => {
+                if !text.is_empty() {
+                    content.push(ContentBlock::Text(std::mem::take(&mut text)));
+                }
+                content.push(ContentBlock::Reasoning {
+                    id: id.clone(),
+                    minted_by: minted_by.clone(),
+                    opaque: opaque.clone(),
+                });
+            }
+            Event::ToolUseStart { id, name } => {
+                if !text.is_empty() {
+                    content.push(ContentBlock::Text(std::mem::take(&mut text)));
+                }
+                open.push((id.clone(), name.clone(), String::new()));
+            }
+            Event::ToolUseArgsDelta { id, json_fragment } => {
+                if let Some(slot) = open.iter_mut().find(|(i, _, _)| i == id) {
+                    slot.2.push_str(json_fragment);
+                }
+            }
+            Event::ToolUseEnd { id } => {
+                if let Some(pos) = open.iter().position(|(i, _, _)| i == id) {
+                    let (id, name, args) = open.remove(pos);
+                    let arguments: Value = if args.trim().is_empty() {
+                        json!({})
+                    } else {
+                        serde_json::from_str(&args).expect("args parse")
+                    };
+                    content.push(ContentBlock::ToolUse {
+                        id,
+                        name,
+                        arguments,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    if !text.is_empty() {
+        content.push(ContentBlock::Text(text));
+    }
+
+    let tool_use_id = content
+        .iter()
+        .find_map(|b| match b {
+            ContentBlock::ToolUse { id, .. } => Some(id.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("{wire}: the first call must have requested a tool"));
+
+    req.messages.push(Message {
+        role: Role::Assistant,
+        content,
+    });
+    req.messages.push(Message {
+        role: Role::User,
+        content: vec![ContentBlock::ToolResult {
+            id: tool_use_id,
+            content: jesse_agent::provider::ToolResultContent::Text("18C and clear".into()),
+            is_error: false,
+        }],
+    });
+
+    let mut stream = provider
+        .stream(&req, CancellationToken::new())
+        .await
+        .expect("second call starts");
+    while stream.recv().await.is_some() {}
+
+    let bodies: Vec<Value> = mock
+        .seen
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|r| r.body.clone())
+        .collect();
+    (bodies, events)
+}
+
+/// MESSAGES: the signed thinking block comes back complete and unmodified.
+///
+/// The wire's own rule, in its own words: pass thinking blocks back "complete and
+/// unmodified", echo the assistant message "exactly as received", and rebuilding it or
+/// filtering out a `redacted_thinking` block is a 400. So the assertion is byte-identity
+/// against the block the stream delivered, not a field-by-field comparison that would pass
+/// on a block this crate had reassembled to its own taste.
+#[tokio::test]
+async fn messages_echoes_the_signed_thinking_block_verbatim() {
+    let first = Reply::sse(frames(&[
+        r#"{"type":"message_start","message":{"id":"msg_1","usage":{"input_tokens":9,"output_tokens":0}}}"#,
+        r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#,
+        r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"The user wants "}}"#,
+        r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"the weather."}}"#,
+        r#"{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"SIGNATURE-ABC123"}}"#,
+        r#"{"type":"content_block_stop","index":0}"#,
+        r#"{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_1","name":"get_weather"}}"#,
+        r#"{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{}"}}"#,
+        r#"{"type":"content_block_stop","index":1}"#,
+        r#"{"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":12}}"#,
+        r#"{"type":"message_stop"}"#,
+    ]));
+    let second = Reply::sse(frames(&[
+        r#"{"type":"message_start","message":{"id":"msg_2","usage":{"input_tokens":40,"output_tokens":0}}}"#,
+        r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+        r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"18C and clear."}}"#,
+        r#"{"type":"content_block_stop","index":0}"#,
+        r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}}"#,
+        r#"{"type":"message_stop"}"#,
+    ]));
+
+    let (bodies, events) = two_iteration_turn(Wire::Messages, first, second).await;
+    assert_eq!(bodies.len(), 2, "two calls went out");
+
+    // What the stream said was minted.
+    let minted = events
+        .iter()
+        .find_map(|e| match e {
+            Event::Reasoning { opaque, .. } => Some(opaque.clone()),
+            _ => None,
+        })
+        .expect("a reasoning block was captured");
+    assert_eq!(
+        minted,
+        json!({
+            "type": "thinking",
+            "thinking": "The user wants the weather.",
+            "signature": "SIGNATURE-ABC123"
+        }),
+        "the block is reassembled from its opening block and its deltas"
+    );
+
+    // And what actually went back out, in position: first block of the assistant turn,
+    // ahead of the tool_use it accompanies.
+    let assistant = bodies[1]
+        .pointer("/messages/1")
+        .expect("the assistant turn is the second message");
+    assert_eq!(assistant.pointer("/role"), Some(&json!("assistant")));
+    assert_eq!(
+        assistant.pointer("/content/0"),
+        Some(&minted),
+        "the thinking block goes back verbatim, and first: {assistant}"
+    );
+    assert_eq!(
+        assistant.pointer("/content/1/type"),
+        Some(&json!("tool_use")),
+        "and it accompanies the tool_use block: {assistant}"
+    );
+}
+
+/// MESSAGES: a `redacted_thinking` block survives the round trip untouched.
+///
+/// It carries `data` and neither `thinking` nor `signature`, and filtering it out is a
+/// documented 400 — so the reassembly must not invent the two fields it does not have.
+#[tokio::test]
+async fn messages_echoes_a_redacted_thinking_block_untouched() {
+    let first = Reply::sse(frames(&[
+        r#"{"type":"message_start","message":{"id":"msg_1","usage":{"input_tokens":9,"output_tokens":0}}}"#,
+        r#"{"type":"content_block_start","index":0,"content_block":{"type":"redacted_thinking","data":"OPAQUE-REDACTED-BYTES"}}"#,
+        r#"{"type":"content_block_stop","index":0}"#,
+        r#"{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_1","name":"get_weather"}}"#,
+        r#"{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{}"}}"#,
+        r#"{"type":"content_block_stop","index":1}"#,
+        r#"{"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":12}}"#,
+        r#"{"type":"message_stop"}"#,
+    ]));
+    let second = Reply::sse(frames(&[
+        r#"{"type":"message_start","message":{"id":"msg_2","usage":{"input_tokens":40,"output_tokens":0}}}"#,
+        r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}"#,
+        r#"{"type":"message_stop"}"#,
+    ]));
+
+    let (bodies, _) = two_iteration_turn(Wire::Messages, first, second).await;
+    assert_eq!(
+        bodies[1].pointer("/messages/1/content/0"),
+        Some(&json!({"type": "redacted_thinking", "data": "OPAQUE-REDACTED-BYTES"})),
+        "a redacted block goes back exactly as it arrived: {}",
+        bodies[1]
+    );
+}
+
+/// RESPONSES: the encrypted reasoning item comes back in `input`, verbatim.
+///
+/// This is the stateless mechanism the wire documents for `store: false`: the reasoning
+/// items from the previous response's output are echoed in the next request's `input`, or
+/// the chain is lost the moment a tool is dispatched.
+#[tokio::test]
+async fn responses_echoes_the_encrypted_reasoning_item_verbatim() {
+    let first = Reply::sse(frames(&[
+        r#"{"type":"response.created","response":{"id":"resp_1"}}"#,
+        r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"rs_1"}}"#,
+        r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"rs_1","summary":[],"encrypted_content":"ENCRYPTED-REASONING-XYZ"}}"#,
+        r#"{"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"get_weather","arguments":""}}"#,
+        r#"{"type":"response.function_call_arguments.done","item_id":"fc_1","arguments":"{}"}"#,
+        r#"{"type":"response.completed","response":{"id":"resp_1","status":"completed","usage":{"input_tokens":9,"output_tokens":12}}}"#,
+    ]));
+    let second = Reply::sse(frames(&[
+        r#"{"type":"response.created","response":{"id":"resp_2"}}"#,
+        r#"{"type":"response.output_text.delta","delta":"18C and clear."}"#,
+        r#"{"type":"response.completed","response":{"id":"resp_2","status":"completed","usage":{"input_tokens":40,"output_tokens":5}}}"#,
+    ]));
+
+    let (bodies, events) = two_iteration_turn(Wire::Responses, first, second).await;
+    assert_eq!(bodies.len(), 2);
+
+    // The request-side companion: without it a host that predates the default has nothing
+    // to return, and the echo below would be echoing an item that never arrived.
+    assert_eq!(
+        bodies[0].pointer("/include"),
+        Some(&json!(["reasoning.encrypted_content"])),
+        "the first request asks for the encrypted item: {}",
+        bodies[0]
+    );
+
+    let minted = events
+        .iter()
+        .find_map(|e| match e {
+            Event::Reasoning { opaque, .. } => Some(opaque.clone()),
+            _ => None,
+        })
+        .expect("a reasoning item was captured");
+    assert_eq!(
+        minted,
+        json!({
+            "type": "reasoning",
+            "id": "rs_1",
+            "summary": [],
+            "encrypted_content": "ENCRYPTED-REASONING-XYZ"
+        }),
+        "the item is captured whole, from `output_item.done`"
+    );
+
+    // A TOP-LEVEL INPUT ITEM, not a content part inside a message — which is what this wire
+    // takes — and ahead of the assistant message it belongs to.
+    let input = bodies[1]
+        .pointer("/input")
+        .and_then(Value::as_array)
+        .expect("input is an array");
+    let at = input
+        .iter()
+        .position(|i| i == &minted)
+        .unwrap_or_else(|| panic!("the reasoning item is absent from input: {input:?}"));
+    let message_at = input.iter().position(|i| {
+        i.pointer("/type") == Some(&json!("message"))
+            && i.pointer("/role") == Some(&json!("assistant"))
+    });
+    if let Some(m) = message_at {
+        assert!(at < m, "the reasoning item precedes the assistant message");
+    }
+}
+
+/// CHAT: THE ABSENCE CASE. No reasoning field appears anywhere in the second request.
+///
+/// This wire mints no reasoning artefact and has nothing to echo, so the correct behaviour
+/// is to send the turn without one. The assertion is deliberately crude — the whole body,
+/// searched as a string — because the point is that NOTHING of the sort appears, and a
+/// pointer-based check would only look where a bug was expected to be.
+#[tokio::test]
+async fn chat_never_carries_a_reasoning_artefact() {
+    let first = Reply::sse(frames(&[
+        r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"get_weather","arguments":"{}"}}]}}]}"#,
+        r#"{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+        "[DONE]",
+    ]));
+    let second = Reply::sse(frames(&[
+        r#"{"choices":[{"index":0,"delta":{"content":"18C and clear."}}]}"#,
+        r#"{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+        "[DONE]",
+    ]));
+
+    let (bodies, events) = two_iteration_turn(Wire::Chat, first, second).await;
+    assert!(
+        !events.iter().any(|e| matches!(e, Event::Reasoning { .. })),
+        "this wire mints no reasoning artefact"
+    );
+    let out = bodies[1].to_string();
+    for needle in ["reasoning", "encrypted_content", "signature", "thinking"] {
+        assert!(
+            !out.contains(needle),
+            "the second request carried {needle:?} on a wire that has no such concept: {out}"
+        );
+    }
+}
+
+/// A REASONING BLOCK FROM ANOTHER PROVIDER IS REFUSED BEFORE ANY BYTES GO OUT.
+///
+/// An opaque artefact is meaningful only to the model that minted it, and the registry lets
+/// the phone switch models mid-conversation. Replaying one across that switch is a 400 on
+/// the second iteration of a turn at best; here it is a `Protocol` error raised while the
+/// body is still being built, and the mock proves no request was made.
+#[tokio::test]
+async fn a_reasoning_block_from_another_provider_is_refused() {
+    for (wire, foreign) in [
+        (
+            Wire::Messages,
+            ReasoningOrigin::new(Wire::Responses, "test-model"),
+        ),
+        (
+            Wire::Messages,
+            ReasoningOrigin::new(Wire::Messages, "a-different-model"),
+        ),
+        (
+            Wire::Responses,
+            ReasoningOrigin::new(Wire::Messages, "test-model"),
+        ),
+        (
+            Wire::Responses,
+            ReasoningOrigin::new(Wire::Responses, "a-different-model"),
+        ),
+    ] {
+        let mock = Mock::start(vec![Reply::sse(frames(&["[DONE]"]))]).await;
+        let cfg = ProviderConfig::new(
+            wire,
+            &mock.base_url,
+            "test-model",
+            AuthScheme::Bearer("mock-token-not-a-real-credential".into()),
+        );
+        let provider: Box<dyn Provider> = build_provider(cfg).expect("adapter exists");
+        let req = Request {
+            messages: vec![
+                Message::user("hello"),
+                Message {
+                    role: Role::Assistant,
+                    content: vec![ContentBlock::Reasoning {
+                        id: None,
+                        minted_by: foreign.clone(),
+                        opaque: json!({"type": "thinking", "thinking": "x", "signature": "s"}),
+                    }],
+                },
+            ],
+            sampling: Sampling {
+                max_output_tokens: 256,
+                ..Default::default()
+            },
+            request_tag: "d13-guard".into(),
+            ..Default::default()
+        };
+        match provider.stream(&req, CancellationToken::new()).await {
+            Err(ProviderError::Protocol(m)) => {
+                assert!(
+                    m.contains("reasoning"),
+                    "{wire}: the refusal names what it refused: {m}"
+                );
+            }
+            other => panic!("{wire}: a foreign reasoning block must be refused, got {other:?}"),
+        }
+        assert!(
+            mock.seen.lock().unwrap().is_empty(),
+            "{wire}: the refusal must happen BEFORE any bytes go out"
+        );
+    }
 }
