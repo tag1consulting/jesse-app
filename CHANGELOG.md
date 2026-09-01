@@ -14,7 +14,7 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
-## [agent 0.8.0] - 2026-09-01
+## [agent 0.8.0, bridge 0.113.1] - 2026-09-01
 
 **Reasoning continuity: `LEAKS.md` L5, implemented across all three adapters.** A reasoning
 model lost its own chain of thought the moment the loop dispatched a tool, on **two** of the
@@ -49,6 +49,10 @@ non-additive accounting L5 promised.
 
 ### Changed
 
+- **bridge 0.113.1** — no bridge source changed; it picks up `jesse-agent` 0.8.0, so the
+  binary it builds is a different binary. A direct-harness turn on a reasoning model now
+  keeps its chain of thought across a tool loop, and the thread files the bridge writes are
+  unchanged in shape because the artefact never reaches them.
 - **Messages adapter** — the decoder now reassembles a `thinking` block from its opening
   block and its deltas, including `signature_delta`, which it previously discarded as
   "ignored, not fatal". The signature is precisely what the wire validates when the block
