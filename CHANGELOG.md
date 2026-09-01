@@ -14,6 +14,90 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [agent 0.7.0, bridge 0.113.0, eval 0.4.0] - 2026-09-01
+
+**Search that survives the real vault, and exactly one boundary for it.** D9's F4 — one
+`vault_search` over the owner's vault taking the eval process past 12 GB of resident memory
+without returning — is fixed at its root, and the two-doors-onto-one-vault arrangement D10
+documented is closed to one.
+
+### Fixed
+
+- **F4 — `GrepIndex` was proportional to the largest document, not to a constant.** Measured
+  on a synthetic store before anything was changed: **one 32 MB document cost 126 MB of peak
+  live memory and 379 MB of total allocation, a 3.9× and 11.8× multiple of the file.** Three
+  mechanisms, each removed:
+  - **`FsVaultStore::meta_of` read every file whole** — twice, plus a lossy UTF-8 copy — to
+    find a heading in the first 50 lines and hash the bytes. A `list` of 200 documents
+    therefore paid the full bytes of all 200 before the caller saw a single title. It now
+    streams in fixed chunks, keeping a bounded `META_HEAD_BYTES` head for the title and front
+    matter and a rolling SHA-256 for the hash. The hash is byte-identical, so the
+    compare-and-swap cannot tell the two apart.
+  - **`read` capped at `READ_MAX_BYTES` *after* materialising the whole document**, so a
+    request for three lines of a large file still paid for all of it. It now streams and caps
+    while reading, and a file with one enormous line is bounded too.
+  - **`GrepIndex` allocated a fresh lowercase copy of the entire body once per query term**,
+    on top of the body it already held, to answer "did every term appear". That is now
+    tracked in the single line pass that was already happening.
+  - New bounds, structural rather than tuned: **`GREP_MAX_DOC_BYTES` (2 MB)** — a document
+    past it is skipped **before the read**, from the listing's own size, counted, and named
+    in `Hits::degraded`; and bounded hit accumulation, replacing a `Vec<Hit>` that grew until
+    the walk ended.
+  - After: the same 32 MB document costs **0 bytes of peak growth and 5.4 MB of total
+    allocation**, and quadrupling a document from 8 MB to 32 MB moves peak from 205 KB to
+    133 KB — i.e. not at all. `agent/tests/grep_index_memory.rs` asserts the contract with a
+    counting global allocator confined to that test binary, and three of its four assertions
+    fail on the old code.
+
+### Added
+
+- **The misconfiguration is loud where the operator looks.** The bridge measures the vault at
+  startup — **stat only, never reading a document**, because a size check written through the
+  store's own `list` would have been another F4 — and when the index is grep over a store past
+  `GREP_SCALE_DOCUMENTS` (the grep scan stop) or `GREP_SCALE_BYTES`, it warns by name and
+  names `[direct] qmd`. The same condition is **`search_degraded` on `GET /jesse/models`**
+  (the endpoint's pinned entry shape gains one boolean) and `direct_search_degraded` on
+  `/health`. It warns rather than refuses: turning on qmd needs a binary and a collection name
+  only the owner can supply, so this is the owner's call made visible, not made for them.
+- **The eval driver can run the index the bridge actually selects.** `--index grep|qmd` with
+  `--qmd-collection` and `--qmd-bin` on `jesse-eval run --driver direct`, mirroring
+  `direct_index` in `bridge/src/harness/direct.rs`. Before this the driver constructed
+  `GrepIndex` unconditionally, so an eval run structurally could not measure a deployment
+  configured for a large vault — the README's claim to measure the deployed path was false for
+  exactly the deployments that need it most. `results.json` and the scorecard now record which
+  index answered. `--index qmd` without a collection is **refused at the CLI**, never guessed.
+  Proven in CI with **no `qmd` installed**: a `/bin/sh` stand-in that touches a marker and
+  prints canned hits shows the binary is really spawned, that a hit only it could know comes
+  back (with a grep control returning nothing), that a **cold document, a stale hit for a file
+  that does not exist, and a hit from another collection are all dropped by the store filter**,
+  and that the one visible hit survives.
+
+### Changed
+
+- **ONE BOUNDARY: the store. An index sits behind it, never beside it.** `[direct] qmd = true`
+  opens every hit **through the store**, so an `exclude`d or cold document is dropped before
+  the model sees it. A `[[direct.mcp]]` grant of the same server answers from qmd's own index
+  with **no store filter at all** — a second door onto the same content, and two boundaries
+  over one body of content is one too many because the looser one is the real one. So:
+  - **The `qmd` `[[direct.mcp]]` example grant is gone from `jesse.example.toml`.** The worked
+    example is now a corpus the vault rules have no opinion about, which is the only shape
+    this grant should take.
+  - **Granting a shadowing server warns at startup, by name** — `VAULT_SHADOWING_SERVERS`, a
+    **deny-by-name list extended in config review rather than guessed at runtime**, because
+    nothing in a server's advertised tools distinguishes "query over the owner's notes" from
+    "query over a public manual set". It appears on `/health` as
+    `direct_mcp_shadows_vault_search`. It warns rather than refuses for the same reason.
+  - **`SECURITY.md`, `agent/README.md` and `jesse.example.toml` now tell one story** where
+    they described two boundaries and left the reader to choose.
+  - The MCP client and `McpToolSet` are untouched. The mechanism is right; this grant was the
+    wrong use of it.
+- **`bridge/README.md` gains the PID-kill discipline**, from the D9 incident: a scratch or
+  eval bridge records its PID at spawn and is stopped by that PID. **A path-based `pkill` is
+  never used** — the launchd wrapper passes this repository's path in the live service's argv,
+  so a pattern written for a scratch build matches the live bridge, and `KeepAlive` restarts
+  it. No script or document in the repository suggested a path-based kill; the rule is now
+  written down rather than assumed.
+
 ## [eval 0.3.0] - 2026-09-01
 
 **The three defects D9 found in the instrument, repaired — the eval harness could not have

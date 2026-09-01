@@ -697,6 +697,234 @@ fn compare_reports_parity_between_the_two_good_runs() {
     assert!(json["unpaired"].as_array().unwrap().is_empty());
 }
 
+// ---- D12: the eval driver can run the index the bridge actually selects -------------
+//
+// Before D12 `eval/src/driver/direct.rs` built a `GrepIndex` unconditionally, so an eval run
+// structurally could not measure a deployment configured with `[direct] qmd = true` — which
+// is the configuration a vault large enough to need it runs. These two tests use a FAKE `qmd`
+// binary (a shell script whose stdout is a canned hit list) so CI can prove the selection and
+// the store filter with no `qmd` installed anywhere.
+
+/// Write a `qmd` stand-in that prints `canned` for any `search`/`query` invocation and
+/// succeeds on `--version`. Returns its path.
+///
+/// `/bin/sh`, and nothing in it needs an escape: the JSON is written to its own file and the
+/// script `cat`s it. CI's `/bin/sh` is dash, where a `printf '\xNN'` a bash author would
+/// reach for silently emits the literal text.
+fn fake_qmd(dir: &std::path::Path, canned: &str) -> std::path::PathBuf {
+    let json = dir.join("hits.json");
+    fs::write(&json, canned).unwrap();
+    let bin = dir.join("qmd");
+    fs::write(
+        &bin,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'qmd 0.0.0-fake'; exit 0; fi\n\
+             : > {marker}\ncat {json}\n",
+            marker = dir.join("was-run").display(),
+            json = json.display(),
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    bin
+}
+
+/// Run a one-task suite on the direct driver with the given extra args, returning the task
+/// row and its transcript text — the transcript read here, before the temp dir is dropped,
+/// because `transcript_path` in `results.json` is relative to the run's output directory.
+fn run_one_task_direct(
+    extra: &[&str],
+    fixture_files: serde_json::Value,
+) -> (serde_json::Value, String) {
+    let tmp = tempfile::tempdir().unwrap();
+    let suite_path = tmp.path().join("suite.json");
+    let mock_path = tmp.path().join("mock.json");
+    let out = tmp.path().join("out");
+    let suite = serde_json::json!({
+        "name": "idx",
+        "tasks": [{
+            "id": "search-it",
+            "class": "multi-document-search",
+            "prompt": "search for the launch",
+            "workspace": "fixture",
+            "allowed_tools": ["Grep"],
+            "level": "read",
+            "fixture_files": fixture_files,
+            "assertions": [{"type": "completed"}]
+        }]
+    });
+    fs::write(&suite_path, serde_json::to_vec_pretty(&suite).unwrap()).unwrap();
+    // One scripted turn: search once, then answer with what came back.
+    let mock = serde_json::json!({
+        "responses": {
+            "search-it": [
+                {"type": "tool_calls", "calls": [
+                    {"name": "vault_search", "arguments": {"query": "launch"}}
+                ]},
+                {"type": "text", "text": "done"}
+            ]
+        }
+    });
+    fs::write(&mock_path, serde_json::to_vec_pretty(&mock).unwrap()).unwrap();
+
+    let mut args: Vec<String> = vec![
+        "run".into(),
+        "--driver".into(),
+        "direct".into(),
+        "--suite".into(),
+        suite_path.to_str().unwrap().into(),
+        "--out".into(),
+        out.to_str().unwrap().into(),
+        "--mock".into(),
+        mock_path.to_str().unwrap().into(),
+    ];
+    args.extend(extra.iter().map(|s| s.to_string()));
+    let status = Command::new(bin()).args(&args).status().unwrap();
+    assert!(status.success(), "direct run should exit success");
+    let results: serde_json::Value =
+        serde_json::from_slice(&fs::read(out.join("results.json")).unwrap()).unwrap();
+    let task = results["tasks"].as_array().unwrap()[0].clone();
+    let transcript = task["transcript_path"]
+        .as_str()
+        .map(|p| fs::read_to_string(out.join(p)).unwrap_or_default())
+        .unwrap_or_default();
+    (task, transcript)
+}
+
+/// `--index qmd` REALLY REACHES THE BINARY. The fake qmd is the only thing that could have
+/// produced this id: the grep index would have had to find the word in a document that does
+/// not contain it.
+#[test]
+fn the_direct_driver_searches_through_qmd_when_asked() {
+    let home = tempfile::tempdir().unwrap();
+    let qmd = fake_qmd(
+        home.path(),
+        r#"[{"file":"qmd://vault/notes/only-qmd-knows.md","score":9.5,"line":3,"snippet":"the launch is on Tuesday"}]"#,
+    );
+    let (task, transcript) = run_one_task_direct(
+        &[
+            "--index",
+            "qmd",
+            "--qmd-collection",
+            "vault",
+            "--qmd-bin",
+            qmd.to_str().unwrap(),
+        ],
+        serde_json::json!({
+            // The word "launch" appears NOWHERE in the store, so grep can return nothing.
+            "notes/only-qmd-knows.md": "# Only qmd knows\n\nnothing here says the word\n",
+        }),
+    );
+    assert_eq!(task["tool_names"][0], "vault_search");
+    assert_eq!(task["completed"], true, "{task}");
+    // THE FALSIFIABLE HALF, and it has to be a side effect rather than a transcript line: a
+    // transcript records tool CALLS and never tool RESULTS, because results are vault
+    // content. The marker exists only if the child was spawned, which the grep index would
+    // never do. What came BACK from it is asserted in
+    // `driver::direct::tests::a_qmd_hit_the_store_will_not_open_is_dropped`, where the hits
+    // are in hand rather than behind the boundary.
+    assert!(
+        home.path().join("was-run").exists(),
+        "the qmd binary was never spawned; the driver did not select qmd"
+    );
+    assert!(!transcript.is_empty(), "the run wrote a transcript");
+}
+
+/// AND THE STORE STILL FILTERS IT. qmd is told about a cold document and a document that
+/// does not exist; neither may reach the model, because the store is the boundary and the
+/// index is behind it. This is the property D12's one-boundary rewrite is about, asserted on
+/// the path the eval now runs.
+#[test]
+fn a_qmd_hit_the_store_will_not_open_never_reaches_the_turn() {
+    let home = tempfile::tempdir().unwrap();
+    let qmd = fake_qmd(
+        home.path(),
+        r#"[{"file":"qmd://vault/private/secret.md","score":9.9,"line":1,"snippet":"COLDBODY launch"},
+            {"file":"qmd://vault/notes/ghost.md","score":9.8,"line":1,"snippet":"launch"},
+            {"file":"qmd://vault/notes/real.md","score":1.0,"line":3,"snippet":"the launch is on Tuesday"}]"#,
+    );
+    let (task, transcript) = run_one_task_direct(
+        &[
+            "--index",
+            "qmd",
+            "--qmd-collection",
+            "vault",
+            "--qmd-bin",
+            qmd.to_str().unwrap(),
+        ],
+        serde_json::json!({
+            // Cold by its own front matter, so `stat` reports Cold and the filter drops it.
+            "private/secret.md": "---\nvisibility: cold\n---\n# Secret\n\nCOLDBODY launch\n",
+            "notes/real.md": "# Real\n\nthe launch is on Tuesday\n",
+            // `notes/ghost.md` is deliberately NOT created: qmd's index is stale, and a hit
+            // for a document the store cannot stat must vanish rather than 404 the turn.
+        }),
+    );
+    assert!(
+        home.path().join("was-run").exists(),
+        "the qmd binary was never spawned"
+    );
+    let seen = format!("{task}{transcript}");
+    assert!(
+        !seen.contains("COLDBODY"),
+        "a cold document's snippet reached the turn: {seen}"
+    );
+    assert!(
+        !seen.contains("secret.md"),
+        "a cold document's id reached the turn: {seen}"
+    );
+    assert!(
+        !seen.contains("ghost.md"),
+        "a hit for a document the store cannot stat reached the turn: {seen}"
+    );
+    assert_eq!(task["completed"], true, "{task}");
+}
+
+/// `--index qmd` WITHOUT A COLLECTION IS REFUSED, not defaulted. A guessed collection strips
+/// the wrong prefix off every hit and reports ids that resolve to nothing, which a reader
+/// cannot tell from "the vault does not contain it".
+#[test]
+fn qmd_without_a_collection_is_refused_at_the_cli() {
+    let tmp = tempfile::tempdir().unwrap();
+    let suite_path = tmp.path().join("suite.json");
+    fs::write(
+        &suite_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "name": "idx",
+            "tasks": [{
+                "id": "t", "class": "c", "prompt": "p", "workspace": "fixture",
+                "assertions": [{"type": "completed"}]
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let out = Command::new(bin())
+        .args([
+            "run",
+            "--driver",
+            "direct",
+            "--index",
+            "qmd",
+            "--suite",
+            suite_path.to_str().unwrap(),
+            "--out",
+            tmp.path().join("out").to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "a run with no collection must fail");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("--qmd-collection"),
+        "the refusal must name the missing flag: {err}"
+    );
+}
+
 /// `compare` refuses two runs of different suites rather than pairing nothing and calling
 /// it parity.
 #[test]

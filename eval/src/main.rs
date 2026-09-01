@@ -56,6 +56,19 @@ enum DriverKind {
     Direct,
 }
 
+/// Which search index a `direct` run answers `vault_search` with.
+///
+/// **THE POINT OF THE FLAG IS THAT THE BRIDGE HAS A CHOICE HERE AND THE EVAL DID NOT.**
+/// `bridge/src/harness/direct.rs` selects `qmd` whenever `[direct] qmd = true` and a
+/// collection is named, and grep otherwise; this driver hardcoded grep, so an eval run could
+/// never measure the configuration a deployment with a large vault actually runs. `grep`
+/// stays the default because CI has no `qmd` binary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum IndexArg {
+    Grep,
+    Qmd,
+}
+
 /// The provider wire the direct driver speaks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum WireArg {
@@ -114,6 +127,19 @@ struct RunArgs {
     /// Path to the `claude` binary.
     #[arg(long, default_value = "claude")]
     claude_bin: String,
+    /// The index a `direct` run searches with. Ignored by `claude-cli`.
+    #[arg(long, value_enum, default_value_t = IndexArg::Grep)]
+    index: IndexArg,
+    /// The qmd COLLECTION whose documents map onto the workspace root.
+    ///
+    /// REQUIRED with `--index qmd` and deliberately never guessed, for the reason
+    /// `jesse_agent::index::QmdConfig` gives: qmd reports a hit as `qmd://<collection>/<path>`
+    /// and stripping the wrong prefix produces ids that resolve to the wrong documents.
+    #[arg(long)]
+    qmd_collection: Option<String>,
+    /// Path to the `qmd` binary. Omit to resolve the bare name on `PATH`.
+    #[arg(long)]
+    qmd_bin: Option<PathBuf>,
     /// Per-task wall-clock timeout, seconds.
     #[arg(long, default_value_t = 600)]
     timeout_secs: u64,
@@ -234,7 +260,21 @@ fn do_run(a: RunArgs) -> Result<(), String> {
                 }
                 None => None,
             };
+            // REFUSED AT THE BOUNDARY, not defaulted. `--index qmd` without a collection
+            // would silently search with the wrong prefix stripped and report hits that
+            // resolve to nothing, which reads as "the vault does not contain it".
+            let index = match a.index {
+                IndexArg::Grep => driver::EvalIndex::Grep,
+                IndexArg::Qmd => driver::EvalIndex::Qmd {
+                    collection: a.qmd_collection.clone().ok_or(
+                        "--index qmd needs --qmd-collection; the collection name cannot be \
+                         guessed from the workspace path",
+                    )?,
+                    binary: a.qmd_bin.clone(),
+                },
+            };
             Box::new(driver::DirectDriver {
+                index,
                 base_url: a.endpoint,
                 wire: a.wire.into(),
                 model: a.model,

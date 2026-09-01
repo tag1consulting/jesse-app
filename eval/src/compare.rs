@@ -336,6 +336,7 @@ mod tests {
             suite: "product-v1".into(),
             driver: driver.into(),
             wire: None,
+            index: None,
             endpoint: None,
             model: None,
             mock: true,

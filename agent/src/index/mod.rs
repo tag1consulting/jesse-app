@@ -189,21 +189,49 @@ pub struct GrepIndex<S: DocumentStore> {
     /// seconds of I/O, and a turn waiting seconds for a keyword search is a turn the user
     /// has stopped watching. Past this the results say they are partial.
     scan_limit: usize,
+    /// Cap on the size of one document read, in bytes. See [`GREP_MAX_DOC_BYTES`].
+    max_doc_bytes: u64,
 }
 
 /// How many documents a `GrepIndex` reads before it stops and says it stopped.
 pub const GREP_SCAN_LIMIT: usize = 2_000;
+
+/// The largest document a `GrepIndex` will read, in bytes.
+///
+/// **A DOCUMENT PAST THIS IS SKIPPED, COUNTED, AND SAID SO — never read.** The size is
+/// known from the listing before a single byte of the body is fetched, which is what makes
+/// the bound structural rather than a hope: no query, however phrased, can make this index
+/// hold a document larger than this. Two megabytes is far above any note a person writes
+/// and far below anything that threatens a turn; the vault this was measured against holds
+/// files three orders of magnitude larger, and one of them was D9's twelve-gigabyte search.
+pub const GREP_MAX_DOC_BYTES: u64 = 2 * 1024 * 1024;
+
+/// The most hits a `GrepIndex` holds while scanning.
+///
+/// Results were accumulated without limit and truncated to the caller's `limit` only after
+/// the walk finished, so a common term over a large store held every match it ever saw.
+/// Keeping a little more than the largest limit a caller may ask for is enough to answer
+/// any query correctly, because everything beyond it is discarded anyway.
+const HIT_BUFFER: usize = MAX_SEARCH_LIMIT * 4;
 
 impl<S: DocumentStore> GrepIndex<S> {
     pub fn new(store: S) -> Self {
         GrepIndex {
             store,
             scan_limit: GREP_SCAN_LIMIT,
+            max_doc_bytes: GREP_MAX_DOC_BYTES,
         }
     }
 
     pub fn scanning_at_most(mut self, n: usize) -> Self {
         self.scan_limit = n;
+        self
+    }
+
+    /// Lower the per-document size ceiling. For tests that want to hit it without writing a
+    /// multi-megabyte fixture; the shipped value is [`GREP_MAX_DOC_BYTES`].
+    pub fn with_max_doc_bytes(mut self, n: u64) -> Self {
+        self.max_doc_bytes = n;
         self
     }
 
@@ -244,6 +272,16 @@ fn word_positions(haystack_lower: &str, needle_lower: &str) -> usize {
     count
 }
 
+/// Highest score first, ties broken by id so two runs of one query agree.
+fn sort_hits(hits: &mut [Hit]) {
+    hits.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.id.cmp(&b.id))
+    });
+}
+
 impl<S: DocumentStore> SearchIndex for GrepIndex<S> {
     fn search<'a>(
         &'a self,
@@ -273,6 +311,12 @@ impl<S: DocumentStore> SearchIndex for GrepIndex<S> {
             let mut hits: Vec<Hit> = Vec::new();
             let mut page = 0u32;
             let mut truncated = false;
+            let mut oversized = 0usize;
+            // Prune to this when the buffer overflows. Keeping the caller's own limit would
+            // be enough for the answer but would make the pruning threshold depend on the
+            // query, so the buffer is a constant and the caller's limit is applied at the
+            // end, exactly as before.
+            let keep = HIT_BUFFER;
 
             'outer: loop {
                 let listing = self
@@ -299,17 +343,45 @@ impl<S: DocumentStore> SearchIndex for GrepIndex<S> {
                         truncated = true;
                         break 'outer;
                     }
+                    // THE SIZE CEILING IS APPLIED BEFORE THE READ, from the listing's own
+                    // metadata. This is the difference between an index that is bounded by
+                    // construction and one that is bounded by what happens to be in the
+                    // vault: past this point the body is never fetched, so no document can
+                    // put its own size on this process's heap.
+                    if meta.size_bytes > self.max_doc_bytes {
+                        oversized += 1;
+                        scanned += 1;
+                        continue;
+                    }
                     scanned += 1;
                     let doc = match self.store.read(scope, &meta.id, None).await {
                         Ok(d) => d,
                         // Refused (cold) or vanished — either way, not a hit.
                         Err(_) => continue,
                     };
+                    let title_lower = meta.title.to_lowercase();
                     let mut score = 0f64;
                     let mut snippets = Vec::new();
+                    // ONE PASS, and which terms were seen tracked as it goes. The old shape
+                    // asked the same question afterwards by allocating a fresh lowercase
+                    // copy of the WHOLE body once per query term — three terms meant three
+                    // more copies of the document on top of the one already held.
+                    let mut seen = vec![false; terms.len()];
+                    for (i, t) in terms.iter().enumerate() {
+                        if word_positions(&title_lower, t) > 0 {
+                            seen[i] = true;
+                        }
+                    }
                     for (n, line) in doc.body.lines().enumerate() {
                         let lower = line.to_lowercase();
-                        let matches: usize = terms.iter().map(|t| word_positions(&lower, t)).sum();
+                        let mut matches = 0usize;
+                        for (i, t) in terms.iter().enumerate() {
+                            let c = word_positions(&lower, t);
+                            if c > 0 {
+                                seen[i] = true;
+                                matches += c;
+                            }
+                        }
                         if matches > 0 {
                             score += matches as f64;
                             if snippets.len() < SNIPPETS_PER_HIT {
@@ -323,14 +395,10 @@ impl<S: DocumentStore> SearchIndex for GrepIndex<S> {
                     // A document scores only if EVERY term appears somewhere in it, so a
                     // two-word query behaves like an AND rather than returning everything
                     // containing the commoner word.
-                    let all_terms = terms.iter().all(|t| {
-                        word_positions(&doc.body.to_lowercase(), t) > 0
-                            || word_positions(&meta.title.to_lowercase(), t) > 0
-                    });
+                    let all_terms = seen.iter().all(|s| *s);
                     if score > 0.0 && all_terms {
                         // A title match is worth more than a body match: a document ABOUT
                         // the thing beats one that mentions it.
-                        let title_lower = meta.title.to_lowercase();
                         let title_hits: usize =
                             terms.iter().map(|t| word_positions(&title_lower, t)).sum();
                         hits.push(Hit {
@@ -339,6 +407,10 @@ impl<S: DocumentStore> SearchIndex for GrepIndex<S> {
                             score: score + (title_hits as f64) * 10.0,
                             snippets,
                         });
+                        if hits.len() > keep {
+                            sort_hits(&mut hits);
+                            hits.truncate(keep);
+                        }
                     }
                 }
                 match listing.next_page {
@@ -347,27 +419,32 @@ impl<S: DocumentStore> SearchIndex for GrepIndex<S> {
                 }
             }
 
-            hits.sort_by(|a, b| {
-                b.score
-                    .partial_cmp(&a.score)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    // A deterministic tiebreak, so two runs of one query agree.
-                    .then_with(|| a.id.cmp(&b.id))
-            });
+            sort_hits(&mut hits);
             hits.truncate(limit.clamp(1, MAX_SEARCH_LIMIT));
+
+            // WHAT WAS NOT LOOKED AT IS PART OF THE ANSWER. A bounded search that reported
+            // "no match" for a document it never opened would be worse than an unbounded
+            // one, because the caller could not tell the two apart.
+            let mut notes: Vec<String> = Vec::new();
+            if mode == SearchMode::Hybrid {
+                notes.push("hybrid search is not available here; these are keyword results".into());
+            }
+            if truncated {
+                notes.push(format!(
+                    "only the first {scanned} documents were scanned; narrow the query"
+                ));
+            }
+            if oversized > 0 {
+                notes.push(format!(
+                    "{oversized} document(s) were skipped as too large to scan                      (over {} bytes); read them directly by id",
+                    self.max_doc_bytes
+                ));
+            }
 
             Ok(Hits {
                 hits,
                 served_by: SearchMode::Lexical,
-                degraded: match (mode, truncated) {
-                    (SearchMode::Hybrid, _) => Some(
-                        "hybrid search is not available here; these are keyword results".into(),
-                    ),
-                    (_, true) => Some(format!(
-                        "only the first {scanned} documents were scanned; narrow the query"
-                    )),
-                    _ => None,
-                },
+                degraded: (!notes.is_empty()).then(|| notes.join("; ")),
             })
         })
     }

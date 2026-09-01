@@ -945,37 +945,47 @@ Answer the question I asked, not the one you wish I had asked.
 #   * a server that will not start costs its tools, not the turn. A server that stops
 #     answering is dropped for the rest of that turn and the turn continues without it.
 #
-# THE WORKED EXAMPLE IS `qmd`, this deployment's vault search server — the same server the
-# claude-code turn already runs, granting the same four read-only tools.
+# THE WORKED EXAMPLE IS A CORPUS THE VAULT RULES HAVE NO OPINION ABOUT — a second body of
+# documents that is not this vault. That is the only shape a direct-harness MCP grant should
+# take, and the reason is the next paragraph.
 #
 # [[direct.mcp]]
-# name = "qmd"                                  # the `qmd` in mcp__qmd__query
-# command = "qmd"                               # a bare name, resolved off the forwarded PATH
+# name = "manuals"                              # the `manuals` in mcp__manuals__query
+# command = "some-doc-mcp"                      # a bare name, resolved off the forwarded PATH
 # args = ["mcp"]
-# tools = ["query", "get", "multi_get", "status"]
+# tools = ["query", "get"]
 # class = "read"                                # read | vault_write | egress; default read
 # # per_tool_class = { query = "read" }         # overrides for one tool
-# # env = { QMD_TOKEN = "JESSE_QMD_TOKEN" }     # server var = NAME of a bridge env var
+# # env = { API_TOKEN = "JESSE_MANUALS_TOKEN" } # server var = NAME of a bridge env var
 #
-# WHICH QMD PATH TO PREFER, AND WHY IT IS NOT SIMPLY "THE SERVER".
+# ---------------------------------------------------------------------------
+# ONE BOUNDARY: THE STORE. AN INDEX SITS BEHIND IT, NEVER BESIDE IT.
+# ---------------------------------------------------------------------------
 #
-# There are two ways to give a direct turn qmd, and they are NOT equivalent:
+# Vault content reaches a direct model through the store's boundary and through nothing else.
+# `exclude`, `cold_prefixes` and the jail are that boundary, and every read a turn makes is
+# checked against it.
 #
-#   1. `qmd = true` above (the D3 index path). `vault_search` shells out to qmd and then
-#      FILTERS EVERY HIT THROUGH THE STORE: a match inside `exclude` or under a
-#      `cold_prefixes` entry is dropped before the model sees it, and dropped silently,
-#      because telling the model "there is a match you may not see" leaks exactly what the
-#      exclusion hides.
-#   2. `[[direct.mcp]]` with the block above (the D10 server path). `mcp__qmd__query` and
-#      `mcp__qmd__get` answer from qmd's own index, WITH NO STORE FILTER AT ALL. If the
-#      collection covers your vault, a cold or excluded document is reachable through them.
+# `qmd` is the case that made this rule explicit, because there were briefly two ways to give
+# a direct turn qmd and they were NOT equivalent:
 #
-# So: PREFER (1) FOR VAULT SEARCH whenever the qmd collection overlaps anything `exclude` or
-# `cold_prefixes` names — it is the only path that honours those two settings. Prefer (2)
-# when the collection is something the vault rules have no opinion about (another corpus,
-# another machine's notes), or when you want qmd's own retrieval verbs rather than the one
-# `vault_search` shape. Setting both is fine and is what a deployment with a private vault
-# and a separate public corpus wants; it is not a fallback arrangement in either direction.
+#   * `qmd = true` above is an INDEX. `vault_search` asks qmd which documents match and then
+#     opens each hit THROUGH THE STORE, so a match inside `exclude` or under a
+#     `cold_prefixes` entry is dropped before the model sees it — dropped silently, because
+#     telling the model "there is a match you may not see" leaks exactly what the exclusion
+#     hides. This is the supported way to make search fast on a large vault.
+#   * A `[[direct.mcp]]` grant of the same server would be a SECOND DOOR. `mcp__qmd__query`
+#     and `mcp__qmd__get` answer from qmd's own index with NO STORE FILTER AT ALL, so where
+#     the collection covers this vault, a cold or excluded document is readable through them.
+#     Two boundaries over one body of content is one boundary too many: whichever is looser
+#     is the real one, and it is not the one the settings above describe.
+#
+# So there is no qmd example here any more. If you grant a server whose tools search or fetch
+# THE SAME CONTENT the vault store governs, the bridge warns at startup and names the server
+# (see `shadowing_direct_mcp_grants`) — it does not refuse, because a same-named server over a
+# genuinely different corpus is legitimate, and only you can say which you have. Speed over
+# the vault comes from `qmd = true`; a grant is for content the vault rules have no opinion
+# about.
 
 # ---------------------------------------------------------------------------
 # Three `direct` models, one per wire the harness drives

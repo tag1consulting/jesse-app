@@ -1,6 +1,6 @@
 [package]
 name = "jesse-agent"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "Provider-neutral agent layer for Jesse: one request/response model, one streaming event vocabulary, per-wire adapters (Anthropic Messages, OpenAI Chat Completions, OpenAI Responses), the tool-calling turn loop that runs on top of them, and a stdio MCP client that supplies a second tool source under the same boundary."

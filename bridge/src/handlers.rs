@@ -544,6 +544,22 @@ pub async fn health(State(st): State<AppState>, headers: HeaderMap) -> Json<Valu
                 }))
                 .collect::<Vec<_>>());
         }
+        // ONE BOUNDARY, and whether this deployment has two. A granted MCP server whose
+        // index covers the vault answers with no store filter, so it reads past `exclude`
+        // and `cold_prefixes`. Absent = none granted, which is the shipped posture.
+        if let Some(names) = SHADOWING_GRANTS.get().filter(|g| !g.is_empty()) {
+            body["direct_mcp_shadows_vault_search"] = json!(names);
+        }
+        // The vault measured against the index configured to search it, once at startup.
+        // Present only when the two do not match — grep over a store past its scan stop —
+        // because that is the state where search is quietly answering from a prefix.
+        if let Some(scale) = SEARCH_SCALE.get().filter(|s| s.degraded) {
+            body["direct_search_degraded"] = json!({
+                "index": scale.index,
+                "documents": scale.documents,
+                "bytes": scale.bytes,
+            });
+        }
         if let Some(drift) = BINARY_DRIFT.get().filter(|d| !d.is_empty()) {
             body["containment_stale"] = json!(drift
                 .iter()
@@ -2401,6 +2417,16 @@ fn model_row(
         // property. A harness that no longer resolves reports `true` — the streaming
         // assumption every client already makes — rather than failing the row.
         "streams_text": registry_harness(cfg_harnesses, &m.harness).map(|h| h.streams_text()).unwrap_or(true),
+        // SEARCH IS QUIETLY PARTIAL ON THIS MODEL. True only for a direct-harness model on a
+        // deployment whose vault is too large for the index it is configured to search with —
+        // `[direct] qmd` unset (or set without a collection) over a store past
+        // `GREP_SCALE_DOCUMENTS`. D9's F4: grep stops after two thousand documents and says
+        // so only in a note at the end of a result list, so a vault that outgrew it looks
+        // exactly like a vault where the answer is not there. Measured once at startup, never
+        // per request. `false` on every other harness, and on a direct model whose vault is
+        // within range.
+        "search_degraded": m.harness == DIRECT_ID
+            && SEARCH_SCALE.get().map(|s| s.degraded).unwrap_or(false),
         "last_checked_ms": h.status.as_ref().map(|s| s.checked_at_ms),
         "latency_ms": h.status.as_ref().and_then(|s| s.latency_ms),
         "vision": {

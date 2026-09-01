@@ -5152,10 +5152,12 @@ async fn set_model_unavailable_is_409_and_does_not_switch() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// THE MODELS-ENDPOINT SHAPE, pinned. Each entry gains exactly two fields — `level` and
-/// `streams_text` — and keeps every field it had. A silently changed shape is a client
-/// that renders the wrong thing, so the whole key set is asserted rather than the new
-/// pair alone.
+/// THE MODELS-ENDPOINT SHAPE, pinned. A silently changed shape is a client that renders the
+/// wrong thing, so the whole key set is asserted rather than each new field alone. It has
+/// gained `level` and `streams_text`, and in D12 `search_degraded` — the flag that says this
+/// deployment's direct turns are searching a vault too large for the index configured for
+/// it, which is otherwise visible only as results that quietly stop at two thousand
+/// documents.
 #[tokio::test]
 async fn the_models_endpoint_entry_shape_is_pinned() {
     let dir = std::env::temp_dir().join(format!("jesse-model-it-{}", random_hex()));
@@ -5183,6 +5185,7 @@ async fn the_models_endpoint_entry_shape_is_pinned() {
             "last_checked_ms",
             "latency_ms",
             "level",
+            "search_degraded",
             "streams_text",
             "vision",
             "wire",

@@ -3052,6 +3052,37 @@ everything looks healthy until the next restart, and `KeepAlive` then makes the 
 permanent rather than transient. This is not hypothetical; see `../SECURITY.md`
 § "Re-running it".
 
+## Shutting down a scratch or eval bridge: BY PID, NEVER BY PATH
+
+A scratch bridge (a build under test on a spare port) and an eval bridge are ordinary child
+processes, and they are stopped by the **PID recorded when they were spawned**:
+
+```bash
+# Spawn, recording the PID. Do this even for a process you expect to stop with Ctrl-C.
+./target/release/jesse-bridge & echo $! > /tmp/scratch-bridge.pid
+
+# Stop it. Only this process, whatever else on the machine looks like it.
+kill "$(cat /tmp/scratch-bridge.pid)" && rm -f /tmp/scratch-bridge.pid
+```
+
+**Never `pkill -f` on a path, a binary name, or any pattern.** The launchd job runs the
+service through a wrapper that passes **this repository's path in the service's argv**, so a
+pattern written to match a scratch build out of `bridge/target/release/` matches the **live
+bridge** as well. `KeepAlive` then restarts it, so the symptom is not an error but a
+few seconds of unexplained downtime and a fresh process — which is exactly what happened
+during the D9 gate run (see `../eval-runs/2026-08-31-phase1-gate-report.md`, deviations
+table). Nothing was lost that time. Nothing guarantees that twice.
+
+The same rule covers `killall`, and it covers a pattern you believe is narrow enough: the
+live process's argv is not under your control, and a pattern that is safe today stops being
+safe when the wrapper's arguments change. If a PID was genuinely not recorded, find the one
+process by port (`lsof -nP -iTCP:<scratch port> -sTCP:LISTEN`) and kill that PID — never a
+pattern.
+
+**Stopping the LIVE bridge is a different operation entirely**: `launchctl bootout`, then
+`bootstrap` (see the build-order section above). `kill` on the live PID is not a stop —
+`KeepAlive` restarts it — and is never the right way to restart the service.
+
 ## Versioning
 
 The **bridge** and the **app** are versioned **independently**:

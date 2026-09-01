@@ -229,7 +229,18 @@ impl ContentHash {
     /// Hash bytes.
     pub fn of(bytes: &[u8]) -> Self {
         let d = ring::digest::digest(&ring::digest::SHA256, bytes);
-        ContentHash(d.as_ref().iter().map(|b| format!("{b:02x}")).collect())
+        ContentHash::from_digest(d.as_ref())
+    }
+
+    /// The same hash, from a digest computed incrementally.
+    ///
+    /// A store that reads a large file in chunks cannot call [`ContentHash::of`], which
+    /// wants every byte at once — and the whole point of reading in chunks is that they are
+    /// never all resident. This is the same SHA-256 rendered the same way, so a hash from a
+    /// streaming read and a hash from a buffer are interchangeable; the compare-and-swap
+    /// cannot tell them apart, which is the property that matters.
+    pub(crate) fn from_digest(digest: &[u8]) -> Self {
+        ContentHash(digest.iter().map(|b| format!("{b:02x}")).collect())
     }
 
     /// Accept a hash the model handed back. Validated as 64 hex characters rather than

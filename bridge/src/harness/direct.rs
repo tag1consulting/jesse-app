@@ -1391,12 +1391,151 @@ fn with_note(text: String, note: &str) -> String {
     }
 }
 
+/// The store size past which the built-in grep index is the wrong index for this vault.
+///
+/// **THE DOCUMENT COUNT IS THE REAL THRESHOLD.** `GrepIndex` stops after
+/// `GREP_SCAN_LIMIT` documents and says so, which means that past that count every search
+/// on this deployment answers from an arbitrary prefix of the vault: a document the owner
+/// knows is there simply is not found, and the only sign is a note at the end of a result
+/// list nobody reads. The byte total is the second half because a vault can be under the
+/// count and still hold documents too large to scan (see `GREP_MAX_DOC_BYTES`), which
+/// degrades search the same way for a different reason.
+pub const GREP_SCALE_DOCUMENTS: u64 = jesse_agent::index::GREP_SCAN_LIMIT as u64;
+
+/// The byte total past which grep is the wrong index, even under the document threshold.
+pub const GREP_SCALE_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// What this deployment's vault costs the index that is actually configured for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchScale {
+    /// `"qmd"` or `"grep"` — the index `direct_index` will select for a turn.
+    pub index: &'static str,
+    /// Documents under the vault root, excluding what the store excludes.
+    pub documents: u64,
+    /// Their total size on disk.
+    pub bytes: u64,
+    /// Grep, on a store too big for it. The condition this whole type exists to surface.
+    pub degraded: bool,
+}
+
+/// The scale advisory computed at startup, for `/jesse/models` to report without walking the
+/// vault inside a request. Same shape as `SETTINGS_DRIFT` and `UNRESOLVED_MCP`.
+pub static SEARCH_SCALE: std::sync::OnceLock<SearchScale> = std::sync::OnceLock::new();
+
+/// Count the documents under `root` and their total size, WITHOUT READING ANY OF THEM.
+///
+/// Stat only. That distinction is the entire point: the store's own `list` derives a title
+/// and a content hash per document, which before D12 meant reading every file whole — so a
+/// "how big is this vault" check written the obvious way would itself have been an F4. This
+/// walks directories, skips what the store always excludes, and asks the filesystem for a
+/// length.
+fn measure_store(root: &Path, extra_excludes: &[String]) -> (u64, u64) {
+    let mut documents = 0u64;
+    let mut bytes = 0u64;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if jesse_agent::store::fs::ALWAYS_EXCLUDED.contains(&name.as_ref()) {
+                continue;
+            }
+            let rel = path.strip_prefix(root).unwrap_or(&path).to_string_lossy();
+            if extra_excludes
+                .iter()
+                .any(|e| rel.starts_with(e.trim_matches('/')))
+            {
+                continue;
+            }
+            let Ok(ft) = entry.file_type() else { continue };
+            if ft.is_symlink() {
+                continue;
+            }
+            if ft.is_dir() {
+                stack.push(path);
+            } else if ft.is_file() {
+                documents += 1;
+                bytes += entry.metadata().map(|m| m.len()).unwrap_or(0);
+            }
+        }
+    }
+    (documents, bytes)
+}
+
+/// Measure this deployment's vault against the index it is configured to search it with.
+///
+/// **ADVISORY, NEVER A REFUSAL.** A vault too large for grep is the owner's call to make —
+/// `[direct] qmd` exists, and turning it on needs a `qmd` binary and a collection name that
+/// only the owner can supply. What this makes impossible is making that call by accident:
+/// before D12 the sole sign that search had quietly become a scan of the first two thousand
+/// documents was a sentence at the end of a result list.
+pub fn search_scale(cfg: &Config) -> SearchScale {
+    let index = if cfg.direct.qmd && cfg.direct.qmd_collection.is_some() {
+        "qmd"
+    } else {
+        "grep"
+    };
+    let (documents, bytes) = measure_store(Path::new(&cfg.vault), &cfg.direct.exclude);
+    SearchScale {
+        index,
+        documents,
+        bytes,
+        degraded: index == "grep" && (documents > GREP_SCALE_DOCUMENTS || bytes > GREP_SCALE_BYTES),
+    }
+}
+
+/// Server names whose tools answer from an index over THE SAME CONTENT the vault store
+/// governs, and which therefore shadow `vault_search` rather than adding to it.
+///
+/// **A DENY-BY-NAME LIST, EXTENDED IN CONFIG REVIEW RATHER THAN GUESSED AT RUNTIME.** There
+/// is no way to look at a server's advertised tools and tell whether its corpus is this
+/// vault: `query` over the owner's notes and `query` over a public manual set advertise
+/// identically. Guessing would either warn about every retrieval server (noise an operator
+/// learns to ignore) or about none. So the one known case is named, and a new one is added
+/// here — in a diff, with a reason — when someone grants it.
+///
+/// `qmd` is the known case. `[direct] qmd = true` makes it an INDEX BEHIND the store, where
+/// every hit is opened through the store and an excluded or cold document is dropped; a
+/// `[[direct.mcp]]` grant of the same server makes it a SECOND DOOR, answering from its own
+/// index with no store filter at all. Two boundaries over one body of content is one too
+/// many, because whichever is looser becomes the real one.
+pub const VAULT_SHADOWING_SERVERS: &[&str] = &["qmd"];
+
+/// Granted MCP servers whose names are in [`VAULT_SHADOWING_SERVERS`].
+///
+/// **ADVISORY, NEVER A REFUSAL.** A server called `qmd` pointed at a corpus that is not this
+/// vault is a legitimate grant, and nothing the bridge can see distinguishes the two. What
+/// this makes impossible is granting the second door by accident.
+pub fn shadowing_direct_mcp_grants(cfg: &Config) -> Vec<String> {
+    cfg.direct
+        .mcp
+        .iter()
+        .filter(|g| VAULT_SHADOWING_SERVERS.contains(&g.name.as_str()))
+        .map(|g| g.name.clone())
+        .collect()
+}
+
+/// The shadow grants found at startup, for `/health` to report. Same shape as
+/// `SETTINGS_DRIFT` and `UNRESOLVED_MCP`.
+pub static SHADOWING_GRANTS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
 /// The index this deployment's direct turns search with.
 ///
-/// `qmd` when `[direct] qmd = true` AND the binary actually resolves on the PATH; grep
-/// otherwise. **The fallback is silent-free**: choosing grep when qmd was asked for is logged
-/// once, because the difference is visible to the owner as worse search results and the reason
-/// should not have to be guessed.
+/// `qmd` when `[direct] qmd = true` AND a collection is named; grep otherwise. **The fallback
+/// is silence-free**: choosing grep when qmd was asked for is logged once, because the
+/// difference is visible to the owner as worse search results and the reason should not have
+/// to be guessed. Whether the BINARY resolves is not decided here — `QmdIndex` degrades to
+/// grep at query time with its own note if it does not, which is the only point at which the
+/// answer is actually known.
+///
+/// **EITHER WAY THE STORE IS THE BOUNDARY.** `GrepIndex` walks through it; `QmdIndex` opens
+/// every hit through it. There is no configuration of this function that returns an index
+/// beside the store rather than behind it — see `VAULT_SHADOWING_SERVERS` for the grant that
+/// would have been one.
 fn direct_index(settings: &DirectSettings, store: &Arc<dyn DocumentStore>) -> Arc<dyn SearchIndex> {
     if settings.qmd {
         match settings.qmd_collection.as_deref() {
@@ -1796,5 +1935,118 @@ mod tests {
         assert_eq!(sum.output_tokens, Some(7));
         assert_eq!(sum.cache_read_input_tokens, None);
         assert_eq!(sum.cache_creation_input_tokens, Some(3));
+    }
+
+    // ---- D12: one boundary, and an index sized for the vault -------------------------
+
+    /// THE SHADOW GRANT IS NAMED, and only when it is actually granted. A `qmd` grant is a
+    /// second door onto the same content the store governs; the shipped posture (no grants)
+    /// says nothing, which is what keeps this warning worth reading.
+    #[test]
+    fn a_qmd_grant_is_reported_as_shadowing_vault_search_and_nothing_else_is() {
+        let mut cfg = crate::testutil::test_config();
+        assert!(
+            shadowing_direct_mcp_grants(&cfg).is_empty(),
+            "the shipped posture grants nothing and must warn about nothing"
+        );
+
+        cfg.direct.mcp = vec![grant("manuals", &["query"], ActionClass::Read)];
+        assert!(
+            shadowing_direct_mcp_grants(&cfg).is_empty(),
+            "a corpus the vault rules have no opinion about is a legitimate grant"
+        );
+
+        cfg.direct.mcp = vec![
+            grant("manuals", &["query"], ActionClass::Read),
+            grant("qmd", &["query", "get"], ActionClass::Read),
+        ];
+        assert_eq!(
+            shadowing_direct_mcp_grants(&cfg),
+            vec!["qmd".to_string()],
+            "the known second door is named, and only it"
+        );
+    }
+
+    /// `[direct] qmd = true` IS NOT THE SAME THING and must not trip the warning. It is the
+    /// supported way to be fast over this vault: the same binary, behind the store instead
+    /// of beside it.
+    #[test]
+    fn the_qmd_index_setting_is_not_a_shadow_grant() {
+        let mut cfg = crate::testutil::test_config();
+        cfg.direct.qmd = true;
+        cfg.direct.qmd_collection = Some("vault".into());
+        assert!(shadowing_direct_mcp_grants(&cfg).is_empty());
+    }
+
+    /// THE SCALE ADVISORY FIRES ON THE CONFIGURATION D9 WAS RUN UNDER — grep, over a store
+    /// past its scan stop — and is silent once qmd is configured, because then the document
+    /// count is not what bounds an answer.
+    #[test]
+    fn grep_over_a_store_past_the_scan_stop_is_reported_and_qmd_is_not() {
+        let dir = std::env::temp_dir().join(format!(
+            "jesse-scale-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("notes")).unwrap();
+        // Two documents, and a threshold lowered to one by asking the question directly:
+        // writing two thousand files to assert a `>` would be a slow test of `>`.
+        std::fs::write(dir.join("notes/a.md"), "# A\n").unwrap();
+        std::fs::write(dir.join("notes/b.md"), "# B\n").unwrap();
+
+        let mut cfg = crate::testutil::test_config();
+        cfg.vault = dir.to_string_lossy().to_string();
+        let grep = search_scale(&cfg);
+        assert_eq!(grep.index, "grep");
+        assert_eq!(grep.documents, 2, "stat-only walk counts both documents");
+        assert!(grep.bytes > 0);
+        assert!(
+            !grep.degraded,
+            "two documents is not too many for grep: {grep:?}"
+        );
+
+        cfg.direct.qmd = true;
+        cfg.direct.qmd_collection = Some("vault".into());
+        let qmd = search_scale(&cfg);
+        assert_eq!(qmd.index, "qmd");
+        assert!(!qmd.degraded, "qmd is never degraded by document count");
+
+        // The threshold itself, asserted rather than trusted: the constant IS the grep scan
+        // stop, so the condition is "grep will silently answer from a prefix".
+        assert_eq!(
+            GREP_SCALE_DOCUMENTS,
+            jesse_agent::index::GREP_SCAN_LIMIT as u64
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// AND THE MEASUREMENT DOES NOT READ THE DOCUMENTS. This is the trap D12 exists to
+    /// close: a "how big is this vault" check written through the store's own `list` would
+    /// derive a title and a content hash per file, which is exactly the unbounded read F4
+    /// was about. A file far larger than any read cap must cost nothing here but a stat.
+    #[test]
+    fn measuring_the_store_stats_rather_than_reads() {
+        let dir = std::env::temp_dir().join(format!(
+            "jesse-scale-big-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let big = "x".repeat(4 * 1024 * 1024);
+        std::fs::write(dir.join("big.md"), &big).unwrap();
+        let (documents, bytes) = measure_store(&dir, &[]);
+        assert_eq!(documents, 1);
+        assert_eq!(
+            bytes,
+            big.len() as u64,
+            "the size comes from the filesystem"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

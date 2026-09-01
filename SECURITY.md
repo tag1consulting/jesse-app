@@ -117,15 +117,46 @@ recorded with `mcp_set = "none"`, and a deployment that grants a server records 
 - **A server is started per turn and shut down with it.** No server outlives the request that
   justified it.
 
-**WHAT A GRANT DOES NOT INHERIT: the vault's own visibility rules.** This is the sharp edge and
-it is worth stating on its own. `[direct] qmd = true` routes `vault_search` through the qmd
-binary and then **filters every hit through the store**, so a match inside `exclude` or under
-`cold_prefixes` is dropped before the model sees it. A granted `mcp__qmd__query` /
-`mcp__qmd__get` answers from qmd's own index with **no store filter at all**. If the collection
-covers the vault, those two tools can reach a document the vault rules hide. Prefer the index
-path for vault search whenever the collection overlaps anything `exclude` or `cold_prefixes`
-names; grant the server for corpora those settings have no opinion about. `jesse.example.toml`
-carries the same note beside the block.
+**ONE BOUNDARY: THE STORE. AN INDEX SITS BEHIND IT, NEVER BESIDE IT.**
+
+Vault content reaches a direct model through the store's boundary and through nothing else.
+`exclude`, `cold_prefixes` and the path jail *are* that boundary, and every document a turn
+reads is opened through it.
+
+An MCP grant does **not** inherit those rules, and that is the sharp edge. Until D12 this
+document described two ways to give a direct turn `qmd` and left the choice to the reader:
+
+- `[direct] qmd = true` routes `vault_search` through the qmd binary and then **opens every
+  hit through the store**, so a match inside `exclude` or under `cold_prefixes` is dropped
+  before the model sees it — silently, because saying "there is a match you may not see"
+  leaks exactly what the exclusion hides. qmd is an **index behind the boundary**.
+- A granted `mcp__qmd__query` / `mcp__qmd__get` answers from qmd's own index with **no store
+  filter at all**. Where the collection covers the vault, those tools read documents the
+  vault rules hide. That is a **second door**, beside the boundary rather than behind it.
+
+**Two boundaries over one body of content is one boundary too many**: whichever is looser is
+the real one, and it is not the one `exclude` and `cold_prefixes` describe. So the rule is
+now single, and the documentation no longer offers a choice:
+
+> Vault content reaches a direct model through the store. `qmd`'s speed arrives via
+> `[direct] qmd = true`, never via a raw MCP grant of the same server.
+
+`jesse.example.toml` no longer carries a `qmd` grant as its worked `[[direct.mcp]]` example —
+the example is a corpus the vault rules have no opinion about, which is the only shape this
+grant should take. Granting a server named in `VAULT_SHADOWING_SERVERS`
+(`bridge/src/harness/direct.rs`) **warns at startup by name** and appears on `/health` as
+`direct_mcp_shadows_vault_search`. It warns rather than refuses because a same-named server
+over a genuinely different corpus is legitimate and nothing the bridge can see distinguishes
+the two — the list is deny-by-name, extended in config review rather than guessed at runtime.
+
+**A related honesty requirement, from the same measurement.** The built-in grep index stops
+after `GREP_SCAN_LIMIT` documents and skips any single document over `GREP_MAX_DOC_BYTES`,
+saying so in the result. On a vault past that count, search answers from a prefix — which
+looks exactly like a vault that does not contain the answer. The bridge measures the store at
+startup (stat only, never reading a document) and warns when grep is configured over a store
+too large for it; the same condition is `search_degraded` on `GET /jesse/models` and
+`direct_search_degraded` on `/health`. It is the owner's call to make, not the bridge's, but
+it can no longer be made by accident.
 
 ### The accepted asymmetry: this harness has none of the shell surface
 
