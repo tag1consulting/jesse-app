@@ -571,6 +571,7 @@ pub struct DirectToml {
     pub fetch_allow: Option<Vec<String>>,
     pub qmd: Option<bool>,
     pub qmd_collection: Option<String>,
+    pub qmd_collection_prefix: Option<String>,
     pub max_iterations: Option<u32>,
     pub max_tool_calls: Option<u32>,
     /// `[[direct.mcp]]` — the stdio MCP servers a direct turn may reach, and the tools each
@@ -628,6 +629,7 @@ pub fn load_direct_settings(home: &str) -> DirectSettings {
     }
     out.qmd = t.qmd.unwrap_or(false);
     out.qmd_collection = trimmed_nonempty(t.qmd_collection);
+    out.qmd_collection_prefix = trimmed_nonempty(t.qmd_collection_prefix);
     // Zero is refused rather than honoured: a budget of zero iterations is a turn that cannot
     // answer, and an operator who typed it meant something else.
     out.max_iterations = t.max_iterations.filter(|n| *n > 0);

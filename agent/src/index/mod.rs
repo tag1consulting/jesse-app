@@ -484,6 +484,18 @@ pub struct QmdConfig {
     /// derive: on the machine this was built against the collection covering the vault is
     /// not named after it.
     pub collection: String,
+    /// Where the collection's ROOT sits inside the store, when the two are not the same
+    /// directory. Empty (the default) means they are.
+    ///
+    /// REQUIRED WHENEVER THEY DIFFER, and like `collection` it is an operator fact this code
+    /// cannot derive: `qmd` reports a hit relative to the COLLECTION root, while the store
+    /// resolves an id relative to ITS root. Where a deployment indexes `<store>/vault` as a
+    /// collection, every hit comes back as `Knowledge/x.md` and the store is asked for
+    /// `<store>/Knowledge/x.md`, which does not exist — so every hit is dropped by the
+    /// visibility filter and the search returns nothing, silently and for every query. That
+    /// is strictly worse than the grep fallback, and it looks like an empty vault rather
+    /// than a misconfiguration, which is why this is spelled out rather than guessed.
+    pub collection_prefix: String,
     /// Extra entries prepended to `PATH` for the child, for the nvm case above.
     pub path_prepend: Vec<PathBuf>,
     /// Seconds to wait. Hybrid runs an expansion step and is measured in seconds, not
@@ -496,6 +508,7 @@ impl Default for QmdConfig {
         QmdConfig {
             binary: PathBuf::from("qmd"),
             collection: String::new(),
+            collection_prefix: String::new(),
             path_prepend: Vec::new(),
             timeout_secs: 30,
         }
@@ -551,7 +564,15 @@ impl<S: DocumentStore> QmdIndex<S> {
         if collection != self.config.collection {
             return None;
         }
-        DocumentId::parse(path).ok()
+        // Re-root the hit: qmd reports it relative to the COLLECTION, the store resolves it
+        // relative to ITSELF. `DocumentId::parse` still does the containment check, so a
+        // `..` in the reported path cannot climb out through this join.
+        let prefix = self.config.collection_prefix.trim_matches('/');
+        if prefix.is_empty() {
+            DocumentId::parse(path).ok()
+        } else {
+            DocumentId::parse(&format!("{prefix}/{path}")).ok()
+        }
     }
 
     /// Run the binary. Returns the parsed hits, or a content-free reason it could not.
@@ -877,6 +898,60 @@ mod tests {
         assert!(index.id_of("qmd://other/notes/launch.md").is_none());
         assert!(index.id_of("/absolute/path.md").is_none());
         assert!(index.id_of("qmd://vault/../escape.md").is_none());
+    }
+
+    /// Where the collection is rooted BELOW the store root, every hit has to be re-rooted or
+    /// the store is asked for a path that does not exist and drops it — a search that returns
+    /// nothing for every query while looking like an empty vault.
+    #[tokio::test]
+    async fn a_collection_rooted_below_the_store_root_is_re_rooted() {
+        let w = World::new("prefix");
+        let store = w.store();
+        let index = QmdIndex::new(
+            store.clone(),
+            QmdConfig {
+                collection: "todo-list".into(),
+                collection_prefix: "notes".into(),
+                ..Default::default()
+            },
+        );
+        // qmd reports the hit relative to the COLLECTION; the store wants it relative to
+        // itself, so `notes/` is prepended.
+        let id = index.id_of("qmd://todo-list/launch.md").unwrap();
+        assert_eq!(id.as_str(), "notes/launch.md");
+        assert_eq!(
+            store.stat(&scope(), &id).await.unwrap().visibility,
+            Visibility::Hot
+        );
+        // A leading/trailing slash in the operator's value is tolerated, not doubled.
+        let slashed = QmdIndex::new(
+            store.clone(),
+            QmdConfig {
+                collection: "todo-list".into(),
+                collection_prefix: "/notes/".into(),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            slashed.id_of("qmd://todo-list/launch.md").unwrap().as_str(),
+            "notes/launch.md"
+        );
+        // The containment check still applies THROUGH the join — a `..` cannot climb out.
+        assert!(index.id_of("qmd://todo-list/../../escape.md").is_none());
+        // An empty prefix is the old behaviour, unchanged.
+        let flat = QmdIndex::new(
+            store.clone(),
+            QmdConfig {
+                collection: "todo-list".into(),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            flat.id_of("qmd://todo-list/notes/launch.md")
+                .unwrap()
+                .as_str(),
+            "notes/launch.md"
+        );
     }
 
     #[tokio::test]

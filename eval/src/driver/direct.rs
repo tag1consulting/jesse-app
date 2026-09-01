@@ -105,6 +105,10 @@ pub enum EvalIndex {
     /// it. `collection` is required and never guessed, for the reason `QmdConfig` gives.
     Qmd {
         collection: String,
+        /// Where the collection's root sits inside the workspace, when the two are not the
+        /// same directory. Empty means they are, and see `QmdConfig::collection_prefix` for
+        /// why a wrong value here returns nothing rather than failing.
+        collection_prefix: String,
         /// The binary. `None` means the bare name `qmd`, resolved on `PATH`.
         binary: Option<PathBuf>,
     },
@@ -131,9 +135,14 @@ impl EvalIndex {
     {
         match self {
             EvalIndex::Grep => Arc::new(GrepIndex::new(store)),
-            EvalIndex::Qmd { collection, binary } => {
+            EvalIndex::Qmd {
+                collection,
+                collection_prefix,
+                binary,
+            } => {
                 let mut qc = QmdConfig {
                     collection: collection.clone(),
+                    collection_prefix: collection_prefix.clone(),
                     ..Default::default()
                 };
                 if let Some(b) = binary {
@@ -600,6 +609,51 @@ mod tests {
         .collect()
     }
 
+    /// THE PREFIX IS LOAD-BEARING, and its absence is silent. The deployment this was found
+    /// on indexes `<workspace>/vault` as the collection while the store is rooted at the
+    /// workspace, so qmd reports `Knowledge/x.md` for a document the store knows as
+    /// `vault/Knowledge/x.md`. Without `--qmd-collection-prefix` every hit resolves to a path
+    /// that does not exist and is dropped by the visibility filter: a suite that scores as
+    /// though the vault were empty, and passes its run.
+    #[test]
+    fn a_collection_rooted_below_the_workspace_needs_the_prefix() {
+        let home = tempfile::tempdir().unwrap();
+        // The hit as qmd reports it: relative to the COLLECTION, so no `vault/` segment.
+        let hit =
+            r#"[{"file":"qmd://todo-list/notes/launch.md","score":9.0,"line":1,"snippet":"x"}]"#;
+        let files = &[(
+            "vault/notes/launch.md",
+            "# Launch\n\nthe launch is Tuesday\n",
+        )];
+
+        let without = tempfile::tempdir().unwrap();
+        let ids = search_ids(
+            &EvalIndex::Qmd {
+                collection: "todo-list".into(),
+                collection_prefix: String::new(),
+                binary: Some(fake_qmd(home.path(), hit)),
+            },
+            without.path(),
+            files,
+        );
+        assert!(
+            ids.is_empty(),
+            "without the prefix the hit resolves to nothing, got {ids:?}"
+        );
+
+        let with = tempfile::tempdir().unwrap();
+        let ids = search_ids(
+            &EvalIndex::Qmd {
+                collection: "todo-list".into(),
+                collection_prefix: "vault".into(),
+                binary: Some(fake_qmd(home.path(), hit)),
+            },
+            with.path(),
+            files,
+        );
+        assert_eq!(ids, vec!["vault/notes/launch.md".to_string()]);
+    }
+
     /// SELECTION. `--index qmd` reaches the binary, and the hit it invents comes back even
     /// though the word appears in no document — which is what makes this falsifiable: the
     /// grep index physically cannot return this id.
@@ -613,6 +667,7 @@ mod tests {
         );
         let index = EvalIndex::Qmd {
             collection: "vault".into(),
+            collection_prefix: String::new(),
             binary: Some(bin),
         };
         let ids = search_ids(
@@ -659,6 +714,7 @@ mod tests {
         let ids = search_ids(
             &EvalIndex::Qmd {
                 collection: "vault".into(),
+                collection_prefix: String::new(),
                 binary: Some(bin),
             },
             dir.path(),
@@ -694,6 +750,7 @@ mod tests {
         let ids = search_ids(
             &EvalIndex::Qmd {
                 collection: "vault".into(),
+                collection_prefix: String::new(),
                 binary: Some(bin),
             },
             dir.path(),

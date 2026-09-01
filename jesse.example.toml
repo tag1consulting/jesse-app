@@ -902,6 +902,15 @@ Answer the question I asked, not the one you wish I had asked.
 # qmd = true
 # qmd_collection = "vault"
 #
+# # Where the collection's ROOT sits inside the vault, when the two are not the same directory.
+# # Omit when they coincide (the common case). REQUIRED when they do not: qmd reports a hit
+# # relative to the COLLECTION while the store resolves an id relative to the VAULT, so where a
+# # collection is rooted at `<vault>/vault`, every hit comes back as `Knowledge/x.md`, the store
+# # is asked for `<vault>/Knowledge/x.md`, and the miss is dropped by the visibility filter.
+# # The failure is SILENT and total — every query returns nothing, which reads as an empty vault
+# # rather than a misconfiguration, and is strictly worse than the grep fallback qmd replaced.
+# qmd_collection_prefix = "vault"
+#
 # # Per-turn ceilings, overriding the agent layer's defaults. The WALL clock is not here: it is
 # # JESSE_TIMEOUT, so the loop stops itself just before the driver would cut it off and the
 # # user gets a partial answer with a reason rather than a bare 504.

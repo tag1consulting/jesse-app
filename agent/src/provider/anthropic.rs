@@ -97,14 +97,25 @@ impl AnthropicMessages {
         // property of a block and the string form has nowhere to put it. The array form is
         // accepted for every request, so there is no case where the string form is needed.
         if !req.system.is_empty() {
+            // The breakpoint goes on the LAST cacheable system block ONLY, for the same
+            // reason it goes on the last tool: a breakpoint covers everything BEFORE it, so
+            // one on the final cacheable block already puts every earlier block inside the
+            // cached prefix. Marking each cacheable block individually was not just wasteful
+            // — the wire caps a request at FOUR `cache_control` blocks and rejects the whole
+            // request with a 400 past that. The persona renders one block per section on this
+            // wire (`persona::render`, which folds them into a single block on the Chat and
+            // Responses wires), so a pack of five sections plus the caller's own blocks used
+            // to put a working configuration over the cap and fail every turn.
+            let last_cacheable = req.system.iter().rposition(|b| b.cacheable);
             let blocks: Vec<Value> = req
                 .system
                 .iter()
-                .map(|b| {
+                .enumerate()
+                .map(|(i, b)| {
                     let mut o = Map::new();
                     o.insert("type".into(), json!("text"));
                     o.insert("text".into(), json!(b.text));
-                    if b.cacheable {
+                    if Some(i) == last_cacheable {
                         o.insert("cache_control".into(), json!({"type": "ephemeral"}));
                     }
                     Value::Object(o)
@@ -776,6 +787,70 @@ mod tests {
             Some(&json!("ephemeral"))
         );
         assert!(body.pointer("/system/1/cache_control").is_none());
+    }
+
+    /// The wire caps a request at FOUR `cache_control` blocks. The persona renders one
+    /// system block per section on this wire, so "one breakpoint per cacheable block" put a
+    /// realistic pack over the cap and the API rejected every turn with a 400.
+    #[test]
+    fn many_cacheable_system_blocks_spend_exactly_one_breakpoint() {
+        let p = provider();
+        let req = Request {
+            system: vec![
+                SystemBlock::cacheable("persona 1"),
+                SystemBlock::cacheable("persona 2"),
+                SystemBlock::cacheable("persona 3"),
+                SystemBlock::cacheable("persona 4"),
+                SystemBlock::cacheable("persona 5"),
+                SystemBlock::cacheable("tool guidance"),
+            ],
+            tools: vec![ToolSpec {
+                name: "a".into(),
+                description: "d".into(),
+                input_schema: json!({"type": "object"}),
+                strict: false,
+            }],
+            messages: vec![Message::user("hi")],
+            ..Default::default()
+        };
+        let body = p.body(&req).unwrap();
+        let n = body.to_string().matches("cache_control").count();
+        assert_eq!(n, 2, "one system breakpoint + one tool breakpoint, got {n}");
+        // It is the LAST cacheable block that carries it — a breakpoint covers what precedes it.
+        for i in 0..5 {
+            assert!(
+                body.pointer(&format!("/system/{i}/cache_control"))
+                    .is_none(),
+                "block {i} should not carry a breakpoint"
+            );
+        }
+        assert_eq!(
+            body.pointer("/system/5/cache_control/type"),
+            Some(&json!("ephemeral"))
+        );
+    }
+
+    /// A trailing NON-cacheable block (a volatile suffix such as the date) must not drag the
+    /// breakpoint past the stable prefix — it lands on the last cacheable block, not the last.
+    #[test]
+    fn a_volatile_suffix_keeps_the_breakpoint_on_the_stable_prefix() {
+        let p = provider();
+        let req = Request {
+            system: vec![
+                SystemBlock::cacheable("stable a"),
+                SystemBlock::cacheable("stable b"),
+                SystemBlock::plain("today is Tuesday"),
+            ],
+            messages: vec![Message::user("hi")],
+            ..Default::default()
+        };
+        let body = p.body(&req).unwrap();
+        assert!(body.pointer("/system/0/cache_control").is_none());
+        assert_eq!(
+            body.pointer("/system/1/cache_control/type"),
+            Some(&json!("ephemeral"))
+        );
+        assert!(body.pointer("/system/2/cache_control").is_none());
     }
 
     #[test]

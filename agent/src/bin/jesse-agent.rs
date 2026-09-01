@@ -140,6 +140,9 @@ struct Args {
 struct QmdSettings {
     binary: PathBuf,
     collection: String,
+    /// Where the collection's root sits inside `--root`, when the two are not the same
+    /// directory. Empty means they are. See `QmdConfig::collection_prefix`.
+    collection_prefix: String,
     /// Directories prepended to the child's `PATH`.
     ///
     /// This exists because of a real deployment: `qmd` is commonly an nvm shim that runs
@@ -157,7 +160,7 @@ usage: jesse-agent turn --wire <messages|chat> --base-url <url> --model <id>
                         [--thinking <off|low|medium|high>]
                         [--exclude <prefix-or-glob>]... [--cold-prefix <prefix>]...
                         [--fetch-allow <host-or-*.domain>]...
-                        [--qmd [<binary>]] [--qmd-collection <name>] [--qmd-path <dir>]...
+                        [--qmd [<binary>]] [--qmd-collection <name>]\n                        [--qmd-collection-prefix <path>] [--qmd-path <dir>]...
                         [--artifact-dir <dir>]
                         [--budget-iterations <n>] [--budget-tool-calls <n>]
                         [--budget-output-tokens <n>] [--budget-input-tokens <n>]
@@ -213,6 +216,7 @@ fn parse(argv: Vec<String>) -> Result<Args, String> {
     let mut artifact_dir = None;
     let mut qmd_binary: Option<PathBuf> = None;
     let mut qmd_collection: Option<String> = None;
+    let mut qmd_collection_prefix: Option<String> = None;
     let mut qmd_path: Vec<PathBuf> = Vec::new();
 
     let mut budget = Budget::with_wall(Duration::from_secs(300));
@@ -242,6 +246,7 @@ fn parse(argv: Vec<String>) -> Result<Args, String> {
             "--qmd" => qmd_binary = Some(PathBuf::from("qmd")),
             "--qmd-binary" => qmd_binary = Some(PathBuf::from(value()?)),
             "--qmd-collection" => qmd_collection = Some(value()?),
+            "--qmd-collection-prefix" => qmd_collection_prefix = Some(value()?),
             "--qmd-path" => qmd_path.push(PathBuf::from(value()?)),
             "--budget-iterations" => budget.max_iterations = number(&arg, &value()?)?,
             "--budget-tool-calls" => budget.max_tool_calls = number(&arg, &value()?)?,
@@ -299,6 +304,7 @@ fn parse(argv: Vec<String>) -> Result<Args, String> {
             (binary, Some(collection)) => Some(QmdSettings {
                 binary: binary.unwrap_or_else(|| PathBuf::from("qmd")),
                 collection,
+                collection_prefix: qmd_collection_prefix.unwrap_or_default(),
                 path_prepend: qmd_path,
             }),
         },
@@ -427,6 +433,7 @@ async fn run(args: Args) -> Result<ExitCode, String> {
             QmdConfig {
                 binary: q.binary.clone(),
                 collection: q.collection.clone(),
+                collection_prefix: q.collection_prefix.clone(),
                 path_prepend: q.path_prepend.clone(),
                 ..Default::default()
             },
