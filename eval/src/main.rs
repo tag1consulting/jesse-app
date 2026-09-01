@@ -137,6 +137,13 @@ struct RunArgs {
     /// and stripping the wrong prefix produces ids that resolve to the wrong documents.
     #[arg(long)]
     qmd_collection: Option<String>,
+    /// Where the qmd collection's ROOT sits inside the workspace, when the two are not the
+    /// same directory (a vault indexed at `<workspace>/vault`, say). Omit when they coincide.
+    ///
+    /// Wrong or missing where it is needed, every hit resolves to a path the store does not
+    /// have and is dropped — a run that scores as though the vault were empty.
+    #[arg(long)]
+    qmd_collection_prefix: Option<String>,
     /// Path to the `qmd` binary. Omit to resolve the bare name on `PATH`.
     #[arg(long)]
     qmd_bin: Option<PathBuf>,
@@ -270,6 +277,7 @@ fn do_run(a: RunArgs) -> Result<(), String> {
                         "--index qmd needs --qmd-collection; the collection name cannot be \
                          guessed from the workspace path",
                     )?,
+                    collection_prefix: a.qmd_collection_prefix.clone().unwrap_or_default(),
                     binary: a.qmd_bin.clone(),
                 },
             };

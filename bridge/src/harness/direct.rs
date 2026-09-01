@@ -341,6 +341,9 @@ pub struct DirectSettings {
     /// to the wrong documents or to none. On this machine the collection covering the vault
     /// is not named after it, which is exactly why a default would be wrong.
     pub qmd_collection: Option<String>,
+    /// Where the qmd collection's root sits inside the vault, when it is not the vault root
+    /// itself (`[direct] qmd_collection_prefix`). Empty means they coincide.
+    pub qmd_collection_prefix: Option<String>,
     /// Per-turn ceilings, overriding the agent crate's defaults. `None` keeps the default.
     pub max_iterations: Option<u32>,
     pub max_tool_calls: Option<u32>,
@@ -1544,6 +1547,10 @@ fn direct_index(settings: &DirectSettings, store: &Arc<dyn DocumentStore>) -> Ar
                     store.clone(),
                     jesse_agent::index::QmdConfig {
                         collection: collection.to_string(),
+                        collection_prefix: settings
+                            .qmd_collection_prefix
+                            .clone()
+                            .unwrap_or_default(),
                         ..Default::default()
                     },
                 ));

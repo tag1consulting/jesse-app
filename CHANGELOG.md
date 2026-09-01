@@ -14,6 +14,49 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [agent 0.9.0, bridge 0.114.0, eval 0.5.0] - 2026-09-01
+
+**Two defects that stop a direct model answering a turn at all.** Both surfaced standing up a
+second instance whose direct models are the only models it has. Nothing in this repository
+runs a `harness = "direct"` model as its main path, so neither defect had anywhere to show up
+before, and neither is caught by a test that mocks the wire.
+
+Both share a failure shape worth naming: the health probe passes and the model reports
+`healthy`, because a one-token probe carries neither a realistic persona nor a search. The
+green badge was measuring something the turn does not do.
+
+### Fixed
+
+- **The Messages adapter spent one cache breakpoint per cacheable system block, and the wire
+  caps a request at four.** The persona renders one block per SECTION on this wire — it folds
+  them into a single block on Chat and Responses, which is why only the Anthropic wire was
+  affected — so a realistic pack plus the caller's own blocks reached seven and the API
+  rejected *every* turn with a 400. The breakpoint now lands on the LAST cacheable block only,
+  which is the reasoning already applied to the last tool: a breakpoint covers everything
+  before it, so one covers the whole prefix. A trailing volatile block (the date) does not
+  drag it past the stable prefix; two tests pin both halves.
+
+- **`QmdIndex` mapped a hit onto a store id relative to the COLLECTION root while the store
+  resolves it relative to ITS root.** Where the collection is rooted below the store — a vault
+  indexed at `<vault>/vault` — every hit resolved to a path that does not exist and was
+  dropped by the visibility filter. Every query returned zero hits, silently, looking like an
+  empty vault rather than a misconfiguration, and strictly worse than the grep fallback qmd
+  was chosen over.
+
+### Added
+
+- **`[direct] qmd_collection_prefix`**, and its equivalents on both CLI surfaces
+  (`jesse-agent --qmd-collection-prefix`, `jesse-eval --qmd-collection-prefix`): where the
+  collection root sits inside the store, when the two are not the same directory. Empty keeps
+  today's behaviour exactly. It is an operator fact this code cannot derive, in the same
+  spirit as `qmd_collection`, and it is spelled out rather than guessed for the same reason:
+  a wrong value here returns nothing rather than failing. `DocumentId::parse` still does the
+  containment check *through* the join, so a `..` in a reported path cannot climb out.
+
+- The eval driver carries the fix too, with a test that runs the same fixture with and without
+  the prefix. Without it, a suite against a vault indexed this way scores as though the vault
+  were empty — and passes its own run while doing so.
+
 ## [App 1.0 (123)] - 2026-09-01
 
 **One conversation, one name.** The thread list showed each row's AI-generated title
