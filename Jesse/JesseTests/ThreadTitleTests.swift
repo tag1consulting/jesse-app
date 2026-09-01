@@ -1,10 +1,16 @@
 import XCTest
 @testable import Jesse
 import JesseCore
+import JesseConversations
 
 // Pure-function tests for the AI-title seams: the content key (invalidation), the
 // digest (what the app sends), and the display precedence. No view host, no
 // network — mirroring ThreadSectioningTests / ThreadFoldersTests.
+//
+// The helpers themselves now live in JesseConversations (both apps name a thread
+// through them), which is why this file imports it. What these tests do NOT cover
+// is any given surface actually calling them — ThreadDetailTitleTests exists
+// because the detail view did not, and passing tests here said nothing about it.
 @MainActor
 final class ThreadTitleTests: XCTestCase {
 

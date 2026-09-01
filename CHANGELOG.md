@@ -14,6 +14,53 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [App 1.0 (123)] - 2026-09-01
+
+**One conversation, one name.** The thread list showed each row's AI-generated title
+("Dentist appointment"); tapping the row pushed a screen whose navigation bar showed the
+first thing ever typed into that thread instead. Two names for the same conversation, and
+the useful one vanished exactly when it had a full-width bar to sit in.
+
+The root cause is not the wrong string, it is a bypassed seam. `displayTitle(for:)` has
+always resolved the two sources in order (`aiTitle`, else the trimmed derived `title`, else
+a placeholder), and the list row called it. `ThreadDetailView`'s `.navigationTitle` did not:
+it read `thread.title` directly with an inline `isEmpty` check, so no AI title could ever
+reach it. The fix is that the detail view resolves its name the same single way every other
+surface does.
+
+### Fixed
+
+- **`ThreadDetailView` names the open conversation through `displayTitle(for:)`.** The
+  expression lives in a `navigationTitleText` property so the detail view's OWN title is
+  assertable without standing up a view host, which is what the two new failing-first tests
+  pin. A whitespace-only `aiTitle` is also handled now, where the inline `isEmpty` check
+  admitted one.
+
+- **The Live Activity carried the same defect and is fixed with it.** A running turn's Lock
+  Screen card built its `threadTitle` from `thread.title` with its own inline fallback, so
+  the turn was announced under the first message too.
+
+### Changed
+
+- **`ThreadTitle.swift` moved from the iOS app target into `JesseConversations`, and the
+  four private copies of its fallback chain are gone.** This is the reason the drift was
+  possible: the helper was reachable only from iOS, so the Mac had grown three near-identical
+  private `displayTitle` implementations (`MacThreadDetailView`, `MacRootView`'s sidebar row,
+  `JesseMacApp`'s reply notification) and the iOS detail view a fourth, inline. All four now
+  call the one public function in the module both apps already link. The three Mac copies were
+  behaviourally correct, and that is not a defence: correct duplicates are how a fifth copy
+  gets written wrong.
+
+- **`displayTitle(for:placeholder:)` takes the placeholder as a parameter.** One surface
+  genuinely wants different wording for a thread with no name yet — a notification banner
+  reading "New conversation" names nothing, where "Jesse replied" says what happened — and a
+  parameter is how that surface keeps its wording without keeping its own chain.
+
+- **Audited every other surface that names a thread.** The list row and the Mac sidebar row
+  (now shared), both navigation titles, the Live Activity, the Mac reply notification. The
+  watch app, the widgets bundle and the Siri intents name no thread; the search corpus reads
+  `title` deliberately (matching, not naming) and is left alone.
+
 ## [agent 0.8.0, bridge 0.113.1] - 2026-09-01
 
 **Reasoning continuity: `LEAKS.md` L5, implemented across all three adapters.** A reasoning
