@@ -14,6 +14,111 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [bridge 0.115.0] - 2026-09-04
+
+**A document that is not on the phone can now be read, and the two channels that cannot serve
+one say so instead of being answered around.**
+
+### Root cause
+
+Asked about a PDF sitting in an email or a chat thread, a turn could reach no byte of it —
+and, worse, nothing said so. The model answered from the message text surrounding the
+attachment and the answer read as though it had opened the file. That silence is the defect;
+the missing capability is only half of it.
+
+Underneath were three separate causes, and the first was NOT the one it looked like:
+
+- **Gmail and WhatsApp: the fetch never happened.** Both MCP servers advertise an attachment
+  download tool and both were **deliberately ungranted**, because both write fetched bytes to
+  a path of their own choosing on a host where the same child holds a vault write grant. The
+  reasoning is written out above `DEFAULT_ALLOWED_TOOLS` and a test fails the build if
+  `mcp__whatsapp__download_media` ever appears in a granted set. So this was never a
+  read-scope problem to be fixed by widening a path; it was a grant decision, and the fix had
+  to keep it.
+
+- **Fastmail was blind to attachments outright.** The JMAP server this deployment runs exposes
+  `search_emails`, `get_mailboxes` and `get_email_content`, none of which enumerates an
+  attachment or downloads one.
+
+- **A staged file would have been unreadable anyway.** A child's reads are scoped to its
+  working directory, so a fetched file under the system temp dir is refused at the permission
+  layer no matter who fetched it.
+
+### Added
+
+- **`.jesse-inbound/`, a staging directory under the workspace** (`InboundStaging`): 0700, files
+  0600 with randomized names carrying only the sniffed extension, gitignored in this repo AND
+  in the vault (the 15-minute autocommit would otherwise sweep a fetched bank statement into
+  git history). Unlike the composer's per-request scratch dir it has **no `Drop` guard, on
+  purpose** — a staged document must outlive its turn so a follow-up question about the same
+  invoice does not refetch it — so a TTL sweep is the only thing bounding it, and it runs at
+  every bridge boot and before every staging write.
+
+- **`inbound`, the bridge's own MCP server** (`jesse-inbound-mcp`), with two tools:
+  `list_attachments` and `fetch_attachment`. **THE FETCH MOVED INSTEAD OF THE BOUNDARY.** It
+  performs the same downloads the two ungranted tools would — the WhatsApp one through the
+  very loopback REST endpoint `download_media` itself calls, Gmail's through the account's own
+  read-only OAuth grant, Fastmail's over JMAP with the token the deployment already exports —
+  from the bridge's side, and it can write to exactly one directory. The child gains a path it
+  may READ and nowhere to put bytes. `download_media` and `get_gmail_attachment_content` stay
+  ungranted and the test holding the first one out is untouched.
+
+  Two tool names rather than eight, with the channel as an argument: every name is a grant
+  that a containment record has to re-certify, which is the same reasoning that made
+  `places`' detail level an argument rather than a third tool.
+
+- Every fetched blob goes through **`validate_one_blob`, the composer path's own gate**, split
+  out of `validate_and_decode_attachments` rather than reimplemented — one MIME whitelist and
+  one magic-byte cross-check, so the two ways a file reaches a model cannot drift. The
+  per-file cap is a parameter, because a document cap sized like a photo cap would refuse
+  ordinary contracts.
+
+- A staged file reaches the model through **`prepare_attachments_for_harness`**, the same
+  conversion table the composer path uses: a PDF is handed to Claude Code whole, rasterized to
+  page images for a harness that cannot read one, and a page-cap truncation is returned as its
+  own field so it reaches the user's answer rather than dying in a prompt.
+
+### Not added, deliberately
+
+- **iMessage.** Reading `~/Library/Messages/chat.db` needs Full Disk Access, and `SECURITY.md`
+  forbids the bridge holding it: the bridge's code signature changes on every rebuild, so the
+  grant would lapse at the next deploy — silently, because a launchd job cannot answer a TCC
+  prompt. A capability that works until the next deploy and then quietly stops is a worse
+  version of this entry's root cause, not a fix for it. `imcp` advertises no attachment tool
+  to grant instead. The `imessage` channel therefore resolves to a refusal that names the
+  channel, what is missing and what the user can do, on both tools — because an absent
+  capability teaches a model nothing, while one that explains itself gets repeated instead of
+  papered over.
+
+### Changed
+
+- `MAIN_CHILD_MCP_CONFIG` is now seventeen servers; the sixteen-server set it replaces is kept
+  as `MESSAGES_BUILD_PLACES_MCP_CONFIG` with its label, so no existing containment row is
+  silently re-pointed at a set nobody probed. **Claude Code only** — Codex stays on
+  `MESSAGES_MCP_CONFIG`, on the same reasoning that kept `build` off it in 0.86.0.
+
+- **The containment battery was re-run and `bridge/containment.toml` re-recorded** (claude
+  2.1.252, 2026-09-04, gate `pass`, 64 probes, $16.25). Granting a tool moves
+  `capability_args`, which the record commits and compares by strict equality at boot, so a
+  re-record is the cost of the two new grants rather than an optional step.
+
+  Two `baseline` probes on the `write` row **swapped**: `read_agent_credential` now reads
+  `allowed` where `read_escape_parent` did, and vice versa. Recorded rather than waved
+  through, because the standing rule is that an unexplained improvement is as much a sign
+  something moved as an unexplained regression. Both are the SAME open surface — "can a
+  `Write` child, which has `Bash`, read a file outside the workspace" — already recorded as a
+  known-open baseline on that row and unchanged as a class; what differs is which decoy the
+  child happened to reach on the day. Nothing in this change touches `Bash`, its allowlist
+  entries or a `Write` child's read scope, and the pinned CLI also moved (2.1.243 → 2.1.252)
+  between the two records. Every `hard_gate` probe is `denied` on every row, as before.
+
+- The Claude Code child now carries `--add-dir` for the staging directory on **every** turn
+  whose MCP set loads `inbound`, not only turns that already fetched something: a resolver
+  stages mid-turn, long after the argv was built. It is emitted even though the directory is
+  already inside the workspace scope, because whether `Read(//${WORKSPACE}/**)` matches a dot
+  directory is a property of the CLI's glob matcher rather than of this code, and guessing
+  wrong there would reproduce the exact failure above.
+
 ## [agent 0.9.0, bridge 0.114.0, eval 0.5.0] - 2026-09-01
 
 **Two defects that stop a direct model answering a turn at all.** Both surfaced standing up a

@@ -8,12 +8,12 @@ use jesse_bridge::{
     app, binary_exists, bind_broker, build_apns, detect_binary_drift,
     detect_unresolved_mcp_servers, env_string, env_truthy, export_mcp_server_env, harness_bin_env,
     harness_default_bin, harnesses_in_use, is_bind_allowed, load_local_models,
-    manual_pairing_lines, pairing_payload, prune_direct_state, qr_env_tristate, search_scale,
-    sentinel_advert, serve_broker, settings_permission_drift, shadowing_direct_mcp_grants,
-    show_qr_opt_in, show_token_opt_in, spawn_eviction_task, spawn_scheduler, spawn_session_gc_task,
-    start_health_prober, validate_model_config, AppState, Config, ConfigError, QrArt, Runner,
-    TokenVisibility, BINARY_DRIFT, CONTAINMENT_RECORDS, DIRECT_ID, SEARCH_SCALE, SETTINGS_DRIFT,
-    SHADOWING_GRANTS, UNRESOLVED_MCP,
+    manual_pairing_lines, open_inbound_staging, pairing_payload, prune_direct_state,
+    qr_env_tristate, search_scale, sentinel_advert, serve_broker, settings_permission_drift,
+    shadowing_direct_mcp_grants, show_qr_opt_in, show_token_opt_in, spawn_eviction_task,
+    spawn_scheduler, spawn_session_gc_task, start_health_prober, validate_model_config, AppState,
+    Config, ConfigError, QrArt, Runner, TokenVisibility, BINARY_DRIFT, CONTAINMENT_RECORDS,
+    DIRECT_ID, INBOUND_DIR_NAME, SEARCH_SCALE, SETTINGS_DRIFT, SHADOWING_GRANTS, UNRESOLVED_MCP,
 };
 
 #[tokio::main]
@@ -147,6 +147,44 @@ async fn main() {
         );
     }
     let _ = UNRESOLVED_MCP.set(unresolved);
+
+    // THE INBOUND STAGING DIRECTORY, opened and SWEPT at boot.
+    //
+    // Opening it here rather than lazily on first use is what makes the retention promise
+    // real. `.jesse-inbound/` holds documents fetched out of a mailbox or a chat thread —
+    // tax records, medical results, contracts — and unlike the composer's per-request
+    // scratch dir it has NO `Drop` guard, deliberately: a staged file must outlive its turn
+    // so a follow-up question about the same invoice does not refetch it. The sweep is
+    // therefore the only thing bounding it, and a sweep that ran only when something was
+    // fetched would leave a bridge that has answered no document question in a week holding
+    // a week-old bank statement.
+    //
+    // Two sweeps, not one: here at every boot, and inside `InboundStaging::stage` before
+    // every write. Never on a timer, which stops bounding the directory the moment its task
+    // dies.
+    //
+    // ADVISORY, never fatal. A staging directory that cannot be opened costs the inbound
+    // capability for this run — the MCP server will say so, loudly, on the first fetch — and
+    // must not cost the bridge its boot.
+    match open_inbound_staging(&cfg) {
+        Ok(staging) => {
+            let removed = staging.sweep();
+            if removed > 0 {
+                // COUNT ONLY. Never a filename and never a byte of content: the whole point
+                // of the directory's posture is that what passes through it is not recorded
+                // anywhere else.
+                eprintln!(
+                    "jesse-bridge: swept {removed} expired staged document(s) from \
+                     {INBOUND_DIR_NAME}"
+                );
+            }
+        }
+        Err(e) => eprintln!(
+            "jesse-bridge: WARNING — could not open the inbound staging directory under the \
+             vault ({e}). Fetching a document from a mailbox or a chat thread will fail on \
+             this run, and it will fail loudly rather than answering without the document."
+        ),
+    }
 
     // ADVISORY, never fatal: has a `[[direct.mcp]]` grant opened a SECOND DOOR onto the vault?
     //

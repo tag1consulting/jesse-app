@@ -229,6 +229,20 @@ pub enum McpSet {
     /// way and which did not. As in 0.86.0, THE LABEL MOVED FOR CLAUDE CODE ONLY, so no Codex
     /// signature was orphaned.
     MessagesBuildPlaces,
+    /// The places set PLUS the **inbound** server ([`MAIN_CHILD_MCP_CONFIG`]): every **Claude
+    /// Code** main turn from bridge 0.115.0. Seventeen servers.
+    ///
+    /// What it adds is the ability to READ A DOCUMENT THAT IS NOT ON THE PHONE — an
+    /// attachment sitting in a mailbox or a chat thread. It reaches no host the sixteen-server
+    /// set did not already reach and carries no credential the deployment did not already
+    /// export; what is new is that a received file's CONTENTS enter the turn's context, at the
+    /// same trust level as the message bodies the chat servers have carried since 0.73.0.
+    ///
+    /// It is also the one server here that can WRITE, and the scope of that write is the whole
+    /// reason it exists rather than a grant of the two download tools the set already loads:
+    /// it writes into `.jesse-inbound/` under the workspace and nowhere else. See
+    /// [`crate::inbound`].
+    MessagesBuildPlacesInbound,
 }
 
 /// The label for [`McpSet::Messages`], written ONCE.
@@ -254,6 +268,13 @@ unifi+routeros+proxmox+whatsapp+imcp+google-perseido+build";
 const MESSAGES_BUILD_PLACES_LABEL: &str = "qmd+slack+browser+homeassistant+roon+google+github+\
 fastmail+unifi+routeros+proxmox+whatsapp+imcp+google-perseido+build+places";
 
+/// The label for [`McpSet::MessagesBuildPlacesInbound`], written ONCE for the reason every
+/// label above it is: at seventeen servers a typo in the `parse` arm fails the round trip for
+/// exactly the row a startup gate needs to resolve, and it fails it by returning `None`
+/// rather than by failing to compile.
+const MESSAGES_BUILD_PLACES_INBOUND_LABEL: &str = "qmd+slack+browser+homeassistant+roon+google+\
+github+fastmail+unifi+routeros+proxmox+whatsapp+imcp+google-perseido+build+places+inbound";
+
 impl McpSet {
     /// The label used in the results file and on the command line.
     pub fn label(&self) -> &'static str {
@@ -269,6 +290,7 @@ impl McpSet {
             McpSet::Messages => MESSAGES_LABEL,
             McpSet::MessagesBuild => MESSAGES_BUILD_LABEL,
             McpSet::MessagesBuildPlaces => MESSAGES_BUILD_PLACES_LABEL,
+            McpSet::MessagesBuildPlacesInbound => MESSAGES_BUILD_PLACES_INBOUND_LABEL,
         }
     }
 
@@ -286,6 +308,7 @@ impl McpSet {
             MESSAGES_LABEL => Some(McpSet::Messages),
             MESSAGES_BUILD_LABEL => Some(McpSet::MessagesBuild),
             MESSAGES_BUILD_PLACES_LABEL => Some(McpSet::MessagesBuildPlaces),
+            MESSAGES_BUILD_PLACES_INBOUND_LABEL => Some(McpSet::MessagesBuildPlacesInbound),
             _ => None,
         }
     }
@@ -304,7 +327,8 @@ impl McpSet {
             McpSet::Morning => MORNING_MCP_CONFIG,
             McpSet::Messages => MESSAGES_MCP_CONFIG,
             McpSet::MessagesBuild => MESSAGES_BUILD_MCP_CONFIG,
-            McpSet::MessagesBuildPlaces => MAIN_CHILD_MCP_CONFIG,
+            McpSet::MessagesBuildPlaces => MESSAGES_BUILD_PLACES_MCP_CONFIG,
+            McpSet::MessagesBuildPlacesInbound => MAIN_CHILD_MCP_CONFIG,
         }
     }
 
@@ -334,7 +358,8 @@ impl McpSet {
             | McpSet::Morning
             | McpSet::Messages
             | McpSet::MessagesBuild
-            | McpSet::MessagesBuildPlaces => true,
+            | McpSet::MessagesBuildPlaces
+            | McpSet::MessagesBuildPlacesInbound => true,
         }
     }
 
@@ -358,7 +383,8 @@ impl McpSet {
             | McpSet::Morning
             | McpSet::Messages
             | McpSet::MessagesBuild
-            | McpSet::MessagesBuildPlaces => true,
+            | McpSet::MessagesBuildPlaces
+            | McpSet::MessagesBuildPlacesInbound => true,
         }
     }
 
@@ -372,7 +398,8 @@ impl McpSet {
             | McpSet::Morning
             | McpSet::Messages
             | McpSet::MessagesBuild
-            | McpSet::MessagesBuildPlaces => true,
+            | McpSet::MessagesBuildPlaces
+            | McpSet::MessagesBuildPlacesInbound => true,
         }
     }
 
@@ -390,7 +417,8 @@ impl McpSet {
             | McpSet::Morning
             | McpSet::Messages
             | McpSet::MessagesBuild
-            | McpSet::MessagesBuildPlaces => true,
+            | McpSet::MessagesBuildPlaces
+            | McpSet::MessagesBuildPlacesInbound => true,
         }
     }
 
@@ -403,7 +431,8 @@ impl McpSet {
             | McpSet::Morning
             | McpSet::Messages
             | McpSet::MessagesBuild
-            | McpSet::MessagesBuildPlaces => true,
+            | McpSet::MessagesBuildPlaces
+            | McpSet::MessagesBuildPlacesInbound => true,
         }
     }
 
@@ -419,7 +448,8 @@ impl McpSet {
             McpSet::Morning
             | McpSet::Messages
             | McpSet::MessagesBuild
-            | McpSet::MessagesBuildPlaces => true,
+            | McpSet::MessagesBuildPlaces
+            | McpSet::MessagesBuildPlacesInbound => true,
         }
     }
 
@@ -434,7 +464,8 @@ impl McpSet {
             McpSet::Morning
             | McpSet::Messages
             | McpSet::MessagesBuild
-            | McpSet::MessagesBuildPlaces => true,
+            | McpSet::MessagesBuildPlaces
+            | McpSet::MessagesBuildPlacesInbound => true,
         }
     }
 
@@ -449,7 +480,8 @@ impl McpSet {
             McpSet::Morning
             | McpSet::Messages
             | McpSet::MessagesBuild
-            | McpSet::MessagesBuildPlaces => true,
+            | McpSet::MessagesBuildPlaces
+            | McpSet::MessagesBuildPlacesInbound => true,
         }
     }
 
@@ -466,7 +498,8 @@ impl McpSet {
             McpSet::Morning
             | McpSet::Messages
             | McpSet::MessagesBuild
-            | McpSet::MessagesBuildPlaces => true,
+            | McpSet::MessagesBuildPlaces
+            | McpSet::MessagesBuildPlacesInbound => true,
         }
     }
 
@@ -482,7 +515,8 @@ impl McpSet {
             McpSet::Morning
             | McpSet::Messages
             | McpSet::MessagesBuild
-            | McpSet::MessagesBuildPlaces => true,
+            | McpSet::MessagesBuildPlaces
+            | McpSet::MessagesBuildPlacesInbound => true,
         }
     }
 
@@ -499,7 +533,8 @@ impl McpSet {
             McpSet::Morning
             | McpSet::Messages
             | McpSet::MessagesBuild
-            | McpSet::MessagesBuildPlaces => true,
+            | McpSet::MessagesBuildPlaces
+            | McpSet::MessagesBuildPlacesInbound => true,
         }
     }
 
@@ -515,7 +550,10 @@ impl McpSet {
             | McpSet::QmdSlackBrowser
             | McpSet::House
             | McpSet::Morning => false,
-            McpSet::Messages | McpSet::MessagesBuild | McpSet::MessagesBuildPlaces => true,
+            McpSet::Messages
+            | McpSet::MessagesBuild
+            | McpSet::MessagesBuildPlaces
+            | McpSet::MessagesBuildPlacesInbound => true,
         }
     }
 
@@ -543,7 +581,10 @@ impl McpSet {
             | McpSet::QmdSlackBrowser
             | McpSet::House
             | McpSet::Morning => false,
-            McpSet::Messages | McpSet::MessagesBuild | McpSet::MessagesBuildPlaces => true,
+            McpSet::Messages
+            | McpSet::MessagesBuild
+            | McpSet::MessagesBuildPlaces
+            | McpSet::MessagesBuildPlacesInbound => true,
         }
     }
 
@@ -562,7 +603,10 @@ impl McpSet {
             | McpSet::QmdSlackBrowser
             | McpSet::House
             | McpSet::Morning => false,
-            McpSet::Messages | McpSet::MessagesBuild | McpSet::MessagesBuildPlaces => true,
+            McpSet::Messages
+            | McpSet::MessagesBuild
+            | McpSet::MessagesBuildPlaces
+            | McpSet::MessagesBuildPlacesInbound => true,
         }
     }
 
@@ -583,7 +627,9 @@ impl McpSet {
             | McpSet::House
             | McpSet::Morning
             | McpSet::Messages => false,
-            McpSet::MessagesBuild | McpSet::MessagesBuildPlaces => true,
+            McpSet::MessagesBuild
+            | McpSet::MessagesBuildPlaces
+            | McpSet::MessagesBuildPlacesInbound => true,
         }
     }
 
@@ -606,7 +652,30 @@ impl McpSet {
             | McpSet::Morning
             | McpSet::Messages
             | McpSet::MessagesBuild => false,
-            McpSet::MessagesBuildPlaces => true,
+            McpSet::MessagesBuildPlaces | McpSet::MessagesBuildPlacesInbound => true,
+        }
+    }
+
+    /// Whether this set loads the **inbound** document server — same exhaustiveness rule as
+    /// every sibling above, and never a `_` arm.
+    ///
+    /// This is the one predicate whose `true` means the row's child could cause a FILE TO BE
+    /// WRITTEN, and the record should say so plainly rather than leave it to be inferred from
+    /// a server name: the write is performed by the server process, not by the child, and its
+    /// destination is a single directory under the workspace. The child's own write posture is
+    /// unchanged — a `read` row with this set still cannot write a byte itself.
+    pub fn contains_inbound(&self) -> bool {
+        match self {
+            McpSet::None
+            | McpSet::Qmd
+            | McpSet::QmdSlack
+            | McpSet::QmdSlackBrowser
+            | McpSet::House
+            | McpSet::Morning
+            | McpSet::Messages
+            | McpSet::MessagesBuild
+            | McpSet::MessagesBuildPlaces => false,
+            McpSet::MessagesBuildPlacesInbound => true,
         }
     }
 
@@ -662,6 +731,9 @@ impl McpSet {
         }
         if self.contains_places() {
             out.push("places");
+        }
+        if self.contains_inbound() {
+            out.push("inbound");
         }
         out
     }
@@ -733,11 +805,11 @@ pub const CLAUDE_CODE_SHIPPED_ROWS: [ContainmentRow; 4] = [
     },
     ContainmentRow {
         capability: Capability::Read,
-        mcp: McpSet::MessagesBuildPlaces,
+        mcp: McpSet::MessagesBuildPlacesInbound,
     },
     ContainmentRow {
         capability: Capability::Write,
-        mcp: McpSet::MessagesBuildPlaces,
+        mcp: McpSet::MessagesBuildPlacesInbound,
     },
 ];
 
@@ -1409,18 +1481,19 @@ mod tests {
         // The corrected row key: `Read` names TWO containments (the main read-only turn with
         // qmd, the vault-QA child with no servers), so one `Read` row would describe a
         // posture that was never probed.
-        // Claude Code's main rows carry the BUILD+PLACES set; Codex's carry the
+        // Claude Code's main rows carry the BUILD+PLACES+INBOUND set; Codex's carry the
         // fourteen-server set. The asymmetry is the point of the assertion: one harness
-        // gaining a server — a code-execution one in 0.86.0, a network one in 0.100.0 — must
-        // not silently re-key the other harness's recorded rows.
+        // gaining a server — a code-execution one in 0.86.0, a network one in 0.100.0, a
+        // document-fetching one in 0.115.0 — must not silently re-key the other harness's
+        // recorded rows.
         let cc: Vec<String> = CLAUDE_CODE_SHIPPED_ROWS.iter().map(|r| r.label()).collect();
         assert_eq!(
             cc,
             vec![
                 "basic/none",
                 "read/none",
-                &format!("read/{MESSAGES_BUILD_PLACES_LABEL}"),
-                &format!("write/{MESSAGES_BUILD_PLACES_LABEL}")
+                &format!("read/{MESSAGES_BUILD_PLACES_INBOUND_LABEL}"),
+                &format!("write/{MESSAGES_BUILD_PLACES_INBOUND_LABEL}")
             ]
         );
 
