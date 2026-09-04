@@ -1554,6 +1554,11 @@ mod tests {
         .expect("client")
     }
 
+    /// Gated to macOS because its only callers are: the two PDF-routing tests below need
+    /// Core Graphics to rasterize, so they are macOS-only, and an ungated helper is dead code
+    /// on a Linux CI runner (where `-D warnings` makes that a build failure rather than a
+    /// note).
+    #[cfg(target_os = "macos")]
     fn read_fixture(name: &str) -> Vec<u8> {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("../eval/vision/{name}"));
         std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
