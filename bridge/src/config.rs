@@ -587,6 +587,44 @@ pub const DEFAULT_MAX_ATTACHMENTS_TOTAL_BYTES: usize = 20 * 1024 * 1024;
 // (a deliberately bad value still errored, so the key was really being read).
 // `granted_mcp_tools` splits on the `mcp__<server>__` prefix, so `google` and
 // `google-perseido` cannot bleed into one another in either direction.
+// ---- `inbound`: the two grants that read a document nobody attached ---------
+//
+// `mcp__inbound__list_attachments` and `mcp__inbound__fetch_attachment` are the
+// bridge's own server (`jesse-inbound-mcp`), and they exist to close a SILENT
+// failure: asked about a PDF sitting in an email or a chat thread, a turn could
+// reach no byte of it and did not say so, so the model answered from the text
+// around the attachment and the answer read as though it had opened the file.
+//
+// READ THESE TWO NAMES AGAINST THE TWO THAT ARE STILL MISSING FROM THIS LIST, because
+// the contrast is the whole design. `mcp__whatsapp__download_media` and
+// `mcp__google__get_gmail_attachment_content` do the same downloads and are
+// LOADED BUT UNGRANTED, on the reasoning recorded above: they write fetched bytes
+// to a path of their own choosing on a host where this same child holds a vault
+// write grant. That decision is NOT reversed here and the test in
+// `harness::claude_code` that fails the build on `download_media` is untouched.
+//
+// What changed is WHO FETCHES. The bridge's own server performs the downloads —
+// the WhatsApp one through the very loopback REST endpoint `download_media`
+// itself calls — and it can write to exactly one place: `.jesse-inbound/` under
+// the workspace, 0700, with randomized 0600 names and a TTL sweep. So these two
+// grants hand the child a PATH IT MAY READ and no ability to put bytes anywhere.
+// A filename arriving from a mail header or a chat message never becomes an
+// on-disk name; it reaches the model only as display prose.
+//
+// NEITHER TOOL CAN MUTATE A CHANNEL. There is no send, no delete, no mark-read
+// and no label anywhere in the server, on either tool, on any channel — asserted
+// by a test that enumerates the module's public surface rather than left to
+// review. The credentials it uses are the ones the deployment already exports for
+// the `fastmail` and `google` servers; no new secret and no new store.
+//
+// iMESSAGE IS A CHANNEL VALUE THAT ALWAYS REFUSES, and that is deliberate rather
+// than unfinished. Reading `~/Library/Messages/chat.db` needs Full Disk Access
+// SECURITY.md forbids the bridge holding (its cdhash moves on every rebuild, so
+// the grant would lapse silently at the next deploy), and `imcp` advertises no
+// attachment tool to grant instead. The refusal names the reason, because a
+// capability that is absent teaches the model nothing while one that explains
+// itself gets repeated to the user instead of papered over.
+//
 // THE FOUR FILE-PATH GRANTS AT THE HEAD OF THIS CONST are rooted absolutely at the turn's
 // own working directory, named by `WORKSPACE_TOKEN` and filled in by
 // `claude_code::fill_workspace` when the child is spawned.
@@ -852,7 +890,8 @@ mcp__google-perseido__list_drive_items,mcp__google-perseido__get_drive_file_perm
 mcp__google-perseido__check_drive_file_public_access,\
 mcp__google-perseido__get_drive_shareable_link,\
 mcp__build__build_bridge,mcp__build__test_bridge,\
-mcp__places__places_search,mcp__places__place_details";
+mcp__places__places_search,mcp__places__place_details,\
+mcp__inbound__list_attachments,mcp__inbound__fetch_attachment";
 
 // Defense-in-depth: tools that must never run from the bridge even if they slip
 // into the allowlist. Override with JESSE_DISALLOWED_TOOLS.
@@ -1119,6 +1158,19 @@ impl Config {
             .as_deref()
             .map(PathBuf::from)
             .unwrap_or_else(std::env::temp_dir)
+    }
+
+    /// The INBOUND STAGING DIRECTORY: `<vault>/.jesse-inbound`.
+    ///
+    /// Under the vault rather than the temp dir on purpose, and that is Piece 1 of the
+    /// inbound-document change: a child's reads are scoped to its working directory
+    /// (`Read(./**)` at [`Capability::Read`], `Read(//${WORKSPACE}/**)` at `Write`), so a
+    /// fetched file in `/tmp` is refused at the permission layer no matter who fetched it.
+    /// Staging inside the workspace puts the file inside a scope that already exists instead
+    /// of widening one. See [`crate::InboundStaging`] for the 0700/0600 posture and the
+    /// retention sweep that bounds it.
+    pub fn inbound_dir(&self) -> PathBuf {
+        PathBuf::from(&self.vault).join(INBOUND_DIR_NAME)
     }
 
     /// The directory under which per-job result files are written, or `None`
@@ -3136,6 +3188,23 @@ pub fn export_mcp_server_env() {
             "WORKSPACE_ATTACHMENT_DIR",
             &home
                 .join(".config/jesse-google/attachments")
+                .to_string_lossy(),
+        );
+        // WHERE THE WHATSAPP GO BRIDGE PUTS DOWNLOADED MEDIA — a directory, not a
+        // credential, and the thing `inbound`'s prefix check is taken against. Composed from
+        // `HOME` at runtime like the two above, both because a literal would hard-code one
+        // home directory into a tracked file (ci-guards R5) and because that is what makes
+        // the default work on a fresh install with no plist edit.
+        //
+        // IT IS THE CHECKOUT'S OWN `store/`, and it has to be: the Go bridge creates that
+        // directory relative to its working directory and the Python half resolves the
+        // message store the same way (see the `whatsapp-mcp` launcher). Pointed anywhere
+        // else, every WhatsApp fetch would be refused by the prefix check — loudly, but
+        // refused.
+        set_if_unset(
+            "JESSE_INBOUND_WHATSAPP_MEDIA_ROOT",
+            &home
+                .join("devel/whatsapp-mcp/whatsapp-bridge/store")
                 .to_string_lossy(),
         );
         // RouterOS reads its device list from a FILE rather than the environment, so what

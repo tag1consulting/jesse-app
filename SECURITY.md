@@ -2539,6 +2539,95 @@ Files attached to a turn are untrusted input and handled defensively:
   directory when the turn ends — success, error, or timeout — and survives the
   internal retry loop, so decoded files never outlive the turn.
 
+## Inbound documents (`inbound`, 0.115.0)
+
+The reverse of Attachments in one respect only: the file was never on the phone. It is an
+attachment sitting in a mailbox or a chat thread, and the bridge fetches it so a turn can
+read it. Everything else about the posture is Attachments', deliberately.
+
+### The fetch is the BRIDGE's, and that is the security decision
+
+The obvious design is to grant the child the two attachment-download tools its MCP set
+already loads: `mcp__whatsapp__download_media` and `mcp__google__get_gmail_attachment_content`.
+Both are **loaded and ungranted**, and have been since they were enumerated, because both
+**write fetched bytes to a path of their own choosing on the host** — `--read-only` on the
+Google server bounds writes to Google, not to this machine — out of a child that also holds
+a write grant on the vault. A test in `harness::claude_code` fails the build if
+`download_media` ever appears in a granted set.
+
+That decision is not reversed. `jesse-inbound-mcp` performs the same downloads from the
+bridge's side and **can write to exactly one directory**. What the child is granted is two
+tools that RETURN A PATH; it gains no ability to put bytes anywhere.
+
+### What it reaches, and what it does not add
+
+- **No new host.** Gmail and Fastmail are already reachable through the `google` and
+  `fastmail` servers; the WhatsApp download is a loopback call to the Go bridge's own REST
+  API, which is the same endpoint `download_media` calls.
+- **No new credential and no new store.** `JMAP_TOKEN` and `WORKSPACE_MCP_CREDENTIALS_DIR`
+  are already exported for those two servers; this process inherits them. The Google
+  credential cache is **read and never written back** — writing it would race the server that
+  owns it, and a corrupted token cache takes Gmail out until somebody re-consents by hand,
+  which a headless bridge cannot do.
+- **No mutation, on any channel.** No send, no delete, no mark-read, no label. Asserted by a
+  test that enumerates the module's public functions against an exact allowlist, so a new
+  function that could mutate fails the build rather than needing to be noticed in review.
+- **What IS new** is that a received file's CONTENTS enter a turn's context. That content is
+  attacker-authored in the ordinary way any received file is — the same trust level as the
+  message bodies the two chat servers have carried since 0.73.0, and the accepted risk in
+  "The prompt-injection surface, stated plainly" covers it unchanged.
+
+### The staging directory
+
+`.jesse-inbound/` under the workspace, mode `0700`, files `0600` with randomized names
+carrying only the sniffed extension. A filename from a mail header or a chat message is
+attacker-controlled and never becomes an on-disk name; it reaches the model only as display
+prose, flattened to one line first.
+
+**It is under the workspace because a child's reads are scoped there** (`Read(./**)` at
+`Read`, `Read(//${WORKSPACE}/**)` at `Write`), so a fetched file in the system temp dir is
+refused at the permission layer no matter who fetched it. The child is additionally handed
+`--add-dir` for it on every turn whose MCP set loads `inbound`, because a resolver stages
+mid-turn and because whether the workspace glob matches a dot directory is a property of the
+CLI rather than of this code.
+
+**It is gitignored in BOTH repositories.** These are tax records, medical results and
+contracts, and the vault autocommits every fifteen minutes to a remote — so the vault's own
+ignore line is the only thing between a fetched bank statement and git history.
+
+**It has no `Drop` guard, unlike the composer's scratch dir, and that is the deliberate
+trade:** a staged document must outlive its turn so a follow-up question about the same
+invoice does not refetch it. A TTL sweep (default 24h, `JESSE_INBOUND_TTL_SECS`) is
+therefore the only thing bounding it, and it runs at every bridge boot and before every
+staging write — never on a timer, which would stop bounding the directory the moment its
+task died. The sweep reads a LINK's own metadata and unlinks the link, so it can never reach
+through a symlink to delete what it points at, and it does not descend into a directory.
+
+**Nothing staged is logged.** One line per fetch records the channel, the byte count and the
+sniffed type. Never the content, and never the display filename — "Biopsy-results-2026.pdf"
+is itself sensitive.
+
+### The path a channel returns is checked before a byte is read
+
+WhatsApp's download returns a path through a tool result, which is model-influenced data. It
+is canonicalized and required to be inside the configured media root; `..`, an absolute path
+elsewhere and a symlink out of the root are each refused. Without that check a resolver that
+copies a named path into a readable directory is an arbitrary-file-read primitive. The
+refusal names nothing — echoing the path would carry the payload the check just stopped.
+
+### iMessage is NOT served, and the refusal is the feature
+
+Reading `~/Library/Messages/chat.db` needs Full Disk Access, and **the bridge must not hold
+it** — see "iMessage needs NO Full Disk Access" above: the bridge's cdhash changes on every
+rebuild, so such a grant lapses at the next deploy, silently, because a launchd job cannot
+answer a TCC prompt. `imcp` advertises no attachment tool to grant instead.
+
+So the `imessage` channel resolves to a refusal naming the channel, what is missing and what
+the user can do (share the file into the chat from the phone). An absent capability teaches
+a model nothing and it fills the gap with a plausible summary of a document nobody read; an
+explained one gets repeated to the user instead. Every other failure on this path is worded
+the same way and every one of them says "Nothing was read".
+
 ## Artifacts (`GET /jesse/artifact/{id}`)
 
 Files the AGENT returns are the reverse direction of Attachments, and they carry a

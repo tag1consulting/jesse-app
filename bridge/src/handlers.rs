@@ -958,7 +958,8 @@ pub async fn start_turn(
             // send a Codex model looking for a tool it does not have. Anything with no route
             // errors here rather than becoming a turn that silently answers without the file.
             let support = st.cfg.harnesses.serving(&active).attachment_support();
-            let prepared = prepare_attachments_for_harness(&st.cfg, &scratch, &paths, support)?;
+            let prepared =
+                prepare_attachments_for_harness(&st.cfg.vision, &scratch.path, &paths, support)?;
             (
                 format!(
                     "{prompt}{}",

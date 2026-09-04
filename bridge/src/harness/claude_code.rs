@@ -759,10 +759,70 @@ pub const MESSAGES_BUILD_MCP_CONFIG: &str = concat!(
 /// keyed by those labels, and demand a live Codex battery this change does not run. The
 /// asymmetry is deliberate and recorded rather than quietly introduced. See
 /// [`crate::CodexHarness::main_mcp_config`].
-pub const MAIN_CHILD_MCP_CONFIG: &str = concat!(
+pub const MESSAGES_BUILD_PLACES_MCP_CONFIG: &str = concat!(
     r#"{"mcpServers":{"qmd":{"type":"stdio","command":"qmd","args":["mcp"]},"slack":{"type":"stdio","command":"npx","args":["-y","slack-mcp-server@latest","--transport","stdio"]},"browser":{"type":"stdio","command":"npx","args":["-y","@playwright/mcp@latest","--headless","--isolated","--output-dir","/tmp/jesse-browser","--output-max-size","104857600"]},"homeassistant":{"type":"http","url":""#,
     home_assistant_mcp_url!(),
     r#"","headers":{"Authorization":"Bearer ${HA_MCP_TOKEN}"}},"roon":{"type":"http","url":"http://10.40.0.2:8088/mcp"},"google":{"type":"stdio","command":"workspace-mcp","args":["--single-user","--read-only","--tools","calendar","gmail","drive"]},"github":{"type":"stdio","command":"github-mcp-server","args":["stdio","--read-only","--toolsets","repos,actions,issues,pull_requests"]},"fastmail":{"type":"stdio","command":"npx","args":["-y","github:jeremyandrews/jmap-mcp-server"]},"unifi":{"type":"stdio","command":"unifi-network-mcp","args":[]},"routeros":{"type":"stdio","command":"routeros-mcp","args":[]},"proxmox":{"type":"stdio","command":"mcp-proxmox","args":[]},"whatsapp":{"type":"stdio","command":"whatsapp-mcp","args":[]},"imcp":{"type":"stdio","command":"/Applications/iMCP.app/Contents/MacOS/imcp-server","args":[]},"google-perseido":{"type":"stdio","command":"workspace-mcp-perseido","args":["--single-user","--read-only","--tools","calendar","gmail","drive"]},"build":{"type":"stdio","command":"jesse-build-mcp","args":[]},"places":{"type":"stdio","command":"jesse-places-mcp","args":[]}}}"#
+);
+
+/// The sixteen-server set PLUS **`inbound`** — every **Claude Code** main turn from bridge
+/// 0.115.0. Seventeen servers.
+///
+/// # What `inbound` is for: the document that is NOT on the phone
+///
+/// Every attachment path before this one required the file to be in the composer. The common
+/// case is that it is not: it is a PDF invoice in this week's mail, or a contract a spouse
+/// sent on WhatsApp. Asked about one of those, a turn could reach no byte of it — and,
+/// worse, said nothing about that, so the model answered from the message text around the
+/// attachment and the answer read as though it had opened the file. This server closes that,
+/// and its failure strings are written to close the second half of it too: every one of them
+/// says plainly that nothing was read.
+///
+/// # THE FETCH MOVED INSTEAD OF THE BOUNDARY, AND THAT IS THE WHOLE DESIGN
+///
+/// The obvious alternative is to grant the two attachment-download tools this very config
+/// already loads: `mcp__whatsapp__download_media` and `mcp__google__get_gmail_attachment_content`.
+/// Both are UNGRANTED on purpose (see [`crate::DEFAULT_ALLOWED_TOOLS`]) because both write
+/// fetched bytes to a path of their own choosing on a host where the same child holds a
+/// vault write grant, and a test in this file FAILS THE BUILD if the first ever appears in a
+/// granted set. That decision is not reversed here. `inbound` performs the same downloads —
+/// the WhatsApp one through the very loopback endpoint `download_media` itself calls — from
+/// the BRIDGE's side, and can write to exactly one directory: `.jesse-inbound/` under the
+/// workspace. The child gains a path it may READ and nowhere to put bytes.
+///
+/// # What it adds to the child's reach
+///
+/// No new host: Gmail and Fastmail are already reachable through the `google` and `fastmail`
+/// entries above, and the WhatsApp endpoint is on loopback. No new credential: `JMAP_TOKEN`
+/// and `WORKSPACE_MCP_CREDENTIALS_DIR` are already exported for those two servers and this
+/// process inherits them. What IS new is that a document's CONTENTS now enter a turn's
+/// context, which is the point, and that those contents are attacker-authored in the
+/// ordinary way any received file is — the same trust level as the message bodies the two
+/// chat servers have carried since 0.73.0.
+///
+/// # iMESSAGE IS NOT SERVED BY THIS, AND THE TOOL SAYS SO
+///
+/// Reading an iMessage attachment means reading `~/Library/Messages/chat.db`, which needs
+/// Full Disk Access that SECURITY.md forbids the bridge holding: the bridge's cdhash changes
+/// on every rebuild, so the grant would lapse at the next deploy, silently, because a
+/// launchd job cannot answer a TCC prompt. `imcp` advertises no attachment tool either. So
+/// the `imessage` channel resolves to a refusal that names the reason, which is the honest
+/// answer and — unlike an absent capability — one the model repeats instead of papering over.
+///
+/// `jesse-inbound-mcp` is a BARE NAME resolved from the child's `PATH`, like every other
+/// stdio command here, so this const reads identically on every deployment. Like
+/// `jesse-build-mcp` and `jesse-places-mcp` it is THIS repository's own binary; installing it
+/// on the bridge's `PATH` is host setup, documented in SECURITY.md.
+///
+/// **THIS SET IS CLAUDE CODE'S ONLY**, on the same reasoning that kept `build` off Codex in
+/// 0.86.0 and `places` off it in 0.100.0: Codex stays on [`MESSAGES_MCP_CONFIG`]. Giving it
+/// `inbound` would move ITS row labels, orphan the two operator `[[accepted]]` blocks in
+/// `containment-codex.toml` that are keyed by those labels, and demand a live Codex battery
+/// this change does not run.
+pub const MAIN_CHILD_MCP_CONFIG: &str = concat!(
+    r#"{"mcpServers":{"qmd":{"type":"stdio","command":"qmd","args":["mcp"]},"slack":{"type":"stdio","command":"npx","args":["-y","slack-mcp-server@latest","--transport","stdio"]},"browser":{"type":"stdio","command":"npx","args":["-y","@playwright/mcp@latest","--headless","--isolated","--output-dir","/tmp/jesse-browser","--output-max-size","104857600"]},"homeassistant":{"type":"http","url":""#,
+    home_assistant_mcp_url!(),
+    r#"","headers":{"Authorization":"Bearer ${HA_MCP_TOKEN}"}},"roon":{"type":"http","url":"http://10.40.0.2:8088/mcp"},"google":{"type":"stdio","command":"workspace-mcp","args":["--single-user","--read-only","--tools","calendar","gmail","drive"]},"github":{"type":"stdio","command":"github-mcp-server","args":["stdio","--read-only","--toolsets","repos,actions,issues,pull_requests"]},"fastmail":{"type":"stdio","command":"npx","args":["-y","github:jeremyandrews/jmap-mcp-server"]},"unifi":{"type":"stdio","command":"unifi-network-mcp","args":[]},"routeros":{"type":"stdio","command":"routeros-mcp","args":[]},"proxmox":{"type":"stdio","command":"mcp-proxmox","args":[]},"whatsapp":{"type":"stdio","command":"whatsapp-mcp","args":[]},"imcp":{"type":"stdio","command":"/Applications/iMCP.app/Contents/MacOS/imcp-server","args":[]},"google-perseido":{"type":"stdio","command":"workspace-mcp-perseido","args":["--single-user","--read-only","--tools","calendar","gmail","drive"]},"build":{"type":"stdio","command":"jesse-build-mcp","args":[]},"places":{"type":"stdio","command":"jesse-places-mcp","args":[]},"inbound":{"type":"stdio","command":"jesse-inbound-mcp","args":[]}}}"#
 );
 
 /// qmd PLUS slack PLUS browser — the main turn's server set from bridge 0.66.0 until Home
@@ -813,6 +873,24 @@ pub fn mcp_args(config: &str) -> Vec<String> {
         "--mcp-config".to_string(),
         config.to_string(),
     ]
+}
+
+/// Whether an `--mcp-config` value declares the bridge's own `inbound` server.
+///
+/// Parsed rather than substring-matched: the server names are JSON object keys, and a
+/// `contains("inbound")` would also fire on a future server, a path, or a flag that happened
+/// to carry the word — quietly handing out a read grant nothing asked for. A config that will
+/// not parse answers `false`, which is the safe direction: no grant, and the child fails
+/// loudly at the CLI's own config check rather than half-configured here.
+pub fn mcp_config_loads_inbound(config: &str) -> bool {
+    serde_json::from_str::<Value>(config)
+        .ok()
+        .and_then(|v| {
+            v.get("mcpServers")
+                .and_then(|m| m.as_object())
+                .map(|m| m.contains_key("inbound"))
+        })
+        .unwrap_or(false)
 }
 
 /// The MCP server set for a MAIN turn (and the title one-shot, which shares its builder):
@@ -1126,13 +1204,39 @@ pub fn build_claude_args(
     // except the one that recorded it. Emitted here, no containment record moves on either
     // harness. Placed before `--settings`/`--mcp-config` so a FLAG always follows it and its
     // variadic argument list can never swallow the next value.
+    //
+    // THE INBOUND STAGING DIRECTORY RIDES THE SAME FLAG, and it is emitted on EVERY turn
+    // whose MCP set loads the `inbound` server rather than only on turns that already
+    // fetched something. A resolver stages a file MID-TURN, long after this argv was built,
+    // so a grant conditional on "this turn has a staged file" would be decided before the
+    // fact it depends on exists — the read would be refused on precisely the turn that
+    // needed it.
+    //
+    // IT IS EMITTED EVEN THOUGH THE DIRECTORY IS ALREADY INSIDE THE WORKSPACE SCOPE, and
+    // that is a deliberate belt to the braces. `.jesse-inbound` is a DOT directory, and
+    // whether `Read(//${WORKSPACE}/**)` matches a dotfile is a property of the CLI's glob
+    // matcher rather than of this code. Guessing wrong there would reproduce the exact
+    // failure this feature exists to remove — a document fetched and then not readable, with
+    // the model narrating around it — for the cost of two argv strings.
+    //
+    // THE GATE IS "IS THE SERVER LOADED", not a config flag, so the grant and the thing that
+    // writes there cannot drift: a set without `inbound` stages nothing and gets no grant.
+    let mut add_dirs: Vec<PathBuf> = Vec::new();
     if let Some(dir) = attachment_dir {
+        add_dirs.push(dir.to_path_buf());
+    }
+    if mcp_config_loads_inbound(mcp_config) {
+        add_dirs.push(cfg.inbound_dir());
+    }
+    if !add_dirs.is_empty() {
         args.push("--add-dir".to_string());
-        args.push(dir.display().to_string());
-        // The realpath too, when it differs — see the symlink note above.
-        if let Ok(real) = dir.canonicalize() {
-            if real != dir {
-                args.push(real.display().to_string());
+        for dir in &add_dirs {
+            args.push(dir.display().to_string());
+            // The realpath too, when it differs — see the symlink note above.
+            if let Ok(real) = dir.canonicalize() {
+                if real != *dir {
+                    args.push(real.display().to_string());
+                }
             }
         }
     }
@@ -1990,10 +2094,10 @@ mod tests {
             // loads the new set.
             assert_eq!(
                 servers.len(),
-                16,
+                17,
                 "{label}: the main path must declare qmd, slack, browser, homeassistant, roon, \
                  google, github, fastmail, unifi, routeros, proxmox, whatsapp, imessage, \
-                 google-perseido, build and places and nothing else: {mcp:?}"
+                 google-perseido, build, places and inbound and nothing else: {mcp:?}"
             );
             // THE BUILD SERVER IS THE ONE THAT RUNS CODE, so it is asserted BY NAME on top of
             // the count above. The count alone would be satisfied by any fifteenth server;
@@ -2068,7 +2172,7 @@ mod tests {
             // mistake worth failing a build over. The names are the live ones enumerated on
             // 2026-08-10 — `download_media` is in this list because it writes a file, not
             // because it sends.
-            for name in ["whatsapp", "imcp"] {
+            for name in ["whatsapp", "imcp", "inbound"] {
                 assert!(
                     servers.contains_key(name),
                     "{label}: the main path declares the {name} server: {mcp:?}"
@@ -2564,7 +2668,7 @@ mod tests {
     const GOLDEN_QMD_MCP: &str = concat!(
         r#"{"mcpServers":{"qmd":{"type":"stdio","command":"qmd","args":["mcp"]},"slack":{"type":"stdio","command":"npx","args":["-y","slack-mcp-server@latest","--transport","stdio"]},"browser":{"type":"stdio","command":"npx","args":["-y","@playwright/mcp@latest","--headless","--isolated","--output-dir","/tmp/jesse-browser","--output-max-size","104857600"]},"homeassistant":{"type":"http","url":""#,
         home_assistant_mcp_url!(),
-        r#"","headers":{"Authorization":"Bearer ${HA_MCP_TOKEN}"}},"roon":{"type":"http","url":"http://10.40.0.2:8088/mcp"},"google":{"type":"stdio","command":"workspace-mcp","args":["--single-user","--read-only","--tools","calendar","gmail","drive"]},"github":{"type":"stdio","command":"github-mcp-server","args":["stdio","--read-only","--toolsets","repos,actions,issues,pull_requests"]},"fastmail":{"type":"stdio","command":"npx","args":["-y","github:jeremyandrews/jmap-mcp-server"]},"unifi":{"type":"stdio","command":"unifi-network-mcp","args":[]},"routeros":{"type":"stdio","command":"routeros-mcp","args":[]},"proxmox":{"type":"stdio","command":"mcp-proxmox","args":[]},"whatsapp":{"type":"stdio","command":"whatsapp-mcp","args":[]},"imcp":{"type":"stdio","command":"/Applications/iMCP.app/Contents/MacOS/imcp-server","args":[]},"google-perseido":{"type":"stdio","command":"workspace-mcp-perseido","args":["--single-user","--read-only","--tools","calendar","gmail","drive"]},"build":{"type":"stdio","command":"jesse-build-mcp","args":[]},"places":{"type":"stdio","command":"jesse-places-mcp","args":[]}}}"#
+        r#"","headers":{"Authorization":"Bearer ${HA_MCP_TOKEN}"}},"roon":{"type":"http","url":"http://10.40.0.2:8088/mcp"},"google":{"type":"stdio","command":"workspace-mcp","args":["--single-user","--read-only","--tools","calendar","gmail","drive"]},"github":{"type":"stdio","command":"github-mcp-server","args":["stdio","--read-only","--toolsets","repos,actions,issues,pull_requests"]},"fastmail":{"type":"stdio","command":"npx","args":["-y","github:jeremyandrews/jmap-mcp-server"]},"unifi":{"type":"stdio","command":"unifi-network-mcp","args":[]},"routeros":{"type":"stdio","command":"routeros-mcp","args":[]},"proxmox":{"type":"stdio","command":"mcp-proxmox","args":[]},"whatsapp":{"type":"stdio","command":"whatsapp-mcp","args":[]},"imcp":{"type":"stdio","command":"/Applications/iMCP.app/Contents/MacOS/imcp-server","args":[]},"google-perseido":{"type":"stdio","command":"workspace-mcp-perseido","args":["--single-user","--read-only","--tools","calendar","gmail","drive"]},"build":{"type":"stdio","command":"jesse-build-mcp","args":[]},"places":{"type":"stdio","command":"jesse-places-mcp","args":[]},"inbound":{"type":"stdio","command":"jesse-inbound-mcp","args":[]}}}"#
     );
     const GOLDEN_EMPTY_MCP: &str = r#"{"mcpServers":{}}"#;
 
@@ -2605,14 +2709,19 @@ mod tests {
         let main = servers(MAIN_CHILD_MCP_CONFIG);
         for (label, older, added) in [
             (
+                "MESSAGES_BUILD_PLACES_MCP_CONFIG",
+                MESSAGES_BUILD_PLACES_MCP_CONFIG,
+                vec!["inbound"],
+            ),
+            (
                 "MESSAGES_BUILD_MCP_CONFIG",
                 MESSAGES_BUILD_MCP_CONFIG,
-                vec!["places"],
+                vec!["inbound", "places"],
             ),
             (
                 "MESSAGES_MCP_CONFIG",
                 MESSAGES_MCP_CONFIG,
-                vec!["places", "build"],
+                vec!["inbound", "places", "build"],
             ),
         ] {
             let older = servers(older);
@@ -2629,6 +2738,24 @@ mod tests {
                 "{label} should be the main set minus {added:?}"
             );
         }
+    }
+
+    /// The two argv strings a main-turn site now carries ahead of its MCP flags: the read
+    /// grant over the inbound staging directory.
+    ///
+    /// It is here rather than folded into `GOLDEN_BASE` because it is NOT shared by every
+    /// site — the diet and vault-QA children load no `inbound` server and must not get the
+    /// grant, and a golden that quietly gave it to them would stop being a golden.
+    fn golden_with_inbound(cfg: &Config, tail: &[&str]) -> Vec<String> {
+        GOLDEN_BASE
+            .iter()
+            .map(|s| (*s).to_string())
+            .chain([
+                "--add-dir".to_string(),
+                cfg.inbound_dir().display().to_string(),
+            ])
+            .chain(tail.iter().map(|s| (*s).to_string()))
+            .collect()
     }
 
     /// The shared base plus a site's MCP + containment args — one full expected argv.
@@ -2714,14 +2841,22 @@ mod tests {
             Some(dir.as_path()),
         );
 
-        // No attachments → not one byte moves. This is what keeps every ordinary turn, and
-        // every containment argument written about it, exactly as it was.
-        assert!(
-            !plain.iter().any(|a| a == "--add-dir"),
-            "a turn with no attachments must not carry the flag: {plain:?}"
-        );
+        // NO ATTACHMENTS STILL CARRIES ONE DIRECTORY, and it is the inbound staging dir —
+        // because this main set loads the `inbound` server, and that server stages files
+        // MID-TURN, long after this argv was built. A grant conditional on "this turn has a
+        // staged file" would be decided before the fact it depends on exists.
+        //
+        // What has NOT changed is the rule this test was written for: the only thing any of
+        // this adds to a child is a read grant over directories the bridge owns. Permission
+        // mode, settings scopes, MCP boundary and toolset are untouched.
+        let plain_at = plain
+            .iter()
+            .position(|a| a == "--add-dir")
+            .expect("a turn on a set that loads `inbound` carries the staging grant");
+        assert_eq!(plain[plain_at + 1], cfg.inbound_dir().display().to_string());
 
-        // Attachments → the flag, naming the directory AS CREATED first.
+        // Attachments → the SCRATCH dir first, then the staging dir. Order matters only in
+        // that it is asserted: an accidental reordering is a diff worth seeing.
         let at = attached
             .iter()
             .position(|a| a == "--add-dir")
@@ -2732,6 +2867,10 @@ mod tests {
             .take_while(|a| !a.starts_with("--"))
             .count();
         assert_eq!(attached[at + 1], dir.display().to_string());
+        assert!(
+            attached.contains(&cfg.inbound_dir().display().to_string()),
+            "an attachment turn keeps the staging grant too: {attached:?}"
+        );
 
         // The SECOND spelling is conditional on the platform, and deliberately so. On macOS
         // — the deployment target, and where the reported bug happened —
@@ -2741,20 +2880,30 @@ mod tests {
         // and emitting the same path twice would be noise. Asserting the platform's own
         // answer rather than macOS's keeps this test honest on both.
         let real = dir.canonicalize().expect("realpath");
-        if real != dir {
-            assert_eq!(values, 2, "a symlinked temp dir passes both spellings");
+        let scratch_spellings = if real != dir {
             assert_eq!(attached[at + 2], real.display().to_string());
+            2
         } else {
-            assert_eq!(
-                values, 1,
-                "no distinct realpath means one value, not a duplicate"
-            );
-        }
+            1
+        };
+        // The staging dir's own spellings follow, so the total is the scratch dir's plus the
+        // plain turn's.
+        let plain_values = plain[plain_at + 1..]
+            .iter()
+            .take_while(|a| !a.starts_with("--"))
+            .count();
+        assert_eq!(
+            values,
+            scratch_spellings + plain_values,
+            "the attachment turn's list is the scratch dir's spellings then the staging \
+             dir's: {attached:?}"
+        );
 
-        // …and NOTHING else changed: strip the flag and its values and the two argvs are
-        // equal.
+        // …and NOTHING else changed: strip the scratch dir's spellings and the two argvs are
+        // equal. This is the assertion the test exists for — an attachment adds one read
+        // grant and moves no other byte of the child's command line.
         let mut stripped = attached.clone();
-        stripped.drain(at..at + 1 + values);
+        stripped.drain(at + 1..at + 1 + scratch_spellings);
         assert_eq!(
             stripped, plain,
             "an attachment must add the read grant and nothing else"
@@ -2863,15 +3012,18 @@ mod tests {
                 None,
                 None,
             ),
-            golden(&[
-                "--strict-mcp-config",
-                "--mcp-config",
-                GOLDEN_QMD_MCP,
-                "--allowedTools",
-                &allow,
-                "--disallowedTools",
-                &deny,
-            ]),
+            golden_with_inbound(
+                &cfg,
+                &[
+                    "--strict-mcp-config",
+                    "--mcp-config",
+                    GOLDEN_QMD_MCP,
+                    "--allowedTools",
+                    &allow,
+                    "--disallowedTools",
+                    &deny,
+                ],
+            ),
             "main turn (writes on)"
         );
 
@@ -2886,17 +3038,20 @@ mod tests {
                 None,
                 None,
             ),
-            golden(&[
-                "--strict-mcp-config",
-                "--mcp-config",
-                GOLDEN_QMD_MCP,
-                "--tools",
-                "Read,Grep,Glob",
-                "--allowedTools",
-                "Read(./**),Grep(./**),Glob(./**),mcp__qmd__query,mcp__qmd__get,mcp__qmd__multi_get,mcp__qmd__status",
-                "--disallowedTools",
-                "Bash,Write,Edit,NotebookEdit,WebFetch,WebSearch,Task,Agent,ToolSearch,Workflow,TodoWrite,Skill",
-            ]),
+            golden_with_inbound(
+                &cfg,
+                &[
+                    "--strict-mcp-config",
+                    "--mcp-config",
+                    GOLDEN_QMD_MCP,
+                    "--tools",
+                    "Read,Grep,Glob",
+                    "--allowedTools",
+                    "Read(./**),Grep(./**),Glob(./**),mcp__qmd__query,mcp__qmd__get,mcp__qmd__multi_get,mcp__qmd__status",
+                    "--disallowedTools",
+                    "Bash,Write,Edit,NotebookEdit,WebFetch,WebSearch,Task,Agent,ToolSearch,Workflow,TodoWrite,Skill",
+                ],
+            ),
             "main turn (writes off)"
         );
 

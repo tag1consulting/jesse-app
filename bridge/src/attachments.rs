@@ -174,9 +174,66 @@ pub struct DecodedAttachment {
     pub ext: &'static str,
 }
 
+/// THE GATE, for ONE blob of already-decoded bytes: the per-file size cap, the magic-byte
+/// sniff, and the cross-check of the sniffed type against whatever type the source DECLARED.
+///
+/// # Why this is a function rather than the body of the loop below
+///
+/// There are now two ways bytes reach a model — the composer (which posts base64 and a
+/// client-declared MIME) and a CHANNEL RESOLVER (`inbound`, which gets raw bytes and a
+/// server-declared MIME from a mail store or a chat store). Both are untrusted in exactly
+/// the same way and must meet exactly the same bar, and the failure mode of writing that
+/// bar twice is that the two whitelists drift: one path starts admitting a type the other
+/// refuses, and which one you get depends on where the file came from rather than what it
+/// is. So the whitelist, the sniff and the mismatch rule live HERE, once, and both callers
+/// reach them through this function.
+///
+/// `cap` is a parameter rather than read from the config because the two paths are sized
+/// differently on purpose: a photo cap sized for a camera roll snapshot and a document cap
+/// sized for a forty-page contract. Everything else about the check is identical, and that
+/// is the point.
+///
+/// `label` names the blob in every error ("attachment 2", "the WhatsApp document"), so the
+/// message says which file failed without this function knowing what a request looks like.
+pub fn validate_one_blob(
+    bytes: Vec<u8>,
+    declared_mime: &str,
+    cap: usize,
+    label: &str,
+) -> Result<DecodedAttachment, ApiError> {
+    if bytes.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, format!("{label} is empty")));
+    }
+    if bytes.len() > cap {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("{label} is {} bytes (per-file cap {cap})", bytes.len()),
+        ));
+    }
+    let (sniffed, ext) = sniff_attachment(&bytes).ok_or((
+        StatusCode::BAD_REQUEST,
+        format!("{label}: unsupported or unrecognized file type"),
+    ))?;
+    let claimed = normalize_mime(declared_mime);
+    if claimed != sniffed {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "{label}: declared type {declared_mime:?} does not match detected type \
+                 {sniffed:?}"
+            ),
+        ));
+    }
+    Ok(DecodedAttachment { bytes, ext })
+}
+
 /// Decode and validate every attachment, enforcing the count / per-file / total
 /// caps and the MIME-whitelist-plus-magic-byte-match rule. Any failure is a
 /// `400` — bad input, never a server fault. Nothing is written to disk here.
+///
+/// The per-blob half of that is [`validate_one_blob`], which the inbound channel resolvers
+/// share; what stays here is what only a REQUEST has — a count cap, a combined-size cap,
+/// and base64 transport.
 pub fn validate_and_decode_attachments(
     cfg: &Config,
     atts: &[Attachment],
@@ -209,37 +266,13 @@ pub fn validate_and_decode_attachments(
         }
         let bytes = base64_decode(&a.data_base64)
             .map_err(|e| (StatusCode::BAD_REQUEST, format!("attachment {label}: {e}")))?;
-        if bytes.is_empty() {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                format!("attachment {label} is empty"),
-            ));
-        }
-        if bytes.len() > cfg.max_attachment_bytes {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                format!(
-                    "attachment {label} is {} bytes (per-file cap {})",
-                    bytes.len(),
-                    cfg.max_attachment_bytes
-                ),
-            ));
-        }
-        let (sniffed, ext) = sniff_attachment(&bytes).ok_or((
-            StatusCode::BAD_REQUEST,
-            format!("attachment {label}: unsupported or unrecognized file type"),
-        ))?;
-        let claimed = normalize_mime(&a.mime);
-        if claimed != sniffed {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                format!(
-                    "attachment {label}: declared type {:?} does not match detected type {:?}",
-                    a.mime, sniffed
-                ),
-            ));
-        }
-        total += bytes.len();
+        let d = validate_one_blob(
+            bytes,
+            &a.mime,
+            cfg.max_attachment_bytes,
+            &format!("attachment {label}"),
+        )?;
+        total += d.bytes.len();
         if total > cfg.max_attachments_total_bytes {
             return Err((
                 StatusCode::BAD_REQUEST,
@@ -249,7 +282,7 @@ pub fn validate_and_decode_attachments(
                 ),
             ));
         }
-        decoded.push(DecodedAttachment { bytes, ext });
+        decoded.push(d);
     }
     Ok(decoded)
 }
@@ -447,9 +480,17 @@ pub struct PreparedAttachments {
 /// A silent drop is the failure this whole change exists to eliminate, so an attachment
 /// that cannot be converted returns an error naming the type and what to do about it —
 /// never a turn that quietly proceeds as if the user had sent nothing.
+/// `out_dir` IS WHERE DERIVED FILES LAND, and it takes a bare path rather than a
+/// [`ScratchDir`] for one reason: the same conversion table now serves two directories with
+/// two different lifetimes. A composer attachment's derived pages belong in the per-request
+/// scratch dir, swept by its `Drop` when the turn ends. A file staged by an inbound channel
+/// resolver belongs in `.jesse-inbound/`, which deliberately OUTLIVES the turn so a
+/// follow-up question about the same document does not refetch it. Passing the guard would
+/// have forced the second caller to invent a second conversion path, which is precisely the
+/// duplication this function exists to prevent.
 pub fn prepare_attachments_for_harness(
-    cfg: &Config,
-    scratch: &ScratchDir,
+    vision: &VisionConfig,
+    out_dir: &Path,
     paths: &[PathBuf],
     support: &AttachmentSupport,
 ) -> Result<PreparedAttachments, ApiError> {
@@ -468,9 +509,7 @@ pub fn prepare_attachments_for_harness(
         }
         match ext.as_str() {
             "heic" => {
-                let jpg = scratch
-                    .path
-                    .join(format!("{label:02}-{}.jpg", random_hex()));
+                let jpg = out_dir.join(format!("{label:02}-{}.jpg", random_hex()));
                 convert_heic_to_jpeg(p, &jpg).map_err(|e| {
                     (
                         StatusCode::INTERNAL_SERVER_ERROR,
@@ -493,7 +532,7 @@ pub fn prepare_attachments_for_harness(
                         format!("attachment {label}: could not re-read the PDF ({e})"),
                     )
                 })?;
-                let r = vision::rasterize_pdf(&bytes, cfg.vision.pdf_dpi, cfg.vision.pdf_page_cap)
+                let r = vision::rasterize_pdf(&bytes, vision.pdf_dpi, vision.pdf_page_cap)
                     .map_err(|e| {
                         (
                             StatusCode::INTERNAL_SERVER_ERROR,
@@ -507,9 +546,7 @@ pub fn prepare_attachments_for_harness(
                     })?;
                 for (n, page) in r.pages.iter().enumerate() {
                     let png =
-                        scratch
-                            .path
-                            .join(format!("{label:02}-p{:02}-{}.png", n + 1, random_hex()));
+                        out_dir.join(format!("{label:02}-p{:02}-{}.png", n + 1, random_hex()));
                     write_scratch_file(&png, page).map_err(|e| {
                         (
                             StatusCode::INTERNAL_SERVER_ERROR,
@@ -573,7 +610,7 @@ fn convert_heic_to_jpeg(src: &Path, dst: &Path) -> Result<(), String> {
 }
 
 /// Write one derived file into the scratch dir with the same 0600 posture `write_all` uses.
-fn write_scratch_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub fn write_scratch_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let mut f = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -952,7 +989,7 @@ mod tests {
         ] {
             for support in [&CLAUDE_CODE_ATTACHMENTS, &CODEX_ATTACHMENTS] {
                 let (s, paths) = staged(&format!("01-aa.{ext}"), bytes);
-                let out = prepare_attachments_for_harness(&cfg, &s, &paths, support)
+                let out = prepare_attachments_for_harness(&cfg.vision, &s.path, &paths, support)
                     .unwrap_or_else(|e| panic!("{ext} must have a route: {e:?}"));
                 assert_eq!(
                     out.paths, paths,
@@ -1002,9 +1039,13 @@ mod tests {
         }
 
         for support in [&CLAUDE_CODE_ATTACHMENTS, &CODEX_ATTACHMENTS] {
-            let out =
-                prepare_attachments_for_harness(&cfg, &src, std::slice::from_ref(&heic), support)
-                    .expect("heic must have a route on every harness");
+            let out = prepare_attachments_for_harness(
+                &cfg.vision,
+                &src.path,
+                std::slice::from_ref(&heic),
+                support,
+            )
+            .expect("heic must have a route on every harness");
             assert_eq!(out.paths.len(), 1);
             let p = &out.paths[0];
             assert_eq!(
@@ -1042,15 +1083,20 @@ mod tests {
         let cfg = test_config();
 
         let (s1, paths) = staged("01-aa.pdf", PDF_BYTES);
-        let cc = prepare_attachments_for_harness(&cfg, &s1, &paths, &CLAUDE_CODE_ATTACHMENTS)
-            .expect("Claude Code reads a PDF directly");
+        let cc = prepare_attachments_for_harness(
+            &cfg.vision,
+            &s1.path,
+            &paths,
+            &CLAUDE_CODE_ATTACHMENTS,
+        )
+        .expect("Claude Code reads a PDF directly");
         assert_eq!(
             cc.paths, paths,
             "no conversion on the harness that can read it"
         );
 
         let (s2, paths2) = staged("01-aa.pdf", PDF_BYTES);
-        match prepare_attachments_for_harness(&cfg, &s2, &paths2, &CODEX_ATTACHMENTS) {
+        match prepare_attachments_for_harness(&cfg.vision, &s2.path, &paths2, &CODEX_ATTACHMENTS) {
             // Rendered: every named path is a page image, never the PDF itself.
             Ok(out) => {
                 assert!(!out.paths.is_empty(), "a rasterized PDF yields page images");
@@ -1095,8 +1141,13 @@ mod tests {
         .expect("the committed multi-page fixture");
 
         let (s1, paths) = staged("01-aa.pdf", &pdf);
-        let native = prepare_attachments_for_harness(&cfg, &s1, &paths, &CLAUDE_CODE_ATTACHMENTS)
-            .expect("Claude Code reads a PDF directly");
+        let native = prepare_attachments_for_harness(
+            &cfg.vision,
+            &s1.path,
+            &paths,
+            &CLAUDE_CODE_ATTACHMENTS,
+        )
+        .expect("Claude Code reads a PDF directly");
         assert_eq!(native.paths, paths, "the PDF itself, unconverted");
         assert!(
             native.notes.is_empty(),
@@ -1104,8 +1155,9 @@ mod tests {
         );
 
         let (s2, paths2) = staged("01-aa.pdf", &pdf);
-        let rasterized = prepare_attachments_for_harness(&cfg, &s2, &paths2, &CODEX_ATTACHMENTS)
-            .expect("Codex needs page images, and macOS can render them");
+        let rasterized =
+            prepare_attachments_for_harness(&cfg.vision, &s2.path, &paths2, &CODEX_ATTACHMENTS)
+                .expect("Codex needs page images, and macOS can render them");
         assert_eq!(rasterized.paths.len(), 4, "every page, not just the first");
         for p in &rasterized.paths {
             assert_eq!(p.extension().and_then(|e| e.to_str()), Some("png"));
@@ -1131,7 +1183,7 @@ mod tests {
     fn an_attachment_with_no_route_is_an_error_not_a_silent_drop() {
         let cfg = test_config();
         let (s, paths) = staged("01-aa.tiff", b"II*\x00 not a supported type");
-        let err = prepare_attachments_for_harness(&cfg, &s, &paths, &CODEX_ATTACHMENTS)
+        let err = prepare_attachments_for_harness(&cfg.vision, &s.path, &paths, &CODEX_ATTACHMENTS)
             .expect_err("an unroutable type must not succeed quietly");
         assert_eq!(err.0, StatusCode::INTERNAL_SERVER_ERROR);
         assert!(err.1.contains("tiff"), "name the type: {}", err.1);

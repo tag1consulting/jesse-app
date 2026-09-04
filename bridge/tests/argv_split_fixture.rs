@@ -42,6 +42,23 @@
 //! Codex's `-C` and its `writable_roots`). A fixture built on that would be a fixture that
 //! only ever passes on the machine that wrote it.
 //!
+//! **REGENERATED ONCE, in bridge 0.115.0, and here is exactly what moved.** The file is no
+//! longer the pre-split capture byte for byte, so the claim above has to be restated rather
+//! than left to imply more than it now proves. Three arguments changed and ONLY on Claude
+//! Code's three main-turn sites (`main-read`, `main-write`, `main-write-resume`):
+//!
+//!   * `--add-dir /vault/.jesse-inbound` appears, because the inbound-document server stages
+//!     files MID-TURN and a grant decided at build time cannot be conditional on a fetch that
+//!     has not happened yet.
+//!   * the `--mcp-config` digest moved, because that set gained the `inbound` server.
+//!   * the `--allowedTools` digest moved on the two WRITE sites, because two tool names were
+//!     granted.
+//!
+//! Nothing else moved: not Codex, not the diet, title or vault-QA children, not a `cwd`, not
+//! an `env_keys` list. That is the whole claim of 0.115.0's containment change, and this
+//! file is where it is checkable — the diff between the two captures is the evidence, and
+//! anyone regenerating again should produce one just as short or stop and explain why.
+//!
 //! To regenerate — which should only ever happen alongside a DELIBERATE argv change, in the
 //! same commit as its changelog entry: `JESSE_ARGV_FIXTURE_WRITE=1 cargo test --test
 //! argv_split_fixture`.

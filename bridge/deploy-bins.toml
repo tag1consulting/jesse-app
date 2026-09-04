@@ -35,4 +35,5 @@ bins = [
     # MCP servers the child speaks to, named as bare commands in the child MCP config.
     "jesse-build-mcp",
     "jesse-places-mcp",
+    "jesse-inbound-mcp",
 ]

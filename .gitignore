@@ -54,3 +54,12 @@ eval-runs/*/answers/
 # The fixture-only suites (product-v1, diet-v1) touch no vault and stay tracked.
 eval-runs/*vaultqa*/
 eval-runs/*jesse-v1*/
+
+# Documents fetched from a mailbox or a chat thread and staged for a turn to read
+# (`jesse-inbound-mcp`, bridge 0.115.0). They are tax records, medical results and
+# contracts, they live UNDER THE WORKSPACE by design — a child's reads are scoped to
+# its working directory, so staging anywhere else is unreadable — and they must never
+# reach a commit. Ignored here for a deployment whose workspace IS this checkout; the
+# vault's own .gitignore carries the same line for the ordinary deployment, where the
+# 15-minute autocommit would otherwise sweep them straight into history.
+.jesse-inbound/
