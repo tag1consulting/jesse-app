@@ -97,6 +97,11 @@ Underneath were three separate causes, and the first was NOT the one it looked l
   silently re-pointed at a set nobody probed. **Claude Code only** — Codex stays on
   `MESSAGES_MCP_CONFIG`, on the same reasoning that kept `build` off it in 0.86.0.
 
+- `tests/fixtures/argv-before-split.json` regenerated, and the test's own docs now record
+  exactly what moved: `--add-dir` plus two digests, on Claude Code's three main-turn sites
+  only. Not Codex, not the diet, title or vault-QA children, not a `cwd`, not an `env_keys`
+  list. That short diff IS the containment claim of this release, and it is checkable.
+
 - **The containment battery was re-run and `bridge/containment.toml` re-recorded** (claude
   2.1.252, 2026-09-04, gate `pass`, 64 probes, $16.25). Granting a tool moves
   `capability_args`, which the record commits and compares by strict equality at boot, so a
