@@ -27,7 +27,7 @@
 
 use jesse_bridge::{
     compare_results, export_mcp_server_env, parse_results, render_results, run_battery,
-    BatteryOptions, Config, ContainmentRow, Harness, McpSet,
+    BatteryOptions, Config, ContainmentRow, McpSet,
 };
 
 /// The committed record. Resolved against the crate root at COMPILE time so the binary always
@@ -86,6 +86,10 @@ async fn main() {
     export_mcp_server_env();
 
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // `--rows`, if it was given. APPLIED AFTER PARSING, not during: the rows depend on
+    // `--harness`, and a flag must not mean different things depending on which side of
+    // another flag it was written.
+    let mut explicit_rows: Option<Vec<jesse_bridge::ContainmentRow>> = None;
     let mut opts = BatteryOptions::default();
     let mut write = false;
     let mut show = false;
@@ -108,7 +112,7 @@ async fn main() {
             "--rows" => {
                 i += 1;
                 let list = args.get(i).cloned().unwrap_or_else(|| usage());
-                opts.rows = list.split(',').map(parse_row).collect();
+                explicit_rows = Some(list.split(',').map(parse_row).collect::<Vec<_>>());
             }
             "--probes" => {
                 i += 1;
@@ -129,6 +133,25 @@ async fn main() {
             }
         }
         i += 1;
+    }
+
+    // THE ROWS FOLLOW THE HARNESS. `--harness` used to set only `opts.harness`, leaving
+    // `rows` at its default — Claude Code's — so `--harness codex --write` probed Codex
+    // children against a set Codex does not ship and wrote it into Codex's record. See
+    // `shipped_rows_for`, and `BatteryOptions::for_harness` for the pairing every
+    // programmatic caller gets.
+    //
+    // ASSIGNED, NOT REBUILT. An earlier spelling of this rebuilt the whole struct with
+    // `..BatteryOptions::for_harness(...)`, which silently reset `--probes`, `--timeout` and
+    // `--keep` to their defaults — a fix that broke three other flags. One field is wrong, so
+    // one field is set.
+    //
+    // AFTER PARSING, so `--harness` and `--rows` may be written in either order.
+    opts.rows =
+        explicit_rows.unwrap_or_else(|| jesse_bridge::shipped_rows_for(&opts.harness).to_vec());
+    if let Err(e) = jesse_bridge::validate_rows_for_harness(&opts.harness, &opts.rows) {
+        eprintln!("containment-probe: {e}");
+        std::process::exit(2);
     }
 
     let results_path = results_path(&opts.harness);
@@ -214,16 +237,23 @@ async fn main() {
 
     // A partial run cannot be a record: a file missing rows or probes reads as a battery that
     // covered everything and found nothing, which is the exact lie this gate exists to stop.
-    let shipped_row_count = match opts.harness.as_str() {
-        jesse_bridge::CODEX_ID => jesse_bridge::Codex.shipped_rows().len(),
-        _ => jesse_bridge::ClaudeCode.shipped_rows().len(),
-    };
-    if write && (opts.probes.is_some() || opts.rows.len() != shipped_row_count) {
-        eprintln!(
-            "containment-probe: --write records the WHOLE battery. Drop --rows/--probes, or \
-             drop --write."
-        );
-        std::process::exit(2);
+    //
+    // IT COMPARES THE ROWS, NOT HOW MANY THERE ARE. The count it used to compare was the one
+    // property a WRONG list is most likely to share with the right one — both spawned
+    // harnesses ship four rows, so four of Claude Code's rows sailed through a check that was
+    // meant to be certifying Codex's. See `records_the_whole_battery`.
+    if write {
+        if let Err(e) = jesse_bridge::records_the_whole_battery(
+            &opts.harness,
+            &opts.rows,
+            opts.probes.as_deref(),
+        ) {
+            eprintln!(
+                "containment-probe: --write records the WHOLE battery — {e}. Drop \
+                 --rows/--probes, or drop --write."
+            );
+            std::process::exit(2);
+        }
     }
 
     let cfg = Config::from_env();

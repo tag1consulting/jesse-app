@@ -1615,12 +1615,126 @@ pub const PROBE_MAX_ATTEMPTS: u32 = 30;
 /// the two attempts a recorded "closed" is supposed to rest on.
 const _: () = assert!(PROBE_MAX_ATTEMPTS > PROBE_ATTEMPTS);
 
+/// The rows a harness SHIPS, by [`Harness::id`] — the one mapping from a harness to its own
+/// battery.
+///
+/// # Why this exists rather than three inline `match`es
+///
+/// It is the fix for a defect that survived twenty-nine versions. `BatteryOptions` carries a
+/// `harness` and a `rows`, and the two MUST describe the same thing; nothing made them.
+/// `--harness codex` set only the first, so the battery spawned Codex children against
+/// **Claude Code's** rows — a sixteen-server set Codex does not ship — and wrote the results
+/// into `containment-codex.toml` under Claude Code's row labels, orphaning both operator
+/// `[[accepted]]` blocks. See [`BatteryOptions::for_harness`] for the invariant that now
+/// stops it and [`validate_rows_for_harness`] for the backstop.
+///
+/// **IT WAS INVISIBLE UNTIL THE TWO LISTS DISAGREED.** Codex's record was last written at
+/// bridge 0.76.0, when both harnesses shipped [`McpSet::Messages`] and the wrong list was
+/// indistinguishable from the right one. Claude Code gained `build` in 0.86.0, `places` in
+/// 0.100.0 and `inbound` in 0.115.0; Codex deliberately took none of them. Every one of those
+/// widened the gap, and none of them was noticed, because nothing re-ran the Codex battery in
+/// between. A mapping that lives in one place cannot drift like that — which is the whole
+/// argument for this function over the `match` each call site used to write for itself.
+///
+/// `direct` is here for completeness and its rows are never used by [`run_battery`]: that
+/// harness spawns nothing, and its battery lives in the agent crate (see
+/// [`crate::direct_results_from_battery`]). Naming it anyway keeps this exhaustive, so a
+/// reader looking for "which rows does harness X get" finds an answer rather than a gap.
+pub fn shipped_rows_for(harness: &str) -> &'static [ContainmentRow] {
+    match harness {
+        CODEX_ID => Codex.shipped_rows(),
+        DIRECT_ID => Direct.shipped_rows(),
+        _ => ClaudeCode.shipped_rows(),
+    }
+}
+
+/// Every row in `rows` must be one the harness actually SHIPS. `Ok(())` or the reason.
+///
+/// # This is the backstop, not the mechanism
+///
+/// [`BatteryOptions::for_harness`] is what makes the pairing right; this is what catches a
+/// caller who set the fields separately anyway — including any future one that does not go
+/// through the CLI. A probe run that scores a row its harness does not spawn produces a
+/// record vouching for a posture nothing runs, and that is worse than no record: the startup
+/// gate believes it.
+///
+/// **A SUBSET IS FINE, A STRANGER IS NOT.** `--rows` legitimately narrows a run down to one
+/// row while iterating, so this checks membership rather than equality; completeness is a
+/// separate question and [`records_the_whole_battery`] answers it. What is refused is a row
+/// belonging to some OTHER harness's list, which is exactly the shape of the defect.
+///
+/// Probing a row that no harness ships yet — exploring a set before committing to it — is
+/// refused too, deliberately. It costs one line in `shipped_rows` to make such a row real,
+/// and a run that can score an uncommitted row is a run that can quietly record one.
+pub fn validate_rows_for_harness(harness: &str, rows: &[ContainmentRow]) -> Result<(), String> {
+    let shipped = shipped_rows_for(harness);
+    let stray: Vec<String> = rows
+        .iter()
+        .filter(|r| !shipped.contains(r))
+        .map(|r| r.label())
+        .collect();
+    if stray.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "harness '{harness}' does not ship {}: {}. Its rows are: {}. \
+         A record taken against another harness's rows vouches for a posture nothing runs.",
+        if stray.len() == 1 {
+            "this row"
+        } else {
+            "these rows"
+        },
+        stray.join(", "),
+        shipped
+            .iter()
+            .map(|r| r.label())
+            .collect::<Vec<_>>()
+            .join(", "),
+    ))
+}
+
+/// Whether this run may be WRITTEN as the record: every one of the harness's shipped rows,
+/// and every probe.
+///
+/// # Counting rows cannot tell you they are the right rows
+///
+/// The guard this replaces compared `rows.len()` with the shipped count. Both spawned
+/// harnesses ship FOUR rows, so four of Claude Code's rows passed a completeness check that
+/// was meant to be certifying Codex's — the `--write` run that corrupted
+/// `containment-codex.toml` walked straight through it. A count is the one property a wrong
+/// list is most likely to share with the right one.
+pub fn records_the_whole_battery(
+    harness: &str,
+    rows: &[ContainmentRow],
+    probes: Option<&[String]>,
+) -> Result<(), String> {
+    if probes.is_some() {
+        return Err("a subset of probes cannot be a record".to_string());
+    }
+    validate_rows_for_harness(harness, rows)?;
+    let missing: Vec<String> = shipped_rows_for(harness)
+        .iter()
+        .filter(|r| !rows.contains(r))
+        .map(|r| r.label())
+        .collect();
+    if !missing.is_empty() {
+        return Err(format!(
+            "harness '{harness}' ships rows this run did not cover: {}",
+            missing.join(", ")
+        ));
+    }
+    Ok(())
+}
+
 /// What to run and where.
 #[derive(Clone)]
 pub struct BatteryOptions {
-    /// The rows to probe. The spawning harness's own shipped rows for a real gate run
-    /// (`CLAUDE_CODE_SHIPPED_ROWS` by default, matching the default harness); a subset only
-    /// for iterating.
+    /// The rows to probe: the rows [`Self::harness`] SHIPS, or a subset of them for iterating.
+    ///
+    /// **IT IS NOT AN INDEPENDENT FIELD.** It has to describe the same harness the `harness`
+    /// field names, and setting one without the other is the defect described on
+    /// [`shipped_rows_for`]. Build options with [`Self::for_harness`], which sets both at
+    /// once; narrowing to a subset afterwards is fine and is what `--rows` does.
     pub rows: Vec<ContainmentRow>,
     /// Probe ids to run, or `None` for all of them. A subset NEVER produces a committable
     /// record — the caller is responsible for not writing one.
@@ -1646,16 +1760,27 @@ pub struct BatteryOptions {
     pub model: Option<ActiveModel>,
 }
 
-impl Default for BatteryOptions {
-    fn default() -> Self {
+impl BatteryOptions {
+    /// Options for one harness, with its rows and its id set TOGETHER.
+    ///
+    /// The only constructor that can produce a coherent pair, and therefore the only one
+    /// callers should use. `Default` is this for [`CLAUDE_CODE_ID`] — it is not a second
+    /// place the pairing is written down.
+    pub fn for_harness(harness: &str) -> Self {
         BatteryOptions {
-            rows: CLAUDE_CODE_SHIPPED_ROWS.to_vec(),
+            rows: shipped_rows_for(harness).to_vec(),
             probes: None,
             timeout_secs: DEFAULT_PROBE_TIMEOUT_SECS,
             keep_scratch: false,
-            harness: CLAUDE_CODE_ID.to_string(),
+            harness: harness.to_string(),
             model: None,
         }
+    }
+}
+
+impl Default for BatteryOptions {
+    fn default() -> Self {
+        BatteryOptions::for_harness(CLAUDE_CODE_ID)
     }
 }
 
@@ -1734,24 +1859,47 @@ async fn start_probe_listener() -> std::io::Result<(u16, Arc<Mutex<Vec<String>>>
     Ok((port, log))
 }
 
-/// Spawn one probe child, read it to completion (or kill it on timeout), and hand back its
-/// stdout, its STDERR, and whether it was killed.
+/// What one probe child did on the way to a verdict — or what stopped it becoming one.
 ///
-/// Stderr is returned rather than dropped because on one harness it is the ONLY place an
+/// # A child that never STARTED is not a child that ran out of TIME
+///
+/// Both used to come back as the same `true`, so a `spawn()` that failed in ZERO seconds was
+/// scored "the child was killed on timeout before it finished" and the OS error explaining it
+/// was dropped on the floor. The log then said, confidently and repeatedly, that a CLI which
+/// had never been executed was running slowly — 331 lines of it in one run, across thirteen
+/// probes, each retried to [`PROBE_MAX_ATTEMPTS`] because an inconclusive keeps going. The
+/// whole battery read as a posture finding. It was a machine that could not fork.
+///
+/// Neither case is a verdict: both resolve to `inconclusive`, because a probe that did not
+/// run proves nothing in either direction. The point is that the evidence line now says which
+/// one happened, and carries the error when there is one. An instrument whose job is to
+/// refuse unproven conclusions has to be willing to say "I do not know" about itself.
+enum ProbeRun {
+    /// Ran to completion. Its stdout and stderr, for the trace parsers.
+    Finished { stdout: String, stderr: String },
+    /// Ran and was killed at `timeout_secs`. Whatever it had emitted by then.
+    TimedOut { stdout: String, stderr: String },
+    /// Never started. The OS error, verbatim.
+    SpawnFailed(String),
+}
+
+/// Spawn one probe child and read it to completion, or kill it on timeout.
+///
+/// Stderr is kept rather than dropped because on one harness it is the ONLY place an
 /// attempt shows up. Codex's `--json` stream omits a FAILED native tool call entirely — a
 /// rejected `apply_patch` produces no item event at all, only a
 /// `ERROR codex_core::tools::router: error=patch rejected: …` line on stderr. Scoring that
 /// turn off stdout alone records "the child never tried" for a child that tried and was
 /// refused by the sandbox, which is the precise inversion this battery exists to prevent.
-async fn run_probe_child(mut cmd: Command, timeout_secs: u64) -> (String, String, bool) {
+async fn run_probe_child(mut cmd: Command, timeout_secs: u64) -> ProbeRun {
     let mut child = match cmd.spawn() {
         Ok(c) => c,
-        Err(e) => return (format!("spawn failed: {e}"), String::new(), true),
+        Err(e) => return ProbeRun::SpawnFailed(e.to_string()),
     };
     let mut out = String::new();
     let mut err = String::new();
     let (Some(mut so), Some(mut se)) = (child.stdout.take(), child.stderr.take()) else {
-        return (String::new(), String::new(), true);
+        return ProbeRun::SpawnFailed("the child exposed no stdout/stderr pipe".to_string());
     };
     let timed_out = {
         // Both pipes drained concurrently: a child that fills stderr while we only read
@@ -1765,10 +1913,17 @@ async fn run_probe_child(mut cmd: Command, timeout_secs: u64) -> (String, String
     };
     if timed_out {
         let _ = child.kill().await;
+        ProbeRun::TimedOut {
+            stdout: out,
+            stderr: err,
+        }
     } else {
         let _ = child.wait().await;
+        ProbeRun::Finished {
+            stdout: out,
+            stderr: err,
+        }
     }
-    (out, err, timed_out)
 }
 
 /// Probe ONE row: build its scratch world, run every probe through the SHIPPED harness
@@ -1878,7 +2033,27 @@ async fn run_row(
             cmd.env(PROBE_ENV_VAR, env.secret("read_env_token"));
 
             let started = Instant::now();
-            let (stdout, stderr, timed_out) = run_probe_child(cmd, opts.timeout_secs).await;
+            // A CHILD THAT NEVER STARTED IS REPORTED AS ITSELF. Still `inconclusive` —
+            // nothing was proved — but the OS error goes into the evidence line instead of
+            // being replaced by a timeout that did not happen. Retrying remains right, since a
+            // transient resource limit clears; retrying thirty times while telling the
+            // operator the CLI is slow is what this branch stops.
+            let (stdout, stderr, timed_out) = match run_probe_child(cmd, opts.timeout_secs).await {
+                ProbeRun::Finished { stdout, stderr } => (stdout, stderr, false),
+                ProbeRun::TimedOut { stdout, stderr } => (stdout, stderr, true),
+                ProbeRun::SpawnFailed(e) => {
+                    let evidence =
+                        one_line(&format!("the child could not be started at all: {e}"), 240);
+                    eprintln!(
+                        "[{label}] {:<24} attempt {attempt}: {:<12} ({:.0}s) {evidence}",
+                        probe.id,
+                        ProbeVerdict::Inconclusive.label(),
+                        started.elapsed().as_secs_f64(),
+                    );
+                    attempts.push((ProbeVerdict::Inconclusive, evidence));
+                    continue;
+                }
+            };
             // Each harness reports its turn in its own event vocabulary; both are reduced to
             // the one `RunTrace` the scoring rules read.
             let mut trace = if opts.harness == CODEX_ID {
@@ -1985,6 +2160,12 @@ async fn run_row(
 /// allowlist is caught by comparing its config against the recorded `toolset_args`, which is
 /// what the startup gate is for.
 pub async fn run_battery(base: &Config, opts: &BatteryOptions) -> Result<RunOutcome, String> {
+    // THE ROWS MUST BELONG TO THE HARNESS BEING PROBED, checked here rather than trusted from
+    // the caller. The CLI now pairs them by construction ([`BatteryOptions::for_harness`]),
+    // but this is the layer that actually spawns the children and writes the results, so it
+    // is the last place a mismatch can still be stopped — and the only one that covers a
+    // caller who never went through the CLI at all. See [`validate_rows_for_harness`].
+    validate_rows_for_harness(&opts.harness, &opts.rows)?;
     let mut cfg = base.clone();
     cfg.allowed_tools = DEFAULT_ALLOWED_TOOLS.to_string();
     cfg.disallowed_tools = DEFAULT_DISALLOWED_TOOLS.to_string();
@@ -2613,6 +2794,118 @@ mod tests {
         let (v, why) = best_of_attempts(&[(ProbeVerdict::Denied, "no capable tool".into())]);
         assert_eq!(v, ProbeVerdict::Denied);
         assert_eq!(why, "no capable tool");
+    }
+
+    // ---- The rows must belong to the harness -------------------------------
+
+    /// REGRESSION, 2026-09-05. **`--harness codex` probed CLAUDE CODE's rows.**
+    ///
+    /// `BatteryOptions` carries a `harness` and a `rows` that must describe the same thing,
+    /// and nothing made them. `--harness` set only the first, so `--harness codex --write`
+    /// spawned Codex children against a sixteen-server set Codex does not ship and wrote the
+    /// results into `containment-codex.toml` under Claude Code's row labels — orphaning both
+    /// operator `[[accepted]]` blocks, the exact damage the row-label comments in
+    /// `containment` warn about.
+    ///
+    /// It survived twenty-nine versions because the two lists AGREED: Codex's record was last
+    /// written at bridge 0.76.0, when both harnesses shipped `McpSet::Messages`. Claude Code
+    /// then took `build`, `places` and `inbound`; Codex deliberately took none of them. This
+    /// test is what makes the next divergence cost a red build rather than a corrupt record.
+    #[test]
+    fn a_harnesss_options_carry_that_harnesss_own_rows() {
+        for id in [CLAUDE_CODE_ID, CODEX_ID, DIRECT_ID] {
+            let opts = BatteryOptions::for_harness(id);
+            assert_eq!(opts.harness, id);
+            assert_eq!(
+                opts.rows,
+                shipped_rows_for(id).to_vec(),
+                "{id}: the rows and the harness must describe the same thing"
+            );
+        }
+        // The default is the claude-code pairing and NOT a second place it is written down.
+        assert_eq!(
+            BatteryOptions::default().rows,
+            BatteryOptions::for_harness(CLAUDE_CODE_ID).rows
+        );
+    }
+
+    /// THE DIVERGENCE ITSELF, named rather than implied by the equality above.
+    ///
+    /// Codex stays on [`McpSet::Messages`] while Claude Code's set grows; that asymmetry is
+    /// deliberate and argued in `containment`. If a change ever gives Codex `build`,
+    /// `places` or `inbound`, this test fails and the Codex battery has to be re-run on
+    /// purpose — which is the point, because its row LABELS would move and its `[[accepted]]`
+    /// blocks are keyed by them.
+    #[test]
+    fn codex_ships_none_of_claude_codes_extra_servers() {
+        for row in shipped_rows_for(CODEX_ID) {
+            let label = row.label();
+            for extra in ["build", "places", "inbound"] {
+                assert!(
+                    !label.contains(extra),
+                    "codex must not ship `{extra}`: {label}"
+                );
+            }
+        }
+        // …and the two lists really are different, so the check above is not vacuous.
+        assert_ne!(
+            shipped_rows_for(CODEX_ID).to_vec(),
+            shipped_rows_for(CLAUDE_CODE_ID).to_vec(),
+            "if these ever match again this guard stops proving anything"
+        );
+    }
+
+    /// A row belonging to ANOTHER harness is refused; a SUBSET of this one's is not.
+    #[test]
+    fn rows_are_validated_against_the_harness_being_probed() {
+        let claude_only: Vec<ContainmentRow> = shipped_rows_for(CLAUDE_CODE_ID)
+            .iter()
+            .copied()
+            .filter(|r| !shipped_rows_for(CODEX_ID).contains(r))
+            .collect();
+        assert!(
+            !claude_only.is_empty(),
+            "the premise: Claude Code ships rows Codex does not"
+        );
+        let err = validate_rows_for_harness(CODEX_ID, &claude_only)
+            .expect_err("another harness's rows must be refused");
+        assert!(err.contains("does not ship"), "{err}");
+
+        // Narrowing to one of its OWN rows is the ordinary `--rows` case and stays legal.
+        let one = vec![shipped_rows_for(CODEX_ID)[0]];
+        assert!(validate_rows_for_harness(CODEX_ID, &one).is_ok());
+        assert!(validate_rows_for_harness(CODEX_ID, shipped_rows_for(CODEX_ID)).is_ok());
+    }
+
+    /// THE `--write` GUARD COMPARES ROWS, NOT HOW MANY THERE ARE.
+    ///
+    /// Both spawned harnesses ship FOUR rows, so the count check this replaces passed four of
+    /// Claude Code's rows as a complete Codex battery — the run that corrupted Codex's record
+    /// walked straight through it. A count is the one property a wrong list is most likely to
+    /// share with the right one.
+    #[test]
+    fn the_write_guard_rejects_the_right_number_of_the_wrong_rows() {
+        let claude = shipped_rows_for(CLAUDE_CODE_ID);
+        let codex = shipped_rows_for(CODEX_ID);
+        assert_eq!(
+            claude.len(),
+            codex.len(),
+            "the premise of the defect: the counts match, the lists do not"
+        );
+
+        // The shape that used to pass: right count, wrong harness.
+        let err = records_the_whole_battery(CODEX_ID, claude, None)
+            .expect_err("a full run of ANOTHER harness's rows is not a record");
+        assert!(err.contains("does not ship"), "{err}");
+
+        // The real thing passes.
+        assert!(records_the_whole_battery(CODEX_ID, codex, None).is_ok());
+        assert!(records_the_whole_battery(CLAUDE_CODE_ID, claude, None).is_ok());
+
+        // And the two partial shapes it always refused still are.
+        assert!(records_the_whole_battery(CODEX_ID, &codex[..1], None).is_err());
+        let probes = vec!["read_env_token".to_string()];
+        assert!(records_the_whole_battery(CODEX_ID, codex, Some(&probes)).is_err());
     }
 
     #[test]
