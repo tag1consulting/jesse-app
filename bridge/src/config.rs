@@ -503,6 +503,31 @@ pub const DEFAULT_MAX_ATTACHMENTS_TOTAL_BYTES: usize = 20 * 1024 * 1024;
 //     is easy to mistake for a read: the name says download, and the surrounding
 //     tools all read. It fetches attachment bytes through the Go bridge's REST API
 //     and puts them on disk, so it belongs with the writers.
+//
+//     STILL WITHHELD IN 0.115.0, AND THE REASON IS NARROWER THAN IT WAS. Its Gmail
+//     counterpart was granted in that version because the bridge can DIRECT where that
+//     write lands (`WORKSPACE_ATTACHMENT_DIR` → the turn's scratch dir → removed by the
+//     turn's `Drop`). The same move does not exist here, and not for want of looking:
+//     the Python tool takes no output path, and the write is not even its own. It POSTs
+//     to the Go bridge's `/api/download`, and THE GO BRIDGE writes the file, into
+//     `store/<chat-jid>/<filename>` relative to ITS OWN working directory — a
+//     long-running process this bridge does not spawn and whose cwd it does not set. The
+//     HTTP reply carries a PATH, never the bytes. So there is no variable to point, no
+//     argument to pass, and no moment at which this bridge is holding the content.
+//
+//     Worth recording because it is not obvious from the tool's name: the on-disk name
+//     is `filename` STRAIGHT OUT OF THE MESSAGE ROW, joined to the chat directory with
+//     no traversal check on the Go side. A grant here would put a remote correspondent's
+//     chosen string into a path on this host.
+//
+//     WHAT A CLEAN GRANT WOULD TAKE is written down rather than left to be re-derived:
+//     a bridge-owned stdio server that calls `/api/download` itself, verifies the
+//     returned path really is under the Go bridge's store root, MOVES it into the turn's
+//     scratch directory under a name this project chose, and unlinks the store copy. That
+//     is a new MCP server — a new `McpSet` row label and a live battery on Claude Code,
+//     and by the standing precedent (`build` in 0.86.0, `places` in 0.100.0) not on Codex,
+//     which would make "open that WhatsApp photo" work on one harness and not the other.
+//     Deferred on that cost, not on principle. See SECURITY.md.
 // Note what the allowlist CANNOT reach: that Go bridge serves an UNAUTHENTICATED
 // send API of its own, and it is below this layer entirely — omitting the tools
 // stops this child, not anything else on the host. See SECURITY.md.
@@ -569,16 +594,34 @@ pub const DEFAULT_MAX_ATTACHMENTS_TOTAL_BYTES: usize = 20 * 1024 * 1024;
 // carry the identical hint; only this list tells them apart, and `maps_search`
 // being `readOnlyHint` is exactly why its egress had to be decided by hand.
 //
-// GOOGLE-PERSEIDO: sixteen of eighteen — the SAME sixteen granted on the tag1
+// GOOGLE-PERSEIDO: SEVENTEEN of eighteen — the SAME seventeen granted on the tag1
 // `google` server, chosen by mirroring rather than re-deciding, because the two
 // servers are the same binary at the same version against a different account and
-// a divergence between them would be an accident rather than a policy. The two
-// omitted are the same two: `get_gmail_attachment_content` (writes attachment
-// bytes to local disk — `--read-only` bounds writes to GOOGLE, not to the host)
-// and `start_google_auth` (an interactive consent flow, which a headless turn
-// cannot complete and must not begin). Read-only holds at BOTH layers here, the
-// same as tag1: the OAuth scopes are `calendar.readonly` / `gmail.readonly` /
-// `drive.readonly`, and this list names read tools only.
+// a divergence between them would be an accident rather than a policy.
+// `the_two_google_servers_grant_the_same_set` is what turns that sentence into
+// something that fails a build rather than something a reader has to check.
+//
+// IT WAS SIXTEEN UNTIL 0.115.0. `get_gmail_attachment_content` was the second omission
+// and is now granted on both, for the reason argued at length above the tag1 entries:
+// the write it performs is DIRECTED at the turn's own scratch directory and removed
+// with it. Nothing about that reasoning is account-specific, so applying it to one
+// instance and not the other would have been exactly the accidental divergence this
+// paragraph warns about.
+//
+// The ONE remaining omission is `start_google_auth` — an interactive consent flow,
+// which a headless turn cannot complete and must not begin. Read-only holds at BOTH
+// layers here, the same as tag1: the OAuth scopes are `calendar.readonly` /
+// `gmail.readonly` / `drive.readonly`, and this list names read tools only.
+//
+// WHAT PERSEIDO NEEDS THAT TAG1 DOES NOT, and it is easy to miss because it is not in
+// this file: its server is started by the `workspace-mcp-perseido` launcher, which
+// supplies the per-instance environment the bridge cannot express (one process, one
+// environment, two instances). The launcher must therefore DEFAULT
+// `WORKSPACE_ATTACHMENT_DIR` rather than assign it, or the per-turn value never reaches
+// the server and the file it writes has no owner. That line is host setup and so is
+// invisible to the containment record — the same trade SECURITY.md already records for
+// this instance's credential — which is why `sweep_fixed_attachment_dirs` reaps the
+// launcher's own directory at every startup. See SECURITY.md.
 //
 // THE SERVER NAME CARRIES A HYPHEN, which no server before it did, and both
 // harnesses were checked rather than assumed: Claude Code matched
@@ -723,6 +766,55 @@ pub const DEFAULT_MAX_ATTACHMENTS_TOTAL_BYTES: usize = 20 * 1024 * 1024;
 // — a confident wrong answer from attacker-editable data is the failure mode worth avoiding.
 // The second source's records are third-party business content rather than wiki text, which
 // is a different provenance but not a more trusted one.
+//
+// ---- THE ONE TOOL HERE THAT WRITES A FILE TO THIS HOST ----------------------
+//
+// `get_gmail_attachment_content` (both Google instances) fetches an attachment's bytes and
+// SAVES THEM TO LOCAL DISK, returning the path. It is `readOnlyHint` and it sits among the
+// mail readers, which is exactly why it is called out: nothing about its name or its
+// neighbours says it writes. `--read-only` on the server bounds writes to GOOGLE. It says
+// nothing about this host.
+//
+// IT WAS WITHHELD FROM 0.73.0 TO 0.114.0, AND THE OBJECTION WAS NOT THAT IT WRITES.
+// Half this list writes something somewhere. The objection was that the write had NO OWNER:
+// the file landed in a fixed directory that nothing reaped, so a phone turn that opened one
+// PDF left it on disk indefinitely, and a hundred such turns left a hundred. "Delete it
+// later" is not a design; it is a hope with no place to live.
+//
+// WHAT CHANGED IN 0.115.0 IS THAT THE WRITE ACQUIRED AN OWNER, and the tool is granted on
+// that basis alone. The bridge names the destination — `WORKSPACE_ATTACHMENT_DIR`, set on
+// the harness child's own `Command` and therefore per turn — and points it at that turn's
+// `ScratchDir`. The directory is removed by that guard's `Drop` on every exit path a turn
+// has: success, error, timeout, cancel, panic. The file is gone when the turn that asked
+// for it is gone, by the same mechanism that has always removed inbound attachments, and
+// `sweep_stale_scratch_dirs` reclaims what a crash strands. See
+// [`WORKSPACE_ATTACHMENT_DIR_ENV`] for why the variable must ride on the child rather than
+// on the bridge, and [`crate::ScratchDir`] for what the directory now holds.
+//
+// THIS IS NOT A NEW CATEGORY OF GRANT, and that is the strongest argument for it.
+// `get_drive_file_download_url` is annotated `readOnlyHint: true`, writes to local disk, and
+// has been GRANTED since 0.68.0 at the operator's request, with the attachment directory
+// pointed out of the working tree. So "a Google tool that writes to disk under a directed
+// output path" was already accepted policy; this one is its sibling, and it arrives with a
+// better lifecycle than the sibling had. The Drive tool gets the same lifecycle for free —
+// it writes through the same module, so it now lands in the turn's directory too, which is
+// a strict improvement on the fixed directory it used before.
+//
+// WHAT IT COSTS, PLAINLY. A turn can put an arbitrary mail attachment — content chosen by
+// whoever sent the mail — on this host and then read it with the same child that reads
+// attacker-authored message bodies. Two things bound that and neither is the tool's shape:
+// the file lives inside a `0700` directory for the length of one turn, and it is never
+// executed, only read. Nothing here confers a send tool and nothing here writes outside
+// that directory.
+//
+// WHY THE READ GRANT DID NOT HAVE TO WIDEN. The turn's scratch directory is outside
+// `Read(//${WORKSPACE}/**)`, so the child needs `--add-dir` to read what it fetched. That
+// flag was already emitted for turns carrying an inbound attachment; from 0.115.0 it is
+// emitted for every main turn, because a fetch can happen on a turn that carried nothing.
+// It grants reads in one empty bridge-owned directory that exists for seconds — measured on
+// claude 2.1.223 to confer no write and not to reach a sibling path — and it is emitted
+// outside `capability_args`, so it moves no containment record. The record moves for the
+// two TOOL NAMES below, and that is the change worth a battery.
 pub const DEFAULT_ALLOWED_TOOLS: &str = "\
 Read(//${WORKSPACE}/**),Edit(//${WORKSPACE}/**),\
 Grep(//${WORKSPACE}/**),Glob(//${WORKSPACE}/**),\
@@ -780,6 +872,7 @@ mcp__roon__hifi_zones,mcp__roon__hifi_now_playing,mcp__roon__hifi_control,\
 mcp__roon__hifi_search,mcp__roon__hifi_play,mcp__roon__hifi_status,\
 mcp__google__list_calendars,mcp__google__get_events,mcp__google__query_freebusy,\
 mcp__google__search_gmail_messages,mcp__google__get_gmail_message_content,\
+mcp__google__get_gmail_attachment_content,\
 mcp__google__get_gmail_messages_content_batch,mcp__google__get_gmail_thread_content,\
 mcp__google__get_gmail_threads_content_batch,mcp__google__list_gmail_labels,\
 mcp__google__search_drive_files,mcp__google__get_drive_file_content,\
@@ -843,6 +936,7 @@ mcp__imcp__messages_fetch,mcp__imcp__maps_search,\
 mcp__google-perseido__list_calendars,mcp__google-perseido__get_events,\
 mcp__google-perseido__query_freebusy,mcp__google-perseido__search_gmail_messages,\
 mcp__google-perseido__get_gmail_message_content,\
+mcp__google-perseido__get_gmail_attachment_content,\
 mcp__google-perseido__get_gmail_messages_content_batch,\
 mcp__google-perseido__get_gmail_thread_content,\
 mcp__google-perseido__get_gmail_threads_content_batch,\
@@ -3045,6 +3139,93 @@ impl Config {
     }
 }
 
+/// The variable `workspace-mcp` reads to decide WHERE it writes a fetched file.
+///
+/// One name, two lifetimes, and the difference is the whole of 0.115.0:
+///
+///   * [`export_mcp_server_env`] publishes it ONCE at startup, pointed at a fixed
+///     per-account directory. That is the FALLBACK — what a server sees if nothing else
+///     sets it — and it exists so a stray write lands outside the vault rather than in it.
+///   * Every main turn then OVERRIDES it on the harness child's own `Command`, pointed at
+///     that turn's [`crate::ScratchDir`]. That is the value production actually uses, and
+///     it is what gives the written file an owner: the directory is removed by the turn's
+///     `Drop`.
+///
+/// **IT MUST BE SET ON THE CHILD, NOT ON THE BRIDGE.** `std::env::set_var` is
+/// process-global and turns run concurrently, so mutating the bridge's own environment
+/// per turn would hand one turn's directory to another turn's fetch. Setting it on the
+/// spawned `Command` is per-child by construction, and both harnesses carry it down to the
+/// MCP server for their own reasons: Claude Code's MCP subprocesses inherit their parent's
+/// environment wholesale, and Codex forwards the NAME it finds in
+/// [`crate::CODEX_MCP_ENV_PASSTHROUGH`] out of its own environment into the server's.
+///
+/// # The server reads it at IMPORT time, which is why a per-turn value works at all
+///
+/// `core/attachment_storage.py` computes its `STORAGE_DIR` once, when the module is first
+/// imported — not per call. That would be fatal for a long-lived server. It is not one:
+/// both harnesses spawn their MCP children per turn, so the import happens inside the turn
+/// whose directory the variable names. Verified against the installed `workspace-mcp`
+/// rather than assumed.
+pub const WORKSPACE_ATTACHMENT_DIR_ENV: &str = "WORKSPACE_ATTACHMENT_DIR";
+
+/// The two FIXED attachment directories [`export_mcp_server_env`] and the
+/// `workspace-mcp-perseido` launcher name — reaped once at startup by
+/// [`crate::sweep_fixed_attachment_dirs`].
+///
+/// # Why the bridge reaps a directory it does not normally write to
+///
+/// With the per-turn override in place nothing should land here, and in a correct
+/// deployment nothing does. This is the backstop for the case where the override does not
+/// reach the server: a vendor change that reads the variable somewhere other than at
+/// import, or the Perseido launcher — which is HOST SETUP, invisible to the containment
+/// record — drifting back to assigning the variable unconditionally instead of defaulting
+/// it.
+///
+/// SECURITY.md already records that the launcher being host setup is a trade, and this is
+/// what bounds it. Without this sweep, a launcher that clobbers the override turns a
+/// fetched mail attachment into a file that lives until somebody notices. With it, the
+/// worst case is bounded by the bridge's own uptime rather than being unbounded.
+///
+/// The second path is the launcher's, not this file's, and it is written here because the
+/// bridge cannot ask the launcher what it chose. If the launcher's directory ever moves,
+/// this list is the thing that has to move with it.
+pub fn fixed_attachment_dirs(home: &str) -> Vec<PathBuf> {
+    let home = PathBuf::from(home);
+    vec![
+        home.join(".config/jesse-google/attachments"),
+        home.join(".config/jesse-google-perseido/attachments"),
+    ]
+}
+
+/// Delete the CONTENTS of the fixed attachment directories, once, at startup.
+///
+/// The directories themselves are left in place — they are the fallback destination and
+/// removing them would only mean the next stray write recreates one. Files are what has no
+/// owner, so files are what goes. No turn is running at startup, so nothing here can be in
+/// use; that is precisely why this runs at startup rather than on a timer.
+///
+/// Best-effort and returns a count, for the same reason [`crate::sweep_stale_scratch_dirs`]
+/// does: the bridge must boot.
+pub fn sweep_fixed_attachment_dirs(home: &str) -> usize {
+    let mut removed = 0usize;
+    for dir in fixed_attachment_dirs(home) {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let ok = match entry.file_type() {
+                Ok(t) if t.is_dir() => std::fs::remove_dir_all(entry.path()).is_ok(),
+                Ok(_) => std::fs::remove_file(entry.path()).is_ok(),
+                Err(_) => false,
+            };
+            if ok {
+                removed += 1;
+            }
+        }
+    }
+    removed
+}
+
 /// Republish the LaunchAgent's `JESSE_*` credentials under the names the MCP servers
 /// actually read, and supply the non-secret settings they need, in the BRIDGE's own
 /// environment — before any child is spawned.
@@ -3129,11 +3310,19 @@ pub fn export_mcp_server_env() {
             "WORKSPACE_MCP_CREDENTIALS_DIR",
             &home.join(".config/jesse-google/creds").to_string_lossy(),
         );
-        // Where the Google server writes attachments and downloaded Drive files. Pointed
-        // OUT of the working tree deliberately: MCP servers run outside the child's sandbox
-        // and default to writing into the cwd, which is the vault.
+        // Where the Google server writes attachments and downloaded Drive files WHEN
+        // NOTHING ELSE SAYS. Pointed OUT of the working tree deliberately: MCP servers run
+        // outside the child's sandbox and default to writing into the cwd, which is the
+        // vault.
+        //
+        // THIS IS THE FALLBACK, NOT THE VALUE PRODUCTION USES. Since 0.115.0 every main
+        // turn overrides it on the harness child's own `Command` with that turn's scratch
+        // directory, which is what gives a fetched file an owner — see
+        // [`WORKSPACE_ATTACHMENT_DIR_ENV`]. It is still set here because a fallback that
+        // lands outside the vault is better than the vendor default, and because it names
+        // one of the two directories `sweep_fixed_attachment_dirs` reaps at startup.
         set_if_unset(
-            "WORKSPACE_ATTACHMENT_DIR",
+            WORKSPACE_ATTACHMENT_DIR_ENV,
             &home
                 .join(".config/jesse-google/attachments")
                 .to_string_lossy(),
@@ -3151,6 +3340,84 @@ pub fn export_mcp_server_env() {
 
 #[cfg(test)]
 mod tests {
+
+    /// THE FIXED DIRECTORIES ARE EMPTIED AT STARTUP, AND THEY SURVIVE BEING EMPTIED.
+    ///
+    /// Both halves matter. The files must go, because a file in there is by definition one
+    /// the per-turn override did not catch and therefore one nothing owns. The DIRECTORIES
+    /// must stay, because they are the fallback destination named by
+    /// `export_mcp_server_env` and the launcher — remove one and the next stray write either
+    /// recreates it or lands somewhere worse.
+    #[test]
+    fn the_startup_reap_empties_the_fixed_attachment_dirs_without_removing_them() {
+        let home = std::env::temp_dir().join(format!("jesse-home-{}", crate::random_hex()));
+        let dirs = fixed_attachment_dirs(&home.to_string_lossy());
+        assert_eq!(dirs.len(), 2, "one per Google instance: {dirs:?}");
+        for d in &dirs {
+            std::fs::create_dir_all(d).expect("fixed dir");
+            std::fs::write(d.join("stray.pdf"), b"%PDF-1.4").expect("stray file");
+            std::fs::create_dir(d.join("nested")).expect("nested");
+        }
+        assert_eq!(sweep_fixed_attachment_dirs(&home.to_string_lossy()), 4);
+        for d in &dirs {
+            assert!(d.is_dir(), "the fallback destination must remain: {d:?}");
+            assert_eq!(
+                std::fs::read_dir(d).expect("readable").count(),
+                0,
+                "nothing unowned may survive a restart: {d:?}"
+            );
+        }
+        // Idempotent, and silent about a home that has no such directories at all.
+        assert_eq!(sweep_fixed_attachment_dirs(&home.to_string_lossy()), 0);
+        assert_eq!(
+            sweep_fixed_attachment_dirs("/nonexistent-home-for-a-test"),
+            0
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// THE TWO GOOGLE INSTANCES GRANT THE SAME SET, and a build fails if they stop.
+    ///
+    /// The `google` and `google-perseido` servers are the same binary at the same version
+    /// against two accounts, and the allowlist has always mirrored one onto the other by
+    /// hand. `DEFAULT_ALLOWED_TOOLS` states that a divergence "would be an accident rather
+    /// than a policy" — this is what makes the statement enforceable rather than aspirational.
+    /// It caught nothing when it was written; its whole value is the next time somebody adds
+    /// a tool to one list and not the other, which is precisely how a mirror rots.
+    ///
+    /// If a divergence is ever DELIBERATE, this test is the place to say so, in words, with
+    /// the reason — not the place to delete.
+    #[test]
+    fn the_two_google_servers_grant_the_same_set() {
+        fn granted(prefix: &str) -> Vec<&str> {
+            let mut v: Vec<&str> = DEFAULT_ALLOWED_TOOLS
+                .split(',')
+                .map(str::trim)
+                .filter_map(|t| t.strip_prefix(prefix))
+                .collect();
+            v.sort_unstable();
+            v
+        }
+        let tag1 = granted("mcp__google__");
+        let perseido = granted("mcp__google-perseido__");
+        assert!(!tag1.is_empty(), "the premise: tag1 grants something");
+        assert_eq!(
+            tag1, perseido,
+            "the two Google instances must grant the same tools; a divergence is an accident \
+             unless this test is updated to argue otherwise"
+        );
+        // Both halves of the 0.115.0 decision, named rather than implied by the equality:
+        // the attachment fetch is IN on both, the interactive consent flow is OUT on both.
+        assert!(
+            tag1.contains(&"get_gmail_attachment_content"),
+            "the attachment fetch is granted: {tag1:?}"
+        );
+        assert!(
+            !tag1.contains(&"start_google_auth"),
+            "a headless turn cannot complete a consent flow: {tag1:?}"
+        );
+    }
 
     /// REGRESSION, 2026-08-21. CLAUDE.md makes the link-graph expansion mandatory after a
     /// QMD hit, so a bridge child that cannot run `bin/vault-links` cannot follow its own

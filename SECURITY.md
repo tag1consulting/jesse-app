@@ -1378,7 +1378,9 @@ Granted and omitted, enumerated live on 2026-08-10 against the running servers:
   `get_message_context`. **Never granted:** `send_message`, `send_file`, `send_audio_message`
   (all send outbound messages under Jeremy's own number) and `download_media` (it **writes a
   file** — it is the one omission that is not about sending, and its name invites the wrong
-  inference).
+  inference). `download_media` is **still** ungranted after 0.115.0 granted its Gmail
+  counterpart; the two are not the same problem, and "Fetching a file onto this host" below
+  says why.
 - **iMessage — 10 of 11 granted.** `tool_get_recent_messages`, `tool_fuzzy_search_messages`,
   `tool_get_chats`, `tool_find_contact`, `tool_check_contacts`, `tool_check_addressbook`,
   `tool_check_db_access`, `tool_check_imessage_availability`, `tool_search_attachments`,
@@ -1389,6 +1391,11 @@ Granted and omitted, enumerated live on 2026-08-10 against the running servers:
   mirroring rather than re-deciding. **Omitted:** `get_gmail_attachment_content` (writes
   attachment bytes to local disk — `--read-only` bounds writes to Google, not to this host)
   and `start_google_auth` (an interactive consent flow a headless turn cannot complete).
+
+  **This bullet is the 0.73.0 enumeration and its first omission is superseded.** Both Google
+  instances grant **17 of 18** from 0.115.0: `get_gmail_attachment_content` is in, on both, for
+  the reasons in "Fetching a file onto this host" below. `start_google_auth` remains the only
+  omission on either.
 
 **The iMessage line above is the 0.73.0 enumeration and is superseded twice over.** The server
 became `imcp` in 0.76.0 (a different, six-tool surface), and in 0.99.0 the grant on it stopped
@@ -1560,6 +1567,117 @@ flags for BOTH Google instances live in the bridge's own const, where a test ass
   FDA.~~ **DONE in 0.76.0, by a different route than this line proposed**: iMCP reads the live
   database through a grant held by the app, so no copy is needed and no FDA is involved. The
   copy route would also have read stale (the newest message lives in the WAL).
+
+## Fetching a file onto this host
+
+Two MCP tools take something out of a remote account and **write it to this machine's disk**:
+`get_gmail_attachment_content` (both Google instances) and WhatsApp's `download_media`. Both
+were withheld from 0.73.0 to 0.114.0. **In 0.115.0 the Gmail one is granted and the WhatsApp
+one is not**, and the reason is not that mail is safer than chat — it is that the bridge can
+own one file's lifetime and cannot own the other's.
+
+### The objection was never "it writes"
+
+Half the granted set writes something somewhere. The objection was that these writes had **no
+owner**: the file landed in a fixed directory, nothing reaped it, and a phone turn that opened
+one PDF left it on disk indefinitely. `--read-only` on the Google server bounds writes to
+*Google*; it says nothing about this host. "Delete it later" was not a design.
+
+### What changed for Gmail: the bridge names the directory
+
+Every main turn already had a per-request scratch directory when it carried an inbound
+attachment — created by the bridge, mode `0700`, under the system temp dir, and removed by a
+`Drop` guard on every exit path a turn has (success, error, timeout, cancel, panic). From
+0.115.0 **every main turn gets one**, and the bridge points `WORKSPACE_ATTACHMENT_DIR` at it.
+
+So a fetched attachment lands in a directory the bridge made, and dies with the turn that
+asked for it. The mechanism is the one that has always removed inbound attachments; nothing
+new reaps, expires, or times anything out.
+
+It is unconditional rather than created on first use because **the bridge cannot see an MCP
+tool call**: that traffic runs between the harness child and the server and never passes
+through this process. By the time the bridge could react to a fetch, the file is written. The
+directory therefore has to exist before the child starts, which means on every turn.
+
+Three details are load-bearing:
+
+- **The variable rides on the harness child, not on the bridge.** `std::env::set_var` is
+  process-global and turns run concurrently, so setting it on the bridge would hand one turn's
+  directory to another turn's fetch. It is set on the spawned `Command`. Claude Code's MCP
+  subprocesses inherit their parent's environment; Codex scrubs the environment and forwards
+  only the names in `CODEX_MCP_ENV_PASSTHROUGH`, so **`google-perseido` gained an entry
+  there** — naming that one variable and nothing else. It carries no credential: it is a
+  scratch directory, identical whichever instance writes into it. The four-name rule that
+  keeps the tag1 client out of the personal instance is unchanged.
+- **The server reads the variable once, at import.** That would be fatal for a long-lived
+  server; both harnesses spawn their MCP children per turn, so the import happens inside the
+  turn whose directory it names. Verified against the installed `workspace-mcp`, not assumed.
+- **The `workspace-mcp-perseido` launcher must DEFAULT this variable, not assign it.** An
+  unconditional assignment there overrides the per-turn value and sends the file back to a
+  fixed directory. The launcher is host setup and therefore invisible to the containment
+  record — the same trade recorded above for that instance's credential — so the bridge does
+  not rely on it being right: **it empties both fixed attachment directories at every
+  startup.** A launcher that drifts back costs a file that lives until the next restart
+  instead of one that lives forever.
+
+**The direct harness is outside this**, and it costs nothing: it runs in-process and hands its
+granted servers the strictest MCP environment in the project (five variables plus whatever an
+operator's own `[[direct.mcp]]` block names), and this deployment grants a direct turn **no
+servers at all** — `containment-direct.toml` records `mcp_set = "none"`. The tool this section
+is about lives on a server only the CLI harnesses load.
+
+**A crash cannot strand a file either.** `Drop` does not run through `SIGKILL` or a power cut,
+so the bridge sweeps orphaned `jesse-attach-*` directories at startup. That sweep is
+**age-guarded** (3 h, comfortably above the 2 h hard turn ceiling) and the guard is
+correctness, not caution: the scratch base is the shared system temp dir, and a second bridge
+instance on this host keeps its live turn directories right beside these. An unguarded sweep
+would delete another instance's in-flight attachment.
+
+### This was already accepted policy, once
+
+`get_drive_file_download_url` is annotated `readOnlyHint: true`, writes to local disk, and has
+been **granted since 0.68.0** at the operator's request, with the attachment directory pointed
+out of the working tree. "A Google tool that writes to disk under a directed output path" is
+therefore not a new category, and `get_gmail_attachment_content` is its sibling rather than a
+new kind of thing. The Drive tool now inherits the better lifecycle for free — it writes
+through the same module, so its output lands in the turn's directory too.
+
+### What it costs, plainly
+
+A turn can put an arbitrary mail attachment — content chosen by whoever sent the mail — on
+this host, and read it with the same child that reads attacker-authored message bodies. Two
+things bound that, and neither is the shape of the tool: the file sits in a `0700` directory
+for the length of one turn, and it is only ever read, never executed. Nothing here confers a
+send tool, and nothing added here writes outside that directory. The child's read scope grew
+by exactly one empty bridge-owned directory per turn (`--add-dir`), measured on claude 2.1.223
+to confer no write and not to reach a sibling path.
+
+### Why WhatsApp is not the same problem
+
+`download_media` takes no output path, and the write is not even its own. It POSTs to the
+WhatsApp Go bridge's `/api/download`, and **the Go bridge writes the file** — into
+`store/<chat-jid>/<filename>` relative to *its own* working directory, a long-running process
+this bridge neither spawns nor sets the cwd of. The HTTP reply carries a **path, never the
+bytes**. There is no variable to point, no argument to pass, and no moment at which the bridge
+is holding the content. Worth stating because the tool's name hides it: the on-disk name is
+`filename` straight out of the message row, joined to the chat directory with **no traversal
+check** on the Go side, so a grant would put a remote correspondent's chosen string into a
+path on this host.
+
+A clean grant is possible, and is written down here rather than left to be re-derived: a
+bridge-owned stdio server that calls `/api/download` itself, checks the returned path really
+is under the store root, **moves** it into the turn's directory under a name this project
+chose, and unlinks the store copy. That is a new MCP server — a new `McpSet` row label and a
+live battery on Claude Code, and by the standing precedent (`build` in 0.86.0, `places` in
+0.100.0) not on Codex, which would make "open that WhatsApp photo" work on one harness and not
+the other. **Deferred on that cost, not on principle.** The three send tools stay ungranted
+regardless; that line has not moved.
+
+### iMessage: nothing to decide
+
+The current `imcp` server advertises six tools and none touches attachments. Its predecessor's
+`tool_get_attachment` resolved an existing path without fetching or writing, and it was lost
+in the 0.76.0 server swap. There is nothing here to grant or withhold.
 
 ## Diet child tool isolation (in-process boundary)
 

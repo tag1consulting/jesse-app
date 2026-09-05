@@ -53,6 +53,13 @@ impl ClaudeCode {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true); // killed if the timeout fires or the task is dropped
+
+        // THIS TURN'S FILE AREA, for the MCP servers rather than for the CLI. `--add-dir`
+        // above tells the MODEL where it may read; this tells the Google server where to
+        // WRITE what the model fetches. The child's MCP subprocesses inherit its environment
+        // wholesale, so setting it here reaches them and reaches nothing else — which is the
+        // property that makes it per turn. See `apply_attachment_env`.
+        apply_attachment_env(&mut cmd, req.attachment_dir);
         apply_main_env(&mut cmd, req.active);
         cmd
     }
@@ -1095,15 +1102,24 @@ pub fn build_claude_args(
         "--setting-sources".to_string(),
         "user,project".to_string(),
     ];
-    // THIS TURN'S ATTACHMENT DIRECTORY, and only when this turn has one.
+    // THIS TURN'S FILE AREA, added to the child's read scope.
     //
-    // WHY IT IS NEEDED. The allowlist scopes reads to `Read(./**)` — cwd-relative, and the
-    // cwd is the vault — while attachments are written under the system temp dir by
-    // `ScratchDir`. So the path the prompt tells the model to read is outside the only
-    // directory the model may read, the Read call becomes a permission REQUEST, and a
-    // headless `-p` child has nobody to answer it. Verified against claude 2.1.223: the
-    // denial lands in the result envelope's `permission_denials` naming the Read call, and
-    // the model narrates "I can't read that path" — Jeremy's report exactly.
+    // WHY IT IS NEEDED. The allowlist scopes reads to `Read(//${WORKSPACE}/**)` — the turn's
+    // own working directory, which is the vault — while the turn's files live under the
+    // system temp dir in a `ScratchDir`. So a path the model is told to read is outside the
+    // only directory it may read, the Read call becomes a permission REQUEST, and a headless
+    // `-p` child has nobody to answer it. Verified against claude 2.1.223: the denial lands
+    // in the result envelope's `permission_denials` naming the Read call, and the model
+    // narrates "I can't read that path" — Jeremy's report exactly.
+    //
+    // IT IS NO LONGER CONDITIONAL ON AN INBOUND ATTACHMENT, and the reason is the other
+    // direction. From 0.115.0 the same directory is where a FETCHED mail attachment lands
+    // (`get_gmail_attachment_content`), and a fetch can happen on a turn that arrived with
+    // nothing — so a flag emitted only for turns carrying a photo would leave the child
+    // unable to read the PDF it had just been allowed to download. Every main turn now
+    // carries a file area, so every main turn emits this. What it adds on a turn that
+    // fetches nothing is read access to one empty directory the bridge just made and is
+    // about to delete.
     //
     // WHAT THE FLAG DOES AND DOES NOT DO, both re-verified on 2.1.223:
     //   * It grants READS inside this one directory, for this one turn. It confers NO
@@ -1119,6 +1135,16 @@ pub fn build_claude_args(
     // both directions when measured — but the flag is variadic and a second value is free,
     // so both are passed rather than resting the fix on a matching rule that is not part of
     // the CLI's contract.
+    //
+    // AS OF 0.115.0 THE SECOND SPELLING IS LOAD-BEARING RATHER THAN BELT-AND-BRACES, and
+    // this is the part to keep if the paragraph above is ever trimmed. `workspace-mcp`
+    // computes its storage directory as `Path(os.getenv(…)).expanduser().RESOLVE()`, so the
+    // path a fetch tool hands back to the model is the REALPATH, always — measured directly
+    // against the installed server, which turned `/tmp/…` into `/private/tmp/…` on the way
+    // in. The bridge creates the directory under the unresolved spelling and the tool
+    // answers with the resolved one, so a child given only the first is handed a path
+    // outside its read scope BY A TOOL IT WAS JUST GRANTED. Pinned by
+    // `a_turns_file_area_adds_its_directory_and_a_child_without_one_is_unchanged`.
     //
     // IT GOES HERE, NOT IN `claude_capability_args`. `validate_toolset_argv` compares a
     // harness's `capability_args` against the recorded `toolset_args` by STRICT EQUALITY, so
@@ -1746,6 +1772,84 @@ mod tests {
             .get_envs()
             .filter_map(|(k, v)| Some((k.to_str()?.to_string(), v?.to_str()?.to_string())))
             .collect()
+    }
+
+    // ---- This turn's file area ---------------------------------------------
+
+    /// A FETCHED FILE LANDS IN THIS TURN'S DIRECTORY, ON THIS HARNESS.
+    ///
+    /// The bridge cannot see an MCP tool call, so it cannot move the file afterwards; the
+    /// only lever it has is telling the server where to put it, and the only place that
+    /// instruction can live is the harness child's environment (Claude Code's MCP
+    /// subprocesses inherit it wholesale). If this variable is missing or stale, the server
+    /// falls back to a FIXED directory and the write has no owner again — which is the exact
+    /// state this project spent 0.73.0 through 0.114.0 refusing to ship.
+    ///
+    /// It must be the TURN'S OWN directory and not merely present, so the assertion is on
+    /// the value.
+    #[test]
+    fn the_child_tells_the_google_server_to_write_into_this_turns_directory() {
+        let cfg = crate::testutil::test_config();
+        let ambient = ActiveModel::ambient();
+        let scratch = std::env::temp_dir().join(format!("jesse-attach-{}", random_hex()));
+        std::fs::create_dir(&scratch).expect("scratch dir");
+
+        let mut req = main_turn_request(
+            &cfg,
+            "PROMPT",
+            None,
+            &ambient,
+            Capability::Write,
+            main_mcp_config(&cfg, &ClaudeCode),
+            BUILDER_TURN_ID,
+        );
+        req.attachment_dir = Some(scratch.as_path());
+        let cmd = ClaudeCode
+            .build_turn(&cfg, &req)
+            .expect("claude never refuses");
+        let env = cmd_env_overrides(&cmd);
+        assert_eq!(
+            env.get(WORKSPACE_ATTACHMENT_DIR_ENV).map(String::as_str),
+            Some(scratch.to_string_lossy().as_ref()),
+            "the fetch destination must be THIS turn's directory: {env:?}"
+        );
+        // And the model must be able to read what it just fetched.
+        let argv = cmd_argv(&cmd);
+        assert!(
+            argv.windows(2)
+                .any(|w| w[0] == "--add-dir" && w[1] == scratch.to_string_lossy()),
+            "the directory must be in the child's read scope: {argv:?}"
+        );
+        let _ = std::fs::remove_dir(&scratch);
+    }
+
+    /// A TURN WITH NO FILE AREA LEAVES THE STARTUP FALLBACK STANDING.
+    ///
+    /// Unsetting the variable would be worse than leaving it: `workspace-mcp` then falls back
+    /// to its OWN default, and the whole reason `export_mcp_server_env` publishes one at
+    /// startup is to keep a stray write out of the vault. So a side child — which has no file
+    /// area and no Google server either — must simply add no override.
+    #[test]
+    fn a_turn_with_no_file_area_adds_no_override_and_keeps_the_startup_fallback() {
+        let cfg = crate::testutil::test_config();
+        let ambient = ActiveModel::ambient();
+        let req = main_turn_request(
+            &cfg,
+            "PROMPT",
+            None,
+            &ambient,
+            Capability::Write,
+            main_mcp_config(&cfg, &ClaudeCode),
+            BUILDER_TURN_ID,
+        );
+        assert!(req.attachment_dir.is_none(), "the premise of this test");
+        let cmd = ClaudeCode
+            .build_turn(&cfg, &req)
+            .expect("claude never refuses");
+        assert!(
+            !cmd_env_overrides(&cmd).contains_key(WORKSPACE_ATTACHMENT_DIR_ENV),
+            "no override means the startup fallback stands; an empty one would not"
+        );
     }
 
     // ---- Diet extract/verify children --------------------------------------
@@ -2682,15 +2786,30 @@ mod tests {
         );
     }
 
-    /// A TURN WITH ATTACHMENTS ADDS THE DIRECTORY; A TURN WITHOUT IS BYTE IDENTICAL.
+    /// A FILE AREA ADDS THE DIRECTORY AND NOTHING ELSE.
     ///
-    /// The whole fix, stated as a difference: the ONLY thing an attachment adds to the child
-    /// is a read grant over the one directory its own files are in. Everything else about
-    /// the argv — permission mode, settings scopes, MCP boundary, toolset — is untouched, so
-    /// the containment posture of an attachment-bearing turn is the posture of every other
-    /// turn.
+    /// The containment claim, stated as a difference: the ONLY thing this turn's directory
+    /// adds to the child is a read grant over that one directory. Everything else about the
+    /// argv — permission mode, settings scopes, MCP boundary, toolset — is untouched, so the
+    /// posture of a turn with a file area is the posture of every other turn. That is what
+    /// let the handler start creating one for EVERY main turn in 0.115.0 without moving a
+    /// containment record: the flag is emitted outside `capability_args`, and the startup
+    /// gate compares only those.
+    ///
+    /// The `None` arm below is now reached by a SIDE CHILD (title, diet, vault-QA, shadow)
+    /// rather than by a main turn — the builder is unchanged, the call site is what moved.
+    ///
+    /// # The second spelling stopped being belt-and-braces in 0.115.0
+    ///
+    /// It was passed because a model trying to read an attachment was observed guessing both
+    /// forms. It is now REQUIRED by a measured behaviour: `workspace-mcp` calls `.resolve()`
+    /// on this directory before writing into it, so the path a fetch tool hands back to the
+    /// model is the REALPATH — `/private/var/folders/…` — not the `/var/folders/…` spelling
+    /// the bridge created. Verified against the installed server. Pass only the first
+    /// spelling and the model is handed a path outside its read scope by a tool it was just
+    /// granted.
     #[test]
-    fn attachment_turn_adds_its_scratch_dir_and_an_ordinary_turn_is_unchanged() {
+    fn a_turns_file_area_adds_its_directory_and_a_child_without_one_is_unchanged() {
         let cfg = test_config();
         let dir = std::env::temp_dir().join(format!("jesse-attach-{}", random_hex()));
         std::fs::create_dir(&dir).expect("scratch dir");
@@ -2714,18 +2833,18 @@ mod tests {
             Some(dir.as_path()),
         );
 
-        // No attachments → not one byte moves. This is what keeps every ordinary turn, and
-        // every containment argument written about it, exactly as it was.
+        // No file area → not one byte moves. This is what keeps a side child, and every
+        // containment argument written about it, exactly as it was.
         assert!(
             !plain.iter().any(|a| a == "--add-dir"),
-            "a turn with no attachments must not carry the flag: {plain:?}"
+            "a child with no file area must not carry the flag: {plain:?}"
         );
 
-        // Attachments → the flag, naming the directory AS CREATED first.
+        // A file area → the flag, naming the directory AS CREATED first.
         let at = attached
             .iter()
             .position(|a| a == "--add-dir")
-            .expect("an attachment turn carries --add-dir");
+            .expect("a turn with a file area carries --add-dir");
         // The flag is variadic, so its values run until the next flag.
         let values = attached[at + 1..]
             .iter()
@@ -2757,7 +2876,7 @@ mod tests {
         stripped.drain(at..at + 1 + values);
         assert_eq!(
             stripped, plain,
-            "an attachment must add the read grant and nothing else"
+            "a file area must add the read grant and nothing else"
         );
         let _ = std::fs::remove_dir(&dir);
     }

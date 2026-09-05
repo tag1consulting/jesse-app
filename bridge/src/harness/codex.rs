@@ -586,15 +586,26 @@ pub fn codex_mcp_args(
 ///     carrying nothing of its own. Note what this replaces: `mac-messages-mcp` needed a Full
 ///     Disk Access grant, which was equally unforwardable (TCC is a property of a binary, not
 ///     a variable) but ALSO never worked, because TCC blames the responsible process.
-///   * `google-perseido` needs the SAME four variables the `google` entry forwards, and must
-///     NOT be given them: they carry the tag1 client and the tag1 credentials directory, and
-///     `workspace-mcp` resolves the client from the environment BEFORE its client-secret
-///     file, so forwarding them is precisely how this instance would silently authenticate as
-///     the wrong account. The `workspace-mcp-perseido` launcher unsets the two `GOOGLE_OAUTH_*`
-///     names for exactly that reason and then points the client and credentials directory at
-///     the Perseido ones itself. Codex's env scrub happens to do the same job here, but the
-///     launcher does not rely on it — Claude Code's MCP children inherit the bridge's full
-///     environment, tag1 client included, and the same launcher has to hold there too.
+///   * `google-perseido` needs the SAME four CREDENTIAL variables the `google` entry
+///     forwards, and must NOT be given them: they carry the tag1 client and the tag1
+///     credentials directory, and `workspace-mcp` resolves the client from the environment
+///     BEFORE its client-secret file, so forwarding them is precisely how this instance would
+///     silently authenticate as the wrong account. The `workspace-mcp-perseido` launcher
+///     unsets the two `GOOGLE_OAUTH_*` names for exactly that reason and then points the
+///     client and credentials directory at the Perseido ones itself. Codex's env scrub happens
+///     to do the same job here, but the launcher does not rely on it — Claude Code's MCP
+///     children inherit the bridge's full environment, tag1 client included, and the same
+///     launcher has to hold there too.
+///
+///     **IT IS NO LONGER ABSENT, AND WHAT IT IS GIVEN IS DELIBERATELY NOT A CREDENTIAL.**
+///     Since 0.115.0 it has an entry naming exactly ONE variable,
+///     `WORKSPACE_ATTACHMENT_DIR`, and that is the whole entry. The reasoning that keeps the
+///     other four out does not reach this one: it names no account and selects no client —
+///     it is a DIRECTORY THIS TURN OWNS, minted by the bridge, identical for whichever
+///     instance writes into it, and removed with the turn. Withholding it would not protect
+///     the account; it would only mean this instance's fetched file lands somewhere nothing
+///     reaps. Read the four-name rule as "no credential crosses over", not "nothing crosses
+///     over", and add a fifth name here only if it passes the same test.
 pub const CODEX_MCP_ENV_PASSTHROUGH: &[(&str, &[&str])] = &[
     ("slack", &["SLACK_MCP_XOXP_TOKEN"]),
     (
@@ -603,7 +614,9 @@ pub const CODEX_MCP_ENV_PASSTHROUGH: &[(&str, &[&str])] = &[
             "GOOGLE_OAUTH_CLIENT_ID",
             "GOOGLE_OAUTH_CLIENT_SECRET",
             "WORKSPACE_MCP_CREDENTIALS_DIR",
-            "WORKSPACE_ATTACHMENT_DIR",
+            // Named by const, not spelled twice: the same variable appears on the
+            // `google-perseido` entry below and the two must not drift apart.
+            WORKSPACE_ATTACHMENT_DIR_ENV,
             "USER_GOOGLE_EMAIL",
         ],
     ),
@@ -631,6 +644,11 @@ pub const CODEX_MCP_ENV_PASSTHROUGH: &[(&str, &[&str])] = &[
         "routeros",
         &["ROUTEROS_DEVICES_CONFIG", "ROUTEROS_SSH_PORT"],
     ),
+    // ONE NAME, AND IT CARRIES NO CREDENTIAL. See the doc comment above for why this server
+    // gets this variable and none of the four the tag1 instance gets. The launcher supplies
+    // this instance's client and credentials directory itself; what it cannot supply is a
+    // path that only exists for the duration of one turn, which is what this is.
+    ("google-perseido", &[WORKSPACE_ATTACHMENT_DIR_ENV]),
 ];
 
 /// The environment variable holding each HTTP MCP server's BEARER TOKEN, BY NAME.
@@ -958,6 +976,14 @@ impl Codex {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+        // THIS TURN'S FILE AREA, for the MCP servers. Nothing on this harness's ARGV moves
+        // for an attachment directory and a test pins that — but the environment is a
+        // different channel and it does move here, on both harnesses, because it is how the
+        // Google server learns where to put a fetched file. Codex scrubs its subprocesses'
+        // environment and forwards only the names in `CODEX_MCP_ENV_PASSTHROUGH`, and
+        // `WORKSPACE_ATTACHMENT_DIR` is named there for BOTH Google instances — so the value
+        // set on this child is what the server ends up reading. See `apply_attachment_env`.
+        apply_attachment_env(&mut cmd, req.attachment_dir);
         // The provider's API key, OUT OF BAND. The argv above names the variable; this puts
         // the value in it, on this child only, so the secret never reaches a process listing,
         // a log, or the recorded argv. See [`CODEX_PROVIDER_KEY_ENV`].
@@ -1790,23 +1816,74 @@ mod tests {
     /// gets holds NO credential — there is nothing in it to read.
     ///
     /// The second half is the containment half. The read surface this harness accepts
-    /// A CODEX TURN'S ARGV IS UNCHANGED BY THE ATTACHMENT FIELD.
+    /// THE NEW GRANT REACHES CODEX'S STRONGER GATE, NOT JUST CLAUDE CODE'S ALLOWLIST.
+    ///
+    /// `enabled_tools` is derived from the same `--allowedTools` string, so in principle a
+    /// name added there arrives here for free. In principle is not the same as measured, and
+    /// this gate is the stricter of the two: a tool absent from `enabled_tools` is not
+    /// merely un-granted, it is not registered at all. Both Google instances are checked
+    /// because `granted_mcp_tools` splits on the `mcp__<server>__` prefix and `google` is a
+    /// PREFIX OF `google-perseido` — a sloppier split would put the personal account's tools
+    /// on the tag1 server's list.
+    #[test]
+    fn the_attachment_tool_is_enabled_on_both_google_servers() {
+        let cfg = crate::testutil::test_config();
+        let args = codex_mcp_args(CODEX_ID, MESSAGES_MCP_CONFIG, &cfg.allowed_tools)
+            .expect("the shipped Codex set translates");
+        for server in ["google", "google-perseido"] {
+            let key = format!("mcp_servers.{server}.enabled_tools=[");
+            let line = args
+                .iter()
+                .find(|a| a.starts_with(&key))
+                .unwrap_or_else(|| panic!("`{server}` must have an enabled_tools line"));
+            assert!(
+                line.contains("\"get_gmail_attachment_content\""),
+                "`{server}` must enable the attachment tool: {line}"
+            );
+            assert!(
+                !line.contains("\"start_google_auth\""),
+                "`{server}` must NOT enable the interactive consent flow: {line}"
+            );
+        }
+        // The prefix trap, stated as an assertion rather than trusted: the tag1 server's
+        // list must not have absorbed the other instance's grants.
+        assert!(
+            granted_mcp_tools(&cfg.allowed_tools, "google")
+                .iter()
+                .all(|t| !t.contains("perseido")),
+            "the `google` prefix must not swallow `google-perseido`"
+        );
+    }
+
+    /// A CODEX TURN'S ARGV IS UNCHANGED BY THE ATTACHMENT FIELD — BUT ITS ENVIRONMENT IS NOT.
     ///
     /// `TurnRequest::attachment_dir` is call-site policy that each harness answers for
-    /// itself, and Codex's answer is "nothing to do": its containment is an OS sandbox that
-    /// scopes writes and network and leaves READS broad, so a file under the system temp
-    /// directory is already reachable and its built-in `view_image` takes the path straight
-    /// from the prompt. Measured on codex-cli 0.146.0: an unprompted turn pointed at a PNG
-    /// there transcribed the text printed in it, with zero shell events on the `--json`
-    /// stream.
+    /// itself, and on the ARGV Codex's answer is still "nothing to do": its containment is an
+    /// OS sandbox that scopes writes and network and leaves READS broad, so a file under the
+    /// system temp directory is already reachable and its built-in `view_image` takes the
+    /// path straight from the prompt. Measured on codex-cli 0.146.0: an unprompted turn
+    /// pointed at a PNG there transcribed the text printed in it, with zero shell events on
+    /// the `--json` stream.
     ///
-    /// So the CLI image flag (`-i`/`--image`) is deliberately NOT emitted. It is a second
-    /// route to pixels that already arrive, it would have to be placed correctly on both the
-    /// plain and the `resume` form of the subcommand, and this harness has already shipped
-    /// one break of exactly that shape (`-C` after `resume`). This test is what says the
-    /// decision was made rather than forgotten.
+    /// So the CLI image flag (`-i`/`--image`) is deliberately NOT emitted, and neither is
+    /// `--add-dir` (which this CLI does not have). Both would be a second route to pixels
+    /// that already arrive, would have to be placed correctly on the plain AND the `resume`
+    /// form of the subcommand, and this harness has already shipped one break of exactly that
+    /// shape (`-C` after `resume`).
+    ///
+    /// # The half that is NOT symmetric, and why it does not weaken the above
+    ///
+    /// Since 0.115.0 the same directory is where a FETCHED mail attachment must land, and
+    /// that instruction cannot ride on the argv on either harness — it is a variable the MCP
+    /// server reads. So the ENV does move here, exactly as it does on Claude Code, and this
+    /// test asserts both halves rather than being relaxed to only the one that still holds.
+    /// Reading it as "an attachment changes nothing about a Codex child" would now be false;
+    /// the true statement is narrower and is what the assertions say.
+    ///
+    /// A missing entry in `CODEX_MCP_ENV_PASSTHROUGH` would make this variable stop at the
+    /// codex process and never reach the server, so the passthrough is asserted beside it.
     #[test]
-    fn an_attachment_dir_changes_nothing_about_a_codex_child() {
+    fn an_attachment_dir_moves_no_codex_argument_but_does_reach_its_mcp_servers() {
         let (cfg, _dir) = scratch_config("attach-noop");
         let m = openai_model("https://api.example/v1", "slug", "sk-secret");
         let scratch = std::env::temp_dir().join(format!("jesse-attach-{}", random_hex()));
@@ -1855,6 +1932,56 @@ mod tests {
                 .any(|x| x == "-i" || x == "--image" || x == "--add-dir"),
             "no image or added-directory flag belongs on this harness: {b:?}"
         );
+
+        // The env half. The value must be THIS turn's directory: a stale or absent one sends
+        // the fetched file to a fixed directory nothing owns.
+        let env_of = |req: &TurnRequest<'_>| -> std::collections::HashMap<String, String> {
+            Codex
+                .build_turn(&cfg, req)
+                .expect("a codex child")
+                .as_std()
+                .get_envs()
+                .filter_map(|(k, v)| Some((k.to_str()?.to_string(), v?.to_str()?.to_string())))
+                .collect()
+        };
+        assert_eq!(
+            env_of(&with)
+                .get(WORKSPACE_ATTACHMENT_DIR_ENV)
+                .map(String::as_str),
+            Some(scratch.to_string_lossy().as_ref()),
+            "the fetch destination must be THIS turn's directory"
+        );
+        assert!(
+            !env_of(&base).contains_key(WORKSPACE_ATTACHMENT_DIR_ENV),
+            "a turn with no file area leaves the startup fallback standing"
+        );
+
+        // …and it must actually be forwarded INTO the server. Codex scrubs the subprocess
+        // environment, so a variable set on this child but unnamed in the passthrough is
+        // set for nothing at all — the silent failure this table exists to prevent.
+        for server in ["google", "google-perseido"] {
+            let (_, vars) = CODEX_MCP_ENV_PASSTHROUGH
+                .iter()
+                .find(|(s, _)| *s == server)
+                .unwrap_or_else(|| panic!("`{server}` must have a passthrough entry"));
+            assert!(
+                vars.contains(&WORKSPACE_ATTACHMENT_DIR_ENV),
+                "`{server}` must forward {WORKSPACE_ATTACHMENT_DIR_ENV}: {vars:?}"
+            );
+        }
+        // The Perseido entry carries THAT NAME AND NOTHING ELSE. Every other name on it
+        // would be a tag1 credential crossing into the personal account's server, which is
+        // the whole reason this entry did not exist before.
+        let (_, perseido) = CODEX_MCP_ENV_PASSTHROUGH
+            .iter()
+            .find(|(s, _)| *s == "google-perseido")
+            .expect("checked above");
+        assert_eq!(
+            *perseido,
+            [WORKSPACE_ATTACHMENT_DIR_ENV],
+            "no credential may be forwarded to the second Google instance"
+        );
+
         let _ = std::fs::remove_dir(&scratch);
     }
 

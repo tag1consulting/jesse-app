@@ -86,6 +86,10 @@ async fn main() {
     export_mcp_server_env();
 
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // Whether `--rows` named the set explicitly. Without it the rows are the SELECTED
+    // harness's own, resolved after parsing so `--harness` and `--rows` may appear in
+    // either order.
+    let mut rows_given = false;
     let mut opts = BatteryOptions::default();
     let mut write = false;
     let mut show = false;
@@ -109,6 +113,7 @@ async fn main() {
                 i += 1;
                 let list = args.get(i).cloned().unwrap_or_else(|| usage());
                 opts.rows = list.split(',').map(parse_row).collect();
+                rows_given = true;
             }
             "--probes" => {
                 i += 1;
@@ -129,6 +134,33 @@ async fn main() {
             }
         }
         i += 1;
+    }
+
+    // THE ROWS FOLLOW THE HARNESS, and until 0.115.0 they did not.
+    //
+    // `BatteryOptions::default` seeds `rows` with CLAUDE CODE's shipped rows, and `--harness`
+    // set only `opts.harness`. So `--harness codex --write` spawned CODEX children against
+    // CLAUDE CODE's rows and wrote the results into `containment-codex.toml` under Claude
+    // Code's row labels — a record that vouches for a posture Codex does not ship.
+    //
+    // IT WAS LATENT FOR TWENTY-NINE VERSIONS BECAUSE THE TWO LISTS AGREED. Codex's record was
+    // last written at bridge 0.76.0, when both harnesses shipped `McpSet::Messages` and the
+    // wrong list was indistinguishable from the right one. Claude Code gained `build` in
+    // 0.86.0 and `places` in 0.100.0; Codex deliberately did not, and from that moment this
+    // defect would have probed Codex with two servers it never loads. Nobody re-ran the Codex
+    // battery in between, so the first run to expose it was the one for 0.115.0 — which
+    // recorded `…+google-perseido+build+places` rows and ORPHANED both operator
+    // `[[accepted]]` blocks, the exact damage the row-label comments in `containment.rs` warn
+    // about.
+    //
+    // The `--write` completeness guard below did not catch it: it compares row COUNTS, and
+    // both harnesses ship four rows. Counting rows cannot tell you they are the right rows.
+    if !rows_given {
+        opts.rows = match opts.harness.as_str() {
+            jesse_bridge::CODEX_ID => jesse_bridge::Codex.shipped_rows().to_vec(),
+            jesse_bridge::DIRECT_ID => jesse_bridge::Direct.shipped_rows().to_vec(),
+            _ => jesse_bridge::ClaudeCode.shipped_rows().to_vec(),
+        };
     }
 
     let results_path = results_path(&opts.harness);

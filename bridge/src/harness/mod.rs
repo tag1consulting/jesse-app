@@ -272,18 +272,67 @@ pub struct TurnRequest<'a> {
     /// additive for them — no child's command line changes because it exists. An in-process
     /// harness hands the path to the tool that writes there.
     pub artifact_dir: Option<&'a Path>,
-    /// The per-request scratch directory this turn's decoded attachments were written to.
+    /// THIS TURN'S FILE AREA: the per-request scratch directory, in both directions.
     ///
-    /// CALL SITE POLICY, exactly like `cwd`: the bridge decided where to write the files, so
-    /// the bridge is what knows the path. A harness reads it and decides what, if anything,
-    /// its CLI must be told — Claude Code needs the directory added to the child's read
-    /// scope, Codex's OS sandbox already leaves reads broad and needs nothing.
+    /// CALL SITE POLICY, exactly like `cwd`: the bridge decided where the files go, so the
+    /// bridge is what knows the path. A harness reads it and decides what its CLI must be
+    /// told.
     ///
-    /// `None` for every ordinary turn, which is nearly all of them: no attachments at all, or
-    /// attachments that the VISION HELPER reads instead of the child. Those two routes are
-    /// mutually exclusive and the gate is in `handlers` — when the helper serves the turn no
-    /// scratch dir is written at all, so there is no directory to name here.
+    /// # It carries two jobs now, and only one of them is visible on an argv
+    ///
+    /// 1. **Inbound.** Decoded attachments are written here and named in the prompt. Claude
+    ///    Code must add the directory to the child's read scope (`--add-dir`); Codex's OS
+    ///    sandbox already leaves reads broad and needs nothing, and a test pins that its
+    ///    argv does not move.
+    /// 2. **Outbound, since 0.115.0.** It is also where the Google MCP server is told to put
+    ///    a file the turn FETCHES (`get_gmail_attachment_content`,
+    ///    `get_drive_file_download_url`). That one is carried by ENVIRONMENT rather than
+    ///    argv — [`crate::WORKSPACE_ATTACHMENT_DIR_ENV`] — and BOTH spawned harnesses set it,
+    ///    so the asymmetry above is about `--add-dir` alone and not about this field.
+    ///
+    /// **`None` NO LONGER MEANS "an ordinary turn".** It used to: the directory was created
+    /// only for a turn carrying inbound attachments. Because job 2 can happen on any turn, a
+    /// main turn now gets one unconditionally, and `None` means either a turn the bridge does
+    /// not route files for at all (a side child — title, diet, vault-QA, shadow) or the
+    /// best-effort creation having failed. A harness must treat it as "no file area", never
+    /// as "no attachments".
     pub attachment_dir: Option<&'a Path>,
+}
+
+/// Point a spawned child's MCP servers at THIS TURN's file area.
+///
+/// Both spawned harnesses call this and neither can do without it, though they carry the
+/// value down to the server by different mechanisms: Claude Code's MCP subprocesses inherit
+/// their parent's environment wholesale, and Codex scrubs the environment but forwards the
+/// NAMES in [`crate::CODEX_MCP_ENV_PASSTHROUGH`] out of its own — so in both cases the name
+/// has to be on the harness child, and setting it there is also what makes it per turn. See
+/// [`crate::WORKSPACE_ATTACHMENT_DIR_ENV`] for why the bridge's own environment is the wrong
+/// place for it.
+///
+/// A no-op when the turn has no file area, which leaves the startup fallback standing —
+/// deliberately, because "unset" would hand the vendor its own default INSIDE THE VAULT.
+///
+/// # The direct harness is out of its reach, and that is stated rather than papered over
+///
+/// This takes a `Command`, so it serves the two harnesses that SPAWN one. The direct harness
+/// runs in-process and hands its granted servers
+/// [`crate::DIRECT_MCP_FORWARDED_ENV`] plus whatever an operator's own `[[direct.mcp]]` block
+/// names — the strictest MCP environment this project launches, and resolved from the
+/// bridge's environment rather than from a turn. So a per-turn value cannot reach a direct
+/// turn's servers today.
+///
+/// It costs nothing here because this deployment grants a direct turn NO servers at all
+/// (`containment-direct.toml` records `mcp_set = "none"`), and because the tool this variable
+/// exists for lives on a server only the CLI harnesses load. An operator who granted
+/// `workspace-mcp` to a direct turn would be choosing that server's environment by hand, and
+/// the variable they would have to name is this one — at which point they would be pointing
+/// it at a fixed directory, with the startup reap as its only bound. Anyone extending the
+/// direct harness to spawn servers per turn should thread this through rather than rediscover
+/// it.
+pub fn apply_attachment_env(cmd: &mut Command, attachment_dir: Option<&Path>) {
+    if let Some(dir) = attachment_dir {
+        cmd.env(WORKSPACE_ATTACHMENT_DIR_ENV, dir);
+    }
 }
 
 /// Everything a child needs to talk to the write-lock broker.

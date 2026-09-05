@@ -1734,24 +1734,45 @@ async fn start_probe_listener() -> std::io::Result<(u16, Arc<Mutex<Vec<String>>>
     Ok((port, log))
 }
 
-/// Spawn one probe child, read it to completion (or kill it on timeout), and hand back its
-/// stdout, its STDERR, and whether it was killed.
+/// What one probe child did on the way to a verdict — or what stopped it being one.
 ///
-/// Stderr is returned rather than dropped because on one harness it is the ONLY place an
+/// **A CHILD THAT NEVER STARTED IS NOT A CHILD THAT RAN OUT OF TIME**, and collapsing the two
+/// cost a whole battery run to learn. Both used to come back as `timed_out: true`, so a
+/// `spawn()` that failed in ZERO seconds was reported as "the child was killed on timeout
+/// before it finished" — thirty times per probe, thirteen probes, every line of it a
+/// confident description of something that did not happen. The operator reading that log has
+/// to conclude the CLI is slow; the actual fault was in the machine's ability to start a
+/// process at all, and the error text explaining it was thrown away.
+///
+/// So the two are separate variants and the evidence line says which. Neither is a verdict:
+/// both resolve to `inconclusive`, because a probe that did not run proves nothing either way.
+/// The point is only that the record says what went wrong.
+enum ProbeRun {
+    /// The child ran to completion. Its stdout and stderr, for the trace parsers.
+    Finished { stdout: String, stderr: String },
+    /// The child ran and was killed at `timeout_secs`. Whatever it had emitted by then.
+    TimedOut { stdout: String, stderr: String },
+    /// The child never started. The OS error, verbatim.
+    SpawnFailed(String),
+}
+
+/// Spawn one probe child and read it to completion, or kill it on timeout.
+///
+/// Stderr is kept rather than dropped because on one harness it is the ONLY place an
 /// attempt shows up. Codex's `--json` stream omits a FAILED native tool call entirely — a
 /// rejected `apply_patch` produces no item event at all, only a
 /// `ERROR codex_core::tools::router: error=patch rejected: …` line on stderr. Scoring that
 /// turn off stdout alone records "the child never tried" for a child that tried and was
 /// refused by the sandbox, which is the precise inversion this battery exists to prevent.
-async fn run_probe_child(mut cmd: Command, timeout_secs: u64) -> (String, String, bool) {
+async fn run_probe_child(mut cmd: Command, timeout_secs: u64) -> ProbeRun {
     let mut child = match cmd.spawn() {
         Ok(c) => c,
-        Err(e) => return (format!("spawn failed: {e}"), String::new(), true),
+        Err(e) => return ProbeRun::SpawnFailed(e.to_string()),
     };
     let mut out = String::new();
     let mut err = String::new();
     let (Some(mut so), Some(mut se)) = (child.stdout.take(), child.stderr.take()) else {
-        return (String::new(), String::new(), true);
+        return ProbeRun::SpawnFailed("the child exposed no stdout/stderr pipe".to_string());
     };
     let timed_out = {
         // Both pipes drained concurrently: a child that fills stderr while we only read
@@ -1765,10 +1786,17 @@ async fn run_probe_child(mut cmd: Command, timeout_secs: u64) -> (String, String
     };
     if timed_out {
         let _ = child.kill().await;
+        ProbeRun::TimedOut {
+            stdout: out,
+            stderr: err,
+        }
     } else {
         let _ = child.wait().await;
+        ProbeRun::Finished {
+            stdout: out,
+            stderr: err,
+        }
     }
-    (out, err, timed_out)
 }
 
 /// Probe ONE row: build its scratch world, run every probe through the SHIPPED harness
@@ -1878,7 +1906,27 @@ async fn run_row(
             cmd.env(PROBE_ENV_VAR, env.secret("read_env_token"));
 
             let started = Instant::now();
-            let (stdout, stderr, timed_out) = run_probe_child(cmd, opts.timeout_secs).await;
+            // A CHILD THAT NEVER STARTED IS REPORTED AS ITSELF. It is still `inconclusive` —
+            // nothing was proved — but the OS error is carried into the evidence line instead
+            // of being replaced by a timeout that did not happen. Retrying is right (a
+            // transient resource limit clears), and retrying THIRTY times while telling the
+            // operator the CLI is slow is what this branch stops.
+            let (stdout, stderr, timed_out) = match run_probe_child(cmd, opts.timeout_secs).await {
+                ProbeRun::Finished { stdout, stderr } => (stdout, stderr, false),
+                ProbeRun::TimedOut { stdout, stderr } => (stdout, stderr, true),
+                ProbeRun::SpawnFailed(e) => {
+                    let evidence =
+                        one_line(&format!("the child could not be started at all: {e}"), 240);
+                    eprintln!(
+                        "[{label}] {:<24} attempt {attempt}: {:<12} ({:.0}s) {evidence}",
+                        probe.id,
+                        ProbeVerdict::Inconclusive.label(),
+                        started.elapsed().as_secs_f64(),
+                    );
+                    attempts.push((ProbeVerdict::Inconclusive, evidence));
+                    continue;
+                }
+            };
             // Each harness reports its turn in its own event vocabulary; both are reduced to
             // the one `RunTrace` the scoring rules read.
             let mut trace = if opts.harness == CODEX_ID {

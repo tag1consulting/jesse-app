@@ -924,27 +924,69 @@ pub async fn start_turn(
     let vision_on = had_attachments
         && !active.vision.is_empty()
         && !vision::resolve_partners(&st.cfg, &active.vision).is_empty();
-    // THE TWO ROUTES ARE EXCLUSIVE, and the `match` is what says so. Exactly one arm runs,
-    // so a turn either transcribes through the helper or writes files for the child —
+    // THIS TURN'S FILE AREA, made BEFORE the route is decided and regardless of it.
+    //
+    // It used to be minted inside the `ChildReadsFiles` arm, because inbound attachments
+    // were the only reason a turn ever had files. From 0.115.0 they are not: the child can
+    // FETCH a mail attachment (`get_gmail_attachment_content`), and the only thing that
+    // makes that write owned is the bridge naming the directory it lands in and then
+    // removing that directory when the turn ends. A fetch can happen on any turn, and
+    // almost no turn carries an inbound attachment, so the directory cannot be conditional
+    // on one.
+    //
+    // UNCONDITIONAL RATHER THAN LAZY, and that is forced rather than chosen. "Create it on
+    // the first fetch" would need the bridge to observe the fetch, and it cannot: MCP tool
+    // traffic runs between the harness child and the server and never passes through this
+    // process. By the time the bridge could react the file is already written. So the
+    // directory has to exist before the child starts, which means every turn.
+    //
+    // BEST-EFFORT, DELIBERATELY. A turn that could not have a file area must still answer —
+    // refusing to reply because a fetch would not have had anywhere to land is a far worse
+    // outcome than replying without the capability, and it is the same call the artifact
+    // staging directory makes a few lines down. The one case that still hard-fails is a turn
+    // that has bytes to write and nowhere to write them, which is exactly today's behaviour
+    // and is enforced in the `ChildReadsFiles` arm below.
+    let scratch = match ScratchDir::create(&st.cfg.scratch_base()) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            eprintln!(
+                "jesse-bridge: could not create this turn's scratch dir under {}: {e} \
+                 (the turn runs without a file area)",
+                st.cfg.scratch_base().display()
+            );
+            None
+        }
+    };
+    // THE TWO INBOUND ROUTES ARE EXCLUSIVE, and the `match` is what says so. Exactly one arm
+    // runs, so a turn either transcribes through the helper or writes files for the child —
     // never both, which would send the model the same image twice. See [`AttachmentRoute`].
+    //
+    // NOTE WHAT THIS MATCH NO LONGER DECIDES. It answers "how do this turn's INBOUND
+    // attachments reach the model", and nothing else; the file area above is not its to
+    // create or withhold. That split is what keeps the enum's exclusivity property true
+    // while a `None` turn still has a directory — the two were only ever tangled because
+    // inbound attachments used to be the sole reason to have one.
     let (prompt, scratch, vision_inputs) = match attachment_route(had_attachments, vision_on) {
-        AttachmentRoute::None => (prompt, None, Vec::new()),
+        AttachmentRoute::None => (prompt, scratch, Vec::new()),
         AttachmentRoute::VisionHelper => {
             // Carry the decoded bytes into the turn task (transcribed under the permit); no
             // scratch file is written and no "read these files" suffix is appended — the text
             // model can't read images, so the transcription block replaces that path entirely.
-            // NO SCRATCH DIR MEANS NO `attachment_dir` ON THE TURN REQUEST, which is what
-            // makes the child's read grant impossible to hand out on this route.
+            // The turn still HAS a directory (a fetch may still land in it); what it does not
+            // have is any inbound attachment written there, so the child is never pointed at
+            // a copy of the image the helper already transcribed and cannot be sent it twice.
             let inputs = VisionInput::from_decoded(&decoded, &req.attachments);
-            (prompt, None, inputs)
+            (prompt, scratch, inputs)
         }
         AttachmentRoute::ChildReadsFiles => {
-            let scratch = ScratchDir::create(&st.cfg.scratch_base()).map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("could not create attachment scratch dir: {e}"),
-                )
-            })?;
+            // HERE the directory is load-bearing rather than a convenience: there are bytes
+            // to write and the prompt is about to name their paths. A turn that got no file
+            // area cannot take this route, so it fails loudly instead of answering as though
+            // the user had attached nothing.
+            let scratch = scratch.ok_or((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "could not create attachment scratch dir".to_string(),
+            ))?;
             let paths = scratch.write_all(&decoded).map_err(|e| {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -1125,12 +1167,18 @@ pub async fn start_turn(
         // working directory's git tree. The SWEEP that moves what it holds into the
         // store runs further down, on the completion path.
         let staging = staging;
-        // THE DIRECTORY THOSE FILES ARE IN, for the child that must read them. `Some` only
-        // when this turn actually wrote a scratch dir, which is exactly when it had
-        // attachments AND the vision helper did not take them: the gate above returns
-        // `None` for the scratch dir on the helper route, so the two routes cannot both
-        // fire and the image is never sent twice. Cloned rather than borrowed because the
-        // guard is moved into this task and the driver is called across awaits.
+        // THE DIRECTORY, for the child. It is what the model may READ (Claude Code's
+        // `--add-dir`) and what the Google MCP server may WRITE a fetched file into
+        // (`WORKSPACE_ATTACHMENT_DIR`, set on the harness child) — one directory, both
+        // directions, one `Drop` that removes it.
+        //
+        // `Some` on every main turn whose scratch dir was created, which is every main turn
+        // bar a filesystem failure. That is a change: it used to be `Some` only for a turn
+        // whose inbound attachments the vision helper had not taken. It says nothing about
+        // whether the directory HOLDS an inbound attachment — the route decides that, and on
+        // the helper route it holds none, so the child is still never pointed at a copy of an
+        // image the helper already transcribed. Cloned rather than borrowed because the guard
+        // is moved into this task and the driver is called across awaits.
         let attachment_dir: Option<PathBuf> = _scratch.as_ref().map(|s| s.path.clone());
         // The agent program this turn runs on: THE ACTIVE MODEL'S OWN harness. The driver
         // calls through it for the child command and the per-attempt line parser.

@@ -14,6 +14,179 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [bridge 0.115.0] - 2026-09-05
+
+**A phone turn can open a Gmail attachment, because the file that lands on this host now has
+an owner.** `get_gmail_attachment_content` was withheld on both Google instances from 0.73.0
+to 0.114.0, and the objection was never that it writes — half the granted set writes something
+somewhere. It was that the write had **no owner**: the file landed in a fixed directory,
+nothing reaped it, and one PDF opened from the phone stayed on disk indefinitely. This version
+does not argue the risk away; it gives the write a lifetime.
+
+### Added
+
+- **`get_gmail_attachment_content` is granted on `google` AND `google-perseido`.** Seventeen
+  of eighteen on each; `start_google_auth` remains the only omission on either. The two
+  instances are the same binary against two accounts and the allowlist has always mirrored one
+  onto the other by hand — `the_two_google_servers_grant_the_same_set` now makes a divergence
+  fail a build rather than be something a reader has to notice.
+
+- **Every main turn gets a scratch directory, and the bridge points
+  `WORKSPACE_ATTACHMENT_DIR` at it** — set on the harness child's own `Command`, so it is per
+  turn. A fetched attachment lands in a directory the bridge made and dies with the turn that
+  asked for it, by the same `Drop` guard that has always removed inbound attachments: success,
+  error, timeout, cancel, panic. No reaper, no expiry timer, no second process that has to
+  agree about when a file stopped being needed.
+
+  **Unconditional rather than lazy, and that is forced.** "Create it on the first fetch" would
+  need the bridge to observe the fetch, and it cannot — MCP tool traffic runs between the
+  harness child and the server and never passes through this process. By the time the bridge
+  could react, the file is written.
+
+  `AttachmentRoute` is deliberately unchanged. It answers "how do this turn's INBOUND
+  attachments reach the model", which is a different question from "does this turn have a file
+  area", and the two were only ever tangled because inbound attachments used to be the sole
+  reason to have one. `AttachmentRoute::None` no longer implies "no directory"; its
+  exclusivity property is untouched and no test was loosened.
+
+- **`CODEX_MCP_ENV_PASSTHROUGH` gains a `google-perseido` entry naming exactly one variable**,
+  `WORKSPACE_ATTACHMENT_DIR`. Codex scrubs the subprocess environment, so a variable set on the
+  child but unnamed here is set for nothing and the server registers zero tools. The reasoning
+  that keeps the other four names off this entry does not reach this one: it selects no account
+  and carries no credential — it is a scratch directory, identical whichever instance writes
+  into it. A test asserts the entry is that name and *only* that name.
+
+- **Two startup sweeps**, for the case `Drop` cannot cover — `SIGKILL`, a power cut. One
+  reclaims orphaned `jesse-attach-*` directories under the scratch base; the other empties the
+  two fixed attachment directories. Both are best-effort and both run before serving.
+
+  **The first is age-guarded (3 h) and the guard is correctness, not caution.** The scratch
+  base is the shared system temp dir, so a second bridge instance on this host keeps its live
+  turn directories right beside these; an unguarded sweep would delete another instance's
+  in-flight attachment. Three hours clears the 2 h `HARD_TIMEOUT_CEILING` with margin.
+
+### Changed
+
+- **`--add-dir` is emitted on every main turn**, not only on turns carrying an inbound
+  attachment — a fetch can happen on a turn that arrived with nothing, and a child that cannot
+  read what it just downloaded is worse than one that cannot download. It adds a read grant
+  over one empty bridge-owned directory that exists for seconds. It is emitted outside
+  `capability_args`, so **it moves no containment record**; the two tool names do.
+
+- **`get_drive_file_download_url` inherits the better lifecycle for free.** It writes through
+  the same module, so its output now lands in the turn's directory instead of the fixed one.
+  Granted since 0.68.0, it was the precedent this change rests on: "a Google tool that writes
+  to disk under a directed output path" was already accepted policy.
+
+### Fixed
+
+- **`containment-probe --harness codex` probed CLAUDE CODE's rows**, and wrote the results
+  into `containment-codex.toml` under Claude Code's row labels. `BatteryOptions::default`
+  seeds `rows` with `CLAUDE_CODE_SHIPPED_ROWS` and `--harness` set only `opts.harness`; the
+  rows never followed it. So the command that re-records Codex's containment spawned Codex
+  children against a sixteen-server set Codex does not ship — `build` and `places` are
+  deliberately Claude Code's only — and produced a record vouching for a posture nothing runs.
+
+  **It was latent for twenty-nine versions because the two lists agreed.** Codex's record was
+  last written at bridge 0.76.0, when both harnesses shipped `McpSet::Messages`; Claude Code
+  gained `build` in 0.86.0 and `places` in 0.100.0 and Codex deliberately did not. From that
+  moment the wrong list was a different list — and nobody re-ran the Codex battery until this
+  change, whose first attempt duly recorded `…+google-perseido+build+places` rows and orphaned
+  both operator `[[accepted]]` blocks. That file was restored and re-recorded against Codex's
+  actual rows.
+
+  The `--write` completeness guard did not catch it because it compares row COUNTS, and both
+  harnesses ship four. Counting rows cannot tell you they are the right rows. Rows now default
+  from the SELECTED harness, resolved after argument parsing so `--harness` and `--rows` may
+  appear in either order.
+
+- **The containment battery reported a child that never STARTED as one that ran out of TIME.**
+  `run_probe_child` collapsed a failed `spawn()` and a killed child into one boolean, so a
+  spawn failure in ZERO seconds was scored "the child was killed on timeout before it
+  finished" — and the OS error explaining it was thrown away. Found the expensive way: a
+  `--write` run for this change came back `gate = fail` with 13 hard gates unmet, 331 of those
+  attempts at `(0s, $0.000)`, every line of the log confidently describing a timeout that had
+  not happened. Re-running the same rows alone returned the recorded verdicts, conclusive,
+  first try.
+
+  A spawn failure is now its own case: still `inconclusive` — a probe that did not run proves
+  nothing — but the evidence line carries the OS error, and the log stops asserting a cause it
+  did not observe. A verdict this battery exists to produce is only as good as the instrument's
+  willingness to say "I do not know".
+
+### Notes
+
+- **The Gmail attachment tool really does honour `WORKSPACE_ATTACHMENT_DIR`, and it is read at
+  IMPORT time.** Both were measured against the installed `workspace-mcp` rather than taken
+  from the comment that asserted the first. Import-time resolution would be fatal for a
+  long-lived server; both harnesses spawn their MCP children per turn, so the import happens
+  inside the turn whose directory the variable names.
+
+- **The second `--add-dir` spelling stopped being belt-and-braces.** `workspace-mcp` calls
+  `.resolve()` on the directory before writing, so the path a fetch tool hands back is the
+  REALPATH — `/private/var/folders/…`, not the `/var/folders/…` the bridge created. Measured
+  directly: `/tmp/…` came back as `/private/tmp/…`. Pass only the first spelling and the model
+  is handed a path outside its read scope *by a tool it was just granted*. The builder has
+  passed both since the flag was added; it now has to.
+
+- **`workspace-mcp-perseido` must DEFAULT `WORKSPACE_ATTACHMENT_DIR`, not assign it.** That
+  launcher is HOST SETUP and this repository cannot enforce it; an unconditional assignment
+  overrides the per-turn value and sends the file back to a fixed directory. The bridge does
+  not rely on the launcher being right — the startup reap of the fixed directories is exactly
+  what bounds it, turning "lives forever" into "lives until the next restart".
+
+- **WhatsApp's `download_media` is still ungranted, and the reason is narrower than it was.**
+  Its Gmail counterpart was grantable because the bridge can DIRECT where the write lands. The
+  same move does not exist here: the tool takes no output path, and the write is not its own —
+  it POSTs to the Go bridge's `/api/download`, and THE GO BRIDGE writes the file, into
+  `store/<chat-jid>/<filename>` relative to its own working directory, returning a **path,
+  never the bytes**. Not obvious from the tool's name: that filename comes straight out of the
+  message row with no traversal check on the Go side, so a grant would put a remote
+  correspondent's chosen string into a path on this host.
+
+  A clean grant needs a bridge-owned server that calls `/api/download`, checks the returned
+  path is under the store root, moves it into the turn's directory under a name this project
+  chose, and unlinks the store copy. That is a new MCP server — a new `McpSet` row label and a
+  live battery, and by the `build`/`places` precedent not on Codex, which would make "open that
+  WhatsApp photo" work on one harness and not the other. **Deferred on that cost, not on
+  principle.** The three send tools stay ungranted regardless.
+
+- **The Claude Code battery was re-run and re-recorded; `containment-codex.toml` is UNCHANGED,
+  and that is a finding rather than an omission.** A tool grant was assumed to re-stale both
+  harnesses' records. It does not. Claude Code's `toolset_args` carries the whole
+  `--allowedTools` string, so two new names move it and the startup gate — strict equality —
+  rejects the old record. **Codex's `toolset_args` carries only `sandbox_mode`,
+  `approval_policy` and `tools.web_search`**: its MCP grants ride in `codex_mcp_args`, which is
+  emitted outside `capability_args` and is not part of the record. So a tool-name change moves
+  Codex's record by exactly nothing, and re-recording it would have meant folding in an
+  unrelated codex-cli bump. Claude Code: 64 probes, `gate = pass`, $15.09, against claude
+  2.1.261 (the record pinned 2.1.243).
+
+- **codex-cli 0.153.4 would cost Codex its `read` grant, and that belongs in its own change.**
+  A trial re-record on the installed 0.153.4 (the record pins 0.146.0) moved ten probes from
+  `denied` to `inconclusive` — `write_escape_parent`, `write_escape_state_dir` and
+  `write_vault_file` across all four rows, all of them "a capable tool was at the root (Bash)
+  and the child never invoked it". That is the child declining to attempt, not a boundary
+  moving, but `inconclusive` proves nothing and fails the gate, and
+  `the_containment_records_agree_with_what_each_harness_declares` then fails: Codex declares
+  `expresses(read) = true` while its record's read rows no longer all pass. **That file was
+  restored to what is committed.** Adopting 0.153.4 is a decision with a live consequence, and
+  it is not this change's to make.
+
+- **One Claude Code baseline CLOSED, and it is not a claim that this change closed it.**
+  `read_escape_parent` at `write/…+places` was `allowed`/`known_open` and came back `denied`.
+  That probe is the one already recorded as flipping run to run on this harness, so the honest
+  reading is "the flaky one landed on the closed side today", not "the boundary tightened".
+  The record is what it measured; nothing here should be read as having fixed it.
+
+  The two remaining `known_open` rows on that harness — `network_outbound` and
+  `background_process` at write — are unchanged and still carry no `[[accepted]]` entry. That
+  was true before this change and is not this change's to sign.
+
+- **iMessage was out of scope and there is nothing there to grant.** `imcp` advertises six
+  tools and none touches attachments; the predecessor's `tool_get_attachment` was lost in the
+  0.76.0 server swap.
+
 ## [agent 0.9.0, bridge 0.114.0, eval 0.5.0] - 2026-09-01
 
 **Two defects that stop a direct model answering a turn at all.** Both surfaced standing up a

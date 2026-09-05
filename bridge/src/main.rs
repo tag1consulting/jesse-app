@@ -3,6 +3,7 @@
 //! enforces the startup invariants, prints the pairing QR, and serves the router.
 
 use std::path::Path;
+use std::time::SystemTime;
 
 use jesse_bridge::{
     app, binary_exists, bind_broker, build_apns, detect_binary_drift,
@@ -11,9 +12,10 @@ use jesse_bridge::{
     manual_pairing_lines, pairing_payload, prune_direct_state, qr_env_tristate, search_scale,
     sentinel_advert, serve_broker, settings_permission_drift, shadowing_direct_mcp_grants,
     show_qr_opt_in, show_token_opt_in, spawn_eviction_task, spawn_scheduler, spawn_session_gc_task,
-    start_health_prober, validate_model_config, AppState, Config, ConfigError, QrArt, Runner,
-    TokenVisibility, BINARY_DRIFT, CONTAINMENT_RECORDS, DIRECT_ID, SEARCH_SCALE, SETTINGS_DRIFT,
-    SHADOWING_GRANTS, UNRESOLVED_MCP,
+    start_health_prober, sweep_fixed_attachment_dirs, sweep_stale_scratch_dirs,
+    validate_model_config, AppState, Config, ConfigError, QrArt, Runner, TokenVisibility,
+    BINARY_DRIFT, CONTAINMENT_RECORDS, DIRECT_ID, SEARCH_SCALE, SETTINGS_DRIFT, SHADOWING_GRANTS,
+    UNRESOLVED_MCP,
 };
 
 #[tokio::main]
@@ -398,6 +400,29 @@ async fn main() {
     // Evict expired jobs on a periodic background task rather than on the request
     // hot path (H3), so a sweep's file unlinks never delay a turn.
     spawn_eviction_task(state.jobs.clone(), state.artifacts.clone());
+    // THE FILE AREAS NO TURN OWNS ANY MORE. A turn's scratch directory is removed by its own
+    // `Drop` on every exit path the process survives; these two sweeps are for the ones it
+    // does not — `SIGKILL`, a panic in the runtime, a power cut — which since 0.115.0 can
+    // strand a FETCHED mail attachment rather than only a copy of something the user had
+    // already sent. Both run once, here, while no turn is in flight, and both are
+    // best-effort: a bridge that will not boot over housekeeping is worse than one holding a
+    // few extra files.
+    //
+    // They are two sweeps because they answer two different failure modes. The first
+    // reclaims orphaned per-turn directories and is age-guarded, because the scratch base is
+    // shared with any other bridge instance on the host (see `STALE_SCRATCH_AGE_SECS`). The
+    // second empties the FIXED attachment directories, which nothing should be writing to at
+    // all now — it is the backstop for the per-turn override not reaching a server, and the
+    // only thing bounding the Perseido launcher, which is host setup and invisible to the
+    // containment record.
+    let stale = sweep_stale_scratch_dirs(&state.cfg.scratch_base(), SystemTime::now());
+    let stray = sweep_fixed_attachment_dirs(&state.cfg.home);
+    if stale > 0 || stray > 0 {
+        eprintln!(
+            "jesse-bridge: reclaimed {stale} orphaned scratch dir(s) and {stray} stray \
+             attachment file(s) left by a previous run"
+        );
+    }
     // THE DIRECT HARNESS'S TWO ON-DISK LEDGERS, pruned once at startup, beside the turn-timing
     // prune that already runs there. Both are no-ops on a deployment with no direct model —
     // the files do not exist — and both are best-effort: a prune that fails logs and the

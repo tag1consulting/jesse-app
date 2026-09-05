@@ -291,8 +291,14 @@ pub fn attachment_body_limit(cfg: &Config) -> usize {
 /// falls through to [`Self::ChildReadsFiles`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AttachmentRoute {
-    /// No attachments on this turn. No scratch dir, no prompt suffix, no read grant —
-    /// byte-for-byte an ordinary turn, which is nearly all of them.
+    /// No attachments on this turn — no bytes decoded, no prompt suffix, no path named
+    /// for the model to read. Which is nearly every turn.
+    ///
+    /// IT DOES NOT MEAN "no scratch directory". Since 0.115.0 the turn's [`ScratchDir`] is
+    /// created for every main turn regardless of this decision, because it is also where a
+    /// FETCHED file lands (`get_gmail_attachment_content`), and a fetch can happen on a turn
+    /// that carried nothing inbound. The two are separate questions and this enum answers
+    /// only the inbound one.
     None,
     /// The BRIDGE reads the images and hands the model text. The decoded bytes ride into
     /// the turn task and are transcribed by the resolving vision partner; nothing is
@@ -319,9 +325,29 @@ pub fn attachment_route(has_attachments: bool, vision_resolves: bool) -> Attachm
 }
 
 /// A per-request scratch directory under `base` (the system temp dir by
-/// default, or `JESSE_SCRATCH_DIR`) — NOT the vault, so attachments never
+/// default, or `JESSE_SCRATCH_DIR`) — NOT the vault, so attachment bytes never
 /// pollute it. Removed by `Drop` on every exit path — success, error, or
-/// timeout — so decoded files never outlive the turn.
+/// timeout — so files never outlive the turn.
+///
+/// # It is the turn's file area in BOTH directions, and that is new in 0.115.0
+///
+/// It began as the place INBOUND attachments were decoded to, and it was created only on
+/// a turn that carried one. It is now created for EVERY main turn, because it is also the
+/// directory the Google MCP server is pointed at for the files a turn FETCHES —
+/// `get_gmail_attachment_content` and `get_drive_file_download_url` (see
+/// [`crate::WORKSPACE_ATTACHMENT_DIR_ENV`]). A fetch can happen on any turn; nearly none of
+/// them carry an inbound attachment, so a directory conjured only for inbound bytes is
+/// exactly the wrong lifetime for the outbound half.
+///
+/// THAT IS WHAT MAKES THE FETCHED FILE OWNED. The vendor server picks the file's NAME; this
+/// type picks its DIRECTORY, and owns the directory. `Drop` takes the file with it whether
+/// the turn succeeded, errored, timed out or was cancelled — no reaper, no expiry timer, no
+/// second process that has to agree about when a file stopped being needed.
+///
+/// [`AttachmentRoute`] is unchanged by this and deliberately so: it decides how an INBOUND
+/// attachment reaches the model, which is a different question from whether this turn has a
+/// file area. `AttachmentRoute::None` still means "no bytes were decoded, no path is named
+/// in the prompt, no transcription block" — it no longer implies "no directory".
 ///
 /// THIS DIRECTORY IS OUTSIDE THE CLAUDE CODE CHILD'S READ SCOPE, and the turn must
 /// hand it over explicitly. This comment used to claim the opposite — "verified that
@@ -370,6 +396,79 @@ impl Drop for ScratchDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.path);
     }
+}
+
+/// How long a `jesse-attach-*` directory must have gone untouched before
+/// [`sweep_stale_scratch_dirs`] will remove it.
+///
+/// **THE THRESHOLD IS NOT CONSERVATISM, IT IS CORRECTNESS.** The scratch base defaults to
+/// the SYSTEM TEMP DIR, which is shared by every process on the host — including a SECOND
+/// jesse-bridge (the Jesse Pro instance runs its own service on another port with its own
+/// state directory, but with the same default scratch base). A sweep that removed every
+/// `jesse-attach-*` it found would delete the other instance's LIVE turn directories out
+/// from under it, and the symptom would be a turn that suddenly cannot read the photo it
+/// was just given.
+///
+/// So the sweep only touches directories that no live turn could possibly still own.
+/// [`crate::HARD_TIMEOUT_CEILING`] is the longest a turn may run (2 h), so anything older
+/// than that plus a wide margin is an orphan by construction. Three hours.
+pub const STALE_SCRATCH_AGE_SECS: u64 = 3 * 60 * 60;
+
+/// Remove orphaned per-turn scratch directories under `base`, once, at startup.
+///
+/// # Why this exists
+///
+/// [`ScratchDir`]'s `Drop` is the OWNER and it runs on every exit path a turn can take —
+/// success, error, timeout, cancel, panic. What it cannot survive is the process not
+/// running: `SIGKILL`, a power cut, an OOM kill. Before this sweep the only cleanup was
+/// that `Drop`, so a crash stranded a directory forever, and after 0.115.0 that directory
+/// can hold a FETCHED mail attachment rather than only a copy of something the user had
+/// already sent. A crash must not be able to leave that on disk indefinitely.
+///
+/// # What it will and will not touch
+///
+/// Only entries directly under `base` whose name starts with `jesse-attach-`, only
+/// directories, and only ones untouched for [`STALE_SCRATCH_AGE_SECS`] — see that const for
+/// why the age guard is load-bearing rather than cautious. Anything it cannot stat is
+/// skipped rather than guessed at.
+///
+/// Best-effort throughout, and it returns a COUNT rather than a `Result`: housekeeping that
+/// can stop the bridge booting is worse than housekeeping that did not run.
+pub fn sweep_stale_scratch_dirs(base: &Path, now: SystemTime) -> usize {
+    let Ok(entries) = std::fs::read_dir(base) else {
+        return 0;
+    };
+    let mut removed = 0usize;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.starts_with("jesse-attach-") {
+            continue;
+        }
+        // `file_type` does not follow symlinks, so a symlink named `jesse-attach-…` and
+        // pointed somewhere else is not a directory here and is left alone. Deleting
+        // through it is precisely the thing worth not doing.
+        match entry.file_type() {
+            Ok(t) if t.is_dir() => {}
+            _ => continue,
+        }
+        let Ok(meta) = entry.metadata() else { continue };
+        let Ok(modified) = meta.modified() else {
+            continue;
+        };
+        let Ok(age) = now.duration_since(modified) else {
+            // A future mtime (clock skew, a restored backup). Not old enough to be
+            // provably an orphan, so leave it.
+            continue;
+        };
+        if age.as_secs() < STALE_SCRATCH_AGE_SECS {
+            continue;
+        }
+        if std::fs::remove_dir_all(entry.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
 }
 
 /// WHAT A HARNESS'S OWN ATTACHMENT TOOL CAN ACTUALLY TAKE, and what to tell its model.
@@ -829,6 +928,87 @@ mod tests {
             StatusCode::BAD_REQUEST
         );
     }
+    /// THE OWNING TURN TAKES A FETCHED FILE WITH IT.
+    ///
+    /// The inbound half of this is covered by
+    /// `scratch_dir_writes_randomized_files_and_cleans_up_on_drop`, which writes through
+    /// `write_all`. This one plants the file the way a FETCH does — an outside process
+    /// choosing its own name inside the directory the bridge chose — because that is the case
+    /// the grant in 0.115.0 rests on and it is not the same code path. The bridge never sees
+    /// the write, never learns the name, and must still be the thing that deletes it.
+    #[test]
+    fn a_file_written_into_the_turns_dir_by_something_else_dies_with_the_turn() {
+        let dir = {
+            let scratch = ScratchDir::create(&std::env::temp_dir()).expect("scratch");
+            // A name this crate did not choose, with a nested directory, which is roughly
+            // what a vendor server writing `invoice_3f2a.pdf` looks like from here.
+            let nested = scratch.path.join("sub");
+            std::fs::create_dir(&nested).expect("nested");
+            let planted = nested.join("invoice_3f2a.pdf");
+            std::fs::write(&planted, PDF_BYTES).expect("plant a fetched file");
+            assert!(planted.exists(), "the premise: the file was written");
+            scratch.path.clone()
+        };
+        assert!(
+            !dir.exists(),
+            "the directory and everything an MCP server put in it must go with the turn"
+        );
+    }
+
+    /// THE CRASH BACKSTOP REMOVES A STRANDED DIRECTORY…
+    #[test]
+    fn the_startup_sweep_removes_a_planted_stale_scratch_dir() {
+        let base = std::env::temp_dir().join(format!("jesse-sweep-{}", random_hex()));
+        std::fs::create_dir(&base).expect("base");
+        let stale = base.join(format!("jesse-attach-{}", random_hex()));
+        std::fs::create_dir(&stale).expect("stale dir");
+        std::fs::write(stale.join("orphan.pdf"), PDF_BYTES).expect("orphaned file");
+
+        // `now` is a parameter precisely so this can be tested without sleeping or
+        // back-dating an mtime: ask what the sweep would do three hours from now.
+        let later = SystemTime::now() + Duration::from_secs(STALE_SCRATCH_AGE_SECS + 60);
+        assert_eq!(sweep_stale_scratch_dirs(&base, later), 1);
+        assert!(!stale.exists(), "the orphan and its contents must be gone");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// …AND LEAVES A LIVE TURN'S DIRECTORY ALONE.
+    ///
+    /// This is the half that matters more, because getting it wrong is not a leak but a
+    /// BREAKAGE: the scratch base is the shared system temp dir, so a second bridge instance
+    /// on this host has its live turn directories sitting right beside these. An unguarded
+    /// sweep would delete the photo another instance's turn was in the middle of reading.
+    #[test]
+    fn the_startup_sweep_spares_anything_a_live_turn_could_still_own() {
+        let base = std::env::temp_dir().join(format!("jesse-sweep-{}", random_hex()));
+        std::fs::create_dir(&base).expect("base");
+
+        let fresh = base.join(format!("jesse-attach-{}", random_hex()));
+        std::fs::create_dir(&fresh).expect("fresh dir");
+        // Not ours: a directory under the same base whose name this sweep must not match.
+        let stranger = base.join("jesse-browser-output");
+        std::fs::create_dir(&stranger).expect("stranger");
+        // A FILE with a matching name, which is not a directory and must not be unlinked.
+        let file = base.join(format!("jesse-attach-{}.log", random_hex()));
+        std::fs::write(&file, b"not a directory").expect("file");
+
+        let later = SystemTime::now() + Duration::from_secs(STALE_SCRATCH_AGE_SECS + 60);
+        assert_eq!(
+            sweep_stale_scratch_dirs(&base, SystemTime::now()),
+            0,
+            "nothing here is old enough to be an orphan"
+        );
+        assert!(fresh.exists(), "a live turn's directory must survive");
+
+        // Even once everything IS old enough, only the matching DIRECTORY goes.
+        assert_eq!(sweep_stale_scratch_dirs(&base, later), 1);
+        assert!(stranger.exists(), "another tool's directory is not ours");
+        assert!(file.exists(), "a file is not a scratch directory");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn scratch_dir_writes_randomized_files_and_cleans_up_on_drop() {
         use std::os::unix::fs::PermissionsExt;
