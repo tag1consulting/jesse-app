@@ -15,19 +15,37 @@ use crate::*;
 // from three things, all verified live against the pinned binary (see the spike record in
 // `bridge/containment.toml` and the CHANGELOG):
 //
-//   * a PER-TURN `CODEX_HOME` ([`codex_turn_home`]), so no two turns share a mutable file;
+//   * a PER-CONVERSATION `CODEX_HOME` ([`codex_home_for_turn`]), so no two CONVERSATIONS
+//     share a mutable file;
 //   * `--ignore-user-config`, so an operator's `~/.codex/config.toml` cannot widen the
 //     posture this harness chose (auth still resolves through `CODEX_HOME`, which is
-//     documented behaviour of the flag and is why the per-turn home is seeded with a
-//     credential copy);
+//     documented behaviour of the flag and is why the home is seeded with a credential
+//     copy);
 //   * `-c key=value` overrides for everything this harness actually decides.
 //
 // Verified 2026-07-30 on codex-cli 0.146.0: two concurrent turns with different
-// per-turn homes and different configs each answered from their OWN config, neither home
+// homes and different configs each answered from their OWN config, neither home
 // acquired the other's state, and a `CODEX_HOME`-scoped turn wrote ZERO files under the
 // canonical `~/.codex`.
 //
-// # The credential lives in the per-turn home ON PURPOSE
+// # PER CONVERSATION, NOT PER TURN — and what that costs
+//
+// This was a per-TURN home until bridge 0.120.0, and the scope had to widen because Codex
+// stores a thread's rollout INSIDE `$CODEX_HOME` and `codex exec resume` has no flag that
+// points it anywhere else. A per-turn home therefore made every follow-up in a conversation
+// fail with `no rollout found for thread id`; the full measurement is at
+// [`codex_home_for_turn`].
+//
+// The isolation claim above is the one that narrowed, and it narrowed only between TURNS OF
+// ONE CONVERSATION — which already shared everything that matters (they resume the same
+// thread and read the same history) and which the bridge already serialises with
+// `ConversationLocks`, taken outermost in the turn path. Between conversations the boundary
+// is exactly what it was. What used to come free from a new directory and is now explicit,
+// once per turn, in [`prepare_home_for_turn`]: the credential is re-seeded or REMOVED to
+// match this turn's auth posture, and `hooks.json` is deleted before the turn that wants one
+// writes it.
+//
+// # The credential lives in the conversation's home ON PURPOSE
 //
 // The bridge runs Codex off a subscription OAuth login, the same posture Claude Code runs
 // under, so a per-turn home has to be seeded with a copy of the canonical `auth.json` or the
@@ -759,8 +777,9 @@ pub fn granted_mcp_tools(allowed_tools: &str, server: &str) -> Vec<String> {
 
 // ---- The per-turn home ----------------------------------------------------------
 
-/// Where this harness keeps its per-turn `CODEX_HOME` directories: one subdirectory per
-/// spawn, under the bridge's state directory so they are cleaned with it.
+/// Where this harness keeps its `CODEX_HOME` directories: one subdirectory per CONVERSATION,
+/// under the bridge's state directory. Aged out by [`sweep_expired_codex_homes`] at the same
+/// `session_ttl_days` horizon transcripts use.
 pub fn codex_home_base(cfg: &Config) -> PathBuf {
     cfg.state_dir
         .as_deref()
@@ -779,8 +798,12 @@ pub fn codex_canonical_home(cfg: &Config) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(&cfg.home).join(".codex"))
 }
 
-/// Build a fresh per-turn `CODEX_HOME`, seeded with a COPY of the canonical credential when
+/// Build a FRESH `CODEX_HOME`, seeded with a COPY of the canonical credential when
 /// `seed_credential` is set.
+///
+/// Called for a conversation's FIRST turn only — a turn with a thread to resume goes through
+/// [`codex_home_for_turn`], which finds the home that thread already lives in. The home this
+/// mints becomes that conversation's, and no other conversation is ever given it.
 ///
 /// This is the mechanism the whole isolation argument rests on, so it does exactly two
 /// things and nothing else: make a directory nothing else writes to, and put a copy of
@@ -824,6 +847,470 @@ pub fn codex_turn_home(cfg: &Config, seed_credential: bool) -> std::io::Result<P
     Ok(dir)
 }
 
+// ---- Finding a conversation's saved thread ---------------------------------------
+//
+// `codex exec resume <id>` LOOKS THE ROLLOUT UP INSIDE `$CODEX_HOME`. There is no flag that
+// points it at a rollout file (checked against `codex exec resume --help` on 0.153.4: the
+// only positional is the session id, and the only storage-related flag is `--ephemeral`,
+// which turns persistence OFF). So a turn that resumes must run in the SAME home the turn
+// it is resuming wrote to, or the child exits 1 before the model runs with
+//
+//     Error: thread/resume: thread/resume failed: no rollout found for thread id <id> (code -32600)
+//
+// which is exactly what every follow-up on this harness did, because every turn got a fresh
+// `CODEX_HOME`. Measured on 0.153.4, in an isolated pair of homes: turn 1 in home A wrote
+// `A/sessions/2026/09/05/rollout-<ts>-<id>.jsonl`; resuming that id in a fresh home B failed
+// with the line above; resuming it in home A answered from turn 1's context; and copying the
+// one rollout file into B made B resume it too.
+//
+// Two more measurements shape everything below:
+//
+//   * **A resumed turn keeps the SAME thread id** and APPENDS to the same rollout file — no
+//     fork, no second file. So the id the conversation is bound to stays the key, turn after
+//     turn, and a home accumulates exactly one rollout per conversation.
+//   * **The id is in the rollout's FILENAME and in its first line** (`session_meta.payload
+//     .session_id`), so a home can be matched to a session from the filesystem alone, with
+//     no bridge-side bookkeeping needed to have existed beforehand.
+//
+// That second fact is what makes the index below a CACHE rather than a source of truth, and
+// it is what recovers the conversations that were already broken: their first turn's rollout
+// is still sitting in the home that turn created, so the scan finds it and the follow-up
+// that never worked resumes.
+
+/// The cache mapping a Codex session id to the home holding its rollout: `<base>/index.json`.
+///
+/// A CACHE, and deliberately not an authority. Every entry it holds is re-verified against
+/// the filesystem before use, and a miss falls through to [`find_rollout_home`], which
+/// answers from the rollouts themselves. Deleting this file costs one directory scan per
+/// conversation and loses nothing — which is the property that lets it be written
+/// best-effort and read without trust.
+pub fn codex_home_index_path(cfg: &Config) -> PathBuf {
+    codex_home_base(cfg).join("index.json")
+}
+
+/// How many bridge-owned homes [`find_rollout_home`] will look inside before giving up.
+///
+/// A bound rather than an unbounded walk because this runs on the turn path: the scan is one
+/// `readdir` per home plus a shallow `sessions/<y>/<m>/<d>` walk, and the index means it
+/// happens once per conversation rather than once per turn. The number is far above any real
+/// deployment (the live host had 92 after five weeks) and exists so a pathological state
+/// directory degrades into a clean failure instead of a hung turn.
+pub const CODEX_HOME_SCAN_LIMIT: usize = 4096;
+
+/// Read the session→home cache. A missing, unreadable or malformed file is an EMPTY cache,
+/// never an error: every consumer re-verifies against the filesystem anyway.
+fn read_home_index(path: &Path) -> std::collections::BTreeMap<String, String> {
+    let Ok(bytes) = std::fs::read(path) else {
+        return std::collections::BTreeMap::new();
+    };
+    serde_json::from_slice::<serde_json::Value>(&bytes)
+        .ok()
+        .and_then(|v| v.get("homes").cloned())
+        .and_then(|v| serde_json::from_value(v).ok())
+        .unwrap_or_default()
+}
+
+/// Persist the session→home cache atomically (temp + rename), mode 0600 — the same
+/// discipline as [`crate::conversations::persist_conversations`].
+///
+/// **Best-effort ON PURPOSE, and that covers the race as well as the failure.** Two
+/// conversations resolving at once can both read the file and one can overwrite the other's
+/// new row; a write can fail outright. Either way the cost is a rescan on the next turn of
+/// the conversation that lost its row, and the rescan answers from the rollouts — so the
+/// worst case is slower, never wrong. That is the property that makes a lock unnecessary
+/// here, and it is why nothing downstream trusts a row without re-verifying it.
+fn persist_home_index(path: &Path, homes: &std::collections::BTreeMap<String, String>) {
+    let value = json!({ "v": 1, "homes": homes });
+    let tmp = path.with_extension("json.tmp");
+    let write = || -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        f.write_all(value.to_string().as_bytes())?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, path)
+    };
+    if let Err(e) = write() {
+        eprintln!("jesse-bridge: could not persist the codex home index: {e}");
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+/// Whether `sid` is a token that could name a rollout on disk: ASCII alphanumerics, `-` and
+/// `_`, and short.
+///
+/// THE POINT IS PATH SAFETY, not validation for its own sake. The session id arrives on the
+/// request and is used to build a filename suffix; a `/` or a `..` in it would let a crafted
+/// id steer the lookup out of the bridge's own state directory. Every id this harness ever
+/// binds is a UUID from `thread.started`, so nothing legitimate is excluded.
+pub fn is_rollout_token(sid: &str) -> bool {
+    !sid.is_empty()
+        && sid.len() <= 64
+        && sid
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// Whether `path` really is `sid`'s rollout, read from the file rather than inferred from
+/// its name: the first line is a `session_meta` record carrying the id.
+///
+/// Checked because the filename match alone would accept a file someone else named, and the
+/// consequence of accepting the wrong one is resuming a DIFFERENT conversation's history —
+/// a cross-conversation leak, not a failed turn. An unreadable or unparseable first line is
+/// `false`: unverified is not verified.
+pub fn rollout_declares_session(path: &Path, sid: &str) -> bool {
+    let Ok(f) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut first = String::new();
+    // The meta line carries the whole system prompt, so it is large but bounded; cap the read
+    // so a corrupt file cannot pull an unbounded amount into a turn.
+    {
+        use std::io::BufRead as _;
+        if std::io::BufReader::new(std::io::Read::take(f, 1 << 20))
+            .read_line(&mut first)
+            .is_err()
+        {
+            return false;
+        }
+    }
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(first.trim()) else {
+        return false;
+    };
+    // `payload.session_id` on 0.153.4; the top level is checked too so a layout that hoists
+    // the field degrades into a rescan rather than a false negative.
+    ["payload", ""]
+        .iter()
+        .filter_map(|k| {
+            if k.is_empty() {
+                v.get("session_id")
+            } else {
+                v.get(*k).and_then(|p| p.get("session_id"))
+            }
+        })
+        .any(|id| id.as_str() == Some(sid))
+}
+
+/// `sid`'s rollout inside `home`, if it is there and it verifies.
+///
+/// Codex files rollouts at `$CODEX_HOME/sessions/<yyyy>/<mm>/<dd>/rollout-<ts>-<id>.jsonl`,
+/// and the turn doing the lookup does not know the date, so this walks the three fixed
+/// levels rather than guessing one. Fixed depth, not a recursive descent: the layout is the
+/// CLI's and a deeper walk would only find files this harness has no claim on.
+pub fn rollout_in_home(home: &Path, sid: &str) -> Option<PathBuf> {
+    if !is_rollout_token(sid) {
+        return None;
+    }
+    let suffix = format!("-{sid}.jsonl");
+    let mut level: Vec<PathBuf> = vec![home.join("sessions")];
+    for _ in 0..3 {
+        let mut next = Vec::new();
+        for dir in &level {
+            let Ok(rd) = std::fs::read_dir(dir) else {
+                continue;
+            };
+            for e in rd.flatten() {
+                if e.file_type().is_ok_and(|t| t.is_dir()) {
+                    next.push(e.path());
+                }
+            }
+        }
+        level = next;
+    }
+    for dir in level {
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for e in rd.flatten() {
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with("rollout-")
+                && name.ends_with(&suffix)
+                && rollout_declares_session(&e.path(), sid)
+            {
+                return Some(e.path());
+            }
+        }
+    }
+    None
+}
+
+/// Scan the bridge's own homes for the one holding `sid`'s rollout.
+///
+/// THE RECOVERY PATH, and the reason the fix needs no migration step. Every conversation
+/// that ran a first turn before this change has its rollout sitting in the single-turn home
+/// that turn created; this finds it, and the follow-up that never worked resumes into it.
+///
+/// Only DIRECT children of `base` are considered, and only real directories — never a
+/// symlink — so nothing outside the bridge's state directory can be reached by planting a
+/// link in it. Bounded by [`CODEX_HOME_SCAN_LIMIT`]. When more than one home holds a
+/// verified rollout for the same id (a copied state directory, a restored backup), the
+/// newest wins and the ambiguity is logged rather than silently resolved.
+pub fn find_rollout_home(base: &Path, sid: &str) -> Option<PathBuf> {
+    if !is_rollout_token(sid) {
+        return None;
+    }
+    let mut hits: Vec<(PathBuf, SystemTime)> = Vec::new();
+    let mut looked = 0usize;
+    for e in std::fs::read_dir(base).ok()?.flatten() {
+        if looked >= CODEX_HOME_SCAN_LIMIT {
+            eprintln!(
+                "jesse-bridge: codex home scan stopped at {CODEX_HOME_SCAN_LIMIT} homes \
+                 looking for session {sid}"
+            );
+            break;
+        }
+        // `file_type` on the DirEntry does not follow the link, which is the point.
+        if !e.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        looked += 1;
+        let home = e.path();
+        if let Some(rollout) = rollout_in_home(&home, sid) {
+            let mtime = rollout
+                .metadata()
+                .and_then(|m| m.modified())
+                .unwrap_or(UNIX_EPOCH);
+            hits.push((home, mtime));
+        }
+    }
+    if hits.len() > 1 {
+        eprintln!(
+            "jesse-bridge: session {sid} has a rollout in {} codex homes — resuming the \
+             most recently written one",
+            hits.len()
+        );
+    }
+    hits.sort_by_key(|(_, mtime)| *mtime);
+    hits.pop().map(|(home, _)| home)
+}
+
+/// Whether `home` is a home this bridge owns: a direct, non-symlink child of `base`.
+///
+/// Both sides are resolved before comparing, so a `base` reached through a symlinked state
+/// directory (the deploy uses one) still matches its own children. A cached index entry that
+/// fails this is discarded rather than used — the index is written by this process, but it
+/// is a plain file in a directory an operator can edit.
+fn is_owned_home(base: &Path, home: &Path) -> bool {
+    let (Ok(base), Ok(home)) = (base.canonicalize(), home.canonicalize()) else {
+        return false;
+    };
+    home.parent() == Some(base.as_path()) && home.is_dir()
+}
+
+/// Bring an existing home to THIS turn's posture before it is handed to a child.
+///
+/// A home now outlives the turn that made it, so everything the old per-turn home got for
+/// free by being new has to be re-established explicitly:
+///
+///   * **The credential matches the turn, not the conversation.** A subscription turn gets a
+///     fresh copy of the canonical `auth.json` (fresh, so a re-login reaches the next turn);
+///     a turn on its own provider gets the file REMOVED. A conversation that switches models
+///     mid-thread must not leave a live OAuth token inside the reach of a turn that
+///     authenticates from the environment — that is the narrowing [`codex_turn_home`]
+///     documents, and it has to survive reuse to still be true.
+///   * **Hooks are removed first, always.** `hooks.json` is written only for a write-capable
+///     turn; left behind, it would sit in the home of a later READ turn, which emits no
+///     `--dangerously-bypass-hook-trust` and would therefore skip it *silently*. Deleting
+///     unconditionally means the file present during a turn is always the file that turn
+///     asked for.
+///
+/// Errors seeding the credential are returned; a failed hooks removal is not, because the
+/// caller re-writes the file immediately after and a stale one that cannot be deleted is
+/// caught there.
+fn prepare_home_for_turn(cfg: &Config, home: &Path, seed_credential: bool) -> std::io::Result<()> {
+    let _ = std::fs::remove_file(home.join("hooks.json"));
+    let dest = home.join("auth.json");
+    if !seed_credential {
+        match std::fs::remove_file(&dest) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        return Ok(());
+    }
+    let auth = codex_canonical_home(cfg).join("auth.json");
+    // A missing canonical credential is not an error here for the same reason it is not one
+    // in `codex_turn_home`: Codex's own "not logged in" message is the better signal.
+    if auth.is_file() {
+        std::fs::copy(&auth, &dest)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o600));
+        }
+    }
+    Ok(())
+}
+
+/// THE HOME THIS TURN RUNS IN: the conversation's own, durable across turns and restarts.
+///
+/// * **No session to resume** (a conversation's first turn, or a synthetic `local-` ledger
+///   thread that has no Codex thread behind it) → a fresh home from [`codex_turn_home`].
+///   Nothing is being continued, so nothing has to be found.
+/// * **A session to resume** → the home holding its rollout: the index cache first, then a
+///   verified [`find_rollout_home`] scan, and the mapping is persisted so the scan happens
+///   once per conversation rather than once per turn.
+/// * **A session to resume whose rollout is nowhere** → [`HarnessError::unavailable`]. NOT a
+///   fresh home: spawning one would start a blank thread under the conversation's name and
+///   the phone would show a confident answer with no memory of anything above it. A visible
+///   failure leaves the transcript intact and says what is missing.
+///
+/// The scope this ends up with is per CONVERSATION, arrived at without a conversation id: the
+/// first turn mints a home, the session that turn binds lives in it, and every later turn
+/// resolves that session back to that home. Two conversations therefore never share one, and
+/// the bridge already serialises turns WITHIN a conversation (`ConversationLocks`, taken
+/// outermost in the turn path), so nothing else is writing the home while a turn holds it.
+pub fn codex_home_for_turn(
+    cfg: &Config,
+    session_id: Option<&str>,
+    seed_credential: bool,
+) -> Result<PathBuf, HarnessError> {
+    let io_err = |e: std::io::Error| {
+        HarnessError::unsupported(CODEX_ID, format!("a per-turn home directory ({e})"))
+    };
+    let resume = session_id.filter(|sid| !is_synthetic_session_id(sid));
+    let Some(sid) = resume else {
+        return codex_turn_home(cfg, seed_credential).map_err(io_err);
+    };
+
+    let base = codex_home_base(cfg);
+    std::fs::create_dir_all(&base).map_err(io_err)?;
+    let index_path = codex_home_index_path(cfg);
+    let mut index = read_home_index(&index_path);
+
+    // The cache, re-verified: an entry naming a home that is gone, is not ours, or no longer
+    // holds the rollout is worth exactly as much as no entry at all.
+    let cached = index
+        .get(sid)
+        .map(|name| base.join(name))
+        .filter(|home| is_owned_home(&base, home) && rollout_in_home(home, sid).is_some());
+
+    let home = match cached {
+        Some(home) => home,
+        None => {
+            let found = find_rollout_home(&base, sid).ok_or_else(|| {
+                HarnessError::unavailable(
+                    CODEX_ID,
+                    format!(
+                        "this conversation's saved Codex session ({sid}) is not on this host — \
+                         no rollout for it under {}",
+                        base.display()
+                    ),
+                )
+            })?;
+            if let Some(name) = found.file_name().and_then(|n| n.to_str()) {
+                index.insert(sid.to_string(), name.to_string());
+                // BEFORE the turn runs, not after: the mapping the NEXT turn needs must
+                // survive this one crashing, being cancelled, or the host losing power.
+                persist_home_index(&index_path, &index);
+            }
+            found
+        }
+    };
+
+    prepare_home_for_turn(cfg, &home, seed_credential).map_err(io_err)?;
+    Ok(home)
+}
+
+// ---- Retention -------------------------------------------------------------------
+
+/// Reclaim homes nothing can still need, at the SAME horizon transcripts age out on
+/// (`session_ttl_days`) — so a Codex conversation's saved thread lives exactly as long as a
+/// Claude Code conversation's transcript, rather than on a second, invisible policy.
+///
+/// A home's age is the NEWEST modification time among its top-level entries and its
+/// rollouts. Codex rewrites its sqlite files and appends to the rollout on every turn, so a
+/// home in use is young by definition and a live conversation cannot be reclaimed out from
+/// under itself — the TTL is measured in days and the conversation lock is held for seconds.
+/// An empty or unreadable home is left alone: `0` would make "cannot tell" mean "delete".
+///
+/// Takes `now_secs` rather than reading the clock so it is testable against a fixed one,
+/// exactly like [`crate::sessions::sweep_expired_sessions`]. Returns the home names removed.
+pub fn sweep_expired_codex_homes(base: &Path, now_secs: u64, ttl_days: u64) -> Vec<String> {
+    let Ok(rd) = std::fs::read_dir(base) else {
+        return Vec::new();
+    };
+    let mut reclaimed = Vec::new();
+    for e in rd.flatten() {
+        if !e.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        let home = e.path();
+        let Some(newest) = newest_mtime_secs(&home) else {
+            continue;
+        };
+        if !crate::sessions::is_session_expired(newest, now_secs, ttl_days) {
+            continue;
+        }
+        let name = e.file_name().to_string_lossy().to_string();
+        match std::fs::remove_dir_all(&home) {
+            Ok(()) => reclaimed.push(name),
+            Err(err) => eprintln!("jesse-bridge: codex home GC could not remove {name}: {err}"),
+        }
+    }
+    if !reclaimed.is_empty() {
+        prune_home_index(base, &reclaimed);
+    }
+    reclaimed
+}
+
+/// The newest mtime under `home`, in unix seconds: its top-level entries (Codex's sqlite and
+/// `-wal` files, rewritten every turn) and its rollouts (appended every turn). `None` when
+/// the directory yields nothing readable, which the caller treats as "leave it alone".
+fn newest_mtime_secs(home: &Path) -> Option<u64> {
+    let mut newest: Option<SystemTime> = None;
+    let mut note = |t: SystemTime| {
+        if newest.is_none_or(|cur| t > cur) {
+            newest = Some(t);
+        }
+    };
+    for e in std::fs::read_dir(home).ok()?.flatten() {
+        if let Ok(t) = e.metadata().and_then(|m| m.modified()) {
+            note(t);
+        }
+    }
+    // Rollouts sit three levels down and are what actually proves the conversation is alive.
+    let mut level = vec![home.join("sessions")];
+    for _ in 0..3 {
+        let mut next = Vec::new();
+        for dir in &level {
+            for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+                if e.file_type().is_ok_and(|t| t.is_dir()) {
+                    next.push(e.path());
+                }
+            }
+        }
+        level = next;
+    }
+    for dir in level {
+        for e in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            if let Ok(t) = e.metadata().and_then(|m| m.modified()) {
+                note(t);
+            }
+        }
+    }
+    newest.and_then(|t| t.duration_since(UNIX_EPOCH).ok().map(|d| d.as_secs()))
+}
+
+/// Drop cache entries pointing at homes the sweep removed, so the file does not grow one
+/// dead row per reclaimed conversation forever.
+fn prune_home_index(base: &Path, removed: &[String]) {
+    let path = base.join("index.json");
+    let mut index = read_home_index(&path);
+    let before = index.len();
+    index.retain(|_, name| !removed.iter().any(|r| r == name));
+    if index.len() != before {
+        persist_home_index(&path, &index);
+    }
+}
+
 /// Write this turn's `hooks.json` into its per-turn `CODEX_HOME`. `true` if it landed.
 ///
 /// `$CODEX_HOME/hooks.json` rather than an inline `[hooks]` table in `config.toml`, and the
@@ -832,7 +1319,11 @@ pub fn codex_turn_home(cfg: &Config, seed_credential: bool) -> std::io::Result<P
 /// Codex also REFUSES to load both at once ("prefer a single representation for this layer"),
 /// so writing one and only one matters.
 ///
-/// The home is per turn and is removed with the turn, so the file needs no separate cleanup.
+/// The home now OUTLIVES the turn (it is the conversation's — see [`codex_home_for_turn`]),
+/// so this file does need cleanup: [`prepare_home_for_turn`] deletes it before every turn,
+/// and only a turn that asks for it gets one written back. Left behind it would sit in a
+/// later READ turn's home, which emits no `--dangerously-bypass-hook-trust` and would skip
+/// it SILENTLY.
 ///
 /// The matcher is `*`. Codex's tool vocabulary is not Claude Code's — its writes arrive as
 /// `apply_patch` and its shell as a native exec item — and an enumerated matcher that missed a
@@ -995,9 +1486,12 @@ pub fn build_codex_args(
 }
 
 impl Codex {
-    /// Build one child `Command`: a fresh per-turn `CODEX_HOME`, the capability's sandbox
+    /// Build one child `Command`: the conversation's `CODEX_HOME`, the capability's sandbox
     /// posture, the translated MCP set, the model's own provider (if it names one), piped
     /// stdio and `kill_on_drop`.
+    ///
+    /// Fails with [`HarnessError::unavailable`] when this turn was asked to resume a session
+    /// whose saved thread is not on this host — see [`codex_home_for_turn`].
     pub fn command(&self, cfg: &Config, req: &TurnRequest<'_>) -> Result<Command, HarnessError> {
         let mcp = codex_mcp_args(CODEX_ID, req.mcp_config, &cfg.allowed_tools)?;
         // `None` for the subscription-OAuth posture, which is every turn that came before
@@ -1006,11 +1500,12 @@ impl Codex {
         // The slug this entry declared, plus its Codex tuning. Skips the slug when the
         // provider path above is already emitting it, so it is never in the argv twice.
         let model = codex_model_args(req.active);
-        // A provider turn authenticates from the environment, so it gets a home with NO
-        // credential in it at all — see [`codex_turn_home`].
-        let home = codex_turn_home(cfg, provider.is_none()).map_err(|e| {
-            HarnessError::unsupported(CODEX_ID, format!("a per-turn home directory ({e})"))
-        })?;
+        // THE CONVERSATION'S HOME, not a fresh one per turn: `codex exec resume` looks the
+        // rollout up inside `$CODEX_HOME`, so a follow-up in a new home cannot find the
+        // thread it was asked to continue. See [`codex_home_for_turn`], which also brings an
+        // existing home to this turn's posture. A provider turn authenticates from the
+        // environment, so it gets a home with NO credential in it at all.
+        let home = codex_home_for_turn(cfg, req.session_id, provider.is_none())?;
         let mut cmd = Command::new(&cfg.codex_bin);
         // Install this turn's hooks into the per-turn home BEFORE building the argv, so the
         // trust-bypass flag is emitted only when there is actually a hooks file to trust.
@@ -2673,5 +3168,658 @@ mod tests {
         assert_eq!(granted_mcp_tools(allowed, "browser"), Vec::<String>::new());
         // A prefix that merely STARTS with another server's name is a different server.
         assert_eq!(granted_mcp_tools(allowed, "slackother"), vec!["nope"]);
+    }
+    // ---- The conversation's durable home ------------------------------------------
+    //
+    // WHAT THESE COVER AND WHAT THEY DO NOT. Everything below is the bridge's half of the
+    // contract: which home a turn is given, what is in it, and what happens when the thread
+    // it was asked to continue is not there. They assert NOTHING about codex-cli's own
+    // behaviour — that `resume` reads `$CODEX_HOME`, that a resumed thread keeps its id, that
+    // a rollout's first line carries `session_id`. Those are the CLI's, they were measured
+    // live (see [`codex_home_for_turn`]), and the tests that hold them are
+    // `tests/codex_session_home.rs` (a subprocess fixture enforcing the storage contract in
+    // CI) and its `#[ignore]`d live smoke check against the real binary. A synthetic rollout
+    // written by this module and read back by this module would prove only that it was
+    // spelled consistently.
+
+    /// A scratch state dir per TEST, not per tag: these tests scan the whole home base, so
+    /// two of them sharing one directory would see each other's homes.
+    ///
+    /// **`home` IS OVERRIDDEN, and that is not tidiness.** `test_config` leaves it at the real
+    /// `$HOME`, and [`codex_canonical_home`] resolves to `$HOME/.codex` — the operator's own
+    /// `codex login`. A test that WRITES a fake `auth.json` there destroys a live credential;
+    /// one did, during this change's own development, and the file had to be restored from a
+    /// copy. Pointing `home` at the scratch tree means the canonical this module reads and
+    /// writes is one this test made. `home_credential` re-checks that before every write.
+    fn home_scratch(tag: &str) -> (Config, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("jesse-codex-home-{tag}-{}", random_hex()));
+        std::fs::create_dir_all(&dir).expect("the scratch state dir");
+        let mut cfg = test_config();
+        cfg.state_dir = Some(dir.join("state").to_string_lossy().into_owned());
+        cfg.home = dir.to_string_lossy().into_owned();
+        (cfg, dir)
+    }
+
+    /// Plant a canonical credential for the turn path to copy — refusing, loudly, if the
+    /// path is not inside `root`.
+    ///
+    /// The guard is the point. `CODEX_HOME` in the environment wins over `cfg.home` inside
+    /// [`codex_canonical_home`], so a machine (or a CI job) that exports one would send this
+    /// write somewhere real no matter what the `Config` says. A panic is the correct outcome:
+    /// a test that cannot isolate itself must fail, not proceed.
+    fn plant_canonical_credential(cfg: &Config, root: &Path) {
+        let canonical = codex_canonical_home(cfg);
+        assert!(
+            canonical.starts_with(root),
+            "REFUSING to write a credential outside the scratch tree ({}); unset CODEX_HOME \
+             before running these tests",
+            canonical.display()
+        );
+        std::fs::create_dir_all(&canonical).expect("the scratch canonical home");
+        std::fs::write(
+            canonical.join("auth.json"),
+            r#"{"tokens":{"access_token":"scratch-only"}}"#,
+        )
+        .expect("a canonical credential to copy");
+    }
+
+    /// Plant a rollout for `sid` in `home`, in the layout codex-cli writes: a `session_meta`
+    /// first line carrying the id, under `sessions/<y>/<m>/<d>/`.
+    fn plant_rollout(home: &Path, sid: &str) -> PathBuf {
+        let dir = home.join("sessions").join("2026").join("09").join("05");
+        std::fs::create_dir_all(&dir).expect("the rollout directory");
+        let path = dir.join(format!("rollout-2026-09-05T23-05-37-{sid}.jsonl"));
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n{}\n",
+                json!({
+                    "timestamp": "2026-09-05T21:05:37.801Z",
+                    "type": "session_meta",
+                    "payload": { "session_id": sid, "id": sid, "cli_version": "0.153.4" },
+                }),
+                json!({ "type": "response_item", "payload": { "role": "user" } }),
+            ),
+        )
+        .expect("the rollout");
+        path
+    }
+
+    fn read_req<'a>(m: &'a ActiveModel, sid: Option<&'a str>) -> TurnRequest<'a> {
+        TurnRequest {
+            prompt: "hi",
+            session_id: sid,
+            active: m,
+            capability: Capability::Read,
+            cwd: std::env::temp_dir(),
+            mcp_config: EMPTY_MCP_CONFIG,
+            write_lock: None,
+            turn_id: "test-turn",
+            artifact_dir: None,
+            attachment_dir: None,
+        }
+    }
+
+    fn home_of(cmd: &Command) -> PathBuf {
+        cmd.as_std()
+            .get_envs()
+            .find(|(k, _)| *k == std::ffi::OsStr::new("CODEX_HOME"))
+            .and_then(|(_, v)| v)
+            .map(PathBuf::from)
+            .expect("every codex child is given a CODEX_HOME")
+    }
+
+    /// THE BUG, at the layer that had no test: a turn resuming a thread must be given the
+    /// home that thread's rollout is in, not a new one.
+    ///
+    /// The old builder called `codex_turn_home` unconditionally, so this was a fresh
+    /// directory on every turn and `codex exec resume` exited 1 with `no rollout found for
+    /// thread id` before the model ran. Nothing caught it, because the only resume coverage
+    /// was over `build_codex_args`, which never sees a home.
+    #[test]
+    fn a_resumed_turn_runs_in_the_home_holding_its_rollout() {
+        let (cfg, dir) = home_scratch("resume-finds-home");
+        let m = ActiveModel::ambient();
+
+        // Turn one: nothing to resume, so a fresh home — and it is the one the child would
+        // have written its rollout into.
+        let first = home_of(&Codex.command(&cfg, &read_req(&m, None)).expect("turn one"));
+        let sid = "01a07364-23d6-7ca2-be08-412ca8b41151";
+        plant_rollout(&first, sid);
+
+        // Turns two and three resume it, and both land back in that same home.
+        for turn in 2..=3 {
+            let again = home_of(
+                &Codex
+                    .command(&cfg, &read_req(&m, Some(sid)))
+                    .expect("a turn"),
+            );
+            assert_eq!(
+                again, first,
+                "turn {turn} must run where the thread it resumes was written"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The mapping is on DISK before the turn runs, so the next turn does not depend on this
+    /// process still being alive — a bridge restart between two messages must not break the
+    /// conversation.
+    ///
+    /// Simulated the only way a unit test can: resolve once, throw the whole in-memory world
+    /// away, and resolve again from nothing but the state directory.
+    #[test]
+    fn the_home_survives_a_bridge_restart() {
+        let (cfg, dir) = home_scratch("restart");
+        let m = ActiveModel::ambient();
+        let first = home_of(&Codex.command(&cfg, &read_req(&m, None)).expect("turn one"));
+        let sid = "01a07364-0000-7ca2-be08-000000000001";
+        plant_rollout(&first, sid);
+
+        let before = home_of(
+            &Codex
+                .command(&cfg, &read_req(&m, Some(sid)))
+                .expect("turn two"),
+        );
+        assert!(
+            codex_home_index_path(&cfg).is_file(),
+            "the mapping the next turn needs must be persisted BEFORE that turn, not after"
+        );
+
+        // A "restart": a brand new Config over the same state directory, nothing carried.
+        let mut restarted = test_config();
+        restarted.state_dir = cfg.state_dir.clone();
+        restarted.home = cfg.home.clone();
+        let after = home_of(
+            &Codex
+                .command(&restarted, &read_req(&m, Some(sid)))
+                .expect("turn three, after a restart"),
+        );
+        assert_eq!(after, before, "a restart must not lose the conversation");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The index is a CACHE, so deleting it must cost a scan and nothing else. This is what
+    /// makes it safe to write best-effort.
+    #[test]
+    fn a_lost_index_is_rebuilt_from_the_rollouts() {
+        let (cfg, dir) = home_scratch("index-lost");
+        let m = ActiveModel::ambient();
+        let first = home_of(&Codex.command(&cfg, &read_req(&m, None)).expect("turn one"));
+        let sid = "01a07364-0000-7ca2-be08-000000000002";
+        plant_rollout(&first, sid);
+        let _ = Codex.command(&cfg, &read_req(&m, Some(sid)));
+
+        std::fs::remove_file(codex_home_index_path(&cfg)).expect("drop the cache");
+        let again = home_of(
+            &Codex
+                .command(&cfg, &read_req(&m, Some(sid)))
+                .expect("a turn"),
+        );
+        assert_eq!(
+            again, first,
+            "the rollouts are the authority, not the index"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// RECOVERY OF A CONVERSATION THAT WAS ALREADY BROKEN. Every conversation started before
+    /// this change has its first turn's rollout sitting in the single-turn home that turn
+    /// created, and no index entry anywhere — that is exactly the pre-fix state on the live
+    /// host. The follow-up that never worked must now find it.
+    ///
+    /// The decoys matter as much as the hit: the scan has to pick the right home out of a
+    /// base full of the other conversations' homes, not just find *a* rollout.
+    #[test]
+    fn a_pre_fix_conversation_is_recovered_by_scanning_the_existing_homes() {
+        let (cfg, dir) = home_scratch("pre-fix");
+        let base = codex_home_base(&cfg);
+        std::fs::create_dir_all(&base).expect("the base");
+
+        // Nine other conversations' homes, plus one empty one and one with no sessions dir
+        // at all — the shapes a real state directory actually holds.
+        for i in 0..9 {
+            let other = base.join(uuid::Uuid::new_v4().to_string());
+            std::fs::create_dir_all(&other).expect("a decoy home");
+            plant_rollout(&other, &format!("01a07364-dead-7ca2-be08-00000000000{i}"));
+        }
+        std::fs::create_dir_all(base.join(uuid::Uuid::new_v4().to_string())).expect("an empty");
+
+        let wanted = base.join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&wanted).expect("the real home");
+        let sid = "01a07364-23d6-7ca2-be08-412ca8b41151";
+        plant_rollout(&wanted, sid);
+
+        let m = ActiveModel::ambient();
+        let got = home_of(
+            &Codex
+                .command(&cfg, &read_req(&m, Some(sid)))
+                .expect("the follow-up"),
+        );
+        assert_eq!(
+            got, wanted,
+            "the follow-up must land in ITS conversation's home"
+        );
+
+        // And the recovery is persisted, so it is a one-time scan rather than one per turn.
+        let index = read_home_index(&codex_home_index_path(&cfg));
+        assert_eq!(
+            index.get(sid).map(String::as_str),
+            wanted.file_name().and_then(|n| n.to_str()),
+            "the recovered mapping must be written down: {index:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A ROLLOUT THAT IS NOT THERE IS AN ERROR, NEVER A FRESH THREAD.
+    ///
+    /// The tempting fallback — mint a home and carry on — produces a child that answers
+    /// confidently with no memory of anything above it, under the conversation's own name and
+    /// title. The user cannot tell that from a model that forgot. A failed turn leaves the
+    /// visible transcript intact and says what is missing.
+    #[test]
+    fn a_missing_rollout_fails_the_turn_instead_of_starting_a_blank_one() {
+        let (cfg, dir) = home_scratch("missing");
+        let m = ActiveModel::ambient();
+        let sid = "01a07364-0000-7ca2-be08-00000000dead";
+        let err = Codex
+            .command(&cfg, &read_req(&m, Some(sid)))
+            .expect_err("a thread with no saved state must not be silently replaced");
+        assert_eq!(err.kind, HarnessErrorKind::Unavailable, "{err}");
+        assert!(err.what.contains(sid), "the operator needs the id: {err}");
+        assert!(
+            std::fs::read_dir(codex_home_base(&cfg))
+                .map(|rd| rd.flatten().all(|e| e.file_name() == "index.json"))
+                .unwrap_or(true),
+            "a refused turn must not leave a home behind"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A SYNTHETIC `local-` ID NAMES NO CODEX THREAD, so it must take the fresh-home path
+    /// rather than the lookup — otherwise every context-carry turn would fail the way a
+    /// genuinely missing rollout does.
+    #[test]
+    fn a_synthetic_session_takes_a_fresh_home_rather_than_a_lookup() {
+        let (cfg, dir) = home_scratch("synthetic");
+        let m = ActiveModel::ambient();
+        let home = home_of(
+            &Codex
+                .command(&cfg, &read_req(&m, Some("local-abc123")))
+                .expect("a synthetic id never resumes and never fails a turn"),
+        );
+        assert!(home.is_dir());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// TWO CONVERSATIONS NEVER SHARE A HOME. This is the isolation claim that did NOT
+    /// narrow when the home stopped being per-turn, and it is the one worth a test: a shared
+    /// home would cross two people's threads, their settings and their history.
+    #[test]
+    fn two_conversations_get_two_homes_and_keep_them() {
+        let (cfg, dir) = home_scratch("two-conversations");
+        let m = ActiveModel::ambient();
+        let (a_home, b_home) = (
+            home_of(
+                &Codex
+                    .command(&cfg, &read_req(&m, None))
+                    .expect("A turn one"),
+            ),
+            home_of(
+                &Codex
+                    .command(&cfg, &read_req(&m, None))
+                    .expect("B turn one"),
+            ),
+        );
+        assert_ne!(a_home, b_home, "two first turns must not collide");
+        let (a_sid, b_sid) = (
+            "01a07364-aaaa-7ca2-be08-000000000001",
+            "01a07364-bbbb-7ca2-be08-000000000002",
+        );
+        plant_rollout(&a_home, a_sid);
+        plant_rollout(&b_home, b_sid);
+
+        // Interleaved, the way two phone threads actually arrive.
+        for _ in 0..2 {
+            assert_eq!(
+                home_of(&Codex.command(&cfg, &read_req(&m, Some(a_sid))).expect("A")),
+                a_home
+            );
+            assert_eq!(
+                home_of(&Codex.command(&cfg, &read_req(&m, Some(b_sid))).expect("B")),
+                b_home
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A CANCELLED TURN LEAVES THE CONVERSATION RESUMABLE. Cancellation kills the child
+    /// (`kill_on_drop`) after the home was resolved and the mapping written, so the retry
+    /// must find the same home — the mapping is persisted BEFORE the spawn precisely so a
+    /// turn that never completes cannot cost the conversation its continuity.
+    #[test]
+    fn a_cancelled_turn_is_retried_into_the_same_home() {
+        let (cfg, dir) = home_scratch("cancelled");
+        let m = ActiveModel::ambient();
+        let first = home_of(&Codex.command(&cfg, &read_req(&m, None)).expect("turn one"));
+        let sid = "01a07364-0000-7ca2-be08-00000000cafe";
+        plant_rollout(&first, sid);
+
+        // Built, then dropped without ever being spawned: exactly what a cancel between
+        // admission and spawn leaves behind.
+        drop(
+            Codex
+                .command(&cfg, &read_req(&m, Some(sid)))
+                .expect("the cancelled turn"),
+        );
+        let retry = home_of(
+            &Codex
+                .command(&cfg, &read_req(&m, Some(sid)))
+                .expect("the retry"),
+        );
+        assert_eq!(retry, first, "a cancel must not strand the conversation");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// THE CREDENTIAL FOLLOWS THE TURN, NOT THE CONVERSATION.
+    ///
+    /// A per-turn home got this for free by being empty. A reused one does not: a
+    /// conversation that switches from the subscription login to a model on its own provider
+    /// would otherwise leave a live OAuth token in the home of a turn that authenticates from
+    /// the environment and has no use for it. Both directions, because switching back has to
+    /// work too.
+    #[test]
+    fn a_reused_home_carries_only_this_turns_credential() {
+        let (cfg, dir) = home_scratch("credential-swap");
+        plant_canonical_credential(&cfg, &dir);
+
+        let subscription = ActiveModel::ambient();
+        let provider = openai_model("https://api.example/v1", "slug", "sk-secret");
+        let home = home_of(
+            &Codex
+                .command(&cfg, &read_req(&subscription, None))
+                .expect("turn one"),
+        );
+        assert!(
+            home.join("auth.json").is_file(),
+            "a subscription turn needs it"
+        );
+        let sid = "01a07364-0000-7ca2-be08-0000000c0ffe";
+        plant_rollout(&home, sid);
+
+        let _ = Codex
+            .command(&cfg, &read_req(&provider, Some(sid)))
+            .expect("the provider turn");
+        assert!(
+            !home.join("auth.json").exists(),
+            "a provider turn must not be handed the subscription's OAuth token"
+        );
+
+        let _ = Codex
+            .command(&cfg, &read_req(&subscription, Some(sid)))
+            .expect("back to the subscription");
+        assert!(
+            home.join("auth.json").is_file(),
+            "and switching back must restore it, or the conversation cannot authenticate"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A WRITE TURN'S HOOKS MUST NOT OUTLIVE IT. Left behind, `hooks.json` would sit in the
+    /// home of a later READ turn — which emits no `--dangerously-bypass-hook-trust`, so Codex
+    /// would skip it SILENTLY. That is not a leak so much as a lie: the file is there, the
+    /// bridge did not ask for it, and nothing says it was ignored.
+    #[test]
+    fn a_read_turn_never_inherits_the_previous_turns_hooks() {
+        let (cfg, dir) = home_scratch("hooks-stale");
+        let m = ActiveModel::ambient();
+        let home = home_of(&Codex.command(&cfg, &read_req(&m, None)).expect("turn one"));
+        let sid = "01a07364-0000-7ca2-be08-000000000hoo";
+        plant_rollout(&home, sid);
+        std::fs::write(home.join("hooks.json"), "{\"hooks\":{}}").expect("a stale hooks file");
+
+        let cmd = Codex
+            .command(&cfg, &read_req(&m, Some(sid)))
+            .expect("the read turn");
+        assert!(
+            !home.join("hooks.json").exists(),
+            "the file present during a turn must be the file that turn asked for"
+        );
+        let argv: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !argv.contains(&"--dangerously-bypass-hook-trust".to_string()),
+            "and a read turn still emits no trust bypass: {argv:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// AND A RESUMED WRITE TURN STILL GETS ITS LOCK. The removal above is only half the
+    /// contract; this is the half that protects the vault. A write turn on a home that
+    /// already existed must have `hooks.json` written into it and
+    /// `--dangerously-bypass-hook-trust` on its argv — the pair `Codex::supports_write_lock`
+    /// declares, and which `resolve_slot_plan`'s fail-safe cap reads.
+    #[test]
+    fn a_resumed_write_turn_still_installs_its_lock_hooks() {
+        let (cfg, dir) = home_scratch("hooks-resumed-write");
+        let m = ActiveModel::ambient();
+        let home = home_of(&Codex.command(&cfg, &read_req(&m, None)).expect("turn one"));
+        let sid = "01a07364-0000-7ca2-be08-0000000w1ock";
+        plant_rollout(&home, sid);
+
+        let wl = WriteLockChild {
+            socket: dir.join("lock.sock"),
+            turn: "turn-1".to_string(),
+            conversation: "conv-1".to_string(),
+            helper: dir.join("jesse-hook"),
+        };
+        let req = TurnRequest {
+            capability: Capability::Write,
+            write_lock: Some(&wl),
+            ..read_req(&m, Some(sid))
+        };
+        let cmd = Codex.command(&cfg, &req).expect("the resumed write turn");
+
+        let hooks = std::fs::read_to_string(home.join("hooks.json")).expect("a hooks file");
+        assert!(
+            hooks.contains("PreToolUse") && hooks.contains("PostToolUse"),
+            "{hooks}"
+        );
+        assert!(
+            hooks.contains("--conversation 'conv-1'"),
+            "the hook must carry THIS turn's broker wiring, not an earlier turn's: {hooks}"
+        );
+        let argv: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            argv.contains(&"--dangerously-bypass-hook-trust".to_string()),
+            "an untrusted hooks file is skipped SILENTLY, so the flag and the file travel \
+             together or the lock is a lie: {argv:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The rollout is matched by what it SAYS it is, not only by what it is called. A
+    /// filename match alone would let a file someone else named be resumed as this
+    /// conversation — which is a cross-conversation history leak, not a failed turn.
+    #[test]
+    fn a_rollout_that_names_another_session_is_not_a_match() {
+        let (cfg, dir) = home_scratch("verify-meta");
+        let base = codex_home_base(&cfg);
+        let home = base.join(uuid::Uuid::new_v4().to_string());
+        let sdir = home.join("sessions").join("2026").join("09").join("05");
+        std::fs::create_dir_all(&sdir).expect("the rollout dir");
+        let sid = "01a07364-0000-7ca2-be08-0000000000ff";
+        // Named for `sid`, but its meta line declares a different session.
+        std::fs::write(
+            sdir.join(format!("rollout-2026-09-05T23-05-37-{sid}.jsonl")),
+            format!(
+                "{}\n",
+                json!({ "type": "session_meta", "payload": { "session_id": "someone-else" } })
+            ),
+        )
+        .expect("the mislabelled rollout");
+
+        assert!(rollout_in_home(&home, sid).is_none());
+        assert!(find_rollout_home(&base, sid).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The id becomes a filename suffix, so it has to be a token that cannot steer the
+    /// lookup out of the bridge's state directory.
+    #[test]
+    fn only_a_path_safe_token_is_ever_looked_up() {
+        assert!(is_rollout_token("01a07364-23d6-7ca2-be08-412ca8b41151"));
+        assert!(is_rollout_token("local_thing-1"));
+        for bad in [
+            "",
+            "../../etc/passwd",
+            "a/b",
+            "a b",
+            "a\0b",
+            &"x".repeat(65),
+        ] {
+            assert!(
+                !is_rollout_token(bad),
+                "{bad:?} must not reach the filesystem"
+            );
+        }
+    }
+
+    /// An index entry pointing somewhere that is not one of the bridge's own homes is
+    /// discarded rather than followed. The file is written by this process, but it is a plain
+    /// file in a directory an operator can edit.
+    #[test]
+    fn an_index_entry_outside_the_home_base_is_ignored() {
+        let (cfg, dir) = home_scratch("index-escape");
+        let base = codex_home_base(&cfg);
+        std::fs::create_dir_all(&base).expect("the base");
+        let outside = dir.join("elsewhere");
+        std::fs::create_dir_all(&outside).expect("a directory outside the base");
+        let sid = "01a07364-0000-7ca2-be08-0000000000e5";
+        plant_rollout(&outside, sid);
+
+        let mut index = std::collections::BTreeMap::new();
+        index.insert(sid.to_string(), "../elsewhere".to_string());
+        persist_home_index(&codex_home_index_path(&cfg), &index);
+
+        let m = ActiveModel::ambient();
+        let err = Codex
+            .command(&cfg, &read_req(&m, Some(sid)))
+            .expect_err("an entry outside the base is not a home this bridge owns");
+        assert_eq!(err.kind, HarnessErrorKind::Unavailable, "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// RETENTION. A home ages out on the SAME horizon a transcript does, and — the half worth
+    /// a test — an ACTIVE conversation's home never does, because Codex touches it on every
+    /// turn. "Cannot tell" must not mean "delete" either.
+    #[test]
+    fn the_sweep_reclaims_only_homes_nothing_can_still_need() {
+        let (cfg, dir) = home_scratch("retention");
+        let base = codex_home_base(&cfg);
+        std::fs::create_dir_all(&base).expect("the base");
+        // The real clock, because the homes below are created with real mtimes: a fixed
+        // `now` in the future would make every one of them look aged.
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("after the epoch")
+            .as_secs();
+        let ttl = 30u64;
+
+        let fresh = base.join("fresh");
+        std::fs::create_dir_all(&fresh).expect("a live home");
+        plant_rollout(&fresh, "01a07364-0000-7ca2-be08-00000000live");
+
+        let old = base.join("old");
+        std::fs::create_dir_all(&old).expect("an aged home");
+        plant_rollout(&old, "01a07364-0000-7ca2-be08-0000000000ld");
+        backdate_tree(&old, now - (ttl + 5) * 86_400);
+
+        let empty = base.join("empty");
+        std::fs::create_dir_all(&empty).expect("a home with nothing in it");
+
+        let reclaimed = sweep_expired_codex_homes(&base, now, ttl);
+        assert_eq!(reclaimed, vec!["old".to_string()], "only the aged one");
+        assert!(fresh.is_dir(), "a conversation in use is never reclaimed");
+        assert!(empty.is_dir(), "an empty home is left alone, not deleted");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The sweep also drops the cache rows for the homes it removed, so `index.json` does not
+    /// grow one dead entry per reclaimed conversation forever.
+    #[test]
+    fn the_sweep_prunes_the_index_rows_it_orphaned() {
+        let (cfg, dir) = home_scratch("retention-index");
+        let base = codex_home_base(&cfg);
+        std::fs::create_dir_all(&base).expect("the base");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("after the epoch")
+            .as_secs();
+
+        let old = base.join("old");
+        std::fs::create_dir_all(&old).expect("an aged home");
+        let sid = "01a07364-0000-7ca2-be08-00000000gone";
+        plant_rollout(&old, sid);
+        let mut index = std::collections::BTreeMap::new();
+        index.insert(sid.to_string(), "old".to_string());
+        index.insert("still-here".to_string(), "fresh".to_string());
+        persist_home_index(&codex_home_index_path(&cfg), &index);
+        backdate_tree(&old, now - 40 * 86_400);
+
+        sweep_expired_codex_homes(&base, now, 30);
+        let after = read_home_index(&codex_home_index_path(&cfg));
+        assert!(!after.contains_key(sid), "the dead row must go: {after:?}");
+        assert!(
+            after.contains_key("still-here"),
+            "and only that one: {after:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Backdate every mtime under `root` past the retention horizon. `std::fs` cannot set an
+    /// mtime and pulling a crate in for one test helper is not worth it, so this shells out
+    /// to `touch`, with a UTC stamp both the BSD and the GNU implementation accept.
+    fn backdate_tree(root: &Path, secs: u64) {
+        let out = std::process::Command::new("find")
+            .arg(root)
+            .args(["-exec", "touch", "-d", &format_utc(secs), "{}", "+"])
+            .output()
+            .expect("find + touch");
+        assert!(
+            out.status.success(),
+            "backdate: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// `secs` as `YYYY-MM-DDTHH:MM:SSZ`, which BSD and GNU `touch -d` both accept. A tiny
+    /// civil-from-days conversion rather than a date crate, for one test helper.
+    fn format_utc(secs: u64) -> String {
+        let (days, rem) = ((secs / 86_400) as i64, secs % 86_400);
+        // Howard Hinnant's civil_from_days.
+        let z = days + 719_468;
+        let era = z.div_euclid(146_097);
+        let doe = z.rem_euclid(146_097);
+        let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+        let y = yoe + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = doy - (153 * mp + 2) / 5 + 1;
+        let m = if mp < 10 { mp + 3 } else { mp - 9 };
+        let y = if m <= 2 { y + 1 } else { y };
+        format!(
+            "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
+            rem / 3600,
+            (rem % 3600) / 60,
+            rem % 60
+        )
     }
 }

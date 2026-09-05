@@ -2253,9 +2253,18 @@ async fn run_row(
 
             // THE TURN'S OWN `CODEX_HOME`, read back off the command the harness built.
             //
-            // Taken from the command rather than recomputed, because the harness MINTS a
-            // fresh per-turn home (a uuid under the state dir) and nothing else can name it.
-            // Read BEFORE the spawn: `run_probe_child` consumes the command.
+            // Taken from the command rather than recomputed, because the harness picks the
+            // home (a uuid under the state dir) and nothing else can name it. Read BEFORE the
+            // spawn: `run_probe_child` consumes the command.
+            //
+            // **THE HOME IS THIS TURN'S ALONE, which is what makes "the rollouts in it" mean
+            // "this turn's calls".** Since bridge 0.120.0 a Codex home is scoped to a
+            // CONVERSATION rather than to a turn, and a resumed turn therefore runs in a home
+            // that already holds a rollout. A probe turn resumes nothing (`session_id: None`
+            // above), so it still gets a freshly minted, empty home and `rollout_files` still
+            // sees exactly one file — but the guarantee is now a property of THIS call site
+            // rather than of the harness, so it is named here rather than assumed. A probe
+            // that ever carried a session would need to read only the rollout for that id.
             //
             // This is the directory Codex writes its rollout into, and that rollout is the
             // only witness of a shell command the sandbox refused — see

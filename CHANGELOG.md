@@ -14,6 +14,115 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [bridge 0.120.0] - 2026-09-06
+
+**A Codex follow-up has never worked.** A first question answers; the second message in the
+same conversation comes back as `codex failed (no JSON envelope)`, with `Error: thread/resume:
+thread/resume failed: no rollout found for thread id <id>` and code `-32600` on the child's
+stderr. Nothing is wrong with the model, the credential, or the argv — the bridge points each
+turn at a directory the previous turn's thread is not in.
+
+**Two bugs in a row, which is why this one hid for so long.** The harness landed in 0.50.0
+with both: `-C` emitted after `resume`, which clap rejected outright, and the per-turn home.
+0.59.0 fixed the first, and every follow-up went on failing — with a different message, one
+layer further in. That fix is preserved here and still tested; this is the layer underneath
+it, and the failure has been continuous from 0.50.0 through 0.119.0.
+
+### Fixed
+
+- **A Codex conversation now runs every turn in one `CODEX_HOME`, so `codex exec resume` can
+  find the thread it was told to continue.** `codex_turn_home` minted a fresh UUID directory
+  on every invocation and `Codex::command` assigned it unconditionally, INCLUDING when the
+  request carried a session to resume. Codex stores a thread's rollout inside `$CODEX_HOME`
+  and offers no flag pointing anywhere else (checked against `codex exec resume --help` on
+  codex-cli 0.153.4: the only positional is the session id, and the only storage flag is
+  `--ephemeral`, which turns persistence off) — so the second process searched a new,
+  empty home for a session the first had written somewhere else, and exited 1 before the
+  model ran.
+
+  Measured live on 0.153.4 in an isolated pair of homes rather than reasoned about: turn one
+  in home A wrote `A/sessions/2026/09/05/rollout-<ts>-<id>.jsonl`; resuming that id in a fresh
+  home B produced the exact stderr line above; resuming it in home A answered from turn one's
+  context; and copying the single rollout file into B made B resume it too. Two further
+  measurements shape the fix — a resumed turn keeps the SAME thread id and appends to the
+  same rollout, and the id is in both the filename and the first line's
+  `session_meta.payload.session_id`.
+
+  **The scope is per CONVERSATION, and it is reached without a conversation id.** The first
+  turn mints a home the way it always did; the session that turn binds lives in it; every
+  later turn resolves that session back to that home, through a persisted cache over an
+  authoritative scan of the rollouts themselves. Two conversations therefore never share a
+  home, and the bridge already serialises turns within one (`ConversationLocks`, taken
+  outermost in the turn path), so nothing else writes a home while a turn holds it.
+
+- **Conversations that were already broken are recovered, with no migration step.** Every
+  thread started before this change has its first turn's rollout still sitting in the
+  single-turn home that turn created — the live host had 92 such homes. A bounded scan of the
+  bridge's own home base finds it by session identity, verified against the rollout's own
+  `session_meta` rather than its filename, and persists the mapping so the scan happens once
+  per conversation. Only direct, non-symlink children of the home base are considered and the
+  session id is rejected unless it is a path-safe token, so nothing can steer the lookup out
+  of the state directory.
+
+- **A thread whose saved state is gone now fails the turn instead of silently starting a
+  blank one.** The tempting fallback — mint a home and carry on — produces a fluent answer
+  under the conversation's own name with no memory of anything above it, which a user cannot
+  distinguish from a model that forgot. It returns a `HarnessError::unavailable` (a new
+  variant, so a missing-STATE refusal reads differently from a cannot-express-it one), the
+  visible transcript is untouched, and the message names the session and where it was
+  looked for.
+
+### Changed
+
+- **What a per-turn directory used to give for free is now explicit, once per turn.** A home
+  that outlives its turn cannot rely on being empty, so before every turn the credential is
+  re-seeded from the canonical (a subscription turn) or REMOVED (a turn on its own provider,
+  which authenticates from the environment and must never be handed the subscription's OAuth
+  token), and `hooks.json` is deleted so a write turn's hooks cannot linger into a later read
+  turn — where, with no `--dangerously-bypass-hook-trust` on the argv, Codex would skip them
+  silently.
+
+- **`CODEX_HOME` directories are reclaimed by the session GC**, at the same `session_ttl_days`
+  horizon transcripts age out on, rather than accumulating forever as they had been. A home's
+  age is the newest mtime among its top-level entries and its rollouts; Codex rewrites both on
+  every turn, so a conversation in use is young by definition and cannot be swept out from
+  under itself. An empty or unreadable home is left alone — "cannot tell" must not mean
+  "delete". The sweep also drops the cache rows for the homes it removed.
+
+- **No argv changed.** `bridge/tests/fixtures/argv-before-split.json` still matches byte for
+  byte, so the containment record, the startup gate and every recorded capability argument are
+  untouched. The August fix that keeps `-C` ahead of `resume` is preserved and still tested.
+
+### Testing
+
+- **`bridge/tests/codex_session_home.rs`**, at the layer that had none: command construction
+  plus the filesystem lookup behind it. A `/bin/sh` stand-in implements the one property of
+  codex-cli this fix depends on — a rollout lives in `$CODEX_HOME` and `resume` fails when it
+  is not there, with the real binary's message and exit status — while everything from
+  `Codex::command` down through the real `CodexParser` and `ConversationStore` is the shipping
+  code. Three turns each recalling the last, resume across a bridge restart, two interleaved
+  conversations with no crossed history, recovery of a pre-fix conversation out of nine
+  decoys, a missing thread refused rather than reset, a cancelled turn retried into the same
+  home, and containment preserved on a resumed child. Each of the six conversation-level tests
+  was confirmed to FAIL against the old builder. Fifteen in-crate unit tests cover the lookup,
+  the index, path safety, the credential swap, the hooks in both directions, and the sweep.
+
+- **A live check against the real binary**, `#[ignore]`d because it spends a credential, is
+  the oracle the fixture is not: it asserts on codex-cli itself that a rollout is stored under
+  the home it was given, that resuming in a different home fails, and that resuming in the
+  right one recalls the marker and keeps the thread id. Run on the Studio against 0.153.4 and
+  passing. **A green CI run is not on its own a statement about a new CLI version** — the
+  fixture models the binary and cannot vouch for it.
+
+- **Two test comments corrected for claiming more than they covered.**
+  `a_codex_conversation_resumes_across_three_turns` called itself "the whole safety net for
+  Codex resume"; it feeds synthetic events to the argv builder, never builds a child, and
+  therefore could not have seen this bug. Its aside that a resumed turn necessarily reports a
+  NEW thread id is also wrong on 0.153.4 — the id is reused — so the store's forward-tracking
+  rule is now documented as a property of the store rather than as a claim about the CLI.
+  `install_write_lock_hooks` said its home "is removed with the turn", which was never true:
+  nothing removed one.
+
 ## [bridge 0.119.0] - 2026-09-05
 
 **The battery can see a command the sandbox refused again, and Codex's record is re-recorded

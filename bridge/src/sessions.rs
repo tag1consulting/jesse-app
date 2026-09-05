@@ -209,8 +209,10 @@ pub fn sweep_expired_sessions(dir: &Path, now_secs: u64, ttl_days: u64) -> Vec<(
 /// skipped; its conversations still age out by the record rule below, exactly like a
 /// conversation whose turn failed before writing anything.
 ///
-/// Two phases. First the transcript sweep, unchanged: every `*.jsonl` older than the
-/// TTL is unlinked. Then the CONVERSATION sweep: a record whose bound transcripts are
+/// Three phases. First the transcript sweep, unchanged: every `*.jsonl` older than the
+/// TTL is unlinked. Then the CODEX HOME sweep, which is the same reclaim for the harness
+/// that contributes no transcript directory at all. Then the CONVERSATION sweep: a record
+/// whose bound transcripts are
 /// all gone and whose `registered_ms` is itself past the TTL is dropped, together with
 /// its title and flag rows (both now keyed on the conversation id, so a reclaimed id
 /// can't linger in `titles.json` / `flags.json` and resurrect a stale title or
@@ -240,6 +242,20 @@ pub fn run_session_gc(
         eprintln!(
             "jesse-bridge: session GC swept {} orphaned session(s) older than {} days",
             reclaimed.len(),
+            cfg.session_ttl_days
+        );
+    }
+
+    // The Codex harness keeps no bridge-readable transcript, so the sweep above never sees
+    // it. Its durable state is the per-conversation `CODEX_HOME` holding the thread's
+    // rollout, and it ages out here on the SAME horizon rather than on a second, invisible
+    // policy. See `sweep_expired_codex_homes` for why a live conversation cannot be caught
+    // by it.
+    let homes = sweep_expired_codex_homes(&codex_home_base(cfg), now, cfg.session_ttl_days);
+    if !homes.is_empty() {
+        eprintln!(
+            "jesse-bridge: session GC reclaimed {} codex home(s) older than {} days",
+            homes.len(),
             cfg.session_ttl_days
         );
     }
