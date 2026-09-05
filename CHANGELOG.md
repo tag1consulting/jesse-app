@@ -14,6 +14,55 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [bridge 0.117.0] - 2026-09-05
+
+**The Claude Code containment record, re-recorded against the CLI that is actually installed.**
+No posture change: not one grant, flag or MCP set moves here. The record moved because the
+world under it did.
+
+### Fixed
+
+- **A deploy of 0.116.0 failed its health gate and rolled itself back**, because `claude`
+  auto-updated from 2.1.252 to 2.1.261 during the day and the committed record still pinned
+  2.1.252. A freshly-booted bridge re-reads `claude --version`, reports the record stale, and
+  the sentinel treats a harness that became stale ACROSS a deploy as a failed deploy. It
+  staged, swapped, restarted, caught it in two seconds and was back on the previous bridge
+  twelve seconds later, all five binaries restored. The mechanism worked; the record was the
+  thing that was wrong.
+
+  **The old bridge looked clean only because it booted before the update.** Staleness is
+  computed live from `claude --version` at each health call, but the process that had been up
+  since 09:56 had answered "not stale" all day against a CLI that no longer existed. The
+  deploy is what forced the question.
+
+  Re-recorded: 64 probes, `gate = pass`, $16.74, claude **2.1.261**, against the sixteen-server
+  set current `main` ships — `…+build+places+inbound`, so this is also the first Claude Code
+  record taken since `inbound` joined in 0.115.0.
+
+### Notes
+
+- **One baseline CLOSED and it is not a claim that anything tightened.**
+  `read_agent_credential` at `write/…+inbound` was `allowed`/`known_open` and came back
+  `denied`. That is a write-row read escape, the family already recorded as flipping run to
+  run on this harness, so the honest reading is "the flaky one landed on the closed side
+  today". The record says what it measured.
+
+  The two remaining `known_open` rows there — `network_outbound` and `background_process` —
+  are unchanged and still carry no `[[accepted]]` entry. That was true before this change and
+  is not this change's to sign.
+
+- **`containment-codex.toml` is untouched.** Its `binary_version` still pins codex-cli 0.146.0
+  against an installed 0.153.4, so the bridge will keep reporting `codex` stale — deliberately.
+  Re-recording it on 0.153.4 moves ten probes from `denied` to `inconclusive` and costs Codex
+  its `read` grant (see the 0.117.0 notes on the battery fixes). Because `codex` is stale
+  BEFORE and after, the sentinel's deploy gate filters it and does not trip: the gate guards
+  against a deploy INTRODUCING staleness, not against staleness in general.
+
+- **This will recur.** Nothing pins the `claude` CLI, so the next auto-update re-stales this
+  record and the next deploy after that rolls back the same way. The cheap fix is to pin the
+  version; the alternative is to keep rediscovering it at deploy time, which is how this one
+  was found.
+
 ## [bridge 0.116.0] - 2026-09-05
 
 **A Codex model declared on the subscription login now actually runs on the model it names,
