@@ -79,8 +79,39 @@ fn fixture_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/argv-before-split.json")
 }
 
+/// The resume id the `main-*-resume` rows are built with. Named because it is now a
+/// PRECONDITION as well as an argument: Codex's builder refuses a turn whose thread has no
+/// saved rollout, so [`seed_codex_rollout`] has to put one where the lookup will find it.
+const RESUME_SESSION: &str = "sess-1";
+
+/// Give the Codex builder a home holding `RESUME_SESSION`'s rollout, in the layout codex-cli
+/// writes.
+///
+/// **This changes nothing this fixture captures**, which is the point of doing it here rather
+/// than weakening the assertion: the home is an env VALUE, and values are never recorded. It
+/// exists because since bridge 0.120.0 a resumed Codex turn runs in the home that thread's
+/// rollout is in, and a turn whose thread is nowhere is refused outright — so without a
+/// rollout on disk the `main-write-resume` row could not be BUILT at all, and the resume
+/// argv this file exists to pin would stop being covered.
+fn seed_codex_rollout(cfg: &Config) {
+    let dir = codex_home_base(cfg)
+        .join("fixture-home")
+        .join("sessions/2026/09/05");
+    std::fs::create_dir_all(&dir).expect("the rollout directory");
+    std::fs::write(
+        dir.join(format!(
+            "rollout-2026-09-05T00-00-00-{RESUME_SESSION}.jsonl"
+        )),
+        format!(
+            "{}\n",
+            json!({ "type": "session_meta", "payload": { "session_id": RESUME_SESSION } })
+        ),
+    )
+    .expect("the rollout");
+}
+
 /// A config whose every argv-visible value is FIXED, so the capture is identical on every
-/// machine. `state_dir` is a real temp directory because Codex's builder creates a per-turn
+/// machine. `state_dir` is a real temp directory because Codex's builder creates a
 /// `CODEX_HOME` under it — that path is an env VALUE, so it is never captured.
 fn fixture_config() -> Config {
     let mut cfg = common::test_config();
@@ -143,6 +174,7 @@ fn capture(cmd: &Command) -> Value {
 /// broken once.
 fn rows() -> Value {
     let cfg = fixture_config();
+    seed_codex_rollout(&cfg);
     let ambient = ActiveModel::ambient();
     let mut out = serde_json::Map::new();
     for id in KNOWN_HARNESS_IDS {
@@ -191,7 +223,7 @@ fn rows() -> Value {
                 main_turn_request(
                     &cfg,
                     "PROMPT",
-                    Some("sess-1"),
+                    Some(RESUME_SESSION),
                     &ambient,
                     Capability::Write,
                     mcp,

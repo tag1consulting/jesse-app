@@ -298,8 +298,11 @@ pub struct WriteLockChild {
     /// This TURN's key — the job id. What [`crate::LockBroker::release_turn`] releases.
     pub turn: String,
     /// This CONVERSATION's id, which keys the compare-and-swap read baselines. Not the
-    /// harness's own session id: a Codex turn gets a fresh `CODEX_HOME` every turn, so a
-    /// baseline keyed on the harness's own state would not survive a resume.
+    /// harness's own session id, which is a per-harness identifier the baseline has no
+    /// business depending on: the two harnesses key their threads differently, and a
+    /// resumed turn may or may not report the id it was given (Claude Code forks to a new
+    /// transcript stem; codex-cli 0.153.4 reuses the thread id). The conversation is the one
+    /// identity that means the same thing on both and across a resume.
     pub conversation: String,
     /// The `jesse-hook` helper binary, resolved once at startup.
     pub helper: PathBuf,
@@ -364,19 +367,44 @@ fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
+/// WHY A REFUSAL IS TWO DIFFERENT THINGS, and why the distinction is in the type.
+///
+/// [`HarnessErrorKind::Unsupported`] is a WIRING fault: the caller asked for a request shape
+/// this harness has no way to express, and no amount of retrying or waiting changes that.
+/// [`HarnessErrorKind::Unavailable`] is a STATE fault: the request is expressible and the
+/// harness would normally serve it, but the state it needs is not on this host right now.
+///
+/// They read differently to an operator and they imply different next steps ("fix the
+/// config" vs "this conversation's saved state is gone"), so a single sentence covering
+/// both would have to be vague enough to be useless for either. The variant is what keeps
+/// the message honest; nothing branches on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HarnessErrorKind {
+    /// The harness cannot express the request AT ALL. A deployment/wiring fault.
+    #[default]
+    Unsupported,
+    /// The harness can express it, but the state the request depends on is missing.
+    Unavailable,
+}
+
 /// A harness refusing a request it cannot express, rather than quietly downgrading it.
 /// The point is the refusal: a harness with no MCP concept, or no way to resume a thread,
 /// must say so and let the turn fail visibly instead of silently spawning a child with a
 /// weaker boundary than the caller asked for.
 ///
-/// Nothing on the Claude Code path constructs one (the CLI expresses every request shape
-/// the bridge makes), so today this type exists for the next harness.
+/// The Codex harness also constructs the [`HarnessErrorKind::Unavailable`] form when a
+/// conversation's saved Codex session is not on this host: continuing without it would
+/// start a BLANK thread wearing the old conversation's name, which is the one outcome
+/// worse than a visible failure.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HarnessError {
     /// The harness that refused, by [`Harness::id`].
     pub harness: &'static str,
-    /// What it could not express, in operator-facing words.
+    /// What it could not express — or, for [`HarnessErrorKind::Unavailable`], what is
+    /// missing — in operator-facing words.
     pub what: String,
+    /// Which of the two refusals this is. See [`HarnessErrorKind`].
+    pub kind: HarnessErrorKind,
 }
 
 impl HarnessError {
@@ -386,17 +414,37 @@ impl HarnessError {
         HarnessError {
             harness,
             what: what.into(),
+            kind: HarnessErrorKind::Unsupported,
+        }
+    }
+
+    /// Refuse for want of STATE rather than of capability: `what` names what is missing and,
+    /// where the operator can act on it, where it was looked for.
+    pub fn unavailable(harness: &'static str, what: impl Into<String>) -> Self {
+        HarnessError {
+            harness,
+            what: what.into(),
+            kind: HarnessErrorKind::Unavailable,
         }
     }
 }
 
 impl std::fmt::Display for HarnessError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "the {} harness cannot express {}",
-            self.harness, self.what
-        )
+        match self.kind {
+            HarnessErrorKind::Unsupported => write!(
+                f,
+                "the {} harness cannot express {}",
+                self.harness, self.what
+            ),
+            HarnessErrorKind::Unavailable => {
+                write!(
+                    f,
+                    "the {} harness cannot continue: {}",
+                    self.harness, self.what
+                )
+            }
+        }
     }
 }
 

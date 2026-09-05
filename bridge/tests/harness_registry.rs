@@ -437,22 +437,32 @@ fn the_shipped_registry_is_unchanged_by_any_of_this() {
     );
 }
 
-/// A CODEX CONVERSATION RESUMES ACROSS THREE TURNS, end to end through the same pieces a
-/// real turn uses: the parser reads the thread id off the child's stream, the driver's
-/// `SpawnedSessions` records it, the conversation store binds it, the next turn resolves it
-/// back out, and the argv builder turns it into `codex exec resume <id>`.
+/// THE BOOKKEEPING HALF of a Codex conversation across three turns: the parser reads the
+/// thread id off the child's stream, the driver's `SpawnedSessions` records it, the
+/// conversation store binds it, the next turn resolves it back out, and the argv builder
+/// turns it into `codex exec resume <id>`.
 ///
-/// **Three turns rather than two, because two cannot catch the bug this guards.** Turn 2
-/// proves a resume happens at all. Turn 3 proves the conversation tracks the id FORWARD: a
-/// resumed Codex turn reports a NEW thread id (the thread forks, exactly as a resumed Claude
-/// Code session gets a fresh transcript stem), and a store that kept binding the first one
-/// would resume turn 1's thread forever while every turn appeared to succeed. Nothing about
-/// that failure is visible from the outside — the answers would just quietly lose the middle
-/// of the conversation.
+/// **WHAT THIS TEST DOES NOT COVER, stated because it once claimed otherwise.** It called
+/// itself "the whole safety net for Codex resume", and it was not: it feeds SYNTHETIC events
+/// to the argv builder and never builds a child, so it cannot see the `CODEX_HOME` a turn
+/// would actually run in. That is exactly where resume was broken from 0.50.0 to 0.119.0 —
+/// every turn got a fresh home, so `codex exec resume` could not find the rollout the
+/// previous turn wrote and every follow-up failed before the model ran. Nothing here could
+/// have noticed. The tests that can are in `tests/codex_session_home.rs`, which spawns a
+/// child, and the `#[ignore]`d live check in the same file, which asks the real binary.
 ///
-/// This is the whole safety net for Codex resume. `transcript_dir` is `None`, so there is no
-/// file on disk to fall back to and `resolve_resume_session_for_harness` deliberately skips
-/// its existence check: the bound id IS the record.
+/// **Three turns rather than two**, because two cannot catch the id-tracking bug: turn 2
+/// proves a resume happens at all, turn 3 proves the conversation follows whatever id the
+/// LAST turn reported rather than pinning the first forever. The ids below are synthetic and
+/// deliberately all different, which exercises the forward-tracking rule; that is a property
+/// of the STORE, not a claim about the CLI. Measured on codex-cli 0.153.4, a resumed turn in
+/// fact reports the SAME id and appends to the same rollout — the rule holds either way,
+/// which is why it is written as "bind what this turn reported" and not as "expect a fork".
+///
+/// `transcript_dir` is `None`, so there is no bridge-readable file to fall back on and
+/// `resolve_resume_session_for_harness` deliberately skips its existence check: the bound id
+/// IS the record here. Whether the STATE behind that id still exists is answered one layer
+/// down, in `codex_home_for_turn`.
 #[test]
 fn a_codex_conversation_resumes_across_three_turns() {
     let cfg = test_config();
@@ -460,7 +470,8 @@ fn a_codex_conversation_resumes_across_three_turns() {
     const CID: &str = "conv-codex-resume";
     conversations.register(CID, None, 1_000);
 
-    // Each turn's child reports its own thread id, and a resumed thread reports a new one.
+    // Three DISTINCT synthetic ids, so the forward-tracking rule is actually exercised. Not
+    // a claim about codex-cli: 0.153.4 reuses the id across a resume. See the doc comment.
     let threads = ["th_aaa", "th_bbb", "th_ccc"];
     let mut resumed: Vec<Option<String>> = Vec::new();
 
