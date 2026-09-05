@@ -337,6 +337,7 @@ mod tests {
     fn with_offload_model(mut cfg: Config, id: &str) -> Config {
         let mut models = cfg.model_registry.models.clone();
         models.push(RegistryModel {
+            codex: Default::default(),
             id: id.to_string(),
             label: id.to_string(),
             kind: ModelKind::Local,

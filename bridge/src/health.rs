@@ -792,6 +792,7 @@ mod tests {
         // A configured non-ambient model is selectable from startup (seeded healthy) and is
         // demoted only by an observed failure.
         let glm = RegistryModel {
+            codex: Default::default(),
             id: "glm-5.2".into(),
             label: "GLM".into(),
             kind: ModelKind::Hosted,
@@ -838,6 +839,7 @@ mod tests {
         // unconfigured path itself, so it must not go green merely because some shipped
         // model happens to be unarmed today.
         let unarmed = RegistryModel {
+            codex: Default::default(),
             id: "test-unarmed".into(),
             label: "Unarmed".into(),
             kind: ModelKind::Hosted,

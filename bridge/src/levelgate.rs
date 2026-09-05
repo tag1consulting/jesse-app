@@ -251,6 +251,46 @@ pub fn validate_model_config_with_env(
                 ));
             }
         }
+        // A `reasoning_effort` that does not parse: REFUSED here, and this is the only
+        // place that can catch it.
+        //
+        // The value travels to the child as `-c model_reasoning_effort="<value>"`, and
+        // `codex --strict-config` — the oracle that catches a misspelled `-c` KEY — does not
+        // look at the VALUE at all (measured on codex-cli 0.153.4: `-c
+        // model_reasoning_effort="banana"` loads without complaint). So a typo survives
+        // config loading, survives the health probe, and surfaces only when a real turn asks
+        // the model, as Codex's own "Reasoning effort `banana`. Supported reasoning efforts:
+        // …". That is a model the picker shows as healthy whose every answer fails.
+        //
+        // Naming the model AND the value, because an operator reading "unknown reasoning
+        // effort" against a registry of eight entries has to go find which one.
+        if let Some(raw) = m
+            .reasoning_effort
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            if parse_reasoning_effort(raw).is_none() {
+                let id = m.id.as_deref().unwrap_or("<unnamed>");
+                // `none` gets its own sentence: it is the one wrong value an operator
+                // arrives at by reasoning correctly, since every other thinking key in this
+                // config spells "off" that way. Codex does not — it spells it by the key
+                // being absent — so the fix is a deletion, not a different word.
+                let hint = if raw.eq_ignore_ascii_case("none") {
+                    " There is no \"none\": Codex asks a model for its default effort by \
+                     the key being ABSENT, so remove `reasoning_effort` instead."
+                } else {
+                    ""
+                };
+                errors.push(ConfigError::for_model(
+                    id,
+                    format!(
+                        "unknown reasoning_effort '{raw}' (expected {}).{hint}",
+                        ReasoningEffort::accepted()
+                    ),
+                ));
+            }
+        }
     }
 
     // 4. The records themselves, FIRST among the checks that depend on them: absent or
@@ -748,6 +788,7 @@ mod tests {
         let mut cfg = test_config();
         let mut models = cfg.model_registry.models.clone();
         models.push(RegistryModel {
+            codex: Default::default(),
             id: id.to_string(),
             label: id.to_string(),
             kind: ModelKind::Local,
@@ -816,6 +857,92 @@ mod tests {
             errors
                 .iter()
                 .any(|e| e.message.contains("unknown level 'wrote'")),
+            "{errors:?}"
+        );
+    }
+
+    /// AN UNPARSEABLE `reasoning_effort` IS REFUSED, AND THE ERROR NAMES BOTH THE MODEL AND
+    /// THE VALUE.
+    ///
+    /// This gate is the only thing that can catch it. The value travels to the child as a
+    /// `-c model_reasoning_effort="…"` override, and `codex --strict-config` — which rejects
+    /// a misspelled `-c` KEY — does not inspect the VALUE at all (measured on codex-cli
+    /// 0.153.4). So a typo would load cleanly, pass the health probe, and fail only when a
+    /// real turn reached the model.
+    #[test]
+    fn an_unparseable_reasoning_effort_is_refused_and_names_the_model_and_the_value() {
+        let decl = vec![ModelToml {
+            id: Some("gpt-6-astra".to_string()),
+            reasoning_effort: Some("evar so high".to_string()),
+            ..ModelToml::default()
+        }];
+        let errors = validate(&test_config(), &decl, &claude_only(claude_record()));
+        let e = errors
+            .iter()
+            .find(|e| e.message.contains("reasoning_effort"))
+            .expect("an unparseable reasoning_effort must be refused");
+        assert_eq!(e.model.as_deref(), Some("gpt-6-astra"));
+        assert!(
+            e.message.contains("'evar so high'"),
+            "the error must quote the value the operator wrote: {e}"
+        );
+        assert!(e.message.contains("\"xhigh\""), "{e}");
+        assert!(e.to_string().starts_with("model 'gpt-6-astra'"), "{e}");
+    }
+
+    /// `none` IS REFUSED, AND THE ERROR SAYS WHAT TO DO INSTEAD.
+    ///
+    /// It is the one wrong value an operator reaches by reasoning correctly: `thinking`, the
+    /// key beside it, spells "off" exactly that way. Codex does not — it asks a model for its
+    /// default effort by the key being ABSENT — so accepting `none` would give one posture
+    /// two spellings, and the one that emits an override is the one that can fail. The fix is
+    /// a deletion, which a bare "unknown value" error would not tell anyone.
+    #[test]
+    fn a_none_reasoning_effort_is_refused_and_points_at_deleting_the_key() {
+        let decl = vec![ModelToml {
+            id: Some("gpt-6-astra".to_string()),
+            reasoning_effort: Some("none".to_string()),
+            ..ModelToml::default()
+        }];
+        let errors = validate(&test_config(), &decl, &claude_only(claude_record()));
+        let e = errors
+            .iter()
+            .find(|e| e.message.contains("reasoning_effort"))
+            .expect("`none` must be refused like any other unknown value");
+        assert!(
+            e.message.contains("remove `reasoning_effort`"),
+            "the error must name the remedy: {e}"
+        );
+    }
+
+    /// Every accepted spelling starts, and the key being absent starts — the other half of
+    /// the gate, so a tightened parser cannot lock out a valid config unnoticed.
+    #[test]
+    fn every_accepted_reasoning_effort_starts() {
+        for effort in ReasoningEffort::ALL {
+            let decl = vec![ModelToml {
+                id: Some("gpt-6-astra".to_string()),
+                // Upper case on purpose: the parser is case-insensitive like its siblings.
+                reasoning_effort: Some(effort.as_str().to_ascii_uppercase()),
+                ..ModelToml::default()
+            }];
+            let errors = validate(&test_config(), &decl, &claude_only(claude_record()));
+            assert!(
+                !errors
+                    .iter()
+                    .any(|e| e.message.contains("reasoning_effort")),
+                "{effort:?} must be accepted: {errors:?}"
+            );
+        }
+        let absent = vec![ModelToml {
+            id: Some("gpt-6-astra".to_string()),
+            ..ModelToml::default()
+        }];
+        let errors = validate(&test_config(), &absent, &claude_only(claude_record()));
+        assert!(
+            !errors
+                .iter()
+                .any(|e| e.message.contains("reasoning_effort")),
             "{errors:?}"
         );
     }

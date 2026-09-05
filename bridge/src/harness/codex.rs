@@ -358,6 +358,93 @@ pub fn codex_provider_args(active: &ActiveModel) -> Option<Vec<String>> {
     ])
 }
 
+// ---- The model the child actually runs -------------------------------------------
+
+/// The `-c` overrides that name the MODEL a Codex turn runs on, and how hard it thinks.
+///
+/// # THE DEFECT THIS CLOSES
+///
+/// Before this, a Codex entry's `model` field reached the child on ONE path only — the
+/// provider path above, which requires [`ModelKind::OpenAi`]. On the SUBSCRIPTION-OAuth
+/// posture (`kind = "hosted"`, the deployed `codex` entry) nothing emitted it at all:
+/// [`codex_provider_args`] returned `None`, this builder emitted no `-m`/`--model`, and
+/// `--ignore-user-config` meant `~/.codex/config.toml` could not supply one either. The
+/// declared slug was therefore used for the health probe and the picker label and NOWHERE
+/// else — every turn silently ran on whatever the CLI's built-in default happened to be. A
+/// config that says `model = "gpt-5-codex"` and a child running something else is the worst
+/// shape a registry can have: it is not an error anywhere, it just is not true.
+///
+/// # `-c model=` AND NOT `-m`
+///
+/// For exactly the reason the containment flags are `-c` overrides: **everything emitted
+/// here must be accepted by `codex exec resume` as well as `codex exec`**, or the break is
+/// invisible until a conversation's SECOND turn. Both are in fact declared on `resume` at
+/// 0.153.4 (`-m, --model <MODEL>` is in its `--help`, and `-c` is too), so this one is not
+/// forced — but `-c` is the form the rest of this argv already speaks, it is what the
+/// provider path emits, and picking the same spelling on both paths is what makes "do not
+/// emit the slug twice" a thing the code can ask rather than a thing a reader must notice.
+/// Verified live on 0.153.4: `codex exec resume --strict-config -c model="gpt-6-astra" -c
+/// model_reasoning_effort="xhigh" -c model_auto_compact_token_limit=200000 <id> "x"` gets
+/// past config loading and fails only on the fake session id.
+///
+/// # NOT EMITTED TWICE
+///
+/// The slug is skipped when [`codex_provider_args`] would emit it, and that condition is
+/// asked OF THAT FUNCTION rather than restated here. A second copy of "is this the provider
+/// posture?" would be a second thing to keep in step with the first, and the two drifting
+/// apart yields `-c model=` twice in one argv — where the last wins silently.
+///
+/// # WHY THE SLUG COMES FROM `env`
+///
+/// `ActiveModel::env` is the `(base_url, token, model)` triple, and its third member IS the
+/// declared `model` field — the same one the provider path reads. So there is no new config
+/// key for the slug and no second place it can be spelled; this reads the field that was
+/// always there and was simply never delivered. `None` for the ambient entry and for any
+/// entry whose token never resolved, both of which are unselectable anyway.
+///
+/// # THE ORDER
+///
+/// Returned as one list the caller appends AFTER the containment flags and alongside the
+/// provider args, so which model is running is visibly not part of the boundary. Nothing
+/// here touches `sandbox_mode`, `approval_policy`, `tools.web_search` or the
+/// workspace-write exclusions.
+pub fn codex_model_args(active: &ActiveModel) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut push = |k: String| {
+        args.push("-c".to_string());
+        args.push(k);
+    };
+
+    // The slug — unless the provider path is already emitting `model=` for this entry.
+    if codex_provider_args(active).is_none() {
+        if let Some((_, _, model)) = active.env.as_ref() {
+            push(format!("model={}", toml_string(model)));
+        }
+    }
+
+    // How hard it thinks. Absent means the key is not emitted at all, which is Codex's own
+    // "use this model's default" — see [`ReasoningEffort`], which has no `none` for that
+    // reason. The value is a closed set validated at STARTUP, because `--strict-config`
+    // checks the key of a `-c` override and not its value (measured, 0.153.4).
+    if let Some(effort) = active.codex.reasoning_effort {
+        push(format!(
+            "model_reasoning_effort={}",
+            toml_string(effort.as_str())
+        ));
+    }
+
+    // Where the child compacts. `model_auto_compact_token_limit`, WITH the prefix: the
+    // unprefixed `auto_compact_token_limit` is rejected as an unknown field under
+    // `--strict-config` on 0.153.4, so the shorter spelling would fail the turn outright.
+    // Emitted as a bare integer — TOML, not a string; `toml_string` would quote it into a
+    // type error.
+    if let Some(limit) = active.codex.auto_compact_token_limit {
+        push(format!("model_auto_compact_token_limit={limit}"));
+    }
+
+    args
+}
+
 // ---- The MCP server set, translated ---------------------------------------------
 
 /// Translate the bridge's MCP server set — expressed in Claude Code's `{"mcpServers":{…}}`
@@ -806,6 +893,10 @@ pub fn apply_patch_targets(command: &str) -> Vec<String> {
 /// Pure and side-effect-free so it can be unit-tested without spawning a process — the one
 /// side effect this harness has (the per-turn home) is [`codex_turn_home`]'s, and is passed
 /// in here as an already-created path.
+// A flat argv builder: every parameter is an independent input to one command line, and the
+// ORDER they are emitted in is the thing under test. A params struct would hide that behind a
+// field list. Same call the sibling claude-code builder makes.
+#[allow(clippy::too_many_arguments)]
 pub fn build_codex_args(
     prompt: &str,
     session_id: Option<&str>,
@@ -813,6 +904,7 @@ pub fn build_codex_args(
     cwd: &Path,
     mcp_args: &[String],
     provider_args: &[String],
+    model_args: &[String],
     write_lock_hooks: bool,
 ) -> Vec<String> {
     let mut args = Vec::new();
@@ -892,6 +984,10 @@ pub fn build_codex_args(
     // boundary — and empty for every turn on the subscription login, which is what keeps
     // that turn's argv byte-for-byte what it was.
     args.extend_from_slice(provider_args);
+    // Beside the provider args and for the same reason: WHICH model runs, and how hard it
+    // thinks, is not part of the boundary. Empty for an entry that declared no `model`, so
+    // that turn keeps the argv it always had.
+    args.extend_from_slice(model_args);
 
     // The prompt is positional and LAST, so nothing after it can be read as a flag.
     args.push(prompt.to_string());
@@ -907,6 +1003,9 @@ impl Codex {
         // `None` for the subscription-OAuth posture, which is every turn that came before
         // this and still the deployed one. See [`codex_provider_args`].
         let provider = codex_provider_args(req.active);
+        // The slug this entry declared, plus its Codex tuning. Skips the slug when the
+        // provider path above is already emitting it, so it is never in the argv twice.
+        let model = codex_model_args(req.active);
         // A provider turn authenticates from the environment, so it gets a home with NO
         // credential in it at all — see [`codex_turn_home`].
         let home = codex_turn_home(cfg, provider.is_none()).map_err(|e| {
@@ -926,6 +1025,7 @@ impl Codex {
             &req.cwd,
             &mcp,
             provider.as_deref().unwrap_or_default(),
+            &model,
             hooks,
         ))
         .current_dir(&req.cwd)
@@ -1479,6 +1579,7 @@ mod tests {
             Path::new("/srv/vault notes"),
             &[],
             &[],
+            &[],
             false,
         );
         assert!(
@@ -1494,11 +1595,16 @@ mod tests {
 
     // ---- The resume-shaped argv -----------------------------------------------------
 
-    /// Exactly the option list `codex exec resume --help` prints on codex-cli 0.146.0 — the
+    /// Exactly the option list `codex exec resume --help` prints on codex-cli 0.153.4 — the
     /// installed binary, read rather than assumed. `codex exec` declares MORE than this
     /// (`-C`/`--cd`, `--add-dir`, `-s`/`--sandbox`, `-p`/`--profile`, `--oss`,
     /// `--local-provider`, `--color`), and that gap is the whole bug: a flag only `exec`
     /// defines parses fine on a first turn and kills every turn after it.
+    ///
+    /// **Re-measured on 0.153.4**, the version this change is verified against and the one
+    /// `gpt-6-astra` requires (it needs 0.153.1 or newer; the machine was on 0.146.0). The
+    /// list gained `--thread-source` and lost nothing — `-c`/`--config` and `-m`/`--model`
+    /// are both still here, which is what lets the model override travel on a resumed turn.
     const RESUME_ACCEPTS: &[&str] = &[
         "-c",
         "--config",
@@ -1513,6 +1619,7 @@ mod tests {
         "--model",
         "--dangerously-bypass-approvals-and-sandbox",
         "--dangerously-bypass-hook-trust",
+        "--thread-source",
         "--skip-git-repo-check",
         "--ephemeral",
         "--ignore-user-config",
@@ -1549,6 +1656,7 @@ mod tests {
                 "mcp_servers.qmd.command=\"qmd\"".to_string(),
             ],
             &["-c".to_string(), "model=\"slug\"".to_string()],
+            &[],
             false,
         );
 
@@ -1607,6 +1715,7 @@ mod tests {
             Path::new("/v"),
             &[],
             &[],
+            &[],
             false,
         );
         assert_eq!(args[0], "-C", "{args:?}");
@@ -1624,6 +1733,7 @@ mod tests {
             None,
             Capability::Write,
             Path::new("/srv/we\"ird"),
+            &[],
             &[],
             &[],
             false,
@@ -1754,6 +1864,7 @@ mod tests {
             Path::new("/v"),
             &[],
             &[],
+            &[],
             false,
         );
         assert!(
@@ -1761,6 +1872,31 @@ mod tests {
             "{plain:?}"
         );
         assert_eq!(plain.last().map(String::as_str), Some("hi"));
+
+        // ...AND THE MODEL SEAM IS ADDITIVE IN EXACTLY THE SAME WAY. An entry that declared
+        // no `model` contributes an EMPTY list, so the argv is byte-for-byte the one above
+        // rather than merely similar to it. This half is what says the slug fix cannot move
+        // a turn that did not ask for it.
+        let undeclared = ActiveModel::ambient();
+        assert!(
+            codex_model_args(&undeclared).is_empty(),
+            "an entry with no declared model must contribute nothing: {:?}",
+            codex_model_args(&undeclared)
+        );
+        let still_plain = build_codex_args(
+            "hi",
+            None,
+            Capability::Read,
+            Path::new("/v"),
+            &[],
+            &[],
+            &codex_model_args(&undeclared),
+            false,
+        );
+        assert_eq!(
+            still_plain, plain,
+            "the model seam changed an argv that declared no model"
+        );
     }
 
     /// The provider overrides land BEFORE the prompt — the prompt is positional and must stay
@@ -1776,6 +1912,7 @@ mod tests {
             Path::new("/v"),
             &[],
             &provider,
+            &[],
             false,
         );
         assert_eq!(
@@ -1784,6 +1921,269 @@ mod tests {
         );
         let last_c = args.iter().rposition(|a| a == "-c").expect("a -c override");
         assert!(last_c < args.len() - 1, "{args:?}");
+    }
+
+    // ---- The model seam ------------------------------------------------------------
+
+    /// A Codex entry on the SUBSCRIPTION login, as the deployed `codex` entry is declared:
+    /// `kind = "hosted"`, armed with a token, naming the slug it wants to run.
+    fn hosted_codex_model(model: &str) -> ActiveModel {
+        let mut m = ActiveModel::ambient();
+        m.id = "codex".to_string();
+        m.kind = ModelKind::Hosted;
+        m.harness = CODEX_ID.to_string();
+        m.level = Capability::Read;
+        m.env = Some((
+            "http://127.0.0.1:9100".to_string(),
+            "tok".to_string(),
+            model.to_string(),
+        ));
+        m
+    }
+
+    /// THE DEFECT, PINNED: a hosted entry's declared slug reaches the child.
+    ///
+    /// Before this it did not, and nothing said so — `codex_provider_args` returned `None`
+    /// for a non-`openai` kind, the builder emitted no `-m`, and `--ignore-user-config`
+    /// blocked the config file. The turn ran on the CLI's built-in default while the picker,
+    /// the badge and the health probe all reported `gpt-6-astra`.
+    #[test]
+    fn a_hosted_codex_entry_puts_its_declared_slug_in_the_argv() {
+        let m = hosted_codex_model("gpt-6-astra");
+        let model = codex_model_args(&m);
+        assert_eq!(
+            model,
+            vec!["-c".to_string(), "model=\"gpt-6-astra\"".to_string()],
+            "the subscription posture must name its model"
+        );
+
+        let args = build_codex_args(
+            "hi",
+            None,
+            Capability::Read,
+            Path::new("/v"),
+            &[],
+            &[],
+            &model,
+            false,
+        );
+        assert_eq!(
+            args.iter().filter(|a| a.starts_with("model=")).count(),
+            1,
+            "the slug must appear exactly once: {args:?}"
+        );
+        // Positional prompt stays last; a `-c` after it would be read AS the prompt.
+        assert_eq!(args.last().map(String::as_str), Some("hi"), "{args:?}");
+    }
+
+    /// THE SLUG IS NOT EMITTED TWICE WHEN BOTH PATHS APPLY.
+    ///
+    /// `codex_provider_args` already ends with `-c model="<slug>"` for an `openai`-kind
+    /// entry. If this seam emitted it as well, one argv would carry the key twice — and a
+    /// duplicate `-c` key is not an error, the last one silently wins. So the two paths are
+    /// mutually exclusive by construction, and this is the test that says they stay that way.
+    #[test]
+    fn the_slug_is_never_emitted_twice_on_the_provider_path() {
+        let m = openai_model(
+            "https://api.example/v1",
+            "accounts/example/models/k3",
+            "tok",
+        );
+        let provider = codex_provider_args(&m).expect("an openai-kind model names a provider");
+        let model = codex_model_args(&m);
+        assert!(
+            model.iter().all(|a| !a.starts_with("model=")),
+            "the provider path already emits the slug; this one must not: {model:?}"
+        );
+
+        let args = build_codex_args(
+            "hi",
+            None,
+            Capability::Read,
+            Path::new("/v"),
+            &[],
+            &provider,
+            &model,
+            false,
+        );
+        assert_eq!(
+            args.iter().filter(|a| a.starts_with("model=")).count(),
+            1,
+            "exactly one `model=` override, whichever path produced it: {args:?}"
+        );
+    }
+
+    /// Reasoning effort: emitted as `model_reasoning_effort` when declared, absent when not,
+    /// and every accepted spelling reaches the argv as the exact token Codex expects.
+    ///
+    /// The KEY was confirmed against the installed CLI rather than assumed: `codex exec
+    /// --strict-config -c model_reasoning_effort="high" …` loads, while a misspelled key is
+    /// rejected as "unknown configuration field" (codex-cli 0.153.4). What `--strict-config`
+    /// does NOT check is the VALUE — which is why the closed set is enforced at startup and
+    /// this test only has to prove the mapping is faithful.
+    #[test]
+    fn reasoning_effort_is_emitted_only_when_declared() {
+        let mut m = hosted_codex_model("gpt-6-astra");
+        assert!(
+            codex_model_args(&m)
+                .iter()
+                .all(|a| !a.starts_with("model_reasoning_effort")),
+            "an entry that declared no effort must ask for none"
+        );
+
+        for (effort, token) in [
+            (ReasoningEffort::Low, "low"),
+            (ReasoningEffort::Medium, "medium"),
+            (ReasoningEffort::High, "high"),
+            (ReasoningEffort::XHigh, "xhigh"),
+            (ReasoningEffort::Max, "max"),
+        ] {
+            m.codex.reasoning_effort = Some(effort);
+            let args = codex_model_args(&m);
+            assert!(
+                args.contains(&format!("model_reasoning_effort=\"{token}\"")),
+                "{effort:?} must reach the argv as {token:?}: {args:?}"
+            );
+            // Every override is a `-c` VALUE and must be preceded by its flag.
+            let at = args
+                .iter()
+                .position(|a| a.starts_with("model_reasoning_effort"))
+                .expect("the override");
+            assert_eq!(args[at - 1], "-c", "{args:?}");
+        }
+    }
+
+    /// The auto-compact limit carries the `model_` PREFIX, and that is not a style choice.
+    ///
+    /// Measured on codex-cli 0.153.4: `-c auto_compact_token_limit=200000` is rejected as an
+    /// unknown configuration field under `--strict-config`, while
+    /// `-c model_auto_compact_token_limit=200000` loads. The unprefixed spelling would fail
+    /// the turn at config load, before the model ran.
+    ///
+    /// Emitted as a BARE INTEGER: the `-c` value is parsed as TOML, so quoting it would hand
+    /// Codex a string where it wants a number.
+    #[test]
+    fn the_auto_compact_limit_is_emitted_with_the_prefix_codex_requires() {
+        let mut m = hosted_codex_model("gpt-6-astra");
+        assert!(
+            codex_model_args(&m)
+                .iter()
+                .all(|a| !a.contains("auto_compact")),
+            "absent means the child keeps its own limit"
+        );
+
+        m.codex.auto_compact_token_limit = Some(272_000);
+        let args = codex_model_args(&m);
+        assert!(
+            args.contains(&"model_auto_compact_token_limit=272000".to_string()),
+            "{args:?}"
+        );
+        assert!(
+            !args
+                .iter()
+                .any(|a| a.starts_with("auto_compact_token_limit")),
+            "the unprefixed key is rejected by the CLI: {args:?}"
+        );
+        assert!(
+            !args.iter().any(|a| a.contains("=\"272000\"")),
+            "the limit is a TOML integer, not a string: {args:?}"
+        );
+    }
+
+    /// THE MODEL OVERRIDES ADD TO THE ARGV AND CHANGE NOTHING ELSE.
+    ///
+    /// The containment flags — sandbox mode, approval policy, `tools.web_search=false`, the
+    /// workspace-write exclusions — are what this harness is trusted for, and the record the
+    /// startup gate reads describes exactly them. So the difference between a turn with
+    /// tuning and the same turn without it must be the tuning and NOTHING BESIDE it: not a
+    /// reordering, not a dropped exclusion. Asserted as a prefix rather than a set, because
+    /// order is part of what the record pins.
+    #[test]
+    fn the_model_overrides_leave_the_containment_argv_untouched() {
+        let mut m = hosted_codex_model("gpt-6-astra");
+        m.codex.reasoning_effort = Some(ReasoningEffort::XHigh);
+        m.codex.auto_compact_token_limit = Some(272_000);
+
+        let bare = build_codex_args(
+            "hi",
+            None,
+            Capability::Write,
+            Path::new("/v"),
+            &[],
+            &[],
+            &[],
+            false,
+        );
+        let tuned = build_codex_args(
+            "hi",
+            None,
+            Capability::Write,
+            Path::new("/v"),
+            &[],
+            &[],
+            &codex_model_args(&m),
+            false,
+        );
+
+        // Everything up to the prompt is the bare argv, verbatim and in order.
+        let bare_head = &bare[..bare.len() - 1];
+        assert_eq!(
+            &tuned[..bare_head.len()],
+            bare_head,
+            "the tuning moved or dropped part of the containment argv"
+        );
+        // What follows is exactly the tuning, then the prompt.
+        let added: Vec<&String> = tuned[bare_head.len()..tuned.len() - 1].iter().collect();
+        let expected = codex_model_args(&m);
+        assert_eq!(
+            added,
+            expected.iter().collect::<Vec<_>>(),
+            "the tuning is what was added, and only it"
+        );
+        assert_eq!(tuned.last().map(String::as_str), Some("hi"));
+    }
+
+    /// A RESUMED TURN CARRYING THE TUNING EMITS NO FLAG `codex exec resume` REJECTS.
+    ///
+    /// The same rule the `-C` break taught, applied to the new overrides: everything after
+    /// `resume` must be a flag that subcommand declares. All three land as `-c` values, and
+    /// `-c`/`--config` is on `resume` at 0.153.4 — verified live, a resume carrying all three
+    /// gets past config loading and fails only on a fake session id.
+    #[test]
+    fn a_resumed_turn_may_carry_the_model_overrides() {
+        let mut m = hosted_codex_model("gpt-6-astra");
+        m.codex.reasoning_effort = Some(ReasoningEffort::Max);
+        m.codex.auto_compact_token_limit = Some(272_000);
+        let args = build_codex_args(
+            "and then?",
+            Some("th_abc"),
+            Capability::Read,
+            Path::new("/v"),
+            &[],
+            &[],
+            &codex_model_args(&m),
+            false,
+        );
+
+        let at = args
+            .iter()
+            .position(|a| a == "resume")
+            .expect("a resume subcommand");
+        for (i, a) in args.iter().enumerate().skip(at + 1) {
+            if i == args.len() - 1 || args[i - 1] == "-c" {
+                continue;
+            }
+            if a.starts_with('-') && a.len() > 1 {
+                assert!(
+                    RESUME_ACCEPTS.contains(&a.as_str()),
+                    "`{a}` is not a flag `codex exec resume` defines, argv: {args:?}"
+                );
+            }
+        }
+        assert!(
+            args.contains(&"model=\"gpt-6-astra\"".to_string()),
+            "{args:?}"
+        );
     }
 
     /// The key travels in the ENVIRONMENT of the child, and the per-turn home a provider turn

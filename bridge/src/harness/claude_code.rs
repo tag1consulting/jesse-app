@@ -2337,6 +2337,7 @@ mod tests {
     /// DISTINCT from every role backend's so a leak is detectable.
     fn glm_active() -> ActiveModel {
         ActiveModel {
+            codex: Default::default(),
             id: "glm-5.2".to_string(),
             kind: ModelKind::Hosted,
             env: Some((
@@ -2361,6 +2362,7 @@ mod tests {
         let mut cfg = test_config();
         let mut models = cfg.model_registry.models.clone();
         models.push(RegistryModel {
+            codex: Default::default(),
             id: "local-oss".to_string(),
             label: "Local OSS".to_string(),
             kind: ModelKind::Local,

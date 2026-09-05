@@ -14,6 +14,95 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [bridge 0.116.0] - 2026-09-05
+
+**A Codex model declared on the subscription login now actually runs on the model it names,
+and can be told how hard to think and where to compact.**
+
+### Root cause
+
+`model = "gpt-5-codex"` on a `kind = "hosted"` Codex entry was a claim nothing checked and
+nothing delivered. Three things had to be true at once for the slug to reach the child, and
+on that posture none of them was:
+
+- **`codex_provider_args` returned `None`.** It emits `-c model="<slug>"` as the last of its
+  provider overrides, but only for a `ModelKind::OpenAi` entry with a resolved backend. The
+  deployed `codex` entry is `hosted`, so it took the early return and no override was built.
+- **`build_codex_args` never emitted `-m` or `--model`.** For any turn, on any posture. The
+  argv named a working directory, a sandbox, an approval policy and an MCP set, and never a
+  model.
+- **`--ignore-user-config` closed the last door.** The flag is there so an operator's
+  `~/.codex/config.toml` cannot widen the containment posture this harness chose, and it
+  works: it also discards any `model = …` that file might have supplied.
+
+So the field was live for exactly two consumers — the startup health probe, which POSTs the
+slug at `base_url`, and the picker label — and inert for the one that matters. Every turn ran
+on whatever `codex exec`'s built-in default was that release, while the config file, the app's
+model badge and a passing health probe all agreed on a different name. Nothing anywhere
+reported a mismatch, because nothing anywhere compared the two.
+
+The failure mode is the reason this is a defect and not a missing feature: an operator editing
+`model` got no error, no warning and no change in behaviour, and a green health probe that
+said the edit had taken.
+
+### Fixed
+
+- **`codex_model_args` emits the declared slug on the subscription path**, as
+  `-c model="<slug>"`. `-c` rather than `-m` because everything in this argv must be accepted
+  by `codex exec resume` as well as `codex exec` — the rule the `-C`/`--cd` break taught, where
+  a flag only `exec` declares parses fine on a first turn and kills every turn after it. Both
+  spellings are in fact on `resume` at 0.153.4; `-c` is the one the rest of the argv already
+  speaks, which is what lets the duplicate check below be a question the code asks rather than
+  a property a reader has to notice.
+- **The slug is never emitted twice.** The provider path already ends with `model=`, so the new
+  path skips it by asking `codex_provider_args` whether it applies, rather than restating the
+  condition. A duplicate `-c` key is not an error in Codex — the last one silently wins — so a
+  drift between two copies of that condition would have been invisible.
+- **An entry that declares no `model` produces a byte-identical argv.** Asserted rather than
+  asserted-about: the existing subscription-argv test now builds the argv both ways and compares
+  the vectors.
+
+### Added
+
+- **`reasoning_effort`** (`low` | `medium` | `high` | `xhigh` | `max`), emitted as
+  `-c model_reasoning_effort="<value>"` only when declared. Absent means the key is not emitted
+  at all, which is how Codex spells "this model's own default", so there is no `none` — writing
+  one is a startup error that names the remedy (delete the key) rather than a fifth synonym for
+  the default.
+
+  **An unrecognised value is refused at startup, naming the model and the value.** It has to be:
+  `codex --strict-config` validates the KEY of a `-c` override and not its VALUE (measured,
+  0.153.4 — `-c model_reasoning_effort="banana"` loads clean), so a typo would otherwise survive
+  config loading and the health probe and surface only when a live turn reached the model.
+- **`auto_compact_token_limit`** (integer), emitted as `-c model_auto_compact_token_limit=<n>`.
+  Note the `model_` prefix on the wire key: the unprefixed spelling is rejected by codex-cli
+  0.153.4 as an unknown configuration field. It exists because a large context is not uniformly
+  priced — `gpt-6-astra` carries ~1.05M tokens but bills input at 2x and output at 1.5x above
+  272K — so an operator needs a way to cap a session below that line. A cost control, not a
+  containment control.
+
+### Containment
+
+Unchanged, and deliberately so. Both new overrides and the slug are appended **after** the
+containment flags, alongside the provider args, so which model is running is visibly not part
+of the boundary. Nothing here touches `sandbox_mode`, `approval_policy`, `tools.web_search`,
+the `workspace-write` exclusions or their order; a test builds the argv with and without the
+tuning and asserts the containment prefix is identical and that what follows is exactly the
+tuning.
+
+### Measurement
+
+Verified against **codex-cli 0.153.4** (the machine was on 0.146.0; `gpt-6-astra` requires
+0.153.1 or newer, so the CLI was upgraded first). `RESUME_ACCEPTS` — the pinned option list
+for `codex exec resume` — was re-measured against it: it gained `--thread-source` and lost
+nothing, with `-c`/`--config` and `-m`/`--model` both still present.
+
+### Known gap
+
+`subagent_model` is still read only by `harness/claude_code.rs` and by nothing in
+`harness/codex.rs`, so on a Codex entry it remains inert. Not fixed here; documented as inert
+in `jesse.example.toml` so the key does not read as load-bearing.
+
 ## [bridge 0.115.0] - 2026-09-04
 
 **A document that is not on the phone can now be read, and the two channels that cannot serve

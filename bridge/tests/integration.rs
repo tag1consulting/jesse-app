@@ -109,6 +109,7 @@ fn ambient_pick() -> RoutedPick {
 fn with_vaultqa_offload(mut cfg: Config) -> Config {
     let mut models = cfg.model_registry.models.clone();
     models.push(RegistryModel {
+        codex: Default::default(),
         id: "local-vaultqa".to_string(),
         label: "Local vault QA".to_string(),
         kind: ModelKind::Local,
@@ -4872,6 +4873,7 @@ fn cfg_with_switch_registry(state_dir: &std::path::Path) -> Config {
     let registry = ModelRegistry {
         models: vec![
             RegistryModel {
+                codex: Default::default(),
                 id: "opus".into(),
                 label: "Claude Opus".into(),
                 kind: ModelKind::Ambient,
@@ -4894,6 +4896,7 @@ fn cfg_with_switch_registry(state_dir: &std::path::Path) -> Config {
                 vision_complementary: false,
             },
             RegistryModel {
+                codex: Default::default(),
                 id: "glm-5.2".into(),
                 label: "GLM 5.2".into(),
                 kind: ModelKind::Hosted,
@@ -4920,6 +4923,7 @@ fn cfg_with_switch_registry(state_dir: &std::path::Path) -> Config {
                 vision_complementary: false,
             },
             RegistryModel {
+                codex: Default::default(),
                 id: "test-unarmed".into(),
                 label: "Unarmed Test Model".into(),
                 kind: ModelKind::Hosted,
@@ -5556,6 +5560,7 @@ async fn preprocess_pairs_and_frames_a_faithful_view() {
     let base = start_mock_helper().await;
     // A registry with the mock helper (configured) and a text model paired to it.
     let helper = RegistryModel {
+        codex: Default::default(),
         id: "mock".into(),
         label: "Mock VL".into(),
         kind: ModelKind::Hosted,
@@ -5574,6 +5579,7 @@ async fn preprocess_pairs_and_frames_a_faithful_view() {
         vision_complementary: false,
     };
     let text = RegistryModel {
+        codex: Default::default(),
         id: "glm".into(),
         label: "GLM".into(),
         kind: ModelKind::Hosted,
@@ -5608,6 +5614,7 @@ async fn preprocess_pairs_and_frames_a_faithful_view() {
     );
 
     let active = ActiveModel {
+        codex: Default::default(),
         id: "glm".into(),
         kind: ModelKind::Hosted,
         env: Some(("http://text".into(), "tt".into(), "tm".into())),
@@ -5651,6 +5658,7 @@ async fn unpaired_model_reports_no_vision() {
     // A configured text model with NO partners reports vision disabled — the capability
     // rule: unpaired == no-vision, surfaced, never a silent half-state.
     let text = RegistryModel {
+        codex: Default::default(),
         id: "glm".into(),
         label: "GLM".into(),
         kind: ModelKind::Hosted,
@@ -5751,6 +5759,7 @@ async fn the_vision_path_is_identical_on_both_harnesses() {
         role: VisionRole::Any,
     };
     let helper = RegistryModel {
+        codex: Default::default(),
         id: "mock".into(),
         label: "Mock VL".into(),
         kind: ModelKind::Hosted,
@@ -5809,6 +5818,7 @@ async fn the_vision_path_is_identical_on_both_harnesses() {
     let _ = std::fs::remove_dir_all(&dir);
 
     let active_on = |harness: &str| ActiveModel {
+        codex: Default::default(),
         id: "glm".into(),
         kind: ModelKind::Hosted,
         env: Some(("http://text".into(), "tt".into(), "tm".into())),

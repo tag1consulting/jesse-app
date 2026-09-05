@@ -237,8 +237,27 @@ Answer the question I asked, not the one you wish I had asked.
 #                  (the bridge appends /v1/messages). For `responses`, the OpenAI API ROOT —
 #                  the segment BEFORE /responses (e.g.
 #                  https://api.fireworks.ai/inference/v1).
-#   model          the backend model id
+#   model          the backend model id — the SLUG the child is told to run.
+#
+#                  IT REACHES THE CHILD ON EVERY HARNESS, including a Codex entry on the
+#                  subscription login. That last clause is new: this field used to be
+#                  delivered only where the entry named its own provider (`kind = "openai"`
+#                  on `harness = "codex"`, or an Anthropic-surface triple on
+#                  `harness = "claude-code"`). On a `kind = "hosted"` Codex entry — the
+#                  subscription-OAuth posture — NOTHING passed it to the child: no `-m` was
+#                  emitted, no `-c model=` was emitted, and `--ignore-user-config` blocked
+#                  ~/.codex/config.toml from supplying one. The turn ran on whatever the
+#                  CLI's built-in default was, while this file, the picker and the health
+#                  probe all said otherwise. It is now emitted as `-c model="<slug>"`, once,
+#                  on both paths.
 #   subagent_model model for the subagents the turn spawns (defaults to `model`)
+#
+#                  READ BY `harness = "claude-code"` ONLY, which propagates it as
+#                  CLAUDE_CODE_SUBAGENT_MODEL. The `codex` harness does not read it at all,
+#                  so on a Codex entry this key is INERT — subagents follow whatever the
+#                  main turn resolved to. Documented rather than removed because it is
+#                  meaningful on the other harness; if you are declaring a Codex model, this
+#                  key does nothing and setting it will not make it do anything.
 #   auth_token_env the NAME of the env var holding the token — NEVER the token itself.
 #                  The token is read from the process env at startup; an unset var makes
 #                  the model configured-but-unarmed (it appears in the list, disabled,
@@ -303,6 +322,46 @@ Answer the question I asked, not the one you wish I had asked.
 #                    strict_tools                pass a tool's `strict` flag to the wire
 #                  Defaults are per host (both `strict_tools` and `reasoning_effort` on for
 #                  api.openai.com, off elsewhere; `multiple_system_messages` off everywhere).
+#
+#   ---- `harness = "codex"` ONLY. Ignored by claude-code and direct. Each is emitted as a
+#        `-c` override on the child's command line, AFTER the containment flags, so neither
+#        is part of the sandbox boundary and neither can widen it. ----
+#
+#   reasoning_effort
+#                  "low" | "medium" | "high" | "xhigh" | "max". How hard the model thinks
+#                  before answering, emitted as `-c model_reasoning_effort="<value>"`.
+#
+#                  ABSENT MEANS THE KEY IS NOT EMITTED AT ALL, which is how Codex spells
+#                  "this model's own default". THERE IS NO "none" — unlike `thinking` above,
+#                  which does spell off that way. Writing `reasoning_effort = "none"` is a
+#                  startup error that tells you to delete the key instead; the two spellings
+#                  would otherwise mean the same thing while only one of them can fail.
+#
+#                  AN UNRECOGNISED VALUE IS A STARTUP ERROR naming the model and the value,
+#                  never a silent fallback — because nothing downstream would catch it.
+#                  `codex --strict-config` validates the KEY of a `-c` override and not its
+#                  VALUE (measured on codex-cli 0.153.4), so a typo would load cleanly, probe
+#                  healthy, and fail only when a real turn reached the model.
+#
+#                  Which values a given model actually accepts is the MODEL's business: Codex
+#                  answers a value it does not support with "Supported reasoning efforts: …".
+#                  This list is the set the bridge will pass on, not a promise every model
+#                  takes all five.
+#   auto_compact_token_limit
+#                  integer. The context size at which the child compacts, emitted as
+#                  `-c model_auto_compact_token_limit=<n>`. Absent means the child keeps its
+#                  own built-in limit.
+#
+#                  NOTE THE `model_` PREFIX ON THE WIRE KEY. The unprefixed
+#                  `auto_compact_token_limit` is rejected by codex-cli 0.153.4 as an unknown
+#                  configuration field; the operator-facing key here is the short name and
+#                  the bridge emits the long one.
+#
+#                  WHAT IT IS FOR: a large context is not uniformly priced. `gpt-6-astra`
+#                  carries ~1.05M tokens but bills input at 2x and output at 1.5x above 272K,
+#                  so an operator who wants the model without the surcharge caps the session
+#                  below that line — e.g. `auto_compact_token_limit = 272000`. It is a cost
+#                  control, not a containment control.
 #
 #                  WHAT `level` DOES NOT BOUND, so "read" is not read as "nothing can
 #                  happen": it bounds the TOOLS the model is granted. It does not bound the
@@ -466,6 +525,16 @@ Answer the question I asked, not the one you wish I had asked.
 #
 # `level = "basic"` is refused at startup on this harness — see the `harness` field above.
 #
+# WHICH MODEL IT ACTUALLY RUNS. The `model` slug below is passed to the child as
+# `-c model="<slug>"`, on this subscription posture as well as on a provider one. It did not
+# used to be: on a `kind = "hosted"` Codex entry the slug reached the health probe and the
+# picker label and nothing else, so the turn silently ran on the CLI's built-in default. If
+# you are reading an older deployment's logs, that is why its argv names no model.
+#
+# THE CLI VERSION MATTERS FOR THE SLUG YOU PICK. `gpt-6-astra` needs codex-cli 0.153.1 or
+# newer; the whole harness is measured against 0.153.4. An older binary takes the override
+# and then rejects the model name. `JESSE_CODEX_BIN` names the binary this harness runs.
+#
 # Arm it with: JESSE_CODEX_TOKEN=...
 # [[models]]
 # id = "codex-native"
@@ -475,9 +544,14 @@ Answer the question I asked, not the one you wish I had asked.
 # base_url = "http://127.0.0.1:8900"       # health probe only on this path; the turn does
 #                                          # not use it — auth and endpoint come from the
 #                                          # subscription login in ~/.codex
-# model = "gpt-5-codex"
+# model = "gpt-6-astra"                    # emitted as `-c model="gpt-6-astra"`; needs
+#                                          # codex-cli >= 0.153.1
 # auth_token_env = "JESSE_CODEX_TOKEN"     # the NAME of the env var, never the token
 # level = "write"                          # OS-sandboxed writes, scoped to the vault
+# reasoning_effort = "xhigh"               # optional; low|medium|high|xhigh|max. Omit for
+#                                          # the model's own default — there is no "none"
+# auto_compact_token_limit = 272000        # optional; caps the session under Astra's 272K
+#                                          # line, above which input bills 2x and output 1.5x
 # price = { in_per_m = 1.25, cached_per_m = 0.13, out_per_m = 10.00 }
 # health = { interval_secs = 30, timeout_secs = 3 }
 
