@@ -1873,6 +1873,106 @@ pub fn parse_thinking(s: &str) -> Option<DirectThinking> {
     }
 }
 
+/// How hard a Codex child is asked to think, as the `model_reasoning_effort` config value.
+///
+/// **A CLOSED SET, checked at startup rather than on the wire.** `codex --strict-config`
+/// validates the KEY of a `-c` override and not its VALUE — measured on codex-cli 0.153.4,
+/// `-c model_reasoning_effort="banana"` passes config loading untouched — so a typo would
+/// travel all the way to the model, where Codex rejects it per model with "Reasoning effort
+/// `x`. Supported reasoning efforts: …". That is a turn failure at answer time, on a model
+/// the picker showed as healthy. Parsing here makes it a startup error instead.
+///
+/// **`none` IS NOT A VARIANT, deliberately.** Codex spells "do not think" by the key being
+/// ABSENT, and this type's `Option` already spells that. A `none` variant would give the
+/// same posture two spellings, one of which emits an override asking a model to do the
+/// thing the other achieves by asking nothing — so the parser refuses it like any other
+/// unknown word, and the operator deletes the key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningEffort {
+    Low,
+    Medium,
+    High,
+    XHigh,
+    Max,
+}
+
+impl ReasoningEffort {
+    /// The exact token Codex expects in `model_reasoning_effort`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReasoningEffort::Low => "low",
+            ReasoningEffort::Medium => "medium",
+            ReasoningEffort::High => "high",
+            ReasoningEffort::XHigh => "xhigh",
+            ReasoningEffort::Max => "max",
+        }
+    }
+
+    /// Every accepted spelling, in the order the error message lists them.
+    pub const ALL: &'static [ReasoningEffort] = &[
+        ReasoningEffort::Low,
+        ReasoningEffort::Medium,
+        ReasoningEffort::High,
+        ReasoningEffort::XHigh,
+        ReasoningEffort::Max,
+    ];
+
+    /// The accepted values as one comma-separated list, for an error message.
+    pub fn accepted() -> String {
+        Self::ALL
+            .iter()
+            .map(|e| format!("\"{}\"", e.as_str()))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+/// Parse a declared `reasoning_effort` value. `None` for anything not in the closed set —
+/// including `none`, which is spelled by omitting the key (see [`ReasoningEffort`]).
+///
+/// Case- and space-insensitive, matching every other declarative value parser here. The
+/// CALLER decides what `None` means: [`registry_model_from_toml`] carries it as "unset" so a
+/// typo never takes a model out of the registry, and `validate_model_config` is what refuses
+/// it at startup, naming the model and the value.
+pub fn parse_reasoning_effort(raw: &str) -> Option<ReasoningEffort> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "low" => Some(ReasoningEffort::Low),
+        "medium" => Some(ReasoningEffort::Medium),
+        "high" => Some(ReasoningEffort::High),
+        "xhigh" => Some(ReasoningEffort::XHigh),
+        "max" => Some(ReasoningEffort::Max),
+        _ => None,
+    }
+}
+
+/// The per-model tuning the `codex` harness turns into `-c` overrides, each `None` unless the
+/// operator set it.
+///
+/// **Grouped for the same reason [`DirectQuirks`] is**: these are read by ONE harness, they
+/// default to "emit nothing", and a reader asking "what does Codex take?" gets one answer
+/// instead of two fields scattered among the wire keys. Neither field is a containment
+/// control — both are emitted after the containment flags, alongside the provider args, so
+/// the boundary stays visibly separate. See [`codex_model_args`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+pub struct CodexTuning {
+    /// `model_reasoning_effort`. `None` — the default — emits nothing, which is Codex's own
+    /// "use whatever this model does by default".
+    pub reasoning_effort: Option<ReasoningEffort>,
+    /// `model_auto_compact_token_limit`: the context size at which the child compacts.
+    ///
+    /// **The operator-facing key is `auto_compact_token_limit`; the wire key is
+    /// `model_auto_compact_token_limit`**, and the prefix is not optional — measured on
+    /// codex-cli 0.153.4, `-c auto_compact_token_limit=…` is rejected as an unknown field
+    /// under `--strict-config` while the prefixed spelling is accepted.
+    ///
+    /// It exists because a large context is not uniformly priced: `gpt-6-astra` carries
+    /// ~1.05M tokens but bills input at 2x and output at 1.5x above 272K, so an operator
+    /// who wants the model without the surcharge needs a way to cap a session below that
+    /// line. Absent, the child keeps its own built-in limit.
+    pub auto_compact_token_limit: Option<u64>,
+}
+
 /// Per-host wire quirks for a `direct` model, each `None` unless the operator set it.
 ///
 /// **THREE `Option<bool>`s RATHER THAN THREE `bool`s**, and the difference is the whole point:
@@ -1959,6 +2059,11 @@ pub struct RegistryModel {
     /// this host", so setting one quirk never silently resets the other two. **Read only by
     /// the `direct` harness.**
     pub quirks: DirectQuirks,
+    /// The per-model tuning the `codex` harness emits as `-c` overrides. **Read only by the
+    /// `codex` harness**, the same way `quirks` and `thinking` above are read only by
+    /// `direct`. Default (both fields `None`) emits nothing and is byte-for-byte the argv
+    /// every Codex turn had before these keys existed.
+    pub codex: CodexTuning,
     /// How hard this model should think before answering, when the wire supports it.
     ///
     /// `None` means `off`, which is the default for every model and the only value that is
@@ -2176,6 +2281,7 @@ fn glm_env_entry(default_interval_secs: u64, global_timeout_secs: Option<u64>) -
         Some("accounts/fireworks/models/glm-5p2"),
     );
     RegistryModel {
+        codex: CodexTuning::default(),
         id: "glm-5.2".to_string(),
         label: "GLM 5.2".to_string(),
         kind: ModelKind::Hosted,
@@ -2234,6 +2340,7 @@ fn kimi_env_entry(default_interval_secs: u64, global_timeout_secs: Option<u64>) 
         Some("accounts/fireworks/models/kimi-k3"),
     );
     RegistryModel {
+        codex: CodexTuning::default(),
         id: "kimi-k3".to_string(),
         // The SURFACE is in the label because there are now two Kimi entries and they are
         // not interchangeable — see [`kimi_codex_env_entry`]. The id is untouched: it is
@@ -2313,6 +2420,7 @@ fn kimi_codex_env_entry(
         Some("accounts/fireworks/models/kimi-k3"),
     );
     RegistryModel {
+        codex: CodexTuning::default(),
         id: "kimi-k3-codex".to_string(),
         label: "Kimi K3 (Codex)".to_string(),
         kind: ModelKind::OpenAi,
@@ -2372,6 +2480,7 @@ fn local_env_entry(default_interval_secs: u64, global_timeout_secs: Option<u64>)
         None,
     );
     RegistryModel {
+        codex: CodexTuning::default(),
         id: "local".to_string(),
         label: "Local".to_string(),
         kind: ModelKind::Local,
@@ -2420,6 +2529,11 @@ pub struct ActiveModel {
     pub level: Capability,
     /// The harness that runs this model's child, by [`Harness::id`].
     pub harness: String,
+    /// This model's Codex tuning, carried onto the turn so the harness can emit it without
+    /// reaching back into the registry (copied from its entry, exactly as `vision` is).
+    /// Both fields `None` for every model that declared neither key — which is every model
+    /// that existed before them — so the argv is unchanged. See [`codex_model_args`].
+    pub codex: CodexTuning,
     /// The price deck for the per-turn cost badge.
     pub price: PriceDeck,
     /// The vision helpers this model is paired with (copied from its registry entry) plus
@@ -2452,6 +2566,8 @@ impl ActiveModel {
             subagent_model: None,
             level: Capability::Write,
             harness: CLAUDE_CODE_ID.to_string(),
+            // Ambient opus runs on `claude-code`, which reads none of this.
+            codex: CodexTuning::default(),
             price: PriceDeck {
                 in_per_m: OPUS_IN_PER_M,
                 cached_per_m: OPUS_CACHED_PER_M,
@@ -2482,6 +2598,8 @@ impl ActiveModel {
             subagent_model: m.subagent_model.clone(),
             level: m.level,
             harness: m.harness.clone(),
+            // The registry entry is the ONLY source; a turn never invents tuning.
+            codex: m.codex,
             price: m.price,
             vision: m.vision.clone(),
             vision_complementary: m.vision_complementary,
@@ -2498,6 +2616,7 @@ impl ActiveModel {
 /// The always-present ambient default entry.
 fn opus_entry() -> RegistryModel {
     RegistryModel {
+        codex: CodexTuning::default(),
         id: DEFAULT_MODEL_ID.to_string(),
         label: "Claude Opus".to_string(),
         kind: ModelKind::Ambient,
@@ -2586,6 +2705,23 @@ pub struct ModelToml {
     pub thinking: Option<String>,
     /// The optional `[models.quirks]` sub-table. Read by `direct` only.
     pub quirks: Option<QuirksToml>,
+    /// `low` | `medium` | `high` | `xhigh` | `max`. Absent means the key is not emitted at
+    /// all, which is how Codex spells "this model's own default" — so there is no `none`
+    /// and an operator who wants that deletes the key. **Read by `codex` only.**
+    ///
+    /// An unrecognised value is a STARTUP ERROR naming the model and the value (see
+    /// `validate_model_config`), not a warn-and-default like the tuning keys above it. The
+    /// difference is that those name a value the agent layer can pick for itself, while this
+    /// one would travel to the model and fail the turn — `--strict-config` checks the key of
+    /// a `-c` override and not its value, so nothing downstream would catch it.
+    pub reasoning_effort: Option<String>,
+    /// The context size, in tokens, at which the Codex child compacts. Absent means the
+    /// child keeps its own built-in limit. **Read by `codex` only.**
+    ///
+    /// Emitted as `model_auto_compact_token_limit` — the operator-facing key here is the
+    /// unprefixed name; see [`CodexTuning::auto_compact_token_limit`] for why the wire
+    /// spelling differs.
+    pub auto_compact_token_limit: Option<u64>,
     /// REMOVED, and parsed only so its presence can be REFUSED at startup.
     ///
     /// The models deserializer ignores unknown keys (so a forward-looking example file
@@ -2826,6 +2962,21 @@ pub fn registry_model_from_toml(
                 .and_then(|q| q.reasoning_effort_supported),
             multiple_system_messages: t.quirks.as_ref().and_then(|q| q.multiple_system_messages),
             strict_tools: t.quirks.as_ref().and_then(|q| q.strict_tools),
+        },
+        // The two `codex` keys. `reasoning_effort` parses PERMISSIVELY here — an
+        // unrecognised value lands as `None` and emits nothing — because this function's
+        // contract is "a bad optional tuning key must not take a model out of the registry".
+        // The startup gate is what REFUSES it, naming the model and the value, so the typo
+        // is loud without this function having to decide the bridge cannot start. Same split
+        // as `level`, three fields up.
+        codex: CodexTuning {
+            reasoning_effort: t
+                .reasoning_effort
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .and_then(parse_reasoning_effort),
+            auto_compact_token_limit: t.auto_compact_token_limit,
         },
         thinking: t
             .thinking
@@ -4122,6 +4273,7 @@ mod tests {
         // A text model paired to an unconfigured helper reports no vision; configuring the
         // helper flips it on.
         let helper_unarmed = RegistryModel {
+            codex: Default::default(),
             id: "vl".into(),
             label: "VL".into(),
             kind: ModelKind::Hosted,
@@ -4140,6 +4292,7 @@ mod tests {
             vision_complementary: false,
         };
         let text = RegistryModel {
+            codex: Default::default(),
             id: "glm".into(),
             label: "GLM".into(),
             kind: ModelKind::Hosted,
@@ -4187,6 +4340,8 @@ mod tests {
         let _g = ENV_LOCK.lock_ok();
         std::env::set_var("JESSE_TEST_DECL_TOKEN2", "tok");
         let t = ModelToml {
+            reasoning_effort: None,
+            auto_compact_token_limit: None,
             harness: None,
             auth_scheme: None,
             quirks: None,
@@ -4227,6 +4382,66 @@ mod tests {
         assert_eq!(m.health.interval_secs, 30);
         assert_eq!(m.health.timeout_secs, 2);
         std::env::remove_var("JESSE_TEST_DECL_TOKEN2");
+    }
+
+    /// The two `codex` keys reach the registry entry, and both default to "emit nothing".
+    ///
+    /// The default is the load-bearing half: every model declared before these keys existed
+    /// carries `None` for both, so [`codex_model_args`] contributes an empty list and those
+    /// turns keep the argv they always had.
+    #[test]
+    fn declarative_codex_tuning_parses_and_defaults_to_nothing() {
+        let _g = ENV_LOCK.lock_ok();
+        std::env::set_var("JESSE_TEST_ASTRA_TOKEN", "tok");
+
+        let bare = model_toml("gpt-6-astra", "hosted", Some("JESSE_TEST_ASTRA_TOKEN"));
+        let m = registry_model_from_toml(&bare, None, None).unwrap();
+        assert_eq!(m.codex, CodexTuning::default(), "the quiet default");
+
+        let mut t = model_toml("gpt-6-astra", "hosted", Some("JESSE_TEST_ASTRA_TOKEN"));
+        t.reasoning_effort = Some("  XHigh ".into());
+        t.auto_compact_token_limit = Some(272_000);
+        let m = registry_model_from_toml(&t, None, None).unwrap();
+        assert_eq!(
+            m.codex.reasoning_effort,
+            Some(ReasoningEffort::XHigh),
+            "trimmed and case-folded like every other declarative value"
+        );
+        assert_eq!(m.codex.auto_compact_token_limit, Some(272_000));
+
+        std::env::remove_var("JESSE_TEST_ASTRA_TOKEN");
+    }
+
+    /// A BAD `reasoning_effort` DOES NOT TAKE THE MODEL OUT OF THE REGISTRY — the startup
+    /// gate refuses it instead.
+    ///
+    /// The split is deliberate and matches `level` three fields up: this function's contract
+    /// is that an optional tuning key with a typo in it must not silently delete a model from
+    /// the picker, and `validate_model_config` is what turns the typo into a loud startup
+    /// error naming the model and the value. A model that vanished here would be a config
+    /// error reported as an absence.
+    #[test]
+    fn a_bad_reasoning_effort_keeps_the_model_and_emits_nothing() {
+        let _g = ENV_LOCK.lock_ok();
+        std::env::set_var("JESSE_TEST_ASTRA_TOKEN2", "tok");
+
+        let mut t = model_toml("gpt-6-astra", "hosted", Some("JESSE_TEST_ASTRA_TOKEN2"));
+        t.reasoning_effort = Some("ludicrous".into());
+        let m = registry_model_from_toml(&t, None, None)
+            .expect("a typo in an optional tuning key must not drop the entry");
+        assert_eq!(m.id, "gpt-6-astra");
+        assert_eq!(
+            m.codex.reasoning_effort, None,
+            "an unparsed effort asks for nothing rather than guessing"
+        );
+
+        // `none` is not a quiet synonym for the default either — same treatment, and the
+        // gate is what explains the remedy.
+        t.reasoning_effort = Some("none".into());
+        let m = registry_model_from_toml(&t, None, None).unwrap();
+        assert_eq!(m.codex.reasoning_effort, None);
+
+        std::env::remove_var("JESSE_TEST_ASTRA_TOKEN2");
     }
 
     /// AN OPENAI-KIND ENTRY NEEDS NO `health` BLOCK TO BE PROBEABLE.

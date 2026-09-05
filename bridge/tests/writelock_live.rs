@@ -367,8 +367,17 @@ fn the_write_lock_adds_exactly_one_known_flag_per_harness() {
     let cfg = s.config();
 
     // ---- Codex ----------------------------------------------------------------
-    let plain = build_codex_args("hi", None, Capability::Write, &s.vault, &[], &[], false);
-    let locked = build_codex_args("hi", None, Capability::Write, &s.vault, &[], &[], true);
+    let plain = build_codex_args(
+        "hi",
+        None,
+        Capability::Write,
+        &s.vault,
+        &[],
+        &[],
+        &[],
+        false,
+    );
+    let locked = build_codex_args("hi", None, Capability::Write, &s.vault, &[], &[], &[], true);
     let added: Vec<&String> = locked.iter().filter(|a| !plain.contains(a)).collect();
     assert_eq!(
         added,

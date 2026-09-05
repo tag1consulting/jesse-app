@@ -263,6 +263,7 @@ mod tests {
     /// A configured, healthy registry entry at `level`.
     fn model(id: &str, level: Capability) -> RegistryModel {
         RegistryModel {
+            codex: Default::default(),
             id: id.to_string(),
             label: id.to_string(),
             kind: ModelKind::Local,

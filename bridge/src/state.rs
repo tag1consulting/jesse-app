@@ -362,6 +362,7 @@ mod tests {
         let registry = ModelRegistry {
             models: vec![
                 RegistryModel {
+                    codex: Default::default(),
                     id: "opus".into(),
                     label: "Claude Opus".into(),
                     kind: ModelKind::Ambient,
@@ -380,6 +381,7 @@ mod tests {
                     vision_complementary: false,
                 },
                 RegistryModel {
+                    codex: Default::default(),
                     id: "glm-5.2".into(),
                     label: "GLM 5.2".into(),
                     kind: ModelKind::Hosted,
