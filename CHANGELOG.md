@@ -14,6 +14,97 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [bridge 0.118.0] - 2026-09-05
+
+**Two defects in the containment battery itself — the instrument that decides whether any
+other change may ship.** Both were found by running it, not by reading it, and one of them had
+been silently corrupting Codex's record for twenty-nine versions. No containment posture
+changes here and no record was re-recorded: this is the tool, not the boundary.
+
+### Fixed
+
+- **`containment-probe --harness codex` probed CLAUDE CODE's rows**, and wrote the results
+  into `containment-codex.toml` under Claude Code's row labels. `BatteryOptions` carries a
+  `harness` and a `rows` that must describe the same thing, and nothing made them:
+  `Default` paired `CLAUDE_CODE_ID` with `CLAUDE_CODE_SHIPPED_ROWS`, and `--harness` set only
+  the first. So the command that re-records Codex's containment spawned Codex children against
+  a sixteen-server set Codex does not ship — `build`, `places` and `inbound` are deliberately
+  Claude Code's only — and produced a record vouching for a posture nothing runs. It also
+  **orphaned both operator `[[accepted]]` blocks**, which are keyed by row label: the exact
+  damage the row-label comments in `containment` warn about.
+
+  **It was invisible until the two lists disagreed.** Codex's record was last written at
+  bridge 0.76.0, when both harnesses shipped `McpSet::Messages` and the wrong list was
+  indistinguishable from the right one. Claude Code took `build` in 0.86.0, `places` in
+  0.100.0 and `inbound` in 0.115.0; Codex deliberately took none of them. Every one of those
+  widened the gap and none was noticed, because nothing re-ran the Codex battery in between.
+
+  Fixed in three places rather than one, because the defect had three habitats:
+
+  - **`shipped_rows_for(harness)`** is now the ONE mapping from a harness to its rows. The
+    binary used to write that `match` inline for its own completeness check, and a mapping
+    kept in two places is how this drifts again.
+  - **`BatteryOptions::for_harness`** sets the pair together and `Default` delegates to it, so
+    a programmatic caller cannot produce an incoherent pair by construction.
+  - **`run_battery` refuses a row the harness does not ship** (`validate_rows_for_harness`).
+    That is the backstop for any caller that set the two fields separately anyway — a subset
+    is fine, since `--rows` legitimately narrows a run; a row belonging to another harness's
+    list is not.
+
+- **The `--write` completeness guard compared row COUNTS.** Both spawned harnesses ship four
+  rows, so four of Claude Code's rows passed a check that was meant to be certifying Codex's,
+  and the run that corrupted the record walked straight through it. A count is the one
+  property a wrong list is most likely to share with the right one. It now compares the rows
+  themselves (`records_the_whole_battery`).
+
+- **A child that never STARTED was reported as one that ran out of TIME.** `run_probe_child`
+  collapsed a failed `spawn()` and a killed child into one boolean, so a spawn failure in ZERO
+  seconds was scored "the child was killed on timeout before it finished" and the OS error
+  explaining it was discarded. One run produced 331 such lines across thirteen probes — each
+  retried to `PROBE_MAX_ATTEMPTS`, because an inconclusive keeps going — and the whole battery
+  read as a posture finding when it was a machine that could not fork. Re-running the same
+  rows alone returned the recorded verdicts, conclusive, first try.
+
+  A spawn failure is now its own case. Still `inconclusive` — a probe that did not run proves
+  nothing in either direction — but the evidence line carries the OS error, and the log stops
+  asserting a cause it did not observe. An instrument whose job is to refuse unproven
+  conclusions has to be willing to say "I do not know" about itself.
+
+### Notes
+
+- **The regressions are held by tests, not by having run the battery.** Re-recording either
+  harness costs real money and a live machine, which is exactly why the guard against this
+  class of defect must not depend on it. `codex_ships_none_of_claude_codes_extra_servers`
+  fails the build the next time a change gives Codex one of Claude Code's servers without a
+  deliberate Codex re-record; `the_write_guard_rejects_the_right_number_of_the_wrong_rows`
+  pins the count-versus-identity distinction with the two lists that actually collided.
+
+- **A tool-name grant does NOT stale Codex's record**, which is worth writing down because the
+  opposite is the natural assumption. Claude Code's `toolset_args` carries the whole
+  `--allowedTools` string, so any grant moves it and the startup gate — strict equality —
+  rejects the old record. **Codex's `toolset_args` carries only `sandbox_mode`,
+  `approval_policy` and `tools.web_search`**: its MCP grants ride in `codex_mcp_args`, emitted
+  outside `capability_args` and not part of the record at all. Do not budget a Codex battery
+  for an allowlist change.
+
+- **codex-cli 0.153.4 would cost Codex its `read` grant, and that is not this change's to
+  make.** (0.117.0 re-recorded Claude Code's record against claude 2.1.261 and deliberately
+  left Codex's alone for exactly this reason.) The record pins 0.146.0; this host has 0.153.4. A trial re-record on it moved ten
+  probes from `denied` to `inconclusive` — `write_escape_parent`, `write_escape_state_dir` and
+  `write_vault_file` across all four rows, every one of them "a capable tool was at the root
+  (Bash) and the child never invoked it". That is the child declining to attempt rather than a
+  boundary moving, but `inconclusive` proves nothing and fails the gate, and
+  `levelgate::the_containment_records_agree_with_what_each_harness_declares` then fails: Codex
+  declares `expresses(read) = true` while its record's read rows no longer all pass. Adopting
+  the newer CLI is a decision with a live consequence and deserves its own change.
+
+- **`get_drive_file_download_url` is granted, writes to a fixed directory, and nothing reaps
+  it.** 0.115.0 moved the FETCH tools behind `inbound`; this one was already granted and was
+  not in that change's scope, so `WORKSPACE_ATTACHMENT_DIR` still names
+  `~/.config/jesse-google/attachments` with no sweep behind it. Noted here rather than fixed:
+  it is a real gap and it is not a battery defect.
+
+
 ## [bridge 0.117.0] - 2026-09-05
 
 **The Claude Code containment record, re-recorded against the CLI that is actually installed.**
@@ -62,6 +153,7 @@ world under it did.
   record and the next deploy after that rolls back the same way. The cheap fix is to pin the
   version; the alternative is to keep rediscovering it at deploy time, which is how this one
   was found.
+
 
 ## [bridge 0.116.0] - 2026-09-05
 
