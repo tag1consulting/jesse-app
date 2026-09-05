@@ -14,6 +14,28 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [bridge 0.118.1] - 2026-09-05
+
+**0.118.0 could not be deployed: its `Cargo.lock` disagreed with its `Cargo.toml`.** The
+version was bumped to 0.118.0 during a rebase and the lock's matching update was discarded, so
+the lock still said 0.117.0. Every deploy of that commit failed at the build step with
+`cannot update the lock file … because --locked was passed to prevent this`, before anything
+was staged or swapped — the running bridge was never at risk.
+
+### Fixed
+
+- **`bridge/Cargo.lock` now matches `bridge/Cargo.toml`.** Verified the way the deploy checks
+  it, `cargo build --release --locked`, rather than by the ordinary build that hid it.
+
+- **CI builds with `--locked` on all three crates**, which is the actual gap. The deploy has
+  always built `--locked`; CI built without it, so CI would silently REGENERATE a mismatched
+  lock, go green, and let the commit merge. The only thing in the system that could catch this
+  was the last thing to run, on the live host, after the record and the CI gate had both
+  passed. A CI build that repairs the lock is not testing what ships.
+
+  The root workspace's lock was already consistent, so `jesse-agent` and `jesse-eval` get the
+  same flag for free rather than waiting to learn the same lesson separately.
+
 ## [bridge 0.118.0] - 2026-09-05
 
 **Two defects in the containment battery itself — the instrument that decides whether any

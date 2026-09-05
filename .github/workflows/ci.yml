@@ -56,8 +56,10 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-agent-${{ hashFiles('Cargo.lock') }}
 
+      # `--locked` for the same reason it is on the bridge's release build: the lock must be
+      # the one that ships, not one CI quietly regenerated. See that step's comment.
       - name: Build
-        run: cargo build -p jesse-agent
+        run: cargo build -p jesse-agent --locked
 
       # `--all-targets` so the conformance suite AND `examples/smoke.rs` are compiled. The
       # smoke is an example rather than a test precisely so this compiles it and never
@@ -97,8 +99,9 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-eval-${{ hashFiles('Cargo.lock') }}
 
+      # `--locked`, as on the other two builds — see the bridge's release step.
       - name: Build
-        run: cargo build -p jesse-eval
+        run: cargo build -p jesse-eval --locked
 
       # This is the teeth check. `product_v1_{direct,cli}_{good,bad}_mock_*` are four of the
       # tests it runs, and between them they are the claim that the suite's assertions catch
@@ -144,8 +147,18 @@ jobs:
       # listener are not compiled into the bridge that answers turns, and this step is
       # what keeps that true — if the probe module ever leaks onto the always-compiled
       # path, this build is where it shows up.
+      # `--locked` IS LOAD-BEARING, and it is here because its absence cost a deploy.
+      #
+      # The deploy builds with `cargo build --release --locked`; CI built without it. So a
+      # commit whose `Cargo.lock` disagreed with its `Cargo.toml` — a version bumped in one
+      # and not the other — went green here, merged, and then failed at the deploy's build
+      # step with "cannot update the lock file ... because --locked was passed". The only
+      # thing in the system that could catch it was the last thing to run.
+      #
+      # A CI build that silently REPAIRS the lock is not testing what ships. This makes the
+      # two builds ask the same question.
       - name: Build (release)
-        run: cargo build --release
+        run: cargo build --release --locked
 
       # Tests and lints DO enable the feature, so the probe module and the containment
       # record's consistency checks (tests/containment.rs, which requires the feature to
