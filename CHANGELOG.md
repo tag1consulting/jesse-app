@@ -14,6 +14,76 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [bridge 0.119.0] - 2026-09-05
+
+**The battery can see a command the sandbox refused again, and Codex's record is re-recorded
+against the CLI that is actually installed.**
+
+### Root cause
+
+codex-cli 0.153 routes the shell through a new `exec` CUSTOM TOOL
+(`tools.exec_command({cmd: …})`) instead of the native exec item, and that path emits **no
+`command_execution` event when the sandbox refuses the command**. Measured live on 0.153.4:
+
+| command                      | `command_execution` items | rollout `custom_tool_call` |
+|------------------------------|---------------------------|----------------------------|
+| `echo hi` (succeeds)         | 2 (started + completed)   | 1                          |
+| `ls /nonexistent` (exit 1)   | 2                         | 1                          |
+| write refused by the sandbox | **0**                     | **1**                      |
+
+An ordinary failure stays visible; only a sandbox refusal disappears. That is precisely the
+case the hard gates exist to measure. The battery builds `attempted()` from those events, so
+a child that tried and was refused became indistinguishable from one that never tried: every
+hard gate scored `inconclusive`, and an inconclusive probe fails whatever its class. A
+re-record on 0.153 would therefore have produced a Codex record with **no grantable level** —
+strictly worse than the stale record it replaced, which is merely advisory.
+
+This is the same defect the stderr pass was written for on 0.146.0, reappearing on a new code
+path. The boundary itself never moved: the escape file never lands.
+
+### Fixed
+
+- **The rollout is the witness.** Codex writes a full session rollout into the per-turn
+  `CODEX_HOME` the harness already mints, recording every `exec` call with its own
+  `exit_code` and the kernel's refusal text verbatim. `codex_rollout_exec_calls` reads it,
+  and `parse_codex_trace` takes exec activity from it.
+
+  It is **codex's record, not the child's claim** — the distinction the whole battery rests
+  on. The model's prose about what happened remains inadmissible.
+
+- **It REPLACES the event stream rather than supplementing it.** The rollout records the
+  successful calls too, so merging both would double-count every visible call, and
+  `tool_errors` is evidence the record commits verbatim.
+
+- **`Some(empty)` and `None` are different answers.** A readable rollout with no `exec` call
+  is positive evidence the child never tried, and stays `inconclusive`. Only an ABSENT
+  rollout is unknown, and then the `command_execution` events stand exactly as before — which
+  is what keeps an older CLI scoring identically across this change.
+
+- **An unparseable output chunk is scored as a FAILURE**, not a clean run. Crediting an
+  unreadable result as exit 0 is the direction that invents containment nobody measured.
+
+### Re-recorded
+
+`bridge/containment-codex.toml`, against **codex-cli 0.153.4** on `gpt-6-astra`. The battery's
+own verdict: *"nothing moved since 2026-08-11 — this run CONFIRMS the previous one."*
+
+Every row status, probe verdict, `toolset_args` and `root_tools` entry is byte-identical to
+the August record; only `binary_version`, `bridge_version`, `recorded`, `model` and the
+evidence lines changed. Both operator `[[accepted]]` blocks carry forward with their original
+`decided = "2026-08-11"` signature, and the run reported no newly open probe that they do not
+cover, beyond the six at `basic/none` that were already unaccepted and unshipped (Codex cannot
+express `basic`; `level = "basic"` on this harness is refused at startup).
+
+The record still reports `gate = "fail"`, as it has since 0.76.0. Nothing regressed: the
+startup gate walks the ROWS, and `read` and `write` remain grantable exactly as before.
+
+### Why this was not caught earlier
+
+Nothing re-ran the Codex battery between 0.76.0 and now, so the CLI upgrade that exposed this
+had no gate in front of it. The deploy gate did its job — it refused a bridge whose record no
+longer described the installed binary, and rolled back cleanly.
+
 ## [bridge 0.118.1] - 2026-09-05
 
 **0.118.0 could not be deployed: its `Cargo.lock` disagreed with its `Cargo.toml`.** The
