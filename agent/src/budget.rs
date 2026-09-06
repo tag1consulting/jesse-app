@@ -131,6 +131,9 @@ impl Budget {
 pub struct PriceDeck {
     pub in_per_m: f64,
     pub cached_per_m: f64,
+    /// Explicit cache-creation rate. Omission preserves the legacy input-rate estimate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_per_m: Option<f64>,
     pub out_per_m: f64,
 }
 
@@ -140,6 +143,7 @@ impl PriceDeck {
     pub const ZERO: PriceDeck = PriceDeck {
         in_per_m: 0.0,
         cached_per_m: 0.0,
+        cache_write_per_m: None,
         out_per_m: 0.0,
     };
 
@@ -149,13 +153,10 @@ impl PriceDeck {
     /// reads, so the three counts are added at their own rates rather than one being
     /// subtracted from another.
     ///
-    /// **CACHE WRITES ARE PRICED AT THE INPUT RATE**, and that is an approximation with a
-    /// reason. On the Anthropic wire a cache write costs about 1.25× input; the deck has
-    /// three rates, not four. Adding a fourth would make this type stop being the bridge's
-    /// deck, which is the one property it is here to have — and would put the divergence
-    /// in the type D4 is meant to adopt. So the approximation is documented, it errs LOW
-    /// by about a quarter of the cache-write component only, and the fourth rate belongs in
-    /// whichever change is prepared to add it on both sides at once.
+    /// Cache creation uses `cache_write_per_m` when configured. Otherwise it retains
+    /// the legacy input-rate estimate. Configure the provider's rate explicitly: wire
+    /// compatibility does not imply the same billing policy. One rate describes the
+    /// cache lifetime used by this deployment; mixed lifetimes need separate counts.
     ///
     /// **[`Usage::reasoning_tokens`] IS NOT PRICED, AND MUST NOT BE.** It is a breakdown
     /// of `output_tokens`, not a fifth count beside it, so adding a term for it would bill
@@ -167,7 +168,8 @@ impl PriceDeck {
         let output = u.output_tokens.unwrap_or(0) as f64;
         let cache_read = u.cache_read_tokens.unwrap_or(0) as f64;
         let cache_write = u.cache_write_tokens.unwrap_or(0) as f64;
-        ((input + cache_write) * self.in_per_m
+        (input * self.in_per_m
+            + cache_write * self.cache_write_per_m.unwrap_or(self.in_per_m)
             + cache_read * self.cached_per_m
             + output * self.out_per_m)
             / 1_000_000.0
@@ -255,6 +257,32 @@ impl Spend {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn explicit_cache_write_rate_reaches_cost_and_budget() {
+        let deck = PriceDeck {
+            in_per_m: 2.0,
+            cached_per_m: 0.2,
+            cache_write_per_m: Some(2.5),
+            out_per_m: 10.0,
+        };
+        let u = usage(0, 0, 0, 100_000);
+        assert!((deck.cost_usd(&u) - 0.25).abs() < 1e-12);
+        let mut spend = Spend::default();
+        spend.record_call(&u, &deck);
+        let mut budget = Budget::with_wall(Duration::from_secs(30));
+        budget.max_cost_usd = Some(0.45);
+        assert_eq!(spend.check(&budget, Duration::ZERO), Some(Ceiling::Cost));
+        let legacy: PriceDeck =
+            serde_json::from_str(r#"{"in_per_m":2,"cached_per_m":0.2,"out_per_m":10}"#).unwrap();
+        assert!((legacy.cost_usd(&u) - 0.2).abs() < 1e-12);
+        let free_writes = PriceDeck {
+            cache_write_per_m: Some(0.0),
+            ..deck
+        };
+        assert_eq!(free_writes.cost_usd(&u), 0.0);
+    }
+
     use super::*;
 
     fn usage(input: u64, output: u64, cache_read: u64, cache_write: u64) -> Usage {
@@ -271,6 +299,7 @@ mod tests {
     const DECK: PriceDeck = PriceDeck {
         in_per_m: 3.0,
         cached_per_m: 0.3,
+        cache_write_per_m: None,
         out_per_m: 15.0,
     };
 

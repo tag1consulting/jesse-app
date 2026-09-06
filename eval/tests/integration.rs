@@ -1058,3 +1058,57 @@ fn vault_readonly_write_level_is_refused_at_cli() {
         "stderr should explain the refusal, got: {stderr}"
     );
 }
+
+#[test]
+fn cache_write_price_cli_reaches_report_without_changing_legacy_default() {
+    let tmp = tempfile::tempdir().unwrap();
+    let suite = tmp.path().join("suite.json");
+    let mock = tmp.path().join("mock.json");
+    fs::write(
+        &suite,
+        serde_json::json!({"name":"cache-price","tasks":[{
+            "id":"cache", "class":"titles", "prompt":"say ready", "workspace":"fixture",
+            "allowed_tools":[], "assertions":[{"type":"completed"}]
+        }]})
+        .to_string(),
+    )
+    .unwrap();
+    fs::write(
+        &mock,
+        serde_json::json!({"responses":{"cache":{"ndjson":[{
+            "type":"result", "subtype":"success", "is_error":false, "result":"ready",
+            "usage":{"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":0,
+                     "cache_creation_input_tokens":1_000_000}
+        }]}}})
+        .to_string(),
+    )
+    .unwrap();
+    for (label, rate, expected) in [
+        ("legacy", None, 2.0),
+        ("priced", Some("2.5"), 2.5),
+        ("free-writes", Some("0"), 0.0),
+    ] {
+        let out = tmp.path().join(label);
+        let mut cmd = Command::new(bin());
+        cmd.args(["run", "--suite"])
+            .arg(&suite)
+            .arg("--mock")
+            .arg(&mock)
+            .arg("--out")
+            .arg(&out)
+            .args(["--price-in", "2"]);
+        if let Some(rate) = rate {
+            cmd.args(["--price-cache-write", rate]);
+        }
+        let result = cmd.output().unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let report: serde_json::Value =
+            serde_json::from_slice(&fs::read(out.join("results.json")).unwrap()).unwrap();
+        let actual = report["tasks"][0]["cost_usd"].as_f64().unwrap();
+        assert!((actual - expected).abs() < 1e-12, "{label}: {actual}");
+    }
+}

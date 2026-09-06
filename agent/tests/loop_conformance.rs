@@ -378,6 +378,7 @@ fn input(tools: Arc<dyn ToolSet>) -> TurnInput {
         prices: PriceDeck {
             in_per_m: 3.0,
             cached_per_m: 0.3,
+            cache_write_per_m: None,
             out_per_m: 15.0,
         },
         thinking: Thinking::Off,

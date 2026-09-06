@@ -1540,6 +1540,8 @@ pub fn resolve_context_carry() -> bool {
 pub struct PriceDeck {
     pub in_per_m: f64,
     pub cached_per_m: f64,
+    /// Cache creation rate; absent preserves the legacy input-rate estimate.
+    pub cache_write_per_m: Option<f64>,
     pub out_per_m: f64,
 }
 
@@ -1548,6 +1550,7 @@ impl PriceDeck {
     pub const ZERO: PriceDeck = PriceDeck {
         in_per_m: 0.0,
         cached_per_m: 0.0,
+        cache_write_per_m: None,
         out_per_m: 0.0,
     };
 
@@ -2299,6 +2302,7 @@ fn glm_env_entry(default_interval_secs: u64, global_timeout_secs: Option<u64>) -
         price: PriceDeck {
             in_per_m: FW_GLM_IN_PER_M,
             cached_per_m: FW_GLM_CACHED_PER_M,
+            cache_write_per_m: None,
             out_per_m: FW_GLM_OUT_PER_M,
         },
         health: HealthConfig {
@@ -2365,6 +2369,7 @@ fn kimi_env_entry(default_interval_secs: u64, global_timeout_secs: Option<u64>) 
             PriceDeck {
                 in_per_m: FW_KIMI_K3_IN_PER_M,
                 cached_per_m: FW_KIMI_K3_CACHED_PER_M,
+                cache_write_per_m: None,
                 out_per_m: FW_KIMI_K3_OUT_PER_M,
             },
         ),
@@ -2443,6 +2448,7 @@ fn kimi_codex_env_entry(
             PriceDeck {
                 in_per_m: FW_KIMI_K3_IN_PER_M,
                 cached_per_m: FW_KIMI_K3_CACHED_PER_M,
+                cache_write_per_m: None,
                 out_per_m: FW_KIMI_K3_OUT_PER_M,
             },
         ),
@@ -2571,6 +2577,7 @@ impl ActiveModel {
             price: PriceDeck {
                 in_per_m: OPUS_IN_PER_M,
                 cached_per_m: OPUS_CACHED_PER_M,
+                cache_write_per_m: None,
                 out_per_m: OPUS_OUT_PER_M,
             },
             // Ambient opus sees images natively (CLI Read tool); never uses the helper layer.
@@ -2638,6 +2645,7 @@ fn opus_entry() -> RegistryModel {
         price: PriceDeck {
             in_per_m: OPUS_IN_PER_M,
             cached_per_m: OPUS_CACHED_PER_M,
+            cache_write_per_m: None,
             out_per_m: OPUS_OUT_PER_M,
         },
         health: HealthConfig::default(),
@@ -2662,6 +2670,7 @@ fn opus_entry() -> RegistryModel {
 pub struct PriceToml {
     pub in_per_m: Option<f64>,
     pub cached_per_m: Option<f64>,
+    pub cache_write_per_m: Option<f64>,
     pub out_per_m: Option<f64>,
 }
 
@@ -2872,6 +2881,7 @@ pub fn registry_model_from_toml(
         .map(|p| PriceDeck {
             in_per_m: p.in_per_m.unwrap_or(0.0),
             cached_per_m: p.cached_per_m.unwrap_or(0.0),
+            cache_write_per_m: p.cache_write_per_m,
             out_per_m: p.out_per_m.unwrap_or(0.0),
         })
         .unwrap_or(PriceDeck::ZERO);
@@ -3053,6 +3063,10 @@ pub fn model_price_from_env(prefix: &str, default: PriceDeck) -> PriceDeck {
     PriceDeck {
         in_per_m: env_parse(&format!("{prefix}_PRICE_IN"), default.in_per_m),
         cached_per_m: env_parse(&format!("{prefix}_PRICE_CACHED"), default.cached_per_m),
+        cache_write_per_m: std::env::var(format!("{prefix}_PRICE_CACHE_WRITE"))
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .or(default.cache_write_per_m),
         out_per_m: env_parse(&format!("{prefix}_PRICE_OUT"), default.out_per_m),
     }
 }
@@ -3371,6 +3385,32 @@ pub fn export_mcp_server_env() {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn configured_cache_write_rate_reaches_badge_and_agent() {
+        let mut t = model_toml("priced", "local", None);
+        t.price = Some(
+            toml::from_str::<PriceToml>(
+                "in_per_m = 2.0\ncached_per_m = 0.2\ncache_write_per_m = 2.5\nout_per_m = 10.0",
+            )
+            .unwrap(),
+        );
+        let m = registry_model_from_toml(&t, None, None).unwrap();
+        let u = crate::ShadowUsage {
+            cache_creation_input_tokens: Some(1_000_000),
+            ..Default::default()
+        };
+        assert!((u.cost_on(&m.price) - 2.5).abs() < 1e-12);
+        let agent = crate::prices_for_agent(&m.price);
+        let usage = jesse_agent::provider::Usage {
+            cache_write_tokens: Some(1_000_000),
+            ..Default::default()
+        };
+        assert!((agent.cost_usd(&usage) - 2.5).abs() < 1e-12);
+        t.price.as_mut().unwrap().cache_write_per_m = None;
+        let legacy = registry_model_from_toml(&t, None, None).unwrap();
+        assert!((u.cost_on(&legacy.price) - 2.0).abs() < 1e-12);
+    }
 
     /// REGRESSION, 2026-08-21. CLAUDE.md makes the link-graph expansion mandatory after a
     /// QMD hit, so a bridge child that cannot run `bin/vault-links` cannot follow its own
@@ -4359,6 +4399,7 @@ mod tests {
             price: Some(PriceToml {
                 in_per_m: Some(2.0),
                 cached_per_m: Some(0.2),
+                cache_write_per_m: None,
                 out_per_m: Some(8.0),
             }),
             health: Some(HealthToml {

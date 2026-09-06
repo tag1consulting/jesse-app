@@ -3266,3 +3266,13 @@ repo, then reads/searches/diffs it.
   dispatches a frame at each new `event:` line. This only affected the live,
   display-only token stream; the poll path (which owns completion) always
   delivered the reply, so no answer was ever lost to it.
+
+## Cache creation pricing
+
+Set `cache_write_per_m` in a model price table when cache creation has a different
+rate from ordinary input. Agent and eval CLI runs use `--price-cache-write`.
+The rate is dollars per million tokens for the configured cache lifetime. When
+omitted, the historical input-rate estimate remains; it is not a provider quote.
+For example, a $2 input rate and $2.50 five-minute cache-write rate must be
+configured separately. The bridge, direct-loop ledger, budget and eval report use
+the same configured rate.
