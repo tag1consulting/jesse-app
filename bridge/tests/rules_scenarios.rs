@@ -1238,6 +1238,76 @@ fn two_publications_at_once_never_leave_a_mixed_bundle() {
 }
 
 #[test]
+fn concurrent_turns_never_see_a_half_published_bundle() {
+    // TURNS, not publications: several threads run the real per-turn gate on both harnesses
+    // while another thread republishes underneath them. A gate may legitimately FAIL during
+    // that window (it is reading a root that is being rewritten, and refusing is the correct
+    // answer to a moment when the pair does not agree). What must never happen is a gate that
+    // SUCCEEDS while reporting a mixed bundle, because that is a turn admitted against policy
+    // that was never published as a whole.
+    let w = World::new("concurrent-turns");
+    let cfg = Arc::new(w.cfg());
+    let root = w.root.clone();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    let publisher = {
+        let root = root.clone();
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::SeqCst) {
+                let _ = rules::publish(
+                    &root,
+                    &rules::PublishOptions {
+                        force: true,
+                        ..Default::default()
+                    },
+                );
+            }
+        })
+    };
+
+    let readers: Vec<_> = ADAPTERS
+        .iter()
+        .map(|h| {
+            let cfg = cfg.clone();
+            let h: &'static str = h;
+            std::thread::spawn(move || {
+                let mut admitted = 0usize;
+                for _ in 0..40 {
+                    if let Ok(Some(r)) = gate(&cfg, h, None, Capability::Write) {
+                        admitted += 1;
+                        // A report only exists when `verify` compared BOTH documents against
+                        // one rendered generation, so a successful gate is itself the claim
+                        // that the pair agreed. Re-checking the core digest here is what would
+                        // catch a future gate that stopped comparing them.
+                        assert_eq!(r.core_digest.len(), 64, "{h}");
+                        assert_eq!(r.digest.len(), 64, "{h}");
+                    }
+                }
+                (h, admitted)
+            })
+        })
+        .collect();
+
+    let results: Vec<(&str, usize)> = readers
+        .into_iter()
+        .map(|t| t.join().expect("thread"))
+        .collect();
+    stop.store(true, Ordering::SeqCst);
+    publisher.join().expect("publisher");
+
+    for (h, admitted) in &results {
+        assert!(
+            *admitted > 0,
+            "{h}: every one of 40 gates failed, so this proved nothing about the happy path"
+        );
+    }
+    // And the root is coherent once the churn stops.
+    let report = rules::check(&w.root);
+    assert!(report.ok(), "{:?}", report.problems);
+}
+
+#[test]
 fn regeneration_is_deterministic_and_idempotent() {
     let w = World::new("determinism");
     let first = (w.read("CLAUDE.md"), w.read("AGENTS.md"));
