@@ -1364,7 +1364,8 @@ fn rollout_files(sessions: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// Parse one CODEX child's stdout (`codex exec --json` JSONL) into the same [`RunTrace`].
+/// Parse one CODEX child's stdout (App Server JSON-RPC notifications, or the legacy
+/// `codex exec --json` JSONL) into the same [`RunTrace`].
 ///
 /// The battery scores every harness through one vocabulary, so this maps Codex's events onto
 /// the fields [`resolve_probe_verdict`] reads. Three mappings are judgment calls and are
@@ -1430,19 +1431,47 @@ pub fn parse_codex_trace(
         let Ok(v) = serde_json::from_str::<Value>(line) else {
             continue;
         };
-        let kind = v.get("type").and_then(|x| x.as_str()).unwrap_or_default();
+        // THE APP SERVER WRAPS EVERY EVENT IN A JSON-RPC NOTIFICATION, and the item names
+        // inside it are camelCase where `codex exec --json` used snake_case. Both spellings
+        // are read here rather than one being deleted, for two reasons: the fixtures in this
+        // file's own tests are captured `exec` streams that still describe real behaviour,
+        // and a record taken before 0.121.0 is still a record of the same boundary. A parser
+        // that silently found nothing would score a contained child as an untried one.
+        let (kind, item) = match v.get("method").and_then(|x| x.as_str()) {
+            Some(m) => (
+                match m {
+                    "item/started" => "item.started",
+                    "item/completed" => "item.completed",
+                    _ => continue,
+                },
+                v.get("params").and_then(|p| p.get("item")),
+            ),
+            None => (
+                v.get("type").and_then(|x| x.as_str()).unwrap_or_default(),
+                v.get("item"),
+            ),
+        };
         if kind != "item.started" && kind != "item.completed" {
             continue;
         }
-        let Some(item) = v.get("item") else { continue };
+        let Some(item) = item else { continue };
+        /// One field, under either spelling.
+        fn field<'a>(item: &'a Value, snake: &str, camel: &str) -> Option<&'a Value> {
+            item.get(snake).or_else(|| item.get(camel))
+        }
         match item
             .get("type")
             .and_then(|x| x.as_str())
             .unwrap_or_default()
         {
             // Last one wins: Codex emits a preamble message before its tool calls and the
-            // real answer after them.
-            "agent_message" if kind == "item.completed" => {
+            // real answer after them. A `commentary`-phase message is that preamble and is
+            // never the answer — the App Server labels it, `exec` did not, and an unlabelled
+            // one is treated as the answer for the reason the protocol schema gives.
+            "agent_message" | "agentMessage" if kind == "item.completed" => {
+                if item.get("phase").and_then(|x| x.as_str()) == Some("commentary") {
+                    continue;
+                }
                 if let Some(text) = item.get("text").and_then(|x| x.as_str()) {
                     t.answer = text.to_string();
                 }
@@ -1450,20 +1479,19 @@ pub fn parse_codex_trace(
             // THE ROLLOUT WINS WHEN THERE IS ONE. It records these same calls AND the
             // sandbox-refused ones this stream drops, so reading both would double-count
             // every visible call. See [`codex_rollout_exec_calls`].
-            "command_execution" if rollout.is_some() => {}
-            "command_execution" => {
+            "command_execution" | "commandExecution" if rollout.is_some() => {}
+            "command_execution" | "commandExecution" => {
                 if kind == "item.started" {
                     t.tool_uses.push("Bash".to_string());
                     continue;
                 }
-                let out = item
-                    .get("aggregated_output")
+                let out = field(item, "aggregated_output", "aggregatedOutput")
                     .and_then(|x| x.as_str())
                     .unwrap_or_default();
                 // Ground truth for a shell probe is the EXIT CODE, not the narration: a
                 // sandbox denial surfaces as a non-zero exit with the kernel's refusal on
                 // stderr, which is exactly the tool-layer failure the battery wants.
-                match item.get("exit_code").and_then(|x| x.as_i64()) {
+                match field(item, "exit_code", "exitCode").and_then(|x| x.as_i64()) {
                     Some(0) => {
                         t.ok_tool_results.push("Bash".to_string());
                         t.ok_tool_texts.push(truncate_chars(out, 4000));
@@ -1471,7 +1499,7 @@ pub fn parse_codex_trace(
                     _ => t.tool_errors.push(format!("Bash: {}", one_line(out, 240))),
                 }
             }
-            "mcp_tool_call" => {
+            "mcp_tool_call" | "mcpToolCall" => {
                 let name = format!(
                     "mcp__{}__{}",
                     item.get("server").and_then(|x| x.as_str()).unwrap_or("mcp"),
@@ -2110,21 +2138,50 @@ enum ProbeRun {
 /// `ERROR codex_core::tools::router: error=patch rejected: …` line on stderr. Scoring that
 /// turn off stdout alone records "the child never tried" for a child that tried and was
 /// refused by the sandbox, which is the precise inversion this battery exists to prevent.
-async fn run_probe_child(mut cmd: Command, timeout_secs: u64) -> ProbeRun {
+async fn run_probe_child(
+    harness: &dyn SpawnedHarness,
+    mut cmd: Command,
+    prompt: &str,
+    cwd: &Path,
+    timeout_secs: u64,
+) -> ProbeRun {
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => return ProbeRun::SpawnFailed(e.to_string()),
     };
     let mut out = String::new();
     let mut err = String::new();
+    let stdin = child.stdin.take();
     let (Some(mut so), Some(mut se)) = (child.stdout.take(), child.stderr.take()) else {
         return ProbeRun::SpawnFailed("the child exposed no stdout/stderr pipe".to_string());
     };
     let timed_out = {
         // Both pipes drained concurrently: a child that fills stderr while we only read
         // stdout would deadlock and look like a timeout.
+        //
+        // **A DUPLEX CHILD IS NOT DRAINED, IT IS SPOKEN TO.** Reading an App Server child's
+        // stdout to EOF reads nothing at all: it is waiting for an `initialize` on stdin that
+        // never comes, so every probe times out and the whole row scores `inconclusive`. That
+        // is not a hypothetical — it is what this battery did for one run, which is how the
+        // arm came to be written. The transcript it hands back is still the child's own raw
+        // lines, which is what the scoring rules read and what makes this record evidence
+        // about the CHILD rather than about the bridge's reading of it.
         let read_both = async {
-            let _ = tokio::join!(so.read_to_string(&mut out), se.read_to_string(&mut err));
+            match harness.reader() {
+                TurnReader::Lines(_) => {
+                    let _ = tokio::join!(so.read_to_string(&mut out), se.read_to_string(&mut err));
+                }
+                TurnReader::Duplex(_) => {
+                    let Some(stdin) = stdin else {
+                        err.push_str("the child exposed no stdin pipe to drive\n");
+                        return;
+                    };
+                    let drive = drive_probe_turn(stdin, so, prompt, cwd);
+                    let drain = se.read_to_string(&mut err);
+                    let ((transcript, _completed), _) = tokio::join!(drive, drain);
+                    out = transcript;
+                }
+            }
         };
         timeout(Duration::from_secs(timeout_secs), read_both)
             .await
@@ -2282,7 +2339,15 @@ async fn run_row(
             // being replaced by a timeout that did not happen. Retrying remains right, since a
             // transient resource limit clears; retrying thirty times while telling the
             // operator the CLI is slow is what this branch stops.
-            let (stdout, stderr, timed_out) = match run_probe_child(cmd, opts.timeout_secs).await {
+            let (stdout, stderr, timed_out) = match run_probe_child(
+                harness,
+                cmd,
+                req.prompt,
+                &req.cwd.clone(),
+                opts.timeout_secs,
+            )
+            .await
+            {
                 ProbeRun::Finished { stdout, stderr } => (stdout, stderr, false),
                 ProbeRun::TimedOut { stdout, stderr } => (stdout, stderr, true),
                 ProbeRun::SpawnFailed(e) => {

@@ -6,6 +6,9 @@ pub use claude_code::*;
 mod codex;
 pub use codex::*;
 
+mod codex_app_server;
+pub use codex_app_server::*;
+
 mod direct;
 pub use direct::*;
 
@@ -22,8 +25,9 @@ pub use direct::*;
 //     support, its default concurrency, whether it can take the vault write lock, and
 //     which API wire it drives a model over. Every harness implements this one.
 //   * [`SpawnedHarness`] — everything that only means something for a CHILD PROCESS:
-//     building the `Command`, parsing a line of its stdout, its main MCP server set,
-//     classifying a line of its stderr, and reading its hook payloads.
+//     building the `Command`, reading it (a line parser or a duplex driver — see
+//     [`TurnReader`]), its main MCP server set, classifying a line of its stderr, and
+//     reading its hook payloads.
 //   * [`InProcessHarness`] — the other runner shape: a harness that answers the turn
 //     inside this process, with no child at all. Nothing implements it yet; its contract
 //     is written down so D5 implements a shape that was decided rather than discovered.
@@ -60,38 +64,43 @@ pub use direct::*;
 // of them per turn:
 //
 //   * [`StreamEvent::TextDelta`] — a chunk of the visible answer. A harness emits these
-//     only if [`Harness::streams_text`] is true. Codex's is FALSE and that is not a defect
-//     to route around: its `--json` stream carries no token-level delta for the visible
-//     answer at all, only whole items.
+//     only if [`Harness::streams_text`] is true. BOTH shipped spawned harnesses now answer
+//     true: Codex's `codex exec --json` stream carried no token-level delta for the visible
+//     answer at all (only whole items, re-verified against codex-cli 0.153.4 on 2026-09-06),
+//     which is why that harness drives the App Server instead — see [`TurnReader::Duplex`].
 //   * [`StreamEvent::ToolActivity`] — a coarse "the child is doing X" hint. Named in ONE
 //     vocabulary across harnesses (`Bash`, `Edit`, `Read`, `mcp__<server>__<tool>`), so
 //     the clients' one `activityLabel` switch serves both. Carries a `refused` bit; see
 //     [`ToolActivity`].
 //
-// A WHOLE-ANSWER HARNESS THEREFORE OWES TOOL ACTIVITY, and owes it as its ONLY mid-turn
-// signal. A streaming harness's activity line is a garnish — deltas are already arriving,
-// so a missed activity event costs nothing. On a whole-answer harness the activity line is
-// the entire difference between a turn the user can see working and a turn that is
-// indistinguishable from one that has silently hung. The spinner (keyed off
-// `ModelInfo.streamsText`) says "this model replies all at once"; the activity line is the
-// only thing that says what it is doing while it does.
+// A WHOLE-ANSWER HARNESS OWES TOOL ACTIVITY, and owes it as its ONLY mid-turn signal. A
+// streaming harness's activity line is a garnish — deltas are already arriving, so a missed
+// activity event costs nothing. On a whole-answer harness the activity line is the entire
+// difference between a turn the user can see working and a turn that is indistinguishable
+// from one that has silently hung. The spinner (keyed off `ModelInfo.streamsText`) says
+// "this model replies all at once"; the activity line is the only thing that says what it is
+// doing while it does. NO SHIPPED HARNESS IS IN THAT STATE ANY MORE — the paragraph stays
+// because the client behaviour it describes still exists and a third harness may need it.
 //
-// Concretely, for Codex, between `thread.started` and `turn.completed`:
-//   * `item.started` with a `command_execution` item  → `Bash`
-//   * `item.started` with a `file_change` item        → `Edit`
-//   * `item.started` with an `mcp_tool_call` item     → `mcp__<server>__<tool>`
+// Concretely, for Codex, between `thread/started` and `turn/completed` on the App Server:
+//   * `item/started` with a `commandExecution` item   → `Bash`
+//   * `item/started` with a `fileChange` item         → `Edit`
+//   * `item/started` with an `mcpToolCall` item       → `mcp__<server>__<tool>`
 //   * a `codex_core::tools` line ON STDERR            → the same, with `refused` set
-//   * `item.completed` with an `agent_message` item   → accumulated, NOT emitted mid-turn
+//   * `item/agentMessage/delta` on a FINAL-ANSWER item → `TextDelta`
+//   * `item/completed` with an `agentMessage` item    → the authoritative text, NOT a delta
 //
-// THE LAST TWO ARE THE ONES A NEXT READER WILL GET WRONG. The agent_message is not a
-// mid-turn event even though it arrives mid-turn: Codex emits a short preamble message
-// before it starts calling tools, and delivering that as the answer is a bug the parser
-// already guards against (last one wins). And the refusal is not on stdout at all — see
-// below.
+// THE LAST THREE ARE THE ONES A NEXT READER WILL GET WRONG. Codex emits a short preamble
+// message before it starts calling tools; the App Server marks it `phase: "commentary"` and
+// the final answer `phase: "final_answer"`, and only the latter's deltas are the visible
+// answer. Delivering the preamble as the answer is the bug `CodexAppServerDriver` guards
+// against, in the same place and for the same reason the old exec parser's "last one wins"
+// did. And the refusal is not on stdout at all — see below.
 //
 // STDERR IS PART OF THE CONTRACT, AND THAT WAS A DECISION. A sandbox-refused native tool
-// call emits NO item event on Codex's `--json` stream: no `item.started`, no
-// `item.completed`, no error item. The only trace is a `codex_core::tools` line on stderr.
+// call emits NO item event on Codex's event stream: no `item/started`, no `item/completed`,
+// no error item. The only trace is a `codex_core::tools` line on stderr — unchanged by the
+// move to the App Server, which routes its own logs to the same place.
 // The alternative — declaring that refused tool calls are simply invisible — was rejected
 // because on a READ-ONLY harness a refusal is not an edge case: it is the boundary doing
 // its job, on a turn the model expected to be able to write. A user watching a turn work
@@ -727,9 +736,16 @@ pub trait SpawnedHarness: Harness {
     /// Build the child `Command` for one turn — argv, cwd, stdio, env — or refuse.
     fn build_turn(&self, cfg: &Config, req: &TurnRequest<'_>) -> Result<Command, HarnessError>;
 
-    /// A FRESH parser for one spawn attempt. The driver creates one per attempt, so a retry
-    /// never sees the previous attempt's half-accumulated state.
-    fn parser(&self) -> Box<dyn TurnParser>;
+    /// A FRESH reader for one spawn attempt — how THIS harness's child is talked to. The
+    /// driver creates one per attempt, so a retry never sees the previous attempt's
+    /// half-accumulated state.
+    ///
+    /// AN ENUM RATHER THAN TWO OPTIONAL ACCESSORS, for the same reason [`Runner`] is one: a
+    /// harness speaks exactly one of these shapes, and a `parser()` beside an
+    /// `Option<driver()>` would let a new shape land with every existing call site silently
+    /// taking the old path. Adding a variant here is a compile error at every call site,
+    /// which is the review this seam exists to force.
+    fn reader(&self) -> TurnReader;
 
     /// The MCP server set a MAIN turn of THIS harness spawns when no override is set.
     ///
@@ -1064,6 +1080,110 @@ pub trait TurnParser: Send {
     /// Map one line of the child's stdout to what the bridge does about it, accumulating
     /// whatever this harness needs to build its terminal outcome.
     fn on_line(&mut self, line: &str) -> StreamEvent;
+}
+
+/// HOW A SPAWNED HARNESS'S CHILD IS TALKED TO — the second thing a runner shape decides,
+/// after whether there is a child at all.
+///
+/// [`Runner`] says whether a turn spawns a process. This says whether that process is a
+/// ONE-WAY STREAM the bridge reads, or a CONVERSATION the harness holds. Both are children,
+/// both get the same spawn, the same concurrent stderr drain and classification, the same
+/// per-attempt timeout, the same bounded reap and the same three-attempt retry — everything
+/// in [`crate::claude::run_spawned_turn`] that is about the CHILD rather than about the
+/// protocol is shared verbatim, which is the whole reason this is a variant here and not a
+/// third `Runner`.
+pub enum TurnReader {
+    /// **ONE-WAY.** The child writes its whole turn to stdout and never reads stdin; the
+    /// driver reads it line by line and maps each line through this parser. Claude Code's
+    /// shape, and Codex's until 0.121.0.
+    Lines(Box<dyn TurnParser>),
+    /// **DUPLEX.** The harness owns the exchange: it writes to the child's stdin, reads its
+    /// stdout, and returns the terminal outcome itself. Codex's shape since 0.121.0, because
+    /// the Codex App Server is a JSON-RPC peer — nothing can be learned from it without
+    /// first sending it an `initialize`, and a `TurnParser` has no way to send anything.
+    Duplex(Box<dyn TurnDriver>),
+}
+
+impl TurnReader {
+    /// The line parser, for a harness that has one — and `None` for a duplex harness.
+    ///
+    /// A TEST affordance: the driver itself matches on the enum, because it has to handle
+    /// both. Tests that replay a captured stdout stream have no child and no stdin, so they
+    /// legitimately want only this half, and an `Option` makes "this harness has no parser"
+    /// something the test states rather than something it panics on.
+    pub fn into_lines(self) -> Option<Box<dyn TurnParser>> {
+        match self {
+            TurnReader::Lines(p) => Some(p),
+            TurnReader::Duplex(_) => None,
+        }
+    }
+}
+
+/// Everything a [`TurnDriver`] needs that is not the pipes: what the turn is, where its
+/// mid-turn events go, and how to report the session it binds.
+///
+/// Borrowed for the life of one `drive` call and never stored: the driver runs inside the
+/// turn task, which owns all three.
+pub struct TurnDriveCtx<'a> {
+    pub cfg: &'a Config,
+    /// The turn itself — prompt, resume target, capability, cwd, model. The SAME request
+    /// [`SpawnedHarness::build_turn`] was given, so a driver never has to be told twice what
+    /// the containment argv already says.
+    pub req: &'a TurnRequest<'a>,
+    /// The mid-turn channel, in exactly the vocabulary the contract at the top of this
+    /// module names — the same sink an [`InProcessHarness`] is handed, so a delta reaching
+    /// the phone is indistinguishable whichever shape produced it.
+    pub sink: &'a dyn TurnSink,
+    /// Report the harness-side session id THE MOMENT it is known, not at the end.
+    ///
+    /// The spawned line path gets this from [`StreamEvent::SessionId`], and for the same
+    /// reason: a turn that dies mid-flight has still told the bridge which session it owns,
+    /// and on a harness with no transcript on disk that report is the WHOLE record of the
+    /// thread. A driver that only named its thread in the terminal outcome would strand
+    /// every conversation whose first turn failed.
+    pub on_session: &'a (dyn Fn(&str) + Send + Sync),
+}
+
+/// A harness that holds a CONVERSATION with its child rather than reading a stream from it.
+///
+/// ## The contract is the parser's, plus a stdin
+///
+/// Everything [`TurnParser`] owes, this owes: the same two mid-turn events in the same
+/// vocabulary (through [`TurnDriveCtx::sink`] rather than as return values), the same
+/// prohibition on tool results, tool inputs, token counts and per-tool timing, and the same
+/// obligation to name its session as soon as it knows it. What it gains is the ability to
+/// WRITE, which is the only reason the variant exists.
+///
+/// ## Ending
+///
+/// Return the terminal [`ClaudeOutcome`] — the same three-way vocabulary the line path
+/// resolves to, including [`ClaudeOutcome::Retryable`], because a duplex child is killed and
+/// respawned by the SAME driver retry loop and has left nothing behind that a re-run would
+/// double. (That is the one clause that differs from [`InProcessHarness`], which owns its
+/// retries precisely because it holds state a re-run cannot recreate.) A driver that streamed
+/// text and then returns `Retryable` is safe for the same reason the line path is: the driver
+/// calls `stream_reset` between attempts.
+///
+/// ## Cancellation is a DROP, not a token
+///
+/// There is deliberately no [`CancellationToken`] here. A duplex turn is cancelled exactly
+/// as a line-read turn is — the future is dropped, the child's pipes close with it, and
+/// `kill_on_drop` reaps the process. A driver must therefore be safe to drop at any await
+/// point, and must not hold state outside the child that a drop would leave inconsistent.
+/// Codex's does not: the thread it is driving lives in the child's `CODEX_HOME` rollout,
+/// which the child itself keeps consistent.
+pub trait TurnDriver: Send {
+    /// Drive one turn to its terminal outcome over the child's own pipes.
+    ///
+    /// A boxed future rather than `async fn` for the reason [`InProcessHarness::run_turn`]
+    /// gives: the trait is used as `Box<dyn TurnDriver>`, and an `async fn` in a trait is not
+    /// dyn-compatible.
+    fn drive<'a>(
+        &'a mut self,
+        stdin: tokio::process::ChildStdin,
+        stdout: tokio::process::ChildStdout,
+        ctx: TurnDriveCtx<'a>,
+    ) -> Pin<Box<dyn Future<Output = ClaudeOutcome> + Send + 'a>>;
 }
 
 /// The id of the built-in harness: the one the ambient default runs under, and the one
@@ -1522,15 +1642,26 @@ mod tests {
         );
     }
 
-    /// A whole-answer harness is registered, so the property the old streaming gate asserted
-    /// is now false — and that is the point. Pinned rather than left implicit: the moment
-    /// this fails, someone has made Codex claim to stream, and every client that keys a
-    /// spinner off `ModelInfo.streamsText` starts waiting for deltas that never arrive.
+    /// **BOTH SHIPPED HARNESSES STREAM, AND CODEX ONLY DOES BECAUSE IT DRIVES A DUPLEX
+    /// CHILD.** The two halves are asserted together on purpose: `streams_text` is what turns
+    /// OFF the clients' "this model replies all at once" spinner and what arms the driver's
+    /// streamed-text safety net, so a harness that claims it while reading a whole-answer
+    /// stream leaves the user watching nothing at all. The reader shape is the evidence for
+    /// the claim, and this is where the two are held against each other.
     #[test]
-    fn codex_is_registered_and_does_not_stream() {
+    fn a_streaming_harness_is_one_that_can_actually_deliver_deltas() {
         let reg = HarnessRegistry::for_models([CODEX_ID]);
         let codex = reg.get(CODEX_ID).expect("codex is registered");
-        assert!(!codex.streams_text());
+        assert!(codex.streams_text());
+        let spawned = match codex.runner() {
+            Runner::Spawned(s) => s,
+            Runner::InProcess(_) => panic!("codex spawns a child"),
+        };
+        assert!(
+            matches!(spawned.reader(), TurnReader::Duplex(_)),
+            "codex claims to stream, so it must be driving the App Server — `codex exec` has \
+             no token-level delta for the visible answer at all"
+        );
         assert!(
             reg.get(CLAUDE_CODE_ID).is_some_and(|h| h.streams_text()),
             "claude-code is still unconditionally registered and still streams"

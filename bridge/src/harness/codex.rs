@@ -73,9 +73,10 @@ use crate::*;
 /// key names to run under it.
 pub const CODEX_ID: &str = "codex";
 
-/// The Codex harness: headless `codex exec --json` against the vault. A unit struct for
-/// the same reason [`ClaudeCode`] is one — it is a shared registry singleton serving
-/// concurrent turns, so all per-turn state lives in [`CodexParser`].
+/// The Codex harness: a headless `codex app-server --listen stdio://` child against the
+/// vault, driven over its own pipes. A unit struct for the same reason [`ClaudeCode`] is one
+/// — it is a shared registry singleton serving concurrent turns, so all per-turn state lives
+/// in [`CodexAppServerDriver`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Codex;
 
@@ -244,8 +245,143 @@ pub fn codex_capability_args(capability: Capability) -> Vec<String> {
     args.push("-c".to_string());
     args.push("tools.web_search=false".to_string());
 
+    // THE APP SERVER'S BUILT-IN CONNECTOR SERVER, OFF. `codex app-server` starts a
+    // `codex_apps` MCP server on every thread — measured on 0.153.4 in a `CODEX_HOME` holding
+    // nothing but an `auth.json`, so it is a property of the transport and not of the
+    // operator's config. It is a ChatGPT-connector surface nothing in this bridge asked for,
+    // and the containment record is keyed by the MCP server set, so recording a set that
+    // omits it while the child loads it would make the record describe a posture that never
+    // ran. Turned off at every level rather than recorded as chosen. `features.apps` is the
+    // config spelling of `--disable apps`.
+    args.push("-c".to_string());
+    args.push("features.apps=false".to_string());
+
     args
 }
+
+/// **THE REPLACEMENT FOR `--ignore-user-config`, AS A REFUSAL RATHER THAN A FLAG.**
+///
+/// `codex app-server` defines no `--ignore-user-config`, so the guarantee has to come from
+/// the directory instead of the command line — and it does, because that directory is one
+/// this bridge mints. [`codex_turn_home`] creates it empty and puts an `auth.json` copy in
+/// it; [`install_write_lock_hooks`] adds a `hooks.json` on a write turn; nothing else in this
+/// process writes there.
+///
+/// # Two tables are expected, and everything else is refused
+///
+/// Codex itself writes a `config.toml` into the home it is given, and both things it writes
+/// are the bridge's own decisions coming back:
+///
+///   * `[projects."<cwd>"] trust_level = "trusted"` — Codex recording that it was told to
+///     run in this directory, which the bridge told it.
+///   * `[hooks.state."…"]` — the hook trust this driver GRANTS over the protocol
+///     ([`CodexAppServerDriver`]), pinned to the hash of the very hooks file the bridge wrote.
+///
+/// Anything else in that file did not come from this code, and a `sandbox_mode` or an
+/// `approval_policy` in it would silently outrank nothing on the command line but would mean
+/// something is writing into a directory that is supposed to be the bridge's alone. The turn
+/// is refused rather than run.
+///
+/// PARSED, NOT PATTERN-MATCHED. A line-prefix allowlist would be fooled by a widening key
+/// indented under a permitted table header, which is the exact shape of the thing it is
+/// supposed to catch.
+///
+/// # What this cannot see
+///
+/// It checks the file's SHAPE, not its provenance: a writer who could reach the home could
+/// put something inside a `[projects]` or `[hooks.state]` table. That is not a gap this check
+/// closes and it is not one it claims to — the home lives under the bridge's own state
+/// directory, and anything that can write there can already write the `hooks.json` this
+/// harness trusts. The check exists to catch the realistic failure (a home seeded from, or
+/// symlinked to, the operator's `~/.codex`), not to stand in for filesystem permissions.
+fn assert_no_user_config(home: &Path) -> Result<(), HarnessError> {
+    let path = home.join("config.toml");
+    let Ok(body) = std::fs::read_to_string(&path) else {
+        return Ok(());
+    };
+    let refuse = |what: String| {
+        Err(HarnessError::unsupported(
+            CODEX_ID,
+            format!(
+                "a turn under a per-turn CODEX_HOME whose config carries {what} ({}) — the App \
+                 Server has no --ignore-user-config, so the posture on the command line is \
+                 only authoritative while that file holds nothing but this bridge's own \
+                 bookkeeping",
+                path.display()
+            ),
+        ))
+    };
+    let Ok(doc) = body.parse::<toml::Table>() else {
+        return refuse("something that is not valid TOML".to_string());
+    };
+    for (key, value) in &doc {
+        match key.as_str() {
+            "projects" => {}
+            // `hooks` may carry `state` and nothing else: `hooks.enabled`, say, would be an
+            // operator switch rather than bookkeeping.
+            "hooks" => {
+                let Some(table) = value.as_table() else {
+                    return refuse("a `hooks` value that is not a table".to_string());
+                };
+                if let Some(k) = table.keys().find(|k| k.as_str() != "state") {
+                    return refuse(format!("`hooks.{k}`"));
+                }
+            }
+            other => return refuse(format!("`{other}`")),
+        }
+    }
+    Ok(())
+}
+
+/// **THE REPLACEMENT FOR `--ignore-rules`, AS A REFUSAL RATHER THAN A FLAG.**
+///
+/// The flag stopped Codex loading project-local execpolicy `.rules` files, whose point here
+/// was never that a rule can escape the sandbox — it cannot, the sandbox is the OS — but that
+/// the files live in the VAULT, and the vault is content the model can write. A turn that
+/// reads its own execution policy out of the directory it is editing has a loop in it.
+///
+/// `codex app-server` defines no such flag, so a turn whose working directory carries one is
+/// REFUSED instead. Loud beats silent: the flag's failure mode was that nobody could tell
+/// whether it had mattered, and a refusal names the file.
+///
+/// # The bound, stated rather than implied
+///
+/// Two directories are checked — the working directory itself and its `.codex/` subdirectory,
+/// which is where Codex keeps project-local config, hooks and exec policies — and neither is
+/// walked recursively. A per-turn recursive scan of a vault this size is not something a turn
+/// can afford, and a bounded check that says what it covers is worth more than an unbounded
+/// one nobody runs. If Codex ever reads rules from a third location this check is blind to
+/// it, which is why it is written down here and not left to be inferred from the code.
+fn assert_no_project_rules(cwd: &Path) -> Result<(), HarnessError> {
+    for dir in [cwd.to_path_buf(), cwd.join(".codex")] {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("rules") {
+                return Err(HarnessError::unsupported(
+                    CODEX_ID,
+                    format!(
+                        "a turn in a working directory carrying an execpolicy rules file \
+                         ({}) — the App Server has no --ignore-rules, and a policy the model \
+                         can edit is not a boundary",
+                        path.display()
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The file the bridge writes its write-lock hooks into, inside the per-turn `CODEX_HOME`.
+///
+/// Named once because three things have to agree about it: [`install_write_lock_hooks`]
+/// writes it, [`prepare_home_for_turn`] removes a previous turn's, and
+/// [`CodexAppServerDriver`] grants trust to hooks whose `sourcePath` is exactly this and to
+/// nothing else.
+pub const CODEX_HOOKS_FILE: &str = "hooks.json";
 
 /// Replace [`WORKSPACE_TOKEN`] with the turn's real working directory, TOML-quoted.
 ///
@@ -1125,7 +1261,7 @@ fn is_owned_home(base: &Path, home: &Path) -> bool {
 /// caller re-writes the file immediately after and a stale one that cannot be deleted is
 /// caught there.
 fn prepare_home_for_turn(cfg: &Config, home: &Path, seed_credential: bool) -> std::io::Result<()> {
-    let _ = std::fs::remove_file(home.join("hooks.json"));
+    let _ = std::fs::remove_file(home.join(CODEX_HOOKS_FILE));
     let dest = home.join("auth.json");
     if !seed_credential {
         match std::fs::remove_file(&dest) {
@@ -1343,7 +1479,7 @@ fn install_write_lock_hooks(home: &Path, wl: &WriteLockChild) -> bool {
         }
     });
     match serde_json::to_vec_pretty(&doc) {
-        Ok(bytes) => std::fs::write(home.join("hooks.json"), bytes).is_ok(),
+        Ok(bytes) => std::fs::write(home.join(CODEX_HOOKS_FILE), bytes).is_ok(),
         Err(_) => false,
     }
 }
@@ -1380,95 +1516,99 @@ pub fn apply_patch_targets(command: &str) -> Vec<String> {
 
 // ---- The argument vector ---------------------------------------------------------
 
-/// Build the argument vector for one `codex` invocation (everything after the binary name).
-/// Pure and side-effect-free so it can be unit-tested without spawning a process — the one
-/// side effect this harness has (the per-turn home) is [`codex_turn_home`]'s, and is passed
-/// in here as an already-created path.
+/// Build the argument vector for one `codex app-server` invocation (everything after the
+/// binary name). Pure and side-effect-free so it can be unit-tested without spawning a
+/// process — the one side effect this harness has (the per-turn home) is
+/// [`codex_turn_home`]'s, and is passed in here as an already-created path.
+///
+/// # THE PROMPT AND THE RESUME TARGET ARE NOT HERE ANY MORE
+///
+/// They used to be: `codex exec [resume <id>] … <prompt>` said what to run and what to
+/// continue on the command line, because that CLI answers one turn per process. The App
+/// Server answers a turn over a PROTOCOL — the prompt travels in `turn/start`, the resume
+/// target in `thread/resume` — so both moved into [`CodexAppServerDriver`]. Everything that
+/// remains here is the same thing it always was: the containment posture, the MCP set, the
+/// provider and the model, all of them `-c key=value` overrides that the root `codex` command
+/// accepts ahead of ANY subcommand.
+///
+/// That is what makes the transport swap safe to reason about: the recorded argv the startup
+/// gate compares (`Harness::capability_args`) is a subsequence of this, unchanged, and the
+/// boundary is set by the same overrides on the same binary.
+///
+/// # The four `exec`-only flags, and what happened to each
+///
+/// `codex app-server --help` on 0.153.4 offers `-c`, `--enable`, `--disable`,
+/// `--code-mode-host`, `--strict-config`, `--listen`, `--stdio`, `--analytics-default-enabled`
+/// and the `--ws-*` family. None of the four flags the `exec` argv carried exists on it, so
+/// each one needed a translation rather than an assumption:
+///
+/// * `--json` — GONE, and not needed. It selected the machine-readable output format of
+///   `exec`; the App Server has no other format.
+/// * `--skip-git-repo-check` — GONE, and not needed. It suppressed `exec`'s refusal to run
+///   outside a git repository. The App Server has no such gate: verified live on 0.153.4 by
+///   starting a thread with `cwd` at `/tmp`, which is not a repository, and running a turn
+///   in it.
+/// * `--ignore-user-config` — REPLACED BY STRUCTURE, and it is a stronger guarantee than the
+///   flag was. The flag stopped `$CODEX_HOME/config.toml` from widening the posture; this
+///   child's `CODEX_HOME` is a per-turn directory this bridge MINTS ([`codex_turn_home`]),
+///   containing an `auth.json` copy and, on a write turn, a `hooks.json` — and never a
+///   `config.toml`. There is no operator config in reach to ignore. `assert_no_user_config`
+///   below is what keeps that true rather than assumed: it REFUSES the turn if one appears.
+/// * `--ignore-rules` — NO FLAG, so the same treatment: the vault's `.rules` execpolicy files
+///   are what it kept out of reach, and [`assert_no_project_rules`] refuses a turn whose
+///   working directory carries one. That is narrower than the flag (which also covered user
+///   rules, and there are none in a minted home) and it fails LOUDLY where the flag failed
+///   silently, which is the direction to err in.
+///
+/// And one addition with no `exec` counterpart: `features.apps=false`. The App Server starts
+/// a built-in `codex_apps` MCP server on every thread — observed on 0.153.4 in a home with no
+/// config at all, so it is not the operator's. The bridge's MCP set is
+/// [`codex_mcp_args`]'s and the containment record is keyed by it, so a server nothing here
+/// asked for is turned off rather than recorded as if it had been chosen.
 // A flat argv builder: every parameter is an independent input to one command line, and the
 // ORDER they are emitted in is the thing under test. A params struct would hide that behind a
 // field list. Same call the sibling claude-code builder makes.
-#[allow(clippy::too_many_arguments)]
 pub fn build_codex_args(
-    prompt: &str,
-    session_id: Option<&str>,
     capability: Capability,
     cwd: &Path,
     mcp_args: &[String],
     provider_args: &[String],
     model_args: &[String],
-    write_lock_hooks: bool,
 ) -> Vec<String> {
     let mut args = Vec::new();
 
-    // THE WORKING DIRECTORY FLAG GOES AT THE ROOT, AHEAD OF THE SUBCOMMAND. `-C`/`--cd` is
-    // defined on the root `codex` command and on `codex exec`, but NOT on `codex exec
-    // resume` (verified against codex-cli 0.146.0's `--help` for all three). clap stops at
-    // the first argument a subcommand does not define, so emitting it after `resume` exited
-    // 2 with `unexpected argument '-C' found` before the model ran — which made EVERY turn
-    // after a conversation's first one fail, since only a resumed turn carries the
-    // subcommand. At the root it is accepted whether or not `resume` follows, and `resume`
-    // still sits directly after `exec`.
+    // THE WORKING DIRECTORY, at the root and ahead of the subcommand — where `-C`/`--cd` is
+    // defined (checked against 0.153.4: it is a root option, and `codex -C <dir> app-server`
+    // is accepted). It anchors Codex's own config and sandbox resolution; the thread's own
+    // `cwd` is sent again in `thread/start` and `thread/resume`, because a thread carries one
+    // and a resumed thread must not silently inherit the directory it was created in.
     //
-    // NOT redundant with the child `Command`'s `current_dir`, which is why it is moved and
-    // not deleted: it is also what anchors Codex's own config and sandbox resolution.
+    // NOT redundant with the child `Command`'s `current_dir`, which is why it is set in both
+    // places, exactly as it was under `exec`.
     args.push("-C".to_string());
     args.push(cwd.display().to_string());
 
-    args.push("exec".to_string());
-
-    // Resume BEFORE the prompt: `codex exec resume <id> <prompt>` is a subcommand, not a
-    // flag. A synthetic `local-<hex>` id names a bridge-minted ledger thread with no real
-    // Codex thread behind it and must never be resumed — the same rule, and the same
-    // reason, as the Claude Code builder's.
-    let resume = session_id.filter(|sid| !is_synthetic_session_id(sid));
-    if let Some(sid) = resume {
-        args.push("resume".to_string());
-        args.push(sid.to_string());
-    }
-
-    // JSONL events on stdout: the only output format that carries the thread id, the tool
-    // activity and the usage as separate machine-readable events.
-    args.push("--json".to_string());
-    // The bridge's cwd is a vault, not necessarily a git repo, and Codex otherwise refuses
-    // to run outside one.
-    args.push("--skip-git-repo-check".to_string());
-    // The operator's own `$CODEX_HOME/config.toml` must not be able to widen the posture
-    // this harness chose. Auth still resolves through CODEX_HOME, which is why the per-turn
-    // home is seeded with a credential copy.
-    args.push("--ignore-user-config".to_string());
-    // Project-level `.rules` execpolicy files live in the vault and are not the bridge's
-    // containment surface; the sandbox is. Loading them would let vault CONTENT influence
-    // what the child may execute.
-    args.push("--ignore-rules".to_string());
-    // THE VAULT WRITE LOCK'S HOOKS, on a write-capable turn only.
+    // THE VAULT WRITE LOCK'S HOOKS ARE NOT ON THIS COMMAND LINE, and their absence is the
+    // most important thing in this function.
     //
-    // Codex reads hooks from `$CODEX_HOME/hooks.json` — which SURVIVES `--ignore-user-config`
-    // (measured on 0.146.0: two runs differing only in this flag, hooks fired in both once
-    // trust was granted). What does NOT survive is hook TRUST: an untrusted hooks file is
-    // skipped **silently** — no stdout item, no stderr line, `0 warn` from `codex doctor` —
-    // and the write lands unlocked. A bridge that believes it is locking and is not is the
-    // exact failure this whole mechanism exists to prevent, so trust cannot be left to chance.
+    // Codex reads hooks from `$CODEX_HOME/hooks.json`, and loads this one: `hooks/list` over
+    // the App Server reports it `enabled: true`. What it does NOT do is TRUST it — an
+    // untrusted hooks file is skipped **silently**, with no notification and no stderr line,
+    // and the write lands unlocked. Measured on 0.153.4 through this bridge's own live
+    // write-lock certification: a write turn created its file and NO `PreToolUse` hook ever
+    // reached the broker.
     //
-    // WHAT THIS FLAG DOES AND DOES NOT DO. It bypasses review of the hooks FILE. It does not
-    // touch `sandbox_mode`, `sandbox_workspace_write.writable_roots`, `network_access`,
-    // `exclude_tmpdir_env_var`, `exclude_slash_tmp` or `approval_policy` — every one of those
-    // is still emitted by `codex_capability_args` and still recorded. The file it trusts is
-    // written by the BRIDGE into a per-turn `CODEX_HOME` that nothing else can reach, so the
-    // source being trusted is this process, not the vault and not the operator's config.
+    // `codex exec` took `--dangerously-bypass-hook-trust` for this. The App Server does not
+    // define it, and `-c bypass_hook_trust=true` does not stand in for it either — measured,
+    // `hooks/list` still reports `trustStatus: "untrusted"` with that override on the argv.
     //
-    // It is NOT `--dangerously-bypass-approvals-and-sandbox`, which removes the sandbox
-    // entirely. Nothing here constructs that flag.
-    if write_lock_hooks {
-        args.push("--dangerously-bypass-hook-trust".to_string());
-    }
-
-    // EVERYTHING FROM HERE ON MUST BE ACCEPTED BY `codex exec resume` TOO, not just by
-    // `codex exec` — a flag only the latter defines is invisible until a resume turn, which
-    // is exactly how the `-C` break shipped. The four long flags above and every argument
-    // below are `-c key=value` overrides or flags `exec resume` declares (checked against
-    // 0.146.0: `-c`, `--json`, `--skip-git-repo-check`, `--ignore-user-config`,
-    // `--ignore-rules` are all on the resume subcommand). Adding one that is not is a
-    // regression the resume-shaped builder test below catches.
+    // **So trust is GRANTED rather than bypassed, over the protocol, by
+    // [`CodexAppServerDriver`]:** `hooks/list` names the loaded hooks with a content hash,
+    // and `config/batchWrite` records `hooks.state."<key>".trusted_hash` for exactly the
+    // hooks whose source is the per-turn home's own `hooks.json`. That is strictly stronger
+    // than the flag it replaces — the flag trusted whatever the file happened to say, and a
+    // hash pins the file the bridge actually wrote — and it is why nothing dangerous-sounding
+    // appears in this argv any more.
     args.extend(fill_workspace(codex_capability_args(capability), cwd));
     args.extend_from_slice(mcp_args);
     // AFTER the containment flags, so a provider definition is visibly not part of the
@@ -1480,8 +1620,13 @@ pub fn build_codex_args(
     // that turn keeps the argv it always had.
     args.extend_from_slice(model_args);
 
-    // The prompt is positional and LAST, so nothing after it can be read as a flag.
-    args.push(prompt.to_string());
+    // The subcommand is LAST, so every override above is read by the root command and applies
+    // to whatever it launches. `--listen stdio://` is the default, named anyway: the transport
+    // is the thing this harness depends on, and a default that moved would otherwise change
+    // the argv's meaning without changing the argv.
+    args.push("app-server".to_string());
+    args.push("--listen".to_string());
+    args.push("stdio://".to_string());
     args
 }
 
@@ -1507,49 +1652,56 @@ impl Codex {
         // environment, so it gets a home with NO credential in it at all.
         let home = codex_home_for_turn(cfg, req.session_id, provider.is_none())?;
         let mut cmd = Command::new(&cfg.codex_bin);
-        // Install this turn's hooks into the per-turn home BEFORE building the argv, so the
-        // trust-bypass flag is emitted only when there is actually a hooks file to trust.
-        let hooks = req
-            .write_lock
-            .map(|wl| install_write_lock_hooks(&home, wl))
-            .unwrap_or(false);
+        // Install this turn's hooks into the per-turn home. The child's argv says nothing
+        // about them — [`CodexAppServerDriver`] finds this file through `hooks/list` and
+        // grants it trust over the protocol, keyed to its content hash. So the only thing
+        // that has to happen here is that the file exists before the child starts.
+        if let Some(wl) = req.write_lock {
+            if !install_write_lock_hooks(&home, wl) {
+                return Err(HarnessError::unsupported(
+                    CODEX_ID,
+                    "a write-capable turn whose lock hooks could not be written — running it \
+                     anyway would leave the vault unlocked while the bridge believed it was \
+                     locked",
+                ));
+            }
+        }
+        // The two guards that stand where `--ignore-user-config` and `--ignore-rules` stood.
+        // AFTER the home is prepared and the hooks are installed, because both describe the
+        // state the child will actually see, and BEFORE the argv is built, because a refused
+        // turn must not leave a command lying around that looks spawnable.
+        assert_no_user_config(&home)?;
+        assert_no_project_rules(&req.cwd)?;
         cmd.args(build_codex_args(
-            req.prompt,
-            req.session_id,
             req.capability,
             &req.cwd,
             &mcp,
             provider.as_deref().unwrap_or_default(),
             &model,
-            hooks,
         ))
         .current_dir(&req.cwd)
         .env("CODEX_HOME", &home)
-        // CLOSED, and this is load-bearing rather than tidiness. `codex exec` reads STDIN
-        // and appends what it finds to the prompt — it announces "Reading additional input
-        // from stdin..." and blocks until EOF. Inheriting the bridge's stdin therefore makes
-        // every Codex turn hang until the driver's timeout kills it, unless the parent's
-        // stdin happens to be at EOF already.
+        // PIPED, AND THAT IS A REVERSAL WORTH READING BEFORE CHANGING IT BACK.
         //
-        // Under launchd it happens to be `/dev/null`, so the deployed bridge got away with
-        // it; run the same binary from a terminal, from a test harness, or under any
-        // supervisor that hands it a pipe, and every turn takes the full timeout and returns
-        // a 504. Observed exactly that: the same live turn passed in 19s with stdin at EOF
-        // and timed out at 300s with a pipe on it.
+        // It used to be `Stdio::null()`, and that was correct for `codex exec`: exec READS
+        // stdin and appends what it finds to the prompt — it announces "Reading additional
+        // input from stdin..." and blocks until EOF — so inheriting the bridge's stdin made
+        // every turn hang until the driver's timeout unless the parent's stdin was already at
+        // EOF. Under launchd it happens to be `/dev/null`, so the deployed bridge got away
+        // with it; from a terminal or a test harness every turn took the full 300s.
         //
-        // Null rather than piped-and-dropped so there is no closing to forget, and set HERE
-        // rather than at the call sites because it is a property of this CLI. Claude Code
-        // takes its prompt as an argument and never reads stdin, which is why it has no
-        // equivalent line and does not need one.
+        // `codex app-server` reads stdin as its PROTOCOL CHANNEL. A null stdin is an
+        // immediate EOF, which the server reads as the client hanging up: it exits before the
+        // handshake and the turn dies with "the child exited before answering". So the same
+        // reasoning that made this `null` makes it `piped` — what stdin is FOR changed, and
+        // the setting followed it.
         //
-        // NO UNIT TEST GUARDS THIS, and that is a limitation rather than an oversight.
-        // `std::process::Command` exposes no getter for a configured stdin, and a spawn-based
-        // test would inherit `cargo test`'s stdin, which is already at EOF — so it would pass
-        // with this line and without it. That is precisely how the bug survived to be found
-        // live. The regression cover is `tests/codex_live_turn.rs`, which took the full 300s
-        // timeout before this line and ~15s after; it is `#[ignore]`d, so re-run it on the
-        // machine being certified whenever this spawn changes.
-        .stdin(Stdio::null())
+        // The hang the old line prevented cannot come back: nothing appends stdin to a prompt
+        // any more, and [`CodexAppServerDriver`] owns the pipe for the life of the turn and
+        // drops it (closing it) when the turn ends. The regression cover is
+        // `tests/codex_live_turn.rs`, which is `#[ignore]`d — re-run it on the machine being
+        // certified whenever this spawn changes.
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
@@ -1570,11 +1722,24 @@ impl Harness for Codex {
         CODEX_ID
     }
 
-    /// FALSE: Codex delivers its answer whole, in one `item.completed` event carrying an
-    /// `agent_message`. There is no partial-message option — the `--json` stream has no
-    /// token-level delta for the visible answer at all, only whole items.
+    /// TRUE since 0.121.0, and the qualification matters: it is true of the TRANSPORT, not
+    /// of the CLI.
+    ///
+    /// `codex exec --json` delivers its answer whole, in one `item.completed` event carrying
+    /// an `agent_message`, and there is no flag that changes that — re-measured against
+    /// codex-cli 0.153.4 on 2026-09-06, a one-sentence turn produced four events and not one
+    /// of them was a delta. So the old `false` was never a defect to route around; it was an
+    /// accurate report about a stream that had nothing finer in it.
+    ///
+    /// `codex app-server` is the same binary speaking a protocol that DOES carry the pieces:
+    /// `item/agentMessage/delta`, one per chunk, the first of them ~0.75s before the turn
+    /// completed on the same measurement. This harness drives that protocol
+    /// ([`TurnReader::Duplex`]), so the flag is now true — and it must not be set true again
+    /// by anything that does not actually deliver deltas end to end, because it is what turns
+    /// OFF the clients' "this model replies all at once" spinner and what arms the driver's
+    /// streamed-text safety net.
     fn streams_text(&self) -> bool {
-        false
+        true
     }
 
     /// **RESPONSES AND MESSAGES, AND THE ASYMMETRY IS THE POINT.**
@@ -1673,8 +1838,9 @@ impl Harness for Codex {
         None
     }
 
-    /// SPAWNED: a `codex exec --json` child, read line by line off its stdout and
-    /// stderr — this harness is the reason stderr is in the mid-turn contract at all.
+    /// SPAWNED: a `codex app-server --listen stdio://` child, driven over its own pipes and
+    /// read line by line off its stderr — this harness is the reason stderr is in the mid-turn
+    /// contract at all.
     fn runner(&self) -> Runner<'_> {
         Runner::Spawned(self)
     }
@@ -1685,8 +1851,10 @@ impl SpawnedHarness for Codex {
         self.command(cfg, req)
     }
 
-    fn parser(&self) -> Box<dyn TurnParser> {
-        Box::new(CodexParser::default())
+    /// DUPLEX. The App Server is a JSON-RPC peer: nothing can be learned from it without
+    /// first sending it an `initialize`, and a [`TurnParser`] has no way to send anything.
+    fn reader(&self) -> TurnReader {
+        TurnReader::Duplex(Box::new(CodexAppServerDriver))
     }
 
     /// The half of a Codex turn that never reaches the event stream.
@@ -1817,32 +1985,7 @@ impl StderrClassifier for Codex {
     }
 }
 
-// ---- The per-turn parser ----------------------------------------------------------
-
-/// Codex's per-turn parser, and the reason [`TurnParser`] is an OBJECT rather than a
-/// stateless function on the harness.
-///
-/// The terminal outcome is assembled from THREE different events, arriving in this order:
-///   * `thread.started` — carries `thread_id`, the id `codex exec resume` accepts. Early.
-///   * `item.completed` with `item.type == "agent_message"` — the visible answer, whole.
-///   * `turn.completed` — carries `usage`, and is the LAST event of the turn.
-///
-/// Only a parser that accumulates across lines can emit a complete `Done`, which is what
-/// this does: it holds the thread id and the latest agent message, and emits `Done` when
-/// `turn.completed` arrives.
-///
-/// **The last `agent_message` wins, not the first.** Codex emits a short preamble message
-/// ("I'll search the notes and quote the rule") as its own `agent_message` item BEFORE it
-/// starts calling tools, then the real answer as another one at the end. Taking the first
-/// would deliver the preamble as the answer — observed on every multi-step turn.
-#[derive(Default)]
-pub struct CodexParser {
-    thread_id: Option<String>,
-    message: Option<String>,
-    /// The last `error` event's text, kept only as a fallback cause for a `turn.failed` that
-    /// carried none. See the `error` arm: these events are retry narration, not terminals.
-    last_error: Option<String>,
-}
+// ---- Terminal classification ------------------------------------------------------
 
 /// Classify a terminal Codex failure message.
 ///
@@ -1862,7 +2005,7 @@ pub struct CodexParser {
 /// depend on which one arrives first: stdout carries it as a `turn.failed` message, stderr as
 /// a `codex_api::endpoint` line. Change the recognised statuses in one and change them in the
 /// other.
-fn codex_failure(message: String) -> ClaudeOutcome {
+pub fn codex_failure(message: String) -> ClaudeOutcome {
     if is_auth_failure(&message) {
         return ClaudeOutcome::Fatal {
             message: auth_failure_message(CODEX_ID, &one_line_trimmed(&message, 200)),
@@ -1913,141 +2056,6 @@ pub fn codex_refused_tool(line: &str) -> Option<(&'static str, &str)> {
     Some((tool, msg))
 }
 
-impl TurnParser for CodexParser {
-    fn on_line(&mut self, line: &str) -> StreamEvent {
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
-            // Codex prints a couple of non-JSON banner lines before the stream proper.
-            return StreamEvent::Ignore;
-        };
-        match v.get("type").and_then(|t| t.as_str()).unwrap_or_default() {
-            // Reported to the driver as well as remembered, and the reporting is the part
-            // that matters. `turn.completed` carries the thread id too, but it only arrives
-            // on SUCCESS — a turn that dies mid-flight would bind nothing, and the next turn
-            // on that conversation would silently start a fresh Codex thread instead of
-            // resuming. `thread.started` is the FIRST event of the stream, so a turn that
-            // fails has still said which thread it owns. This is the same reason Claude Code
-            // reports its id from `system`/`init` rather than from the terminal line; see
-            // [`StreamEvent::SessionId`].
-            //
-            // Codex has no transcript on disk, so this id is the WHOLE record of the thread:
-            // `resolve_resume_session_for_harness` skips the existence check for a harness
-            // with no transcript dir, and there is nothing else to recover it from.
-            "thread.started" => match v.get("thread_id").and_then(|t| t.as_str()) {
-                Some(id) => {
-                    self.thread_id = Some(id.to_string());
-                    StreamEvent::SessionId(id.to_string())
-                }
-                None => StreamEvent::Ignore,
-            },
-            "item.started" | "item.completed" => {
-                let item = v.get("item");
-                let kind = item
-                    .and_then(|i| i.get("type"))
-                    .and_then(|t| t.as_str())
-                    .unwrap_or_default();
-                match kind {
-                    "agent_message" => {
-                        if let Some(text) =
-                            item.and_then(|i| i.get("text")).and_then(|t| t.as_str())
-                        {
-                            // Last one wins — see the struct doc.
-                            self.message = Some(text.to_string());
-                        }
-                        StreamEvent::Ignore
-                    }
-                    // The mid-turn activity feed. A whole-answer harness shows nothing until
-                    // the end unless these are surfaced, so they are the coarse activity
-                    // hint the clients render beside the spinner.
-                    "command_execution" if v["type"] == "item.started" => {
-                        StreamEvent::ToolActivity(ToolActivity::used("Bash"))
-                    }
-                    "mcp_tool_call" if v["type"] == "item.started" => {
-                        let server = item
-                            .and_then(|i| i.get("server"))
-                            .and_then(|s| s.as_str())
-                            .unwrap_or("mcp");
-                        let tool = item
-                            .and_then(|i| i.get("tool"))
-                            .and_then(|s| s.as_str())
-                            .unwrap_or_default();
-                        StreamEvent::ToolActivity(ToolActivity::used(format!(
-                            "mcp__{server}__{tool}"
-                        )))
-                    }
-                    "file_change" if v["type"] == "item.started" => {
-                        StreamEvent::ToolActivity(ToolActivity::used("Edit"))
-                    }
-                    _ => StreamEvent::Ignore,
-                }
-            }
-            "turn.completed" => StreamEvent::Done(ClaudeOutcome::Ok {
-                result: self.message.clone().unwrap_or_default(),
-                session_id: self.thread_id.clone(),
-                usage: codex_usage(v.get("usage")),
-            }),
-            // NOT TERMINAL, and treating it as terminal was a live bug rather than a
-            // hypothetical. Codex emits `error` as RETRY NARRATION while it reconnects
-            // internally — verified on 0.145.0, where one dead credential produced six of
-            // them ("Reconnecting... 2/5" … "5/5", then a bare one) before the real terminal
-            // event. Ending the turn on the first one abandoned a child that still had four
-            // attempts left, and reported "Reconnecting... 2/5" as the failure cause, which
-            // names the retry rather than the fault.
-            //
-            // `turn.failed` is the terminal event and it carries the final message. So this
-            // arm REMEMBERS the last error text and emits nothing; the terminal arm below
-            // uses it only if `turn.failed` somehow carried none.
-            "error" => {
-                if let Some(m) = v.get("message").and_then(|m| m.as_str()) {
-                    self.last_error = Some(m.to_string());
-                }
-                StreamEvent::Ignore
-            }
-            "turn.failed" => {
-                let message = v
-                    .get("error")
-                    .and_then(|e| e.get("message"))
-                    .and_then(|m| m.as_str())
-                    .map(str::to_string)
-                    .or_else(|| self.last_error.clone())
-                    .unwrap_or_else(|| "codex reported a turn failure".to_string());
-                StreamEvent::Done(codex_failure(message))
-            }
-            _ => StreamEvent::Ignore,
-        }
-    }
-}
-
-/// Map Codex's `usage` object onto the bridge's [`ShadowUsage`], which is Anthropic-shaped.
-///
-/// The two shapes disagree on ONE point and it is the one that would silently inflate every
-/// cost badge: Codex reports `input_tokens` as the TOTAL prompt, with `cached_input_tokens`
-/// a SUBSET of it, while `ShadowUsage::cost` assumes the Anthropic convention where
-/// `input_tokens` EXCLUDES cache reads and the two are added. Feeding Codex's numbers
-/// through unchanged would bill every cached token twice — once at the input rate and once
-/// at the cached rate.
-///
-/// So the cached count is SUBTRACTED out here, saturating at zero in case a future version
-/// changes the convention (an underflow would otherwise wrap to an astronomical count).
-///
-/// `reasoning_output_tokens` is folded into `output_tokens` because it is billed at the
-/// output rate and the badge has no separate slot for it.
-fn codex_usage(usage: Option<&serde_json::Value>) -> ShadowUsage {
-    let Some(u) = usage else {
-        return ShadowUsage::default();
-    };
-    let n = |k: &str| u.get(k).and_then(|v| v.as_u64());
-    let cached = n("cached_input_tokens");
-    ShadowUsage {
-        input_tokens: n("input_tokens").map(|t| t.saturating_sub(cached.unwrap_or(0))),
-        cache_read_input_tokens: cached,
-        cache_creation_input_tokens: n("cache_write_input_tokens"),
-        output_tokens: match (n("output_tokens"), n("reasoning_output_tokens")) {
-            (None, None) => None,
-            (a, b) => Some(a.unwrap_or(0) + b.unwrap_or(0)),
-        },
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2068,14 +2076,11 @@ mod tests {
             "{recorded:?}"
         );
         let args = build_codex_args(
-            "hi",
-            None,
             Capability::Write,
             Path::new("/srv/vault notes"),
             &[],
             &[],
             &[],
-            false,
         );
         assert!(
             args.iter()
@@ -2090,60 +2095,84 @@ mod tests {
 
     // ---- The resume-shaped argv -----------------------------------------------------
 
-    /// Exactly the option list `codex exec resume --help` prints on codex-cli 0.153.4 — the
-    /// installed binary, read rather than assumed. `codex exec` declares MORE than this
-    /// (`-C`/`--cd`, `--add-dir`, `-s`/`--sandbox`, `-p`/`--profile`, `--oss`,
-    /// `--local-provider`, `--color`), and that gap is the whole bug: a flag only `exec`
-    /// defines parses fine on a first turn and kills every turn after it.
-    ///
-    /// **Re-measured on 0.153.4**, the version this change is verified against and the one
-    /// `gpt-6-astra` requires (it needs 0.153.1 or newer; the machine was on 0.146.0). The
-    /// list gained `--thread-source` and lost nothing — `-c`/`--config` and `-m`/`--model`
-    /// are both still here, which is what lets the model override travel on a resumed turn.
-    const RESUME_ACCEPTS: &[&str] = &[
+    /// Exactly the option list `codex --help` prints on codex-cli 0.153.4 for the ROOT
+    /// command — the installed binary, read rather than assumed. Everything this builder
+    /// emits ahead of the subcommand is parsed by the root, so this is the list that matters
+    /// for those arguments.
+    const ROOT_ACCEPTS: &[&str] = &[
         "-c",
         "--config",
-        "--last",
-        "--all",
+        "-C",
+        "--cd",
         "--enable",
         "--disable",
-        "-i",
-        "--image",
-        "--strict-config",
-        "-m",
-        "--model",
+        "--add-dir",
+        "--approve-for-me",
         "--dangerously-bypass-approvals-and-sandbox",
         "--dangerously-bypass-hook-trust",
-        "--thread-source",
-        "--skip-git-repo-check",
-        "--ephemeral",
-        "--ignore-user-config",
-        "--ignore-rules",
-        "--output-schema",
-        "--json",
-        "-o",
-        "--output-last-message",
+        "--local-provider",
+        "--no-alt-screen",
+        "--oss",
+        "--remote",
+        "--remote-auth-token-env",
+        "--search",
+        "--strict-config",
+        "-V",
+        "--version",
+        "-a",
+        "--ask-for-approval",
+        "-h",
+        "--help",
+        "-i",
+        "--image",
+        "-m",
+        "--model",
+        "-p",
+        "--profile",
+        "-s",
+        "--sandbox",
     ];
 
-    /// A RESUMED TURN MUST EMIT NO FLAG `codex exec resume` REJECTS — and the working
-    /// directory flag is one it rejects.
+    /// Exactly the option list `codex app-server --help` prints on codex-cli 0.153.4. Note
+    /// what is NOT here and used to be: `--json`, `--skip-git-repo-check`,
+    /// `--ignore-user-config`, `--ignore-rules` and `--dangerously-bypass-hook-trust` are all
+    /// `exec` flags with no App Server spelling. See `build_codex_args` for what each became.
+    const APP_SERVER_ACCEPTS: &[&str] = &[
+        "-c",
+        "--config",
+        "--enable",
+        "--disable",
+        "--code-mode-host",
+        "--strict-config",
+        "--listen",
+        "--stdio",
+        "--analytics-default-enabled",
+        "--ws-auth",
+        "--ws-token-file",
+        "--ws-token-sha256",
+        "--ws-shared-secret-file",
+        "--ws-issuer",
+        "--ws-audience",
+        "--ws-max-clock-skew-seconds",
+        "-h",
+        "--help",
+    ];
+
+    /// **EVERY ARGUMENT MUST BE ONE THE COMMAND THAT PARSES IT ACTUALLY DEFINES**, and which
+    /// command that is depends on which side of the subcommand it sits on.
     ///
-    /// **This is the test whose absence let the break ship.** Every other builder test here
-    /// passes `None` for the session id, so nothing ever constructed the argv shape a
-    /// conversation's SECOND and later turns use. `-C`/`--cd` belongs to the root command
-    /// and to `codex exec`, not to `codex exec resume`; emitted after the subcommand, clap
-    /// exited 2 with `unexpected argument '-C' found` before the model ran. A first turn
-    /// carries no session id, so it parsed — which is exactly why this looked like an
-    /// intermittent fault rather than a total one.
+    /// This is the general form of the test whose absence let the last argv break ship: a
+    /// flag the invoked subcommand does not declare makes clap exit 2 before the model runs,
+    /// and the bridge sees a turn that failed for no visible reason. Under `exec` the trap
+    /// was `-C` after `resume`; under `app-server` it is any `exec` flag left behind by the
+    /// port, which is a whole family rather than one flag.
     ///
-    /// It asserts the general rule, not just the one flag: everything after `resume` is
-    /// checked against the real subcommand's option list, so the NEXT flag added to this
-    /// builder fails here rather than in the morning health routine.
+    /// The list is checked from BOTH sides, because both are reachable mistakes: an `exec`
+    /// flag left ahead of the subcommand is silently accepted by nothing, and one added after
+    /// it is rejected by `app-server`.
     #[test]
-    fn a_resumed_turn_emits_no_flag_the_resume_subcommand_rejects() {
+    fn every_argument_belongs_to_the_command_that_parses_it() {
         let args = build_codex_args(
-            "what did I say?",
-            Some("th_abc"),
             Capability::Write,
             Path::new("/vault/notes"),
             &[
@@ -2152,87 +2181,122 @@ mod tests {
             ],
             &["-c".to_string(), "model=\"slug\"".to_string()],
             &[],
-            false,
         );
 
         let at = args
             .iter()
-            .position(|a| a == "resume")
-            .unwrap_or_else(|| panic!("a resume subcommand, argv: {args:?}"));
+            .position(|a| a == "app-server")
+            .unwrap_or_else(|| panic!("an app-server subcommand, argv: {args:?}"));
 
-        // The working directory flag sits at the ROOT, directly ahead of `exec` — and so
-        // ahead of `resume`, whatever follows.
-        let cd = args
-            .iter()
-            .position(|a| a == "-C")
-            .unwrap_or_else(|| panic!("a working directory flag, argv: {args:?}"));
-        assert!(cd < at, "`-C` must precede `resume`, argv: {args:?}");
-        assert_eq!(args[cd + 1], "/vault/notes", "{args:?}");
-        assert_eq!(
-            args[cd + 2],
-            "exec",
-            "`-C <dir>` sits directly ahead of `exec`, argv: {args:?}"
-        );
-        // The ordering the registry test also depends on stays true.
-        assert_eq!(args[at - 1], "exec", "{args:?}");
-        assert_eq!(&args[at + 1], "th_abc", "{args:?}");
+        // The working directory flag sits at the ROOT, ahead of the subcommand.
+        assert_eq!(args[0], "-C", "{args:?}");
+        assert_eq!(args[1], "/vault/notes", "{args:?}");
         assert_eq!(
             args.iter().filter(|a| *a == "-C").count(),
             1,
             "the working directory flag must be emitted once, argv: {args:?}"
         );
 
-        // Nothing after `resume` may be a flag the subcommand does not declare.
-        for (i, a) in args.iter().enumerate().skip(at + 1) {
-            // The prompt is positional and LAST; a `-c` VALUE is whatever follows a `-c`.
-            if i == args.len() - 1 || args[i - 1] == "-c" {
+        // Ahead of the subcommand: root flags only. A `-c`/`-C`/`-m` VALUE is whatever
+        // follows one of them, and is not itself checked.
+        for (i, a) in args.iter().enumerate().take(at) {
+            if i > 0
+                && matches!(
+                    args[i - 1].as_str(),
+                    "-c" | "--config" | "-C" | "--cd" | "-m"
+                )
+            {
                 continue;
             }
             if a.starts_with('-') && a.len() > 1 {
                 assert!(
-                    RESUME_ACCEPTS.contains(&a.as_str()),
-                    "`{a}` is not a flag `codex exec resume` defines, argv: {args:?}"
+                    ROOT_ACCEPTS.contains(&a.as_str()),
+                    "`{a}` is not a flag the root `codex` command defines, argv: {args:?}"
                 );
             }
         }
+
+        // After it: `app-server` flags only.
+        for (i, a) in args.iter().enumerate().skip(at + 1) {
+            if i > at + 1 && matches!(args[i - 1].as_str(), "-c" | "--config" | "--listen") {
+                continue;
+            }
+            if a.starts_with('-') && a.len() > 1 {
+                assert!(
+                    APP_SERVER_ACCEPTS.contains(&a.as_str()),
+                    "`{a}` is not a flag `codex app-server` defines, argv: {args:?}"
+                );
+            }
+        }
+
+        // NOTHING FROM THE `exec` ARGV SURVIVED. Each of these was on every turn's command
+        // line until 0.121.0 and each is now either unnecessary or replaced by a guard; a
+        // port that left one behind fails the turn at clap, before the model runs.
+        for gone in [
+            "exec",
+            "resume",
+            "--json",
+            "--skip-git-repo-check",
+            "--ignore-user-config",
+            "--ignore-rules",
+            "--dangerously-bypass-hook-trust",
+        ] {
+            assert!(
+                !args.iter().any(|a| a == gone),
+                "`{gone}` is an `exec` argument and does not belong on an App Server argv: \
+                 {args:?}"
+            );
+        }
     }
 
-    /// The FIRST turn keeps the working directory it always had — the fix moves the flag,
-    /// it does not drop it. The child `Command` sets `current_dir` to the same path, but
-    /// `-C` is also what anchors Codex's config and sandbox resolution, so a turn that lost
-    /// it would be contained against the wrong root.
+    /// The FIRST turn keeps the working directory it always had — the port moves the flag's
+    /// neighbours, it does not drop the flag. The child `Command` sets `current_dir` to the
+    /// same path, but `-C` is also what anchors Codex's config and sandbox resolution, so a
+    /// turn that lost it would be contained against the wrong root.
     #[test]
     fn a_first_turn_still_names_its_working_directory_at_the_root() {
-        let args = build_codex_args(
-            "hi",
-            None,
-            Capability::Read,
-            Path::new("/v"),
-            &[],
-            &[],
-            &[],
-            false,
-        );
+        let args = build_codex_args(Capability::Read, Path::new("/v"), &[], &[], &[]);
         assert_eq!(args[0], "-C", "{args:?}");
         assert_eq!(args[1], "/v", "{args:?}");
-        assert_eq!(args[2], "exec", "{args:?}");
+        assert_eq!(
+            args[args.len() - 3..],
+            ["app-server", "--listen", "stdio://"],
+            "{args:?}"
+        );
         assert!(!args.contains(&"resume".to_string()), "{args:?}");
+    }
+
+    /// **NOTHING DANGEROUS-SOUNDING IS ON THIS ARGV, AND THAT IS A PROPERTY WORTH PINNING.**
+    ///
+    /// The `exec` argv carried `--dangerously-bypass-hook-trust` on every write turn, and the
+    /// App Server argv carries no hook switch at all: trust is granted over the protocol, to
+    /// the bridge's own hooks file, keyed to its content hash — see
+    /// `CodexAppServerDriver::grant_own_hook_trust`. So a write turn's command line is
+    /// identical to a read turn's apart from the sandbox mode, and neither can widen the
+    /// boundary by carrying a bypass.
+    ///
+    /// The sandbox bypass is asserted absent separately, because the two were only ever one
+    /// word apart and confusing them removes the sandbox entirely.
+    #[test]
+    fn the_argv_carries_no_bypass_of_any_kind() {
+        let args = build_codex_args(Capability::Write, Path::new("/v"), &[], &[], &[]);
+        for banned in [
+            "bypass_hook_trust",
+            "dangerously-bypass-hook-trust",
+            "dangerously-bypass-approvals-and-sandbox",
+        ] {
+            assert!(
+                !args.iter().any(|a| a.contains(banned)),
+                "`{banned}` must never reach a Codex child: {args:?}"
+            );
+        }
     }
 
     /// A working directory containing a quote must not be able to reinterpret the whole `-c`
     /// override — the substitution quotes the path, it does not paste it.
     #[test]
     fn a_quote_in_the_working_directory_cannot_escape_the_override() {
-        let args = build_codex_args(
-            "hi",
-            None,
-            Capability::Write,
-            Path::new("/srv/we\"ird"),
-            &[],
-            &[],
-            &[],
-            false,
-        );
+        let args = build_codex_args(Capability::Write, Path::new("/srv/we\"ird"), &[], &[], &[]);
         let root = args
             .iter()
             .find(|a| a.starts_with("sandbox_workspace_write.writable_roots"))
@@ -2352,21 +2416,16 @@ mod tests {
     /// provider list appends nothing. The seam is additive or it is a regression.
     #[test]
     fn the_oauth_argv_is_unchanged_by_the_seam() {
-        let plain = build_codex_args(
-            "hi",
-            None,
-            Capability::Read,
-            Path::new("/v"),
-            &[],
-            &[],
-            &[],
-            false,
-        );
+        let plain = build_codex_args(Capability::Read, Path::new("/v"), &[], &[], &[]);
         assert!(
             !plain.iter().any(|a| a.contains("model_provider")),
             "{plain:?}"
         );
-        assert_eq!(plain.last().map(String::as_str), Some("hi"));
+        assert_eq!(
+            plain[plain.len() - 3..],
+            ["app-server", "--listen", "stdio://"],
+            "{plain:?}"
+        );
 
         // ...AND THE MODEL SEAM IS ADDITIVE IN EXACTLY THE SAME WAY. An entry that declared
         // no `model` contributes an EMPTY list, so the argv is byte-for-byte the one above
@@ -2379,14 +2438,11 @@ mod tests {
             codex_model_args(&undeclared)
         );
         let still_plain = build_codex_args(
-            "hi",
-            None,
             Capability::Read,
             Path::new("/v"),
             &[],
             &[],
             &codex_model_args(&undeclared),
-            false,
         );
         assert_eq!(
             still_plain, plain,
@@ -2394,28 +2450,24 @@ mod tests {
         );
     }
 
-    /// The provider overrides land BEFORE the prompt — the prompt is positional and must stay
-    /// last, or a `-c` after it is read as the prompt and the real prompt as a stray argument.
+    /// The provider overrides land BEFORE the subcommand, which must stay last — an override
+    /// emitted after `app-server` is parsed by the subcommand instead of by the root, and
+    /// `app-server` accepts `-c` too, so the mistake would be silent rather than loud.
     #[test]
-    fn the_prompt_stays_last_behind_the_provider_overrides() {
+    fn the_subcommand_stays_last_behind_the_provider_overrides() {
         let m = openai_model("https://api.example/v1", "slug", "tok");
         let provider = codex_provider_args(&m).expect("a provider");
-        let args = build_codex_args(
-            "what is the cadence?",
-            None,
-            Capability::Read,
-            Path::new("/v"),
-            &[],
-            &provider,
-            &[],
-            false,
-        );
-        assert_eq!(
-            args.last().map(String::as_str),
-            Some("what is the cadence?")
-        );
+        let args = build_codex_args(Capability::Read, Path::new("/v"), &[], &provider, &[]);
+        let at = args
+            .iter()
+            .position(|a| a == "app-server")
+            .expect("an app-server subcommand");
         let last_c = args.iter().rposition(|a| a == "-c").expect("a -c override");
-        assert!(last_c < args.len() - 1, "{args:?}");
+        assert!(
+            last_c < at,
+            "a provider override landed after the subcommand: {args:?}"
+        );
+        assert_eq!(at, args.len() - 3, "{args:?}");
     }
 
     // ---- The model seam ------------------------------------------------------------
@@ -2452,23 +2504,18 @@ mod tests {
             "the subscription posture must name its model"
         );
 
-        let args = build_codex_args(
-            "hi",
-            None,
-            Capability::Read,
-            Path::new("/v"),
-            &[],
-            &[],
-            &model,
-            false,
-        );
+        let args = build_codex_args(Capability::Read, Path::new("/v"), &[], &[], &model);
         assert_eq!(
             args.iter().filter(|a| a.starts_with("model=")).count(),
             1,
             "the slug must appear exactly once: {args:?}"
         );
-        // Positional prompt stays last; a `-c` after it would be read AS the prompt.
-        assert_eq!(args.last().map(String::as_str), Some("hi"), "{args:?}");
+        // The subcommand stays last, so the root command is what reads the override.
+        assert_eq!(
+            args[args.len() - 3..],
+            ["app-server", "--listen", "stdio://"],
+            "{args:?}"
+        );
     }
 
     /// THE SLUG IS NOT EMITTED TWICE WHEN BOTH PATHS APPLY.
@@ -2491,16 +2538,7 @@ mod tests {
             "the provider path already emits the slug; this one must not: {model:?}"
         );
 
-        let args = build_codex_args(
-            "hi",
-            None,
-            Capability::Read,
-            Path::new("/v"),
-            &[],
-            &provider,
-            &model,
-            false,
-        );
+        let args = build_codex_args(Capability::Read, Path::new("/v"), &[], &provider, &model);
         assert_eq!(
             args.iter().filter(|a| a.starts_with("model=")).count(),
             1,
@@ -2599,79 +2637,75 @@ mod tests {
         m.codex.reasoning_effort = Some(ReasoningEffort::XHigh);
         m.codex.auto_compact_token_limit = Some(272_000);
 
-        let bare = build_codex_args(
-            "hi",
-            None,
-            Capability::Write,
-            Path::new("/v"),
-            &[],
-            &[],
-            &[],
-            false,
-        );
+        let bare = build_codex_args(Capability::Write, Path::new("/v"), &[], &[], &[]);
         let tuned = build_codex_args(
-            "hi",
-            None,
             Capability::Write,
             Path::new("/v"),
             &[],
             &[],
             &codex_model_args(&m),
-            false,
         );
 
-        // Everything up to the prompt is the bare argv, verbatim and in order.
-        let bare_head = &bare[..bare.len() - 1];
+        // Everything up to the subcommand is the bare argv, verbatim and in order.
+        const TAIL: usize = 3; // `app-server --listen stdio://`
+        let bare_head = &bare[..bare.len() - TAIL];
         assert_eq!(
             &tuned[..bare_head.len()],
             bare_head,
             "the tuning moved or dropped part of the containment argv"
         );
-        // What follows is exactly the tuning, then the prompt.
-        let added: Vec<&String> = tuned[bare_head.len()..tuned.len() - 1].iter().collect();
+        // What follows is exactly the tuning, then the subcommand.
+        let added: Vec<&String> = tuned[bare_head.len()..tuned.len() - TAIL].iter().collect();
         let expected = codex_model_args(&m);
         assert_eq!(
             added,
             expected.iter().collect::<Vec<_>>(),
             "the tuning is what was added, and only it"
         );
-        assert_eq!(tuned.last().map(String::as_str), Some("hi"));
+        assert_eq!(
+            tuned[tuned.len() - TAIL..],
+            ["app-server", "--listen", "stdio://"]
+        );
     }
 
-    /// A RESUMED TURN CARRYING THE TUNING EMITS NO FLAG `codex exec resume` REJECTS.
+    /// A TUNED TURN EMITS NO FLAG THE COMMAND THAT PARSES IT REJECTS.
     ///
-    /// The same rule the `-C` break taught, applied to the new overrides: everything after
-    /// `resume` must be a flag that subcommand declares. All three land as `-c` values, and
-    /// `-c`/`--config` is on `resume` at 0.153.4 — verified live, a resume carrying all three
-    /// gets past config loading and fails only on a fake session id.
+    /// The same rule the `-C` break taught, applied to the model overrides: all three land as
+    /// `-c` values ahead of the subcommand, where the ROOT command parses them, and `-c` is a
+    /// root option at 0.153.4. Under `exec` this test had to be written twice — once for a
+    /// fresh turn and once for a resumed one, because their argvs differed — and it does not
+    /// any more: over the App Server a resume is a protocol request, so there is exactly one
+    /// argv shape to check.
     #[test]
-    fn a_resumed_turn_may_carry_the_model_overrides() {
+    fn a_tuned_turn_emits_no_flag_the_root_command_rejects() {
         let mut m = hosted_codex_model("gpt-6-astra");
         m.codex.reasoning_effort = Some(ReasoningEffort::Max);
         m.codex.auto_compact_token_limit = Some(272_000);
         let args = build_codex_args(
-            "and then?",
-            Some("th_abc"),
             Capability::Read,
             Path::new("/v"),
             &[],
             &[],
             &codex_model_args(&m),
-            false,
         );
 
         let at = args
             .iter()
-            .position(|a| a == "resume")
-            .expect("a resume subcommand");
-        for (i, a) in args.iter().enumerate().skip(at + 1) {
-            if i == args.len() - 1 || args[i - 1] == "-c" {
+            .position(|a| a == "app-server")
+            .expect("an app-server subcommand");
+        for (i, a) in args.iter().enumerate().take(at) {
+            if i > 0
+                && matches!(
+                    args[i - 1].as_str(),
+                    "-c" | "--config" | "-C" | "--cd" | "-m"
+                )
+            {
                 continue;
             }
             if a.starts_with('-') && a.len() > 1 {
                 assert!(
-                    RESUME_ACCEPTS.contains(&a.as_str()),
-                    "`{a}` is not a flag `codex exec resume` defines, argv: {args:?}"
+                    ROOT_ACCEPTS.contains(&a.as_str()),
+                    "`{a}` is not a flag the root `codex` command defines, argv: {args:?}"
                 );
             }
         }
@@ -2861,71 +2895,7 @@ mod tests {
         }
     }
 
-    /// The item events a whole-answer turn emits between `thread.started` and
-    /// `turn.completed`, in the ONE vocabulary both harnesses share — this is the contract
-    /// at the top of `harness/mod.rs`, pinned.
-    #[test]
-    fn mid_turn_items_map_onto_the_shared_activity_vocabulary() {
-        let mut p = CodexParser::default();
-        let cases = [
-            (
-                r#"{"type":"item.started","item":{"type":"command_execution","command":"ls"}}"#,
-                ToolActivity::used("Bash"),
-            ),
-            (
-                r#"{"type":"item.started","item":{"type":"file_change","path":"/x"}}"#,
-                ToolActivity::used("Edit"),
-            ),
-            (
-                r#"{"type":"item.started","item":{"type":"mcp_tool_call","server":"qmd","tool":"query"}}"#,
-                ToolActivity::used("mcp__qmd__query"),
-            ),
-        ];
-        for (line, want) in cases {
-            match p.on_line(line) {
-                StreamEvent::ToolActivity(a) => assert_eq!(a, want),
-                other => panic!("{line} should be activity, got {other:?}"),
-            }
-        }
-        // `item.completed` is the SAME item finishing. Emitting activity again would double
-        // every tool call on screen, so only `item.started` counts.
-        assert!(matches!(
-            p.on_line(r#"{"type":"item.completed","item":{"type":"command_execution"}}"#),
-            StreamEvent::Ignore
-        ));
-        // The answer accumulates; it is not a mid-turn event even though it arrives mid-turn.
-        assert!(matches!(
-            p.on_line(r#"{"type":"item.completed","item":{"type":"agent_message","text":"hi"}}"#),
-            StreamEvent::Ignore
-        ));
-    }
-
     // ---- Credential failure -------------------------------------------------------
-
-    /// A dead daemon credential is `Fatal` with an operator-facing message, NOT `Retryable`.
-    ///
-    /// Retrying is the wrong reflex and the expensive one: there is no interactive
-    /// `codex login` on a bridge host, so three attempts produce three identical 401s and a
-    /// turn that took three times as long to say the same thing.
-    #[test]
-    fn a_dead_credential_is_fatal_and_names_the_remedy() {
-        let mut p = CodexParser::default();
-        let out = p.on_line(
-            r#"{"type":"turn.failed","error":{"message":"unexpected status 401 Unauthorized: token expired"}}"#,
-        );
-        let StreamEvent::Done(ClaudeOutcome::Fatal { message }) = out else {
-            panic!("401 must be Fatal, not Retryable — got {out:?}");
-        };
-        assert!(message.contains(CODEX_ID), "names the harness: {message}");
-        assert!(
-            message.contains("re-authenticate"),
-            "names the remedy: {message}"
-        );
-        assert!(
-            message.contains("other harnesses are unaffected"),
-            "says the blast radius is one harness, not the bridge: {message}"
-        );
-    }
 
     /// The same failure on the other channel, worded identically. The two exist because a
     /// child killed at the driver's timeout has written its stderr and no `turn.failed`.
@@ -2941,43 +2911,6 @@ mod tests {
             auth_failure_message(CODEX_ID, &detail),
             auth_failure_message(CODEX_ID, &detail)
         );
-    }
-
-    /// An ordinary upstream failure keeps its own message: the auth arm must not swallow
-    /// everything that failed.
-    #[test]
-    fn an_ordinary_failure_is_not_dressed_up_as_an_auth_failure() {
-        let mut p = CodexParser::default();
-        let out = p.on_line(r#"{"type":"turn.failed","error":{"message":"model overloaded"}}"#);
-        let StreamEvent::Done(ClaudeOutcome::Fatal { message }) = out else {
-            panic!("got {out:?}");
-        };
-        assert_eq!(message, "model overloaded");
-    }
-
-    /// `error` is RETRY NARRATION, not a terminal event — treating it as terminal abandoned a
-    /// child that still had attempts left and reported "Reconnecting… 2/5" as the cause.
-    #[test]
-    fn error_events_are_narration_and_the_last_one_is_only_a_fallback_cause() {
-        let mut p = CodexParser::default();
-        for n in 2..=5 {
-            assert!(
-                matches!(
-                    p.on_line(&format!(
-                        r#"{{"type":"error","message":"Reconnecting... {n}/5"}}"#
-                    )),
-                    StreamEvent::Ignore
-                ),
-                "an error event must not end the turn"
-            );
-        }
-        // A `turn.failed` carrying no message of its own falls back to the last narration.
-        let StreamEvent::Done(ClaudeOutcome::Fatal { message }) =
-            p.on_line(r#"{"type":"turn.failed"}"#)
-        else {
-            panic!("turn.failed is terminal");
-        };
-        assert_eq!(message, "Reconnecting... 5/5");
     }
 
     /// The three overrides Codex needs and Claude Code does not — see `codex_mcp_args`.
@@ -3632,15 +3565,26 @@ mod tests {
             hooks.contains("--conversation 'conv-1'"),
             "the hook must carry THIS turn's broker wiring, not an earlier turn's: {hooks}"
         );
+        // THE FILE IS WHERE THE DRIVER WILL LOOK FOR IT, and the argv says nothing about it.
+        // An untrusted hooks file is skipped SILENTLY — measured over the App Server, where a
+        // write turn with a bridge-written hooks file and no trust grant fired NEITHER
+        // PreToolUse NOR PostToolUse — so what makes this turn safe is the driver's
+        // `hooks/list` + `config/batchWrite` grant, keyed to exactly this path. The live
+        // certification is `tests/writelock_live.rs`; what a unit test can hold is that the
+        // file the driver will name is the file this turn wrote.
+        assert_eq!(
+            home.join(CODEX_HOOKS_FILE),
+            home.join("hooks.json"),
+            "the driver grants trust by path; it must be the path installed here"
+        );
         let argv: Vec<String> = cmd
             .as_std()
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
         assert!(
-            argv.contains(&"--dangerously-bypass-hook-trust".to_string()),
-            "an untrusted hooks file is skipped SILENTLY, so the flag and the file travel \
-             together or the lock is a lie: {argv:?}"
+            !argv.iter().any(|a| a.contains("hook")),
+            "hook trust is granted over the protocol, never on the command line: {argv:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

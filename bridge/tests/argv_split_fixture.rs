@@ -59,6 +59,26 @@
 //! file is where it is checkable — the diff between the two captures is the evidence, and
 //! anyone regenerating again should produce one just as short or stop and explain why.
 //!
+//! **REGENERATED AGAIN, in bridge 0.121.0, and this one is not short — because the change is
+//! a TRANSPORT, not a flag.** Codex stopped answering turns as `codex exec --json` and
+//! started driving `codex app-server`, so every Codex row's argv is different by design:
+//!
+//!   * `exec`, `--json`, `--skip-git-repo-check`, `--ignore-user-config` and `--ignore-rules`
+//!     are gone — the first two are `exec` concepts with no App Server meaning, and the last
+//!     three are `exec` flags the App Server does not define, each replaced by something
+//!     stated in `build_codex_args` (nothing needed, a structural guarantee, and a refusal).
+//!   * the positional `PROMPT` is gone: it travels in a `turn/start` request now, which is
+//!     also why the `main-*-resume` rows no longer carry `exec resume <id>` and are now
+//!     BYTE-IDENTICAL to their non-resume siblings.
+//!   * `-c features.apps=false` appears, turning off an MCP server the App Server starts on
+//!     every thread and nothing in this bridge asked for.
+//!   * `app-server --listen stdio://` closes every Codex argv (the URL is hashed, like every
+//!     other URL-bearing argument here).
+//!
+//! **The claim this file still makes, and it is the one that matters:** the CLAUDE CODE rows
+//! are byte-for-byte unchanged, and no Codex row gained a containment argument or lost one.
+//! Every `-c` override in the old capture is in the new one, in the same order.
+//!
 //! To regenerate — which should only ever happen alongside a DELIBERATE argv change, in the
 //! same commit as its changelog entry: `JESSE_ARGV_FIXTURE_WRITE=1 cargo test --test
 //! argv_split_fixture`.

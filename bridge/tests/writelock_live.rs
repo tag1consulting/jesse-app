@@ -248,8 +248,11 @@ async fn a_codex_child_acquires_the_lock_under_its_own_sandbox() {
         cb.pre.load(Ordering::SeqCst) > 0,
         "no PreToolUse hook ever reached the broker. Either the hook subprocess is now \
          sandboxed (the measurement this design rests on has changed), or hooks.json is not \
-         being written, or --dangerously-bypass-hook-trust was dropped and codex is SILENTLY \
-         skipping the hooks — which is the failure mode that looks exactly like success."
+         being written, or the `bypass_hook_trust` override was dropped and codex is SILENTLY \
+         skipping the hooks — which is the failure mode that looks exactly like success. \
+         THIS TEST IS THE LIVE CERTIFICATION FOR THAT OVERRIDE on the App Server transport: \
+         measured on 0.153.4, a write turn with a bridge-written hooks.json and no override \
+         fired neither PreToolUse nor PostToolUse, and the write landed unlocked."
     );
 
     // GROUND TRUTH #3: the turn ended, so it holds nothing.
@@ -367,24 +370,26 @@ fn the_write_lock_adds_exactly_one_known_flag_per_harness() {
     let cfg = s.config();
 
     // ---- Codex ----------------------------------------------------------------
-    let plain = build_codex_args(
-        "hi",
-        None,
-        Capability::Write,
-        &s.vault,
-        &[],
-        &[],
-        &[],
-        false,
-    );
-    let locked = build_codex_args("hi", None, Capability::Write, &s.vault, &[], &[], &[], true);
-    let added: Vec<&String> = locked.iter().filter(|a| !plain.contains(a)).collect();
+    //
+    // **THE CODEX WRITE LOCK ADDS NOTHING TO THE ARGV AT ALL, AND THAT IS THE STRONGER
+    // SHAPE.** Under `codex exec` a locked turn carried `--dangerously-bypass-hook-trust`,
+    // and this test's job was to prove it added that and nothing more. The App Server does
+    // not define that flag, and `-c bypass_hook_trust=true` is not a stand-in — measured on
+    // 0.153.4, `hooks/list` still reports `trustStatus: "untrusted"` with it on the argv.
+    // Trust is now GRANTED over the protocol, keyed to the content hash of the hooks file the
+    // bridge itself wrote (`CodexAppServerDriver::grant_own_hook_trust`), so there is no
+    // bypass on the command line to get wrong.
+    let plain = build_codex_args(Capability::Write, &s.vault, &[], &[], &[]);
+    let locked = build_codex_args(Capability::Write, &s.vault, &[], &[], &[]);
     assert_eq!(
-        added,
-        vec![&"--dangerously-bypass-hook-trust".to_string()],
-        "the Codex write lock must add EXACTLY the trust-bypass flag and nothing else"
+        plain, locked,
+        "hook trust is granted in the protocol; the argv must not vary with the write lock"
     );
-    // And the containment-bearing flags are untouched in both.
+    assert!(
+        !locked.iter().any(|a| a.contains("hook")),
+        "no hook switch of any kind belongs on a Codex command line: {locked:?}"
+    );
+    // And the containment-bearing flags are all there.
     for flag in [
         "sandbox_mode=\"workspace-write\"",
         "sandbox_workspace_write.exclude_tmpdir_env_var=true",

@@ -160,18 +160,17 @@
       "argv": [
         "-C",
         "/scratch",
-        "exec",
-        "--json",
-        "--skip-git-repo-check",
-        "--ignore-user-config",
-        "--ignore-rules",
         "-c",
         "sandbox_mode=\"read-only\"",
         "-c",
         "approval_policy=\"never\"",
         "-c",
         "tools.web_search=false",
-        "PROMPT"
+        "-c",
+        "features.apps=false",
+        "app-server",
+        "--listen",
+        "sha256:1b770da17ad08d44bf7f3dfa4d5aeb767cede0b8ed1fce567c33f6facd815a24"
       ],
       "cwd": "/scratch",
       "env_keys": [
@@ -182,17 +181,14 @@
       "argv": [
         "-C",
         "/vault",
-        "exec",
-        "--json",
-        "--skip-git-repo-check",
-        "--ignore-user-config",
-        "--ignore-rules",
         "-c",
         "sandbox_mode=\"read-only\"",
         "-c",
         "approval_policy=\"never\"",
         "-c",
         "tools.web_search=false",
+        "-c",
+        "features.apps=false",
         "-c",
         "mcp_servers.browser.command=\"npx\"",
         "-c",
@@ -315,7 +311,9 @@
         "sha256:727473ce84cce06f86543d5077bd4b9e241f752bfed04da83ec1721d33df66ff",
         "-c",
         "mcp_servers.whatsapp.default_tools_approval_mode=\"approve\"",
-        "PROMPT"
+        "app-server",
+        "--listen",
+        "sha256:1b770da17ad08d44bf7f3dfa4d5aeb767cede0b8ed1fce567c33f6facd815a24"
       ],
       "cwd": "/vault",
       "env_keys": [
@@ -326,11 +324,6 @@
       "argv": [
         "-C",
         "/vault",
-        "exec",
-        "--json",
-        "--skip-git-repo-check",
-        "--ignore-user-config",
-        "--ignore-rules",
         "-c",
         "sandbox_mode=\"workspace-write\"",
         "-c",
@@ -345,6 +338,8 @@
         "approval_policy=\"never\"",
         "-c",
         "tools.web_search=false",
+        "-c",
+        "features.apps=false",
         "-c",
         "mcp_servers.browser.command=\"npx\"",
         "-c",
@@ -467,7 +462,9 @@
         "sha256:727473ce84cce06f86543d5077bd4b9e241f752bfed04da83ec1721d33df66ff",
         "-c",
         "mcp_servers.whatsapp.default_tools_approval_mode=\"approve\"",
-        "PROMPT"
+        "app-server",
+        "--listen",
+        "sha256:1b770da17ad08d44bf7f3dfa4d5aeb767cede0b8ed1fce567c33f6facd815a24"
       ],
       "cwd": "/vault",
       "env_keys": [
@@ -478,13 +475,6 @@
       "argv": [
         "-C",
         "/vault",
-        "exec",
-        "resume",
-        "sess-1",
-        "--json",
-        "--skip-git-repo-check",
-        "--ignore-user-config",
-        "--ignore-rules",
         "-c",
         "sandbox_mode=\"workspace-write\"",
         "-c",
@@ -499,6 +489,8 @@
         "approval_policy=\"never\"",
         "-c",
         "tools.web_search=false",
+        "-c",
+        "features.apps=false",
         "-c",
         "mcp_servers.browser.command=\"npx\"",
         "-c",
@@ -621,7 +613,9 @@
         "sha256:727473ce84cce06f86543d5077bd4b9e241f752bfed04da83ec1721d33df66ff",
         "-c",
         "mcp_servers.whatsapp.default_tools_approval_mode=\"approve\"",
-        "PROMPT"
+        "app-server",
+        "--listen",
+        "sha256:1b770da17ad08d44bf7f3dfa4d5aeb767cede0b8ed1fce567c33f6facd815a24"
       ],
       "cwd": "/vault",
       "env_keys": [
@@ -632,18 +626,17 @@
       "argv": [
         "-C",
         "/vault",
-        "exec",
-        "--json",
-        "--skip-git-repo-check",
-        "--ignore-user-config",
-        "--ignore-rules",
         "-c",
         "sandbox_mode=\"read-only\"",
         "-c",
         "approval_policy=\"never\"",
         "-c",
         "tools.web_search=false",
-        "PROMPT"
+        "-c",
+        "features.apps=false",
+        "app-server",
+        "--listen",
+        "sha256:1b770da17ad08d44bf7f3dfa4d5aeb767cede0b8ed1fce567c33f6facd815a24"
       ],
       "cwd": "/vault",
       "env_keys": [
@@ -654,18 +647,17 @@
       "argv": [
         "-C",
         "/vault",
-        "exec",
-        "--json",
-        "--skip-git-repo-check",
-        "--ignore-user-config",
-        "--ignore-rules",
         "-c",
         "sandbox_mode=\"read-only\"",
         "-c",
         "approval_policy=\"never\"",
         "-c",
         "tools.web_search=false",
-        "PROMPT"
+        "-c",
+        "features.apps=false",
+        "app-server",
+        "--listen",
+        "sha256:1b770da17ad08d44bf7f3dfa4d5aeb767cede0b8ed1fce567c33f6facd815a24"
       ],
       "cwd": "/vault",
       "env_keys": [

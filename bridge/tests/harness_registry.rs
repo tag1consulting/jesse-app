@@ -65,8 +65,8 @@ impl SpawnedHarness for NoTranscriptHarness {
             "spawning a child",
         ))
     }
-    fn parser(&self) -> Box<dyn TurnParser> {
-        Box::new(NoTranscriptParser)
+    fn reader(&self) -> TurnReader {
+        TurnReader::Lines(Box::new(NoTranscriptParser))
     }
 }
 
@@ -116,8 +116,8 @@ impl SpawnedHarness for FixedDirHarness {
             "spawning a child",
         ))
     }
-    fn parser(&self) -> Box<dyn TurnParser> {
-        Box::new(NoTranscriptParser)
+    fn reader(&self) -> TurnReader {
+        TurnReader::Lines(Box::new(NoTranscriptParser))
     }
 }
 
@@ -483,76 +483,41 @@ fn a_codex_conversation_resumes_across_three_turns() {
             resolve_resume_session_for_harness(&cfg, &Codex, sid.as_deref()).map(str::to_string);
         resumed.push(sid.clone());
 
-        // The argv the harness would actually spawn.
+        // THE ARGV NO LONGER CARRIES THE RESUME, and that is a property worth asserting
+        // rather than a line to delete. Under `codex exec` the resume target was a
+        // subcommand, so a builder test could see it; over the App Server it travels in a
+        // `thread/resume` request, so a fresh turn's command line and a resumed turn's are
+        // the SAME — which is what makes it impossible for a resumed turn to be contained
+        // differently from the turn that created its thread. The protocol half of this seam
+        // is covered end to end, against a real child, in `tests/codex_session_home.rs`.
         let argv = build_codex_args(
-            "what did I say?",
-            sid.as_deref(),
             Capability::Read,
             std::path::Path::new("/vault/notes"),
             &[],
             &[],
             &[],
-            false,
         );
-        match &sid {
-            None => assert!(
-                !argv.contains(&"resume".to_string()),
-                "turn {turn} has nothing to resume and must not pass `resume`"
-            ),
-            Some(id) => {
-                let at = argv.iter().position(|a| a == "resume").unwrap_or_else(|| {
-                    panic!("turn {turn} should have resumed {id}, argv: {argv:?}")
-                });
-                assert_eq!(argv[at - 1], "exec", "`resume` is a subcommand of `exec`");
-                assert_eq!(&argv[at + 1], id, "resume must name the bound thread");
-
-                // PLACEMENT, not just position. Asserting only that `resume` follows `exec`
-                // is what let a resumed turn ship with `-C` AFTER the subcommand: `-C` is a
-                // flag of the root command and of `codex exec`, but not of `codex exec
-                // resume`, so clap exited 2 before the model ran and every turn but the
-                // first failed. This vector must be one the real binary accepts.
-                let cd = argv
-                    .iter()
-                    .position(|a| a == "-C")
-                    .unwrap_or_else(|| panic!("turn {turn} lost its cwd flag, argv: {argv:?}"));
-                assert!(
-                    cd < at,
-                    "turn {turn} passes `-C` to a subcommand that rejects it, argv: {argv:?}"
-                );
-                assert_eq!(
-                    argv[cd + 2],
-                    "exec",
-                    "turn {turn}: `-C <dir>` belongs at the root, ahead of `exec`, argv: {argv:?}"
-                );
-            }
-        }
-
-        // Now run this turn's stream through the real parser and the real driver-side
-        // recorder, and bind what it reported — the `spawned.ids()` path in the handler.
-        let spawned = SpawnedSessions::new();
-        let mut parser = Codex.parser();
-        let mut done = None;
-        for line in [
-            format!(r#"{{"type":"thread.started","thread_id":"{thread}"}}"#),
-            r#"{"type":"item.completed","item":{"type":"agent_message","text":"ok"}}"#.to_string(),
-            r#"{"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":2}}"#
-                .to_string(),
-        ] {
-            match parser.on_line(&line) {
-                StreamEvent::SessionId(id) => spawned.record(&id),
-                StreamEvent::Done(o) => done = Some(o),
-                _ => {}
-            }
-        }
         assert!(
-            matches!(done, Some(ClaudeOutcome::Ok { .. })),
-            "turn {turn} ok"
+            !argv.contains(&"resume".to_string()) && !argv.iter().any(|a| a.starts_with("th_")),
+            "turn {turn}: the resume target belongs in the protocol, not the argv: {argv:?}"
         );
+        assert_eq!(argv[0], "-C", "turn {turn}: argv: {argv:?}");
+        assert_eq!(
+            argv[argv.len() - 3..],
+            ["app-server", "--listen", "stdio://"],
+            "turn {turn}: argv: {argv:?}"
+        );
+
+        // Bind what THIS turn's child reported, the way the handler does — `spawned.ids()`
+        // fed from the driver's `on_session` callback. The ids differ per turn here on
+        // purpose, so the forward-tracking rule is actually exercised.
+        let spawned = SpawnedSessions::new();
+        spawned.record(thread);
         assert_eq!(
             spawned.ids(),
             vec![thread.to_string()],
-            "turn {turn}: the id must reach the driver from `thread.started`, not only from \
-             the terminal event — a turn that dies mid-flight still owns its thread"
+            "turn {turn}: the id must reach the driver as soon as the thread is known, not \
+             only from the terminal outcome — a turn that dies mid-flight still owns its thread"
         );
         for id in spawned.ids() {
             conversations.bind_session(CID, &id);

@@ -14,7 +14,7 @@
 //! codex-cli this fix depends on — *a rollout is stored in `$CODEX_HOME` and `resume` fails
 //! when it is not there* — and fails exactly the way the real binary was measured to fail,
 //! with the same message and the same exit status. Everything from `Codex::command` down to
-//! the real `CodexParser` and the real `ConversationStore` is the shipping code.
+//! the real `CodexAppServerDriver` and the real `ConversationStore` is the shipping code.
 //!
 //! **WHAT THIS CANNOT PROVE.** The fixture is the bridge's MODEL of codex-cli, so it cannot
 //! be evidence for that model being right. That every claim in it holds of the real binary
@@ -30,22 +30,24 @@ use jesse_bridge::*;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-/// A stand-in `codex` that keeps its threads the way the real one does.
+/// A stand-in `codex app-server` that keeps its threads the way the real one does.
 ///
-/// It implements the storage contract and nothing else — no model, no sandbox, no config.
-/// Told to start fresh it mints a thread and writes a rollout under `$CODEX_HOME`; told to
-/// resume it looks the rollout up THERE, replays every prompt the thread has seen as its
-/// answer, and appends this one. A resume it cannot find exits 1 with the real binary's
-/// message, byte for byte:
+/// It implements the storage contract and the protocol frame, and nothing else — no model,
+/// no sandbox, no config. Told to start a thread it mints one and writes a rollout under
+/// `$CODEX_HOME`; told to resume it looks the rollout up THERE, replays every prompt the
+/// thread has seen as its answer, and appends this one. A resume it cannot find answers with
+/// the real binary's JSON-RPC error, message for message:
 ///
 /// ```text
-/// Error: thread/resume: thread/resume failed: no rollout found for thread id <id> (code -32600)
+/// thread/resume failed: no rollout found for thread id <id>
 /// ```
 ///
-/// Two behaviours are copied deliberately because the fix depends on them, and both were
-/// measured rather than assumed: **a resumed thread keeps its id** (so the conversation stays
-/// bound to one session across every turn) and **it appends to the same rollout file** (so a
-/// home holds one rollout per conversation, not one per turn).
+/// Three behaviours are copied deliberately because the fix depends on them, and all three
+/// were measured rather than assumed: **a resumed thread keeps its id** (so the conversation
+/// stays bound to one session across every turn), **it appends to the same rollout file** (so
+/// a home holds one rollout per conversation, not one per turn), and **the answer arrives as
+/// deltas ahead of the completed item** (so a test can assert the client saw text before the
+/// turn ended).
 ///
 /// POSIX `sh`, not bash: CI's `/bin/sh` is dash. No arrays, no `$RANDOM`, no `[[`.
 const FAKE_CODEX: &str = r#"#!/bin/sh
@@ -54,16 +56,6 @@ const FAKE_CODEX: &str = r#"#!/bin/sh
 # directory name under the home base — a bridge that "found" a home by joining the id to the
 # base would pass a test using the bare basename, and this makes that shortcut impossible.
 id="sess-$(basename "$CODEX_HOME")"
-
-# The prompt is the LAST argument; `resume <id>` follows `exec` when there is one.
-prompt=""
-resume=""
-prev=""
-prev2=""
-for a in "$@"; do
-  if [ "$prev2" = "exec" ] && [ "$prev" = "resume" ]; then resume="$a"; fi
-  prev2="$prev"; prev="$a"; prompt="$a"
-done
 
 if [ -z "$CODEX_HOME" ]; then
   echo "Error: no CODEX_HOME" >&2
@@ -78,27 +70,56 @@ find_rollout() {
   return 1
 }
 
-if [ -n "$resume" ]; then
-  id="$resume"
-  rollout=$(find_rollout "$id") || {
-    echo "Error: thread/resume: thread/resume failed: no rollout found for thread id $id (code -32600)" >&2
-    exit 1
-  }
-else
-  dir="$CODEX_HOME/sessions/2026/09/05"
-  mkdir -p "$dir"
-  rollout="$dir/rollout-2026-09-05T00-00-00-$id.jsonl"
-  printf '%s\n' "{\"type\":\"session_meta\",\"payload\":{\"session_id\":\"$id\"}}" > "$rollout"
-fi
+field() { printf '%s' "$2" | sed -n "s/.*\"$1\":\"\\([^\"]*\\)\".*/\\1/p"; }
+num()   { printf '%s' "$2" | sed -n "s/.*\"$1\":\\([0-9]*\\).*/\\1/p"; }
 
-# Everything this thread has ever been asked IS its memory, and answering with it is what
-# lets a test assert that turn three still knows turn one's marker.
-memory=$(sed -n 's/.*"type":"prompt","text":"\([^"]*\)".*/\1/p' "$rollout" | tr '\n' ' ')
-printf '%s\n' "{\"type\":\"prompt\",\"text\":\"$prompt\"}" >> "$rollout"
+thread=""
+rollout=""
 
-printf '%s\n' "{\"type\":\"thread.started\",\"thread_id\":\"$id\"}"
-printf '%s\n' "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"recalled: $memory\"}}"
-printf '%s\n' "{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}"
+while IFS= read -r line; do
+  rid=$(num id "$line")
+  method=$(field method "$line")
+  case "$method" in
+    initialize)
+      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$rid,\"result\":{\"userAgent\":\"fake\",\"codexHome\":\"$CODEX_HOME\",\"platformFamily\":\"unix\",\"platformOs\":\"macos\"}}"
+      ;;
+    initialized)
+      ;;
+    thread/start)
+      thread="$id"
+      dir="$CODEX_HOME/sessions/2026/09/05"
+      mkdir -p "$dir"
+      rollout="$dir/rollout-2026-09-05T00-00-00-$thread.jsonl"
+      printf '%s\n' "{\"type\":\"session_meta\",\"payload\":{\"session_id\":\"$thread\"}}" > "$rollout"
+      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"method\":\"thread/started\",\"params\":{\"thread\":{\"id\":\"$thread\"}}}"
+      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$rid,\"result\":{\"thread\":{\"id\":\"$thread\"}}}"
+      ;;
+    thread/resume)
+      want=$(field threadId "$line")
+      if rollout=$(find_rollout "$want"); then
+        thread="$want"
+        printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$rid,\"result\":{\"thread\":{\"id\":\"$thread\"}}}"
+      else
+        printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$rid,\"error\":{\"code\":-32600,\"message\":\"thread/resume failed: no rollout found for thread id $want\"}}"
+      fi
+      ;;
+    turn/start)
+      prompt=$(field text "$line")
+      # Everything this thread has ever been asked IS its memory, and answering with it is
+      # what lets a test assert that turn three still knows turn one's marker.
+      memory=$(sed -n 's/.*"type":"prompt","text":"\([^"]*\)".*/\1/p' "$rollout" | tr '\n' ' ')
+      printf '%s\n' "{\"type\":\"prompt\",\"text\":\"$prompt\"}" >> "$rollout"
+      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$rid,\"result\":{\"turn\":{\"id\":\"turn-1\",\"items\":[],\"status\":\"inProgress\"}}}"
+      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"method\":\"turn/started\",\"params\":{\"threadId\":\"$thread\",\"turn\":{\"id\":\"turn-1\",\"items\":[],\"status\":\"inProgress\"}}}"
+      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"method\":\"item/started\",\"params\":{\"threadId\":\"$thread\",\"turnId\":\"turn-1\",\"startedAtMs\":0,\"item\":{\"type\":\"agentMessage\",\"id\":\"msg-1\",\"text\":\"\",\"phase\":\"final_answer\"}}}"
+      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"method\":\"item/agentMessage/delta\",\"params\":{\"threadId\":\"$thread\",\"turnId\":\"turn-1\",\"itemId\":\"msg-1\",\"delta\":\"recalled: \"}}"
+      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"method\":\"item/agentMessage/delta\",\"params\":{\"threadId\":\"$thread\",\"turnId\":\"turn-1\",\"itemId\":\"msg-1\",\"delta\":\"$memory\"}}"
+      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"method\":\"item/completed\",\"params\":{\"threadId\":\"$thread\",\"turnId\":\"turn-1\",\"completedAtMs\":0,\"item\":{\"type\":\"agentMessage\",\"id\":\"msg-1\",\"text\":\"recalled: $memory\",\"phase\":\"final_answer\"}}}"
+      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"method\":\"thread/tokenUsage/updated\",\"params\":{\"threadId\":\"$thread\",\"turnId\":\"turn-1\",\"tokenUsage\":{\"total\":{\"inputTokens\":1,\"cachedInputTokens\":0,\"outputTokens\":1}}}}"
+      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"method\":\"turn/completed\",\"params\":{\"threadId\":\"$thread\",\"turn\":{\"id\":\"turn-1\",\"items\":[],\"status\":\"completed\"}}}"
+      ;;
+  esac
+done
 exit 0
 "#;
 
@@ -148,14 +169,19 @@ fn codex_model() -> ActiveModel {
 struct Turn {
     session: Option<String>,
     text: String,
+    /// What reached the sink mid-turn, as distinct from the terminal answer. A turn whose
+    /// `text` is right and whose `streamed` is empty is a turn that did NOT stream.
+    streamed: String,
 }
 
 /// Run ONE turn through the shipping path — `Codex::command` builds it, the real
-/// `CodexParser` reads it — and return what the child reported.
+/// [`CodexAppServerDriver`] talks to it — and return what the child reported.
 ///
-/// The two things it does NOT do are the point of using it: it never picks the home (that is
-/// `Codex::command`'s job, and the thing under test) and it never invents a session id (that
-/// comes off `thread.started`, the way the driver takes it).
+/// The three things it does NOT do are the point of using it: it never picks the home (that
+/// is `Codex::command`'s job, and the thing under test), it never invents a session id (that
+/// comes off the thread response, the way the driver takes it), and it never parses the
+/// protocol itself (that is the shipping driver, so a protocol change breaks this test rather
+/// than sliding past it).
 async fn run_turn(
     cfg: &Config,
     model: &ActiveModel,
@@ -174,22 +200,60 @@ async fn run_turn(
         artifact_dir: None,
         attachment_dir: None,
     };
-    let out = Codex.command(cfg, &req)?.output().await.expect("spawn");
-    let mut parser = Codex.parser();
-    let (mut session, mut text) = (None, String::new());
-    for line in String::from_utf8_lossy(&out.stdout).lines() {
-        match parser.on_line(line) {
-            StreamEvent::SessionId(id) => session = Some(id),
-            StreamEvent::Done(ClaudeOutcome::Ok { result, .. }) => text = result,
-            _ => {}
+    let mut child = Codex.command(cfg, &req)?.spawn().expect("spawn");
+    let stdin = child.stdin.take().expect("a stdin pipe");
+    let stdout = child.stdout.take().expect("a stdout pipe");
+    let sink = RecordingSink::default();
+    let session = std::sync::Mutex::new(None::<String>);
+    let on_session = |id: &str| *session.lock().expect("session slot") = Some(id.to_string());
+    let mut driver = match Codex.reader() {
+        TurnReader::Duplex(d) => d,
+        TurnReader::Lines(_) => panic!("codex drives its child; it does not read lines from it"),
+    };
+    let outcome = driver
+        .drive(
+            stdin,
+            stdout,
+            TurnDriveCtx {
+                cfg,
+                req: &req,
+                sink: &sink,
+                on_session: &on_session,
+            },
+        )
+        .await;
+    let _ = child.start_kill();
+    let session = session.lock().expect("session slot").clone();
+    match outcome {
+        ClaudeOutcome::Ok { result, .. } => Ok(Turn {
+            session,
+            text: result,
+            streamed: sink.text(),
+        }),
+        ClaudeOutcome::Fatal { message } | ClaudeOutcome::Retryable { message, .. } => {
+            Err(HarnessError::unavailable(CODEX_ID, message))
         }
     }
-    assert!(
-        out.status.success(),
-        "the child failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    Ok(Turn { session, text })
+}
+
+/// A [`TurnSink`] that keeps what it was given, so a test can assert the client saw the
+/// answer arriving in pieces and not only at the end.
+#[derive(Default)]
+struct RecordingSink {
+    text: std::sync::Mutex<String>,
+}
+
+impl RecordingSink {
+    fn text(&self) -> String {
+        self.text.lock().expect("the streamed text").clone()
+    }
+}
+
+impl TurnSink for RecordingSink {
+    fn text_delta(&self, delta: &str) {
+        self.text.lock().expect("the streamed text").push_str(delta);
+    }
+    fn tool_activity(&self, _activity: ToolActivity) {}
 }
 
 /// THE ACCEPTANCE SHAPE, and the one that used to fail on turn two: a question, then two
@@ -226,6 +290,16 @@ async fn three_turns_of_one_conversation_each_remember_the_last() {
                 out.text
             );
         }
+        // EVERY TURN STREAMED ITS ANSWER, not just the first. A regression that fell back to
+        // whole-answer delivery on a RESUMED turn would leave `text` right and `streamed`
+        // empty, which is exactly the shape a client renders as a long silence followed by a
+        // wall of text — the thing this change exists to remove.
+        assert_eq!(
+            out.streamed,
+            out.text,
+            "turn {} delivered its answer whole rather than in deltas",
+            turn + 1
+        );
         let sid = out.session.expect("a thread id");
         conversations.bind_session(CID, &sid);
         homes.push(sid);
@@ -481,18 +555,26 @@ async fn a_resumed_turn_carries_the_same_containment_it_always_did() {
             "a resumed turn dropped a containment argument ({expected}): {resumed:?}"
         );
     }
-    // A resume adds `exec resume <id>` and changes nothing else.
-    let stripped: Vec<String> = {
-        let at = resumed.iter().position(|a| a == "resume").expect("resume");
-        let mut v = resumed.clone();
-        v.drain(at..=at + 1);
-        v
-    };
+    // **THE ARGV IS NOW IDENTICAL, and that is the point rather than a weaker assertion.**
+    // Under `codex exec` a resume was a SUBCOMMAND, so a resumed turn's argv differed from a
+    // fresh one's and the test had to say how. Over the App Server the resume target travels
+    // in a `thread/resume` request, so the two argvs are the same command line — which means
+    // there is no longer any way for a resumed turn to carry a different containment posture
+    // than the turn that created the thread. The strongest form of the property this test has
+    // always been about.
     assert_eq!(
-        stripped, fresh,
-        "resuming must add the subcommand and its id, and nothing else"
+        resumed, fresh,
+        "a resume must change nothing on the command line — it is a protocol request"
     );
-    assert_eq!(resumed[0], "-C", "`-C` stays at the root, ahead of `exec`");
+    assert_eq!(
+        resumed[0], "-C",
+        "`-C` stays at the root, ahead of the subcommand"
+    );
+    assert_eq!(
+        resumed[resumed.len() - 3..],
+        ["app-server", "--listen", "stdio://"],
+        "the subcommand is last, so every override above it is read by the root command"
+    );
     let _ = std::fs::remove_file(&bin);
 }
 
@@ -587,5 +669,142 @@ async fn the_real_codex_binary_resumes_only_inside_its_own_home() {
         Some(sid.as_str()),
         "0.153.4 keeps the thread id across a resume; if this fails the binding rule in the \
          handler needs re-checking, not this assertion deleting"
+    );
+}
+
+/// **THE LIVE ACCEPTANCE SHAPE, against the real binary.**
+///
+/// Everything above this line proves the fixture's model of codex-cli is wired up correctly.
+/// This proves the three things a person actually notices, on the real thing, in one run:
+///
+///   1. **Three context-dependent turns.** Turn three has to know what turn one said, which
+///      only works if all three ran in one home and one thread.
+///   2. **Resume after a bridge restart.** A different `Config` over the same state directory
+///      is as close to a restart as a test gets — the bridge keeps nothing else between runs.
+///   3. **Two interleaved conversations.** Two threads, alternating turns, each recalling its
+///      own marker and neither seeing the other's — the failure that a single shared home, or
+///      a resume that silently started blank, would produce.
+///
+/// And it asserts the property this transport exists for on every one of those turns: the
+/// answer arrived as DELTAS, not whole. A regression that fell back to whole-answer delivery
+/// on a resumed turn only would pass every other test in this file.
+///
+/// `#[ignore]`d like every live test here — it spends a real credential and about a minute:
+///
+/// ```text
+/// JESSE_CODEX_BIN=$(which codex) cargo test --test codex_session_home \
+///     -- --ignored --nocapture --test-threads=1 the_live_acceptance
+/// ```
+#[tokio::test]
+#[ignore = "spawns six real Codex turns: costs money and minutes; run explicitly"]
+async fn the_live_acceptance_shape_holds_against_the_real_binary() {
+    let Ok(bin) = std::env::var("JESSE_CODEX_BIN") else {
+        panic!("set JESSE_CODEX_BIN to the pinned codex binary");
+    };
+    let s = Scratch::new("live-acceptance", Path::new(&bin));
+    let canonical = s.root.join(".codex");
+    std::fs::create_dir_all(&canonical).expect("the scratch canonical home");
+    let real = PathBuf::from(std::env::var("HOME").expect("HOME")).join(".codex/auth.json");
+    std::fs::copy(&real, canonical.join("auth.json")).expect("a credential to copy");
+    let model = codex_model();
+
+    /// Every turn must have streamed. Checked on each one rather than once at the end,
+    /// because the interesting regression is a turn SHAPE (a resume, a second conversation)
+    /// that silently stops streaming while the first turn still does.
+    fn streamed(turn: &Turn, which: &str) {
+        assert!(
+            !turn.streamed.trim().is_empty(),
+            "{which} delivered its answer whole rather than in deltas"
+        );
+    }
+
+    // ---- 1 & 2: three context-dependent turns, with a restart in the middle -----------
+    let one = run_turn(
+        &s.cfg,
+        &model,
+        None,
+        "Remember this marker word: ZANZIBAR-4417. Reply with just OK.",
+    )
+    .await
+    .expect("turn one");
+    streamed(&one, "turn one");
+    let sid = one.session.expect("a thread id");
+
+    let two = run_turn(
+        &s.cfg,
+        &model,
+        Some(&sid),
+        "Now also remember: NARWHAL-9. OK?",
+    )
+    .await
+    .expect("turn two");
+    streamed(&two, "turn two");
+
+    // THE RESTART. Nothing is carried across but the state directory.
+    let mut restarted = s.cfg.clone();
+    restarted.harnesses = s.cfg.harnesses.clone();
+    let three = run_turn(
+        &restarted,
+        &model,
+        two.session.as_deref().or(Some(&sid)),
+        "List both marker words I gave you, exactly.",
+    )
+    .await
+    .expect("turn three, after a restart");
+    streamed(&three, "turn three");
+    assert!(
+        three.text.contains("ZANZIBAR-4417") && three.text.contains("NARWHAL-9"),
+        "turn three lost the conversation across a restart: {}",
+        three.text
+    );
+
+    // ---- 3: two interleaved conversations --------------------------------------------
+    let a1 = run_turn(
+        &s.cfg,
+        &model,
+        None,
+        "Remember this word and nothing else: PELICAN. Reply OK.",
+    )
+    .await
+    .expect("A turn one");
+    let b1 = run_turn(
+        &s.cfg,
+        &model,
+        None,
+        "Remember this word and nothing else: OBSIDIAN. Reply OK.",
+    )
+    .await
+    .expect("B turn one");
+    let (a_sid, b_sid) = (a1.session.expect("A thread"), b1.session.expect("B thread"));
+    assert_ne!(a_sid, b_sid, "two conversations must not share a thread");
+
+    let a2 = run_turn(
+        &s.cfg,
+        &model,
+        Some(&a_sid),
+        "What word did I ask you to remember?",
+    )
+    .await
+    .expect("A turn two");
+    streamed(&a2, "conversation A's second turn");
+    let b2 = run_turn(
+        &s.cfg,
+        &model,
+        Some(&b_sid),
+        "What word did I ask you to remember?",
+    )
+    .await
+    .expect("B turn two");
+    streamed(&b2, "conversation B's second turn");
+
+    assert!(
+        a2.text.contains("PELICAN") && !a2.text.contains("OBSIDIAN"),
+        "conversation A saw B's history: {}",
+        a2.text
+    );
+    assert!(
+        b2.text.contains("OBSIDIAN") && !b2.text.contains("PELICAN"),
+        "conversation B saw A's history: {}",
+        b2.text
     );
 }

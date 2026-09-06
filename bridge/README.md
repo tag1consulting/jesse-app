@@ -481,10 +481,15 @@ be held (phone suspended, connection blip, an older client).
 | Harness | How a turn is answered | Boundary | Record |
 | --- | --- | --- | --- |
 | `claude-code` | spawns `claude -p`, reads `stream-json` | a named tool allowlist with path scopes, plus strict MCP | `containment.toml` |
-| `codex` | spawns `codex exec --json`, reads stdout **and stderr** | an OS sandbox (`sandbox_mode`, `writable_roots`, no network) | `containment-codex.toml` |
+| `codex` | spawns `codex app-server --listen stdio://` and **drives it over JSON-RPC**, reading stderr beside it | an OS sandbox (`sandbox_mode`, `writable_roots`, no network) | `containment-codex.toml` |
 | `direct` | **no child** — the `agent/` turn loop, in this process | eight typed tools dispatched by exact name, over a path-jailed store | `containment-direct.toml` |
 
-The first two are `Runner::Spawned`; the third is `Runner::InProcess`. A model picks its
+The first two are `Runner::Spawned`; the third is `Runner::InProcess`. The two spawned ones
+differ again in how their child is READ, which is `SpawnedHarness::reader`: Claude Code
+returns `TurnReader::Lines` (a one-way `stream-json` stdout the bridge parses), Codex returns
+`TurnReader::Duplex` (a JSON-RPC peer the harness talks to). Since 0.121.0 both stream text —
+`codex exec --json` carried no token-level delta for the visible answer at all, which is why
+that harness drives the App Server instead. A model picks its
 harness with `harness = "..."`, and the model chip in the app picks the model — so a `direct`
 model is selected exactly like any other.
 
