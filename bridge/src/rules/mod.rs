@@ -1261,6 +1261,40 @@ claude-code = "CLAUDE.md"
     }
 
     #[test]
+    fn a_symlinked_source_pointing_out_of_the_root_is_refused() {
+        // The lexical check below cannot see this one: `notes.md` is a perfectly ordinary
+        // relative path with no `..` in it, and only resolving the link says where it lands.
+        let dir = std::env::temp_dir().join(format!(
+            "jesse-rules-symlink-{}-{}",
+            std::process::id(),
+            crate::random_hex()
+        ));
+        let outside = dir.join("outside");
+        let root = dir.join("root");
+        std::fs::create_dir_all(&outside).expect("outside");
+        std::fs::create_dir_all(&root).expect("root");
+        std::fs::write(outside.join("secret.md"), "not policy\n").expect("secret");
+        std::os::unix::fs::symlink(outside.join("secret.md"), root.join("notes.md"))
+            .expect("symlink");
+        let canon = canonical_root(&root).expect("canonical");
+
+        let e = resolve_under_root(&canon, "notes.md").expect_err("refuses");
+        assert!(matches!(e, RuleError::PathEscape { .. }), "{e}");
+
+        // And a DIRECTORY component that leaves the root is refused for the same reason, so
+        // the check is not merely about the last path element.
+        std::os::unix::fs::symlink(&outside, root.join("linked")).expect("dir symlink");
+        let e = resolve_under_root(&canon, "linked/secret.md").expect_err("refuses");
+        assert!(matches!(e, RuleError::PathEscape { .. }), "{e}");
+
+        // A real file inside the root still resolves.
+        std::fs::write(root.join("real.md"), "x\n").expect("real");
+        assert!(resolve_under_root(&canon, "real.md").is_ok());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_lexical_escape_never_reaches_the_filesystem() {
         let root = std::env::temp_dir();
         let e = resolve_under_root(&root, "../etc/passwd").expect_err("refuses");
