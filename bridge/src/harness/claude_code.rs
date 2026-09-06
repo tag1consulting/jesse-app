@@ -132,8 +132,10 @@ impl SpawnedHarness for ClaudeCode {
         Ok(self.command(cfg, req))
     }
 
-    fn parser(&self) -> Box<dyn TurnParser> {
-        Box::new(ClaudeCodeParser)
+    /// LINES. Claude Code writes its whole turn to stdout as `stream-json` and never reads
+    /// stdin, so there is nothing to say to it after the argv.
+    fn reader(&self) -> TurnReader {
+        TurnReader::Lines(Box::new(ClaudeCodeParser))
     }
 
     /// qmd PLUS the self-hosted read-only Slack server.
@@ -1665,7 +1667,10 @@ mod tests {
     /// fresh parser per attempt carries nothing over (it holds no state to carry).
     #[test]
     fn the_claude_code_parser_matches_the_line_parser() {
-        let mut parser = ClaudeCode.parser();
+        let mut parser = ClaudeCode
+            .reader()
+            .into_lines()
+            .expect("claude code reads lines");
         let delta = r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"hi"}}}"#;
         match parser.on_line(delta) {
             StreamEvent::TextDelta(t) => assert_eq!(t, "hi"),
@@ -1674,7 +1679,10 @@ mod tests {
         let done = r#"{"type":"result","is_error":false,"result":"done","session_id":"s1"}"#;
         assert!(matches!(parser.on_line(done), StreamEvent::Done(_)));
         // A second parser (the next attempt) starts clean and behaves identically.
-        let mut fresh = ClaudeCode.parser();
+        let mut fresh = ClaudeCode
+            .reader()
+            .into_lines()
+            .expect("claude code reads lines");
         assert!(matches!(fresh.on_line(done), StreamEvent::Done(_)));
     }
 

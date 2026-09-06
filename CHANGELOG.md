@@ -14,6 +14,171 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [bridge 0.121.0] - 2026-09-06
+
+**A Codex reply lands all at once.** Ask the phone anything on the Codex model and there is a
+spinner, a wait, and then the whole answer at once — while the same question on Claude Code
+grows on screen as it is written.
+
+**The cause is not buffering anywhere in the bridge.** `codex exec --json` has no
+token-level event for the visible answer: it emits whole ITEMS. Re-measured against codex-cli
+0.153.4 on 2026-09-06, a one-sentence turn produced exactly four events — `thread.started`,
+`turn.started`, `item.completed` carrying the entire `agent_message`, `turn.completed` — and
+`codex exec --help` on that version offers no flag that changes it. So `Codex::streams_text`
+returning `false` was an honest report about a stream with nothing finer in it, the parser was
+not holding text back, and no amount of work on the delivery path could have produced a delta
+that did not exist.
+
+**`codex app-server` is the same binary speaking a protocol that does carry the pieces.** The
+same prompt over the App Server produced 17 `item/agentMessage/delta` notifications, the first
+of them ~0.75s before the turn completed. That gap is the whole feature, and this release is
+the bridge learning to speak that protocol.
+
+### Added
+
+- **A duplex reader shape, so a harness can hold a CONVERSATION with its child rather than
+  read a stream from it.** `SpawnedHarness::parser` becomes `SpawnedHarness::reader`, returning
+  a `TurnReader` that is either `Lines` (a `TurnParser` over stdout, which is Claude Code and
+  was Codex) or `Duplex` (a `TurnDriver` that owns the child's stdin and stdout). An enum
+  rather than a `parser()` beside an `Option<driver()>`, for the reason `Runner` is one:
+  adding a shape is a compile error at every call site instead of every call site silently
+  taking the old path. Everything around it is shared verbatim — the spawn, the concurrent
+  stderr drain and classification, the per-attempt timeout, the bounded reap, the three-attempt
+  retry — which is why this is a variant here and not a third `Runner`.
+
+- **`CodexAppServerDriver`, the JSON-RPC client.** `initialize` → `initialized` →
+  (`thread/start` | `thread/resume`) → `turn/start`, then notifications until `turn/completed`.
+  Correlated responses, asynchronous notifications and server requests are handled as three
+  separate kinds, because they are: a request from the server carries both a `method` and an
+  `id`, and answering it is not optional — an unanswered one hangs the turn until the driver's
+  timeout.
+
+### Changed
+
+- **`Codex::streams_text` is now true, and it is true of the transport rather than of the
+  CLI.** `item/agentMessage/delta` maps onto the same `TurnSink::text_delta` an in-process
+  harness calls, so a delta read off a JSON-RPC notification and a delta read off a line of
+  stdout reach the phone identically. Nothing in the clients changed: `ModelInfo.streamsText`
+  already came from the bridge, and the transcript already rendered `partialText` for any
+  model that had one — the flag only turns off the "this model replies all at once" caption.
+
+- **Commentary and the final answer keep the behaviour they had.** The App Server labels an
+  agent message `commentary` (the "I'll look that up" preamble) or `final_answer`; only the
+  latter's deltas reach the client, and only its completed text becomes the reply. That is
+  byte-for-byte what the old parser's last-one-wins accumulation did to a preamble. An
+  agent message with NO phase counts as the answer, which is what the protocol's own schema
+  asks of a caller. Reasoning is never exposed as reply text: `item/reasoning/*` is not read.
+
+- **A completed item REPLACES the deltas it followed rather than being appended to them**, so
+  a provider that reflows, redacts or normalises its own message cannot deliver the answer
+  twice. The accumulated deltas remain the fallback when a turn completes without one.
+
+- **The argv is the containment posture and nothing else.** The prompt and the resume target
+  moved into the protocol (`turn/start`, `thread/resume`), so a fresh turn's command line and
+  a resumed turn's are now IDENTICAL — which removes, structurally, any way for a resumed turn
+  to carry a different posture than the turn that created its thread. Everything that remains
+  is a `-c key=value` override the root `codex` command parses ahead of any subcommand, so
+  `Harness::capability_args` — the argv the startup gate compares — is unchanged in kind.
+
+- **The child's stdin is piped, reversing a deliberate `Stdio::null()`.** That null was
+  correct for `codex exec`, which reads stdin and appends it to the prompt and would otherwise
+  block until EOF. The App Server reads stdin as its protocol channel, so a null stdin is an
+  immediate hangup: the server exits before the handshake. What stdin is FOR changed, and the
+  setting followed it.
+
+### Fixed
+
+- **The containment battery spoke to its Codex child, which it had never had to do.**
+  `run_probe_child` spawned the child and read its stdout to EOF — correct while the argv was
+  the whole request, and worthless against a server waiting for an `initialize` that never
+  comes. Left unchanged, every probe would have timed out and every row scored `inconclusive`;
+  that is not hypothetical, it is what the first re-record run did. The battery now drives the
+  same handshake the turn path does, through the same `answer_server_request`, and still scores
+  the child's own raw output rather than the bridge's reading of it.
+
+### Security
+
+- **Four `exec`-only flags had no App Server spelling, and each one was translated rather than
+  assumed.** `codex app-server --help` on 0.153.4 defines none of them.
+  * `--json` — gone and unnecessary; the App Server has no other output format.
+  * `--skip-git-repo-check` — gone and unnecessary; verified live by starting a thread with
+    `cwd` at `/tmp`, which is not a repository, and running a turn in it.
+  * `--ignore-user-config` — replaced by STRUCTURE, which is stronger than the flag was. The
+    child's `CODEX_HOME` is a per-turn directory this bridge mints, holding an `auth.json`
+    copy and, on a write turn, a `hooks.json`. `assert_no_user_config` REFUSES the turn if an
+    operator config appears in it, rather than trusting that it will not.
+  * `--ignore-rules` — no equivalent, so `assert_no_project_rules` refuses a turn whose
+    working directory carries an execpolicy `.rules` file. Bounded to the directory and its
+    `.codex/` subdirectory, said out loud in the code rather than left to be inferred.
+
+- **The vault write lock's hooks are now TRUSTED rather than BYPASSED, and the replacement is
+  stronger than what it replaces.** An untrusted hooks file is skipped SILENTLY — no
+  notification, no stderr line — and the write lands unlocked, which is the failure mode that
+  looks exactly like success. Measured over the App Server on 0.153.4 through this repo's own
+  live certification (`writelock_live::a_codex_child_acquires_the_lock_under_its_own_sandbox`):
+  a write turn created its file and NO `PreToolUse` hook ever reached the broker.
+
+  `codex exec` took `--dangerously-bypass-hook-trust` for this. The App Server does not define
+  it — and `-c bypass_hook_trust=true` is NOT a stand-in, which was measured rather than
+  assumed: with that override on the argv, `hooks/list` still answered
+  `trustStatus: "untrusted"` and the live certification still saw no hook fire. That attempt
+  is recorded here because the obvious next fix is to try it again.
+
+  What ships instead is the protocol's own control. After `initialize`, the driver calls
+  `hooks/list`, and for every hook whose `sourcePath` is exactly the per-turn `CODEX_HOME`'s
+  own `hooks.json` it writes `hooks.state."<key>".trusted_hash = <the hash Codex reported>`
+  through `config/batchWrite`. The flag trusted whatever the file happened to say; a hash pins
+  the file the bridge itself wrote seconds earlier. Hooks from any other source — a plugin, a
+  project file, an operator's home — are left exactly as untrusted as they were found, and a
+  turn with no hooks file writes nothing at all.
+
+  **The upshot for the argv: no bypass of any kind reaches a Codex child any more.** A write
+  turn's command line is now identical to a read turn's apart from the sandbox mode, and
+  `the_argv_carries_no_bypass_of_any_kind` pins that. Nothing constructs
+  `--dangerously-bypass-approvals-and-sandbox`, which never was the same thing and is one word
+  away from it.
+
+- **A write-capable turn whose lock hooks could not be written is REFUSED.** It used to fall
+  through to a turn that ran unlocked while `supports_write_lock` still answered true.
+
+- **Every server request is answered, and every approval is denied.** Answering is not
+  politeness: the App Server blocks the turn on an unanswered request. Denying is the
+  boundary: the approval prompt is the escalation route AROUND the sandbox, and a client that
+  auto-approves has turned "the boundary says no" into "the boundary asks, and the bridge says
+  yes". An UNRECOGNISED request answers with a JSON-RPC refusal rather than an empty object,
+  so a request kind this bridge has never seen cannot come to mean "granted" by default.
+  `account/chatgptAuthTokens/refresh` is refused for its own reason: the credential in the
+  per-turn home holds the refresh flow, not this bridge.
+
+- **The App Server's built-in `codex_apps` MCP server is turned off** (`-c
+  features.apps=false`, the config spelling of `--disable apps`). It starts on every thread —
+  observed on 0.153.4 in a `CODEX_HOME` holding nothing but an `auth.json`, so it is a
+  property of the transport and not of the operator's config. The containment record is keyed
+  by the MCP server set, so a server nothing here asked for is turned off rather than recorded
+  as chosen.
+
+- **Subscription authentication is unchanged and there is no fallback.** The turn runs on the
+  ChatGPT OAuth login copied into the per-turn home, exactly as before; `account/read` reports
+  the active mode (`{"type":"chatgpt","planType":"pro"}`) without the credential ever being
+  read or logged. An expired or exhausted login is `Fatal` with the operator's remedy and is
+  never retried — there is no interactive `codex login` on a bridge host — and it never falls
+  back to an API key or another provider.
+
+- **The committed argv fixture is regenerated, and only the Codex rows moved.**
+  `tests/fixtures/argv-before-split.json` is a capture taken on an earlier commit precisely so
+  a refactor cannot rationalise its own golden; a transport change is the one thing that
+  legitimately moves it. Every Claude Code row is byte-for-byte unchanged, no Codex row gained
+  or lost a containment argument, and every `-c` override is still there in the same order.
+  What changed is listed argument by argument in that file's own header.
+
+- **The containment record is re-taken against the changed execution path**
+  (`bridge/containment-codex.toml`, codex-cli 0.153.4, model `codex-write`). Nothing was
+  copied forward: the whole battery was re-run on the App Server transport, and it reports
+  **nothing moved** — every verdict is the one the pre-change record carried, which is the
+  evidence that the transport swap did not move the boundary. `parse_codex_trace` learned the
+  App Server's event shapes (JSON-RPC-wrapped, camelCase item names) while keeping the `exec`
+  spellings, so a record taken before this release still parses.
+
 ## [bridge 0.120.0] - 2026-09-06
 
 **A Codex follow-up has never worked.** A first question answers; the second message in the

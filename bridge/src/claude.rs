@@ -280,6 +280,7 @@ pub fn spawned_only<'a>(
 async fn run_stateless_oneshot(
     cfg: &Config,
     harness: &dyn SpawnedHarness,
+    req: &TurnRequest<'_>,
     mut cmd: Command,
     timeout_secs: u64,
     label: &str,
@@ -290,6 +291,7 @@ async fn run_stateless_oneshot(
             format!("failed to spawn {}: {e}", cfg.claude_bin),
         )
     })?;
+    let stdin = child.stdin.take();
     let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
         return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -310,33 +312,65 @@ async fn run_stateless_oneshot(
     // Read stdout line by line into a LOCAL buffer, stopping at the terminal
     // `result` line — the same completion rule as a turn. One FRESH parser for this
     // spawn, so nothing from an earlier child can bleed in.
-    let mut parser = harness.parser();
+    let reader = harness.reader();
     let read_lines = async {
-        let mut lines = BufReader::new(stdout).lines();
-        let mut terminal: Option<ClaudeOutcome> = None;
-        let mut streamed = String::new();
-        loop {
-            let next = lines
-                .next_line()
-                .await
-                .map_err(|e| (StatusCode::BAD_GATEWAY, format!("claude io error: {e}")))?;
-            let Some(line) = next else { break };
-            match parser.on_line(&line) {
-                StreamEvent::TextDelta(t) => {
-                    if streamed.len() < MAX_OUTPUT_BYTES {
-                        streamed.push_str(&t);
+        match reader {
+            TurnReader::Lines(mut parser) => {
+                let mut lines = BufReader::new(stdout).lines();
+                let mut terminal: Option<ClaudeOutcome> = None;
+                let mut streamed = String::new();
+                loop {
+                    let next = lines
+                        .next_line()
+                        .await
+                        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("claude io error: {e}")))?;
+                    let Some(line) = next else { break };
+                    match parser.on_line(&line) {
+                        StreamEvent::TextDelta(t) => {
+                            if streamed.len() < MAX_OUTPUT_BYTES {
+                                streamed.push_str(&t);
+                            }
+                        }
+                        StreamEvent::Done(outcome) => {
+                            terminal = Some(outcome);
+                            break;
+                        }
+                        // A one-shot child (title / diet / vault-QA) is not a conversation, so
+                        // the session it names is nothing this path binds.
+                        StreamEvent::SessionId(_)
+                        | StreamEvent::ToolActivity(_)
+                        | StreamEvent::Ignore => {}
                     }
                 }
-                StreamEvent::Done(outcome) => {
-                    terminal = Some(outcome);
-                    break;
-                }
-                // A one-shot child (title / diet / vault-QA) is not a conversation, so the
-                // session it names is nothing this path binds.
-                StreamEvent::SessionId(_) | StreamEvent::ToolActivity(_) | StreamEvent::Ignore => {}
+                Ok::<(Option<ClaudeOutcome>, String), ApiError>((terminal, streamed))
+            }
+            // A duplex harness serving a one-shot gets the SAME driver a turn gets, with a
+            // sink that DROPS both mid-turn events — a one-shot has no job, so there is no
+            // stream to push a delta onto and no client watching. Exactly the arrangement
+            // `run_routed_oneshot` already makes for an in-process harness, and for the same
+            // reason: the text comes back in the terminal outcome.
+            TurnReader::Duplex(mut driver) => {
+                let Some(stdin) = stdin else {
+                    return Err((
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!(
+                            "{} drives its child over stdin, but its command configured no \
+                             stdin pipe",
+                            harness.id()
+                        ),
+                    ));
+                };
+                let sink = NullTurnSink;
+                let on_session = |_: &str| {};
+                let ctx = TurnDriveCtx {
+                    cfg,
+                    req,
+                    sink: &sink,
+                    on_session: &on_session,
+                };
+                Ok((Some(driver.drive(stdin, stdout, ctx).await), String::new()))
             }
         }
-        Ok::<(Option<ClaudeOutcome>, String), ApiError>((terminal, streamed))
     };
 
     let (terminal, streamed) = match timeout(Duration::from_secs(timeout_secs), read_lines).await {
@@ -404,7 +438,7 @@ async fn run_routed_oneshot(
             // The routing rule's pick. A no-op for an ambient pick; for a hosted/local one it
             // layers the backend triple onto this child and nothing else.
             apply_routed_env(&mut cmd, pick);
-            run_stateless_oneshot(cfg, h, cmd, timeout_secs, label).await
+            run_stateless_oneshot(cfg, h, req, cmd, timeout_secs, label).await
         }
         Runner::InProcess(h) => {
             // NO ENV OVERRIDE HERE, and its absence is the point: `apply_routed_env` exists to
@@ -726,6 +760,11 @@ async fn run_spawned_turn(
                 format!("failed to spawn {}: {e}", cfg.claude_bin),
             )
         })?;
+        // Taken unconditionally, used only by a duplex reader. `None` on a harness that
+        // configured `Stdio::null()` (Claude Code takes its prompt as an argument and never
+        // reads stdin), which is not an error until something tries to WRITE to it — see the
+        // duplex arm below, which refuses rather than deadlocking on a pipe that is not there.
+        let stdin = child.stdin.take();
         // Map a missing pipe to an error rather than `.expect()` (M2): a panic
         // here on the spawned turn task would otherwise leave the job stuck
         // Running forever (complete never called). Both are configured
@@ -798,39 +837,77 @@ async fn run_spawned_turn(
         // satisfies "the last result line wins." The no-result fallback below (clean EOF
         // with accumulated streamed text) is preserved: that path is reached only when
         // the loop ends via `next_line() == None` without ever seeing a `Done`.
-        let mut parser = harness.parser();
+        //
+        // WHICH OF THE TWO depends on how this harness's child is talked to. Everything
+        // AROUND this — the spawn, the stderr drain, the timeout, the reap, the retry — is
+        // shared verbatim, which is the whole reason [`TurnReader`] is a variant here rather
+        // than a third [`Runner`].
+        let reader = harness.reader();
         let read_lines = async {
-            let mut lines = BufReader::new(stdout).lines();
-            let mut terminal: Option<ClaudeOutcome> = None;
-            loop {
-                let next = lines
-                    .next_line()
-                    .await
-                    .map_err(|e| (StatusCode::BAD_GATEWAY, format!("claude io error: {e}")))?;
-                let Some(line) = next else { break };
-                match parser.on_line(&line) {
-                    StreamEvent::TextDelta(t) => {
-                        // The trace sees the SAME delta the live stream does, into its own
-                        // bounded ring — the stream accumulator is unbounded-per-turn and
-                        // dies with the job, while this is what a cut-off turn hands back.
-                        trace.note_delta(&t);
-                        jobs.stream_push_delta(job_id, &t)
+            match reader {
+                TurnReader::Lines(mut parser) => {
+                    let mut lines = BufReader::new(stdout).lines();
+                    let mut terminal: Option<ClaudeOutcome> = None;
+                    loop {
+                        let next = lines.next_line().await.map_err(|e| {
+                            (StatusCode::BAD_GATEWAY, format!("claude io error: {e}"))
+                        })?;
+                        let Some(line) = next else { break };
+                        match parser.on_line(&line) {
+                            StreamEvent::TextDelta(t) => {
+                                // The trace sees the SAME delta the live stream does, into its
+                                // own bounded ring — the stream accumulator is
+                                // unbounded-per-turn and dies with the job, while this is what
+                                // a cut-off turn hands back.
+                                trace.note_delta(&t);
+                                jobs.stream_push_delta(job_id, &t)
+                            }
+                            StreamEvent::ToolActivity(a) => {
+                                trace.note_tool(&a.name);
+                                jobs.stream_push_activity(job_id, a)
+                            }
+                            // The child named its session. Record it the moment it arrives, so
+                            // a turn that dies after this line has still told us what it owns.
+                            StreamEvent::SessionId(id) => spawned.record(&id),
+                            StreamEvent::Done(outcome) => {
+                                terminal = Some(outcome);
+                                break;
+                            }
+                            StreamEvent::Ignore => {}
+                        }
                     }
-                    StreamEvent::ToolActivity(a) => {
-                        trace.note_tool(&a.name);
-                        jobs.stream_push_activity(job_id, a)
-                    }
-                    // The child named its session. Record it the moment it arrives, so a
-                    // turn that dies after this line has still told us what it owns.
-                    StreamEvent::SessionId(id) => spawned.record(&id),
-                    StreamEvent::Done(outcome) => {
-                        terminal = Some(outcome);
-                        break;
-                    }
-                    StreamEvent::Ignore => {}
+                    Ok::<Option<ClaudeOutcome>, ApiError>(terminal)
+                }
+                // THE DUPLEX ARM. The harness holds the conversation; the two mid-turn events
+                // arrive through the SAME sink an in-process harness is handed, so a delta
+                // read off a JSON-RPC notification and a delta read off a line of stdout land
+                // in `jobs.stream_push_delta` in exactly the same shape.
+                TurnReader::Duplex(mut driver) => {
+                    let Some(stdin) = stdin else {
+                        return Err((
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!(
+                                "{} drives its child over stdin, but its command configured no \
+                                 stdin pipe",
+                                harness.id()
+                            ),
+                        ));
+                    };
+                    let sink = JobStoreSink {
+                        jobs,
+                        job_id,
+                        trace,
+                    };
+                    let on_session = |id: &str| spawned.record(id);
+                    let ctx = TurnDriveCtx {
+                        cfg,
+                        req: &req,
+                        sink: &sink,
+                        on_session: &on_session,
+                    };
+                    Ok(Some(driver.drive(stdin, stdout, ctx).await))
                 }
             }
-            Ok::<Option<ClaudeOutcome>, ApiError>(terminal)
         };
 
         // "Unlimited" (timeout_secs == 0) is a debug-only affordance and never
@@ -1273,7 +1350,10 @@ mod tests {
     fn replay_outcome(fixture: &str, stderr: &str) -> ClaudeOutcome {
         let mut streamed = String::new();
         let mut terminal: Option<ClaudeOutcome> = None;
-        let mut parser = ClaudeCode.parser();
+        let mut parser = ClaudeCode
+            .reader()
+            .into_lines()
+            .expect("claude code reads lines");
         for line in fixture.lines() {
             match parser.on_line(line) {
                 StreamEvent::TextDelta(t) => streamed.push_str(&t),

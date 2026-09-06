@@ -83,18 +83,29 @@ fn kimi_codex_model() -> Option<ActiveModel> {
 /// handle is REMOVED at the terminal frame, so a subscribe attempted afterwards finds
 /// nothing at all. A collector attached after the turn reports zero activity on a turn that
 /// pushed plenty, which looks exactly like the bug these tests exist to catch.
-fn watch(jobs: &Arc<JobStore>, jid: &str) -> tokio::task::JoinHandle<Vec<ToolActivity>> {
+fn watch(jobs: &Arc<JobStore>, jid: &str) -> tokio::task::JoinHandle<Watched> {
     let (_text, _activity, mut rx) = jobs
         .stream_subscribe(jid)
         .expect("the stream is registered before the turn starts");
+    let started = std::time::Instant::now();
     tokio::spawn(async move {
-        let mut out = Vec::new();
+        let mut out = Watched::default();
         while let Ok(frame) = rx.recv().await {
             match frame {
-                StreamFrame::Activity(a) => out.push(a),
+                StreamFrame::Activity(a) => out.activity.push(a),
                 // Terminal frames close the stream; stop rather than spin on RecvError.
                 StreamFrame::Done { .. } | StreamFrame::Error(_) | StreamFrame::Cancelled => break,
-                StreamFrame::Delta(_) => {}
+                // THE TIMING THIS TEST EXISTS TO RECORD SINCE 0.121.0. `first_delta_ms` is
+                // measured from the moment the client subscribed, which is before the child
+                // is spawned — so it INCLUDES process start and the App Server handshake, and
+                // is the number a person watching the phone actually experiences.
+                StreamFrame::Delta(d) => {
+                    if out.first_delta_ms.is_none() {
+                        out.first_delta_ms = Some(started.elapsed().as_millis());
+                    }
+                    out.deltas += 1;
+                    out.text.push_str(&d);
+                }
             }
         }
         out
@@ -103,11 +114,24 @@ fn watch(jobs: &Arc<JobStore>, jid: &str) -> tokio::task::JoinHandle<Vec<ToolAct
 
 /// Collect what the watcher saw. The driver does not emit the terminal frame (the handler
 /// does), so the turn ending is what ends the collection — close the stream to unblock it.
+/// What a watching client saw, in the order and at the times it saw it.
+#[derive(Default, Debug)]
+struct Watched {
+    activity: Vec<ToolActivity>,
+    /// How many `Delta` frames arrived. ZERO on a whole-answer harness, and a Codex turn that
+    /// reports zero has regressed to one.
+    deltas: usize,
+    /// Milliseconds from subscribe to the FIRST delta.
+    first_delta_ms: Option<u128>,
+    /// The deltas, concatenated — what a reconnecting client would replay.
+    text: String,
+}
+
 async fn collected(
     jobs: &Arc<JobStore>,
     jid: &str,
-    w: tokio::task::JoinHandle<Vec<ToolActivity>>,
-) -> Vec<ToolActivity> {
+    w: tokio::task::JoinHandle<Watched>,
+) -> Watched {
     jobs.stream_finish(jid, StreamFrame::Cancelled);
     w.await.expect("the watcher task")
 }
@@ -134,6 +158,7 @@ async fn a_codex_turn_answers_and_shows_what_it_was_doing() {
     let watcher = watch(&jobs, jid);
     let spawned = SpawnedSessions::new();
 
+    let turn_started = std::time::Instant::now();
     let out = run_claude_streaming(
         &cfg,
         "Read note.md in this directory and tell me the agreed cadence. Quote it.",
@@ -151,14 +176,37 @@ async fn a_codex_turn_answers_and_shows_what_it_was_doing() {
     )
     .await;
 
-    let acts = collected(&jobs, jid, watcher).await;
+    let turn_ms = turn_started.elapsed().as_millis();
+    let seen = collected(&jobs, jid, watcher).await;
+    let acts = seen.activity.clone();
 
     let (text, session, _usage) = out.expect("a live Codex turn should answer");
+    // The sanitized timings this test exists to record. No prompt, no answer, no path — three
+    // numbers and a count, which is what a certification note needs and all it needs.
+    eprintln!(
+        "TIMINGS: first forwarded text {:?}ms, turn completed {turn_ms}ms, {} delta frames",
+        seen.first_delta_ms, seen.deltas
+    );
     eprintln!("answer: {text}\nthread: {session:?}\nactivity: {acts:?}");
 
+    assert!(!text.trim().is_empty(), "the answer is not empty");
+
+    // **THE ANSWER REACHED THE CLIENT BEFORE IT EXISTED.** The property this harness gained
+    // in 0.121.0, asserted against the real binary rather than a fixture: a turn that pushed
+    // no deltas has fallen back to whole-answer delivery, whatever else it got right.
     assert!(
-        !text.trim().is_empty(),
-        "the answer arrived whole, not empty"
+        seen.deltas > 1,
+        "a Codex turn must stream its answer — {} delta frames is whole-answer delivery",
+        seen.deltas
+    );
+    let first = seen.first_delta_ms.expect("a first delta");
+    assert!(
+        first < turn_ms,
+        "the first delta ({first}ms) must precede the turn completing ({turn_ms}ms)"
+    );
+    assert!(
+        text.contains(seen.text.trim()) || seen.text.trim().is_empty(),
+        "the replayed deltas must be a prefix of the answer, never a second copy of it"
     );
     assert!(
         text.to_lowercase().contains("tuesday"),
@@ -175,8 +223,9 @@ async fn a_codex_turn_answers_and_shows_what_it_was_doing() {
     );
     assert!(
         !acts.is_empty(),
-        "a whole-answer turn MUST push activity — with none, the client shows a spinner and \
-         nothing else for the entire turn. Frames seen: {acts:?}"
+        "a turn MUST push activity — a streaming harness's activity line is a garnish, but a \
+         turn that reads a file and says so silently is still hiding what it did. Frames \
+         seen: {acts:?}"
     );
     assert!(
         acts.iter().all(|a| !a.name.contains('/')),
@@ -244,7 +293,7 @@ async fn a_kimi_turn_uses_a_tool_through_codex_against_an_openai_provider() {
     .await;
     let elapsed = started.elapsed();
 
-    let acts = collected(&jobs, jid, watcher).await;
+    let acts = collected(&jobs, jid, watcher).await.activity;
     let (text, session, usage) = out.expect("a live Kimi-on-Codex turn should answer");
     eprintln!(
         "answer: {text}\nthread: {session:?}\nusage: {usage:?}\nactivity: {acts:?}\nelapsed: {elapsed:?}"
@@ -316,7 +365,7 @@ async fn a_refused_write_reaches_the_client_as_activity_not_silence() {
     )
     .await;
 
-    let acts = collected(&jobs, jid, watcher).await;
+    let acts = collected(&jobs, jid, watcher).await.activity;
     eprintln!("activity: {acts:?}");
 
     // The turn SUCCEEDS: a refused tool call is the boundary working, not the turn failing.

@@ -721,7 +721,7 @@ mod tests {
             ) -> Result<Command, HarnessError> {
                 Err(HarnessError::unsupported("silent", "a turn"))
             }
-            fn parser(&self) -> Box<dyn TurnParser> {
+            fn reader(&self) -> TurnReader {
                 unreachable!("never spawned in this test")
             }
         }
