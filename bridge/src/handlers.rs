@@ -1033,6 +1033,30 @@ pub async fn start_turn(
         },
     };
 
+    // THE SHARED INSTRUCTION BUNDLE'S ONE SENTENCE, when this deployment has a rules root.
+    //
+    // Not the core: that arrives through the harness's own discovery of the entry document in
+    // the working directory, and injecting it again here would double it. This is the
+    // compaction pointer, which is the one thing discovery cannot survive — see
+    // `rules::reload_prompt_suffix`. Same capability gate as the artifact channel above: a
+    // `Basic` child runs in a neutral directory, discovers no document, and must not be told
+    // to re-read one.
+    let prompt = match (&st.cfg.rules_root, capability >= Capability::Read) {
+        (Some(root), true) => {
+            match rules::reload_prompt_suffix(
+                Path::new(root),
+                st.cfg.harnesses.serving(&active).id(),
+            ) {
+                Some(suffix) => format!("{prompt}{suffix}"),
+                // A root that cannot be read is a turn failure, but it is `rules_gate`'s to
+                // report: it runs at `build_turn` with the full verification behind it and a
+                // message naming what is wrong. Saying nothing here keeps one error path.
+                None => prompt,
+            }
+        }
+        _ => prompt,
+    };
+
     // Open the live stream before spawning so a phone that opens
     // `GET /jesse/stream/{job_id}` immediately finds the broadcast channel.
     st.jobs.stream_register(&job_id);

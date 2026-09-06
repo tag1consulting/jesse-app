@@ -1044,6 +1044,29 @@ pub struct Config {
     // empty-servers const) and runs on the three read-only built-ins alone — qmd is
     // simply absent, never an error. Only the vault-QA child ever reads this.
     pub vaultqa_mcp_config: Option<String>,
+    /// **THE SHARED INSTRUCTION BUNDLE'S SOURCE ROOT** (`JESSE_RULES_ROOT`), or `None` when
+    /// the feature is not configured on this deployment.
+    ///
+    /// The directory holding `jesse-rules.toml`, the canonical rule sources it names, and the
+    /// two generated entry documents the harnesses discover. In the deployed shape it is the
+    /// same directory as [`Config::vault`], because that is the working directory a main turn
+    /// runs in and therefore the only place a `CLAUDE.md` or an `AGENTS.md` is discovered
+    /// from. It is a SEPARATE setting anyway, and that is the point: a rules root is
+    /// something an operator publishes into, so deriving it from the vault would turn "this
+    /// deployment has not adopted the bundle yet" into "this deployment refuses its own
+    /// turns".
+    ///
+    /// What it changes when set, and nothing else:
+    ///   * a turn at [`Capability::Read`] or above whose working directory IS this root
+    ///     verifies the bundle before the child is spawned, and is refused with an actionable
+    ///     error if it is missing, stale, hand-edited, over budget or half-published
+    ///     (see `rules::preflight`);
+    ///   * a write-capable turn's `jesse-hook` command line carries `--rules <root>`, which
+    ///     is what puts the enforceable checks on that turn's tool calls.
+    ///
+    /// Unset: every path is byte for byte what it was before the bundle existed. That is also
+    /// the rollback, and it needs no rebuild.
+    pub rules_root: Option<String>,
     // Optional MCP config for the MAIN turn — a file path or inline JSON, the same two
     // forms `--mcp-config` accepts and the same resolution as `vaultqa_mcp_config` (env
     // `JESSE_MAIN_MCP_CONFIG`). Unlike the vault-QA child, unset does NOT mean "no
@@ -3128,6 +3151,13 @@ impl Config {
                 // (persistence off) rather than writing to a bare "/.jesse-bridge".
                 (!home.is_empty()).then(|| format!("{home}/.jesse-bridge"))
             }),
+            // NO DEFAULT, DELIBERATELY. `JESSE_VAULT` would have been the obvious one and it
+            // is the wrong one: the shared instruction bundle is a thing an operator PUBLISHES
+            // into a root, and defaulting to the vault would make every deployment that has
+            // never run `jesse-rules generate` start refusing its own turns for a missing
+            // manifest. Unset means the whole feature is inert and every path is byte for byte
+            // what it was before it existed, which is also the rollback.
+            rules_root: env_string("JESSE_RULES_ROOT"),
             max_attachments: env_parse("JESSE_MAX_ATTACHMENTS", DEFAULT_MAX_ATTACHMENTS),
             max_attachment_bytes: env_parse(
                 "JESSE_MAX_ATTACHMENT_BYTES",

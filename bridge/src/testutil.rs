@@ -31,6 +31,9 @@ pub(crate) fn test_config() -> Config {
         // No on-disk persistence in tests by default — keeps cargo test off
         // the real $HOME. The persistence tests build a store with a temp dir.
         state_dir: None,
+        // The shared instruction bundle is OFF in the fixture, which is the shipped default:
+        // a test that wants it on points this at a scratch root of its own.
+        rules_root: None,
         max_attachments: DEFAULT_MAX_ATTACHMENTS,
         max_attachment_bytes: DEFAULT_MAX_ATTACHMENT_BYTES,
         max_attachments_total_bytes: DEFAULT_MAX_ATTACHMENTS_TOTAL_BYTES,

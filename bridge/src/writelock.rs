@@ -630,6 +630,10 @@ pub fn build_write_lock_child(
         turn: turn.to_string(),
         conversation: conversation.to_string(),
         helper: helper.clone()?,
+        // The shared instruction bundle's root, when configured. Passed straight through: the
+        // turn-start gate (`rules_gate`) has already verified it, and a hook that is handed a
+        // root it cannot read denies rather than allowing an unchecked write.
+        rules_root: cfg.rules_root.as_deref().map(PathBuf::from),
     })
 }
 

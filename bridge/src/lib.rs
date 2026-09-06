@@ -123,6 +123,13 @@ mod prompt;
 mod queue;
 mod ratelimit;
 mod routing;
+// THE SHARED INSTRUCTION BUNDLE, namespaced rather than flattened, for the reason the
+// sentinel below is: it is a vocabulary of its own (`Rule`, `Manifest`, `Bundle`, `check`,
+// `verify`, `publish`, `Decision`) and half those names would collide with, or quietly
+// shadow, something on the turn path if they were poured into the flat namespace. It is
+// reached as `jesse_bridge::rules::…` by the turn path, by `jesse-hook` and by the
+// `jesse-rules` binary.
+pub mod rules;
 mod schedstate;
 mod schedule;
 mod scheduler;
