@@ -41,6 +41,8 @@ struct Args {
     socket: String,
     turn: String,
     conversation: String,
+    /// The shared instruction bundle's source root, when this deployment has one.
+    rules: Option<String>,
 }
 
 fn parse_args() -> Option<Args> {
@@ -49,6 +51,7 @@ fn parse_args() -> Option<Args> {
     let mut socket = None;
     let mut turn = None;
     let mut conversation = None;
+    let mut rules = None;
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
         let mut take = || it.next();
@@ -58,6 +61,7 @@ fn parse_args() -> Option<Args> {
             "--socket" => socket = take(),
             "--turn" => turn = take(),
             "--conversation" => conversation = take(),
+            "--rules" => rules = take(),
             _ => return None,
         }
     }
@@ -67,6 +71,12 @@ fn parse_args() -> Option<Args> {
         socket: socket?,
         turn: turn?,
         conversation: conversation?,
+        // OPTIONAL, unlike every flag above. A bridge with no rules root configured writes a
+        // hook command without it, and this binary then behaves exactly as it did before the
+        // bundle existed. An OLD hook binary meeting a NEW bridge would reject the unknown
+        // flag and deny every write, which is the safe direction and is also why the two ship
+        // and deploy together (see `deploy-bins.toml`).
+        rules,
     })
 }
 
@@ -98,6 +108,84 @@ fn deny(harness: &str, reason: &str) -> ! {
 /// Allow, saying nothing. Both CLIs treat a silent exit 0 as "proceed".
 fn allow() -> ! {
     std::process::exit(0)
+}
+
+/// Run the bundle's enforceable checks against this tool call, and DENY if one refuses.
+///
+/// **THE THIN ADAPTER.** Everything specific to a harness is asked of the harness — the write
+/// target (`hook_write_target`) and how much of the content this payload shows
+/// (`observed_content`) — and everything else is the one shared component in
+/// `jesse_bridge::rules::enforce`. Nothing about which rule means what lives in this file.
+///
+/// Returns normally when the call is allowed; the checks that could not be evaluated are
+/// written to stderr, which both CLIs treat as hook diagnostics on a zero exit. That line is
+/// the honest half of the record: a check that could not see the content has not passed.
+fn enforce_rules(
+    args: &Args,
+    harness: &dyn jesse_bridge::SpawnedHarness,
+    payload: &HookPayload,
+    root: &std::path::Path,
+) {
+    use jesse_bridge::rules;
+
+    let Ok(canon_root) = root.canonicalize() else {
+        deny(
+            &args.harness,
+            &format!(
+                "jesse-hook: the rules root {} could not be resolved; refusing the tool call \
+                 rather than running it unchecked",
+                root.display()
+            ),
+        );
+    };
+    // The MANIFEST alone, not a whole bundle build: this runs once per tool call and the
+    // enforceable parameters are all it needs. The bundle's own integrity was verified at
+    // turn start by `rules_gate`, and a manifest edited underneath a running turn is caught by
+    // the NEXT turn's gate — stated here rather than left to be discovered, because it is the
+    // one window this design leaves open.
+    let manifest = match rules::Manifest::load(&canon_root) {
+        Ok(m) => m,
+        Err(e) => deny(
+            &args.harness,
+            &format!(
+                "jesse-hook: the rule manifest could not be read ({e}); refusing the tool call \
+                 rather than running it unchecked"
+            ),
+        ),
+    };
+    if manifest.enforce.is_empty() {
+        return;
+    }
+
+    // The harness's own three-way answer, carried across as the shared component's three-way
+    // scope. They are the same distinction: a read, a named write, and a write nothing can
+    // name. Flattening the last two into an `Option` is what would make a shell write read as
+    // a call that passed every path check.
+    let written = harness.hook_write_target(payload);
+    let scope = match &written {
+        WriteTarget::None => rules::WriteScope::None,
+        WriteTarget::Path(p) => rules::WriteScope::Named(p.as_path()),
+        WriteTarget::Global => rules::WriteScope::Unnamed,
+    };
+    let content = harness.observed_content(payload);
+    let ctx = rules::ActionContext {
+        harness: &args.harness,
+        tool: &payload.tool_name,
+        target: scope,
+        content: &content,
+        root: &canon_root,
+    };
+    let verdict = rules::check_action(&manifest.enforce, &ctx);
+    if !verdict.unobservable.is_empty() {
+        eprintln!(
+            "jesse-hook: {} unchecked at this boundary: {}",
+            payload.tool_name,
+            verdict.unobservable.join("; ")
+        );
+    }
+    if let rules::Decision::Deny { rule, reason } = verdict.decision {
+        deny(&args.harness, &format!("[rule {rule}] {reason}"));
+    }
 }
 
 fn main() {
@@ -148,6 +236,23 @@ fn main() {
     };
 
     let socket = std::path::PathBuf::from(&args.socket);
+
+    // ---- THE RULE CHECK, BEFORE THE LOCK ------------------------------------------------
+    //
+    // Ahead of the broker round trip on purpose: a refused call must not take a lock it will
+    // never release through the post hook that a denial suppresses. It runs on `pre` only —
+    // the tool has already run by `post`, and a refusal after the fact is not enforcement,
+    // it is a complaint.
+    //
+    // FAILS CLOSED, like everything else in this binary. `--rules` is passed only when the
+    // bridge has a configured root that it already verified at turn start, so a root that
+    // cannot be read HERE means something changed underneath a running turn, and the safe
+    // answer to that is the same one an unreachable broker gets.
+    if args.event == "pre" {
+        if let Some(root) = &args.rules {
+            enforce_rules(&args, harness, &payload, std::path::Path::new(root));
+        }
+    }
 
     let req = match args.event.as_str() {
         "pre" => {

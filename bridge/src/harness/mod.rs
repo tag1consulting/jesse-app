@@ -315,12 +315,24 @@ pub struct WriteLockChild {
     pub conversation: String,
     /// The `jesse-hook` helper binary, resolved once at startup.
     pub helper: PathBuf,
+    /// The shared instruction bundle's source root, when this deployment has one.
+    ///
+    /// **PRESENT ONLY WHEN THE BRIDGE HAS ALREADY VERIFIED IT.** `rules_gate` runs at
+    /// `build_turn`, before the child exists; this field is what carries the same root down to
+    /// the hook so the enforceable checks act on the tool calls of a turn whose bundle was
+    /// found sound. `None` means no rule enforcement at this boundary and the write lock
+    /// alone, which is byte for byte the behaviour before the bundle existed.
+    ///
+    /// It rides in the hook COMMAND STRING with the rest, for the reason the struct's own
+    /// comment gives: the bridge is already writing a per-turn file, and nothing then depends
+    /// on env inheritance through whatever process tree a CLI uses to run a hook.
+    pub rules_root: Option<PathBuf>,
 }
 
 impl WriteLockChild {
     /// The hook command string for one event, as this harness's hook config will carry it.
     pub fn command(&self, harness: &str, event: &str) -> String {
-        format!(
+        let mut s = format!(
             "{} --harness {} --event {} --socket {} --turn {} --conversation {}",
             shell_quote(&self.helper.display().to_string()),
             harness,
@@ -328,7 +340,12 @@ impl WriteLockChild {
             shell_quote(&self.socket.display().to_string()),
             shell_quote(&self.turn),
             shell_quote(&self.conversation),
-        )
+        );
+        if let Some(root) = &self.rules_root {
+            s.push_str(" --rules ");
+            s.push_str(&shell_quote(&root.display().to_string()));
+        }
+        s
     }
 }
 
@@ -828,6 +845,24 @@ pub trait SpawnedHarness: Harness {
     fn hook_read_target(&self, _payload: &HookPayload) -> Option<PathBuf> {
         None
     }
+
+    /// **HOW MUCH OF THE BYTES ABOUT TO BE WRITTEN THIS HOOK PAYLOAD ACTUALLY SHOWS.**
+    ///
+    /// The second half of the enforcement adapter, beside [`SpawnedHarness::hook_write_target`],
+    /// and per harness for the same reason: the payloads differ. Claude Code's `Write` carries
+    /// the complete post-write content in `tool_input.content`; its `Edit` carries only the
+    /// replacement fragment. Codex's `apply_patch` carries a patch envelope, from which an
+    /// `Add File` section is a complete file and a `Update File` section is a fragment.
+    ///
+    /// **THE DEFAULT IS [`crate::rules::ObservedContent::Opaque`], AND THAT IS THE HONEST
+    /// DEFAULT.** A harness that has not implemented this is saying "I cannot show you the
+    /// content", which makes every content check report itself as UNOBSERVABLE rather than as
+    /// passed. The alternative default — an empty string — would make a "must contain a
+    /// footer" check refuse every write and a "must not contain a dash" check pass every one,
+    /// and both would be a guard reporting on work it never saw.
+    fn observed_content(&self, _payload: &HookPayload) -> crate::rules::ObservedContent {
+        crate::rules::ObservedContent::Opaque
+    }
 }
 
 /// Where an [`InProcessHarness`] sends the two mid-turn events, and the ONLY way its text
@@ -1204,6 +1239,80 @@ pub const CLAUDE_CODE_ID: &str = "claude-code";
 /// the one that recorded it — which is exactly the failure
 /// `the_record_carries_no_absolute_host_paths` exists to prevent at commit time instead.
 pub const WORKSPACE_TOKEN: &str = "${WORKSPACE}";
+
+// ---- The shared instruction bundle's per-turn gate ---------------------------
+
+/// **VERIFY THE BUNDLE BEFORE THE CHILD THAT WOULD LOAD IT IS SPAWNED**, or refuse this turn.
+///
+/// Called from both spawned harnesses' `build_turn`. It is ONE function rather than two
+/// because the question is identical on both: the harnesses discover different FILE NAMES
+/// from the same directory, and which file that is is the bundle's business
+/// ([`crate::rules::document_harness`]), not the caller's.
+///
+/// # The three ways it answers "not my business", and why each is the right shape
+///
+///   * **No configured root.** The feature is not on for this deployment. Every path stays
+///     byte for byte what it was.
+///   * **A child below [`Capability::Read`].** The `Basic` diet and title one-shots are
+///     single-shot text transformations. They must not be refused because a rule source has a
+///     typo in it, and the diet children do not even run in a directory where an entry
+///     document could be discovered. Scoping a bundle failure to the work it affects is the
+///     whole requirement, and this is where it is scoped.
+///   * **A working directory that is not the rules root.** Discovery is by working directory,
+///     so a child running anywhere else loads no entry document and cannot be affected by one.
+///     Compared CANONICALLY: the deployed vault is reached through a symlink, and a string
+///     compare would silently answer "not the root" for every turn.
+///
+/// # What a failure costs
+///
+/// This turn, and nothing else. The error travels as a [`HarnessError`] and becomes that
+/// turn's failure; `/health`, the conversation list, the scheduler and every turn that does
+/// not load the bundle keep working. What must never happen instead is the other option —
+/// spawning the child anyway and letting it run on a stale or half-published document, which
+/// is a turn silently working from policy its owner has already replaced.
+pub fn rules_gate(
+    cfg: &Config,
+    req: &TurnRequest<'_>,
+    harness_id: &'static str,
+) -> Result<Option<crate::rules::PreflightReport>, HarnessError> {
+    let Some(root) = cfg.rules_root.as_deref() else {
+        return Ok(None);
+    };
+    if req.capability < Capability::Read {
+        return Ok(None);
+    }
+    let root = Path::new(root);
+    let (Ok(canon_root), Ok(canon_cwd)) = (root.canonicalize(), req.cwd.canonicalize()) else {
+        // A root that cannot be resolved at all is a configuration fault rather than a turn
+        // fault, but it is one this turn cannot work around: refuse, naming the path.
+        return Err(HarnessError::unavailable(
+            harness_id,
+            format!(
+                "the configured rules root {} could not be resolved; this turn would load \
+                 whatever instruction file happens to be in its working directory",
+                root.display()
+            ),
+        ));
+    };
+    if canon_cwd != canon_root {
+        return Ok(None);
+    }
+    match crate::rules::preflight(&canon_root, harness_id) {
+        Ok(report) => {
+            // The one line a turn writes about its bundle: ids, digests and counts, never a
+            // rule body and never anything from the vault. See `PreflightReport::log_line`.
+            eprintln!("jesse-bridge: {}", report.log_line());
+            Ok(Some(report))
+        }
+        Err(e) => Err(HarnessError::unavailable(
+            harness_id,
+            format!(
+                "the shared instruction bundle at {} is not usable: {e}",
+                canon_root.display()
+            ),
+        )),
+    }
+}
 
 // ---- The routed jobs' child requests ----------------------------------------
 //

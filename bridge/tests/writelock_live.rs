@@ -222,6 +222,7 @@ async fn a_codex_child_acquires_the_lock_under_its_own_sandbox() {
         turn: "job-codex-1".to_string(),
         conversation: "conv-codex".to_string(),
         helper: helper(),
+        rules_root: None,
     };
     let model = write_model(CODEX_ID);
     let text = turn(
@@ -318,6 +319,7 @@ async fn a_claude_child_acquires_the_lock_through_the_bridge_owned_settings() {
         turn: "job-claude-1".to_string(),
         conversation: "conv-claude".to_string(),
         helper: helper(),
+        rules_root: None,
     };
     let model = write_model(CLAUDE_CODE_ID);
     let text = turn(
