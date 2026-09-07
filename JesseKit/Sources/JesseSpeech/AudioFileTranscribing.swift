@@ -95,7 +95,7 @@ public enum TranscriptionFailure: Error, Equatable, Sendable {
         case .localeUnavailable(let language):
             return "This device can’t transcribe \(language). Choose a different language and try again."
         case .modelUnavailable(let language, let reason):
-            return "Couldn’t install the \(language) speech model: \(reason)"
+            return "Couldn’t install the \(language) speech model: \(Self.terminated(reason))"
         case .unreadableFile:
             return "Couldn’t read “\(sourceName)” — it isn’t audio this device can open."
         case .noSpeechFound:
@@ -103,10 +103,23 @@ public enum TranscriptionFailure: Error, Equatable, Sendable {
         case .stalled:
             return "Transcribing “\(sourceName)” stopped making progress, so it was given up on. Try again."
         case .engineFailed(let reason):
-            return "Couldn’t transcribe “\(sourceName)”: \(reason)"
+            return "Couldn’t transcribe “\(sourceName)”: \(Self.terminated(reason))"
         case .cancelled:
             return "Transcribing “\(sourceName)” was cancelled."
         }
+    }
+
+    /// Finish a borrowed clause as a sentence.
+    ///
+    /// The two cases above end in a `reason` that came from somewhere else —
+    /// `error.localizedDescription`, usually — and those arrive punctuated about half the
+    /// time. Appending unconditionally would produce "no space left.." on the half that
+    /// already are, so the terminator is added only when one is missing, and the result is
+    /// a whole sentence either way.
+    private static func terminated(_ clause: String) -> String {
+        let trimmed = clause.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let last = trimmed.last else { return "" }
+        return ".!?".contains(last) ? trimmed : trimmed + "."
     }
 }
 

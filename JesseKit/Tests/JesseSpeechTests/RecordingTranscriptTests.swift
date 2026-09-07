@@ -129,7 +129,7 @@ final class TranscriptionFailureMessageTests: XCTestCase {
         for failure in failures {
             let message = failure.message(sourceName: "memo.m4a")
             XCTAssertFalse(message.isEmpty)
-            XCTAssertTrue(message.hasSuffix(".") || message.hasSuffix("!"),
+            XCTAssertTrue(message.last.map { ".!?".contains($0) } ?? false,
                           "“\(message)” should read as a sentence")
             XCTAssertTrue(seen.insert(message).inserted,
                           "two failures share the wording “\(message)”")
@@ -143,6 +143,18 @@ final class TranscriptionFailureMessageTests: XCTestCase {
         XCTAssertTrue(message.contains("Settings"))
         XCTAssertTrue(message.contains("Speech Recognition"))
         XCTAssertTrue(message.contains("memo.m4a"))
+    }
+
+    /// A borrowed clause is finished as a sentence, and only once — the reasons these
+    /// two cases interpolate come from `error.localizedDescription`, which is punctuated
+    /// about half the time.
+    func testAnInterpolatedReasonIsPunctuatedExactlyOnce() {
+        XCTAssertTrue(TranscriptionFailure.engineFailed(reason: "the recognizer died")
+            .message(sourceName: "memo.m4a").hasSuffix("the recognizer died."))
+        XCTAssertTrue(TranscriptionFailure.engineFailed(reason: "The recognizer died.")
+            .message(sourceName: "memo.m4a").hasSuffix("The recognizer died."))
+        XCTAssertTrue(TranscriptionFailure.modelUnavailable(language: "Italian", reason: "no space left ")
+            .message(sourceName: "memo.m4a").hasSuffix("no space left."))
     }
 
     func testTheUnreadableFileMessageNamesTheFileAndSaysWhy() {
