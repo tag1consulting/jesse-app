@@ -14,6 +14,19 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [agent 0.10.0, bridge 0.123.0, eval 0.6.0] - 2026-09-06
+
+### Fixed
+
+Cache creation was always priced as ordinary input. The three-rate price deck had no
+way to express a different cache-write charge, so the agent ledger, cost budget,
+bridge badge and evaluation reports all understated providers that charge a premium.
+An optional `cache_write_per_m` now travels through the model config, bridge-to-agent
+mapping and all those calculations. Both agent and eval CLIs accept
+`--price-cache-write`; model environment overrides accept `_PRICE_CACHE_WRITE`.
+Omitting the rate retains the legacy estimate for existing configurations. Configure
+the rate for the provider and cache lifetime in use; no rate is inferred from a wire.
+
 ## [bridge 0.122.0] - 2026-09-06
 
 **Two harnesses, one set of rules, and the same mandatory core in both.** Claude Code

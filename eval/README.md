@@ -356,3 +356,13 @@ in CI. See `suites/validation/README.md`.
 `eval/` is its own crate in a root Cargo workspace that **excludes** `bridge/`, so
 the bridge continues to build from `working-directory: bridge` with its own
 `Cargo.lock` exactly as before.
+
+## Cache creation pricing
+
+Set `cache_write_per_m` in a model price table when cache creation has a different
+rate from ordinary input. Agent and eval CLI runs use `--price-cache-write`.
+The rate is dollars per million tokens for the configured cache lifetime. When
+omitted, the historical input-rate estimate remains; it is not a provider quote.
+For example, a $2 input rate and $2.50 five-minute cache-write rate must be
+configured separately. The bridge, direct-loop ledger, budget and eval report use
+the same configured rate.

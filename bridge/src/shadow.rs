@@ -89,7 +89,12 @@ impl ShadowUsage {
     /// badge multiplies a main turn's usage by the ACTIVE model's deck through this. The
     /// two named helpers below are the audit's fixed-deck shorthands over the same math.
     pub fn cost_on(&self, deck: &PriceDeck) -> f64 {
-        self.cost(deck.in_per_m, deck.cached_per_m, deck.out_per_m)
+        (self.input_tokens.unwrap_or(0) as f64 * deck.in_per_m
+            + self.cache_creation_input_tokens.unwrap_or(0) as f64
+                * deck.cache_write_per_m.unwrap_or(deck.in_per_m)
+            + self.cache_read_input_tokens.unwrap_or(0) as f64 * deck.cached_per_m
+            + self.output_tokens.unwrap_or(0) as f64 * deck.out_per_m)
+            / 1_000_000.0
     }
 
     /// Dollar cost of this usage vector on the GLM-on-Fireworks price deck. The shadow

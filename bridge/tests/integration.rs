@@ -4889,6 +4889,7 @@ fn cfg_with_switch_registry(state_dir: &std::path::Path) -> Config {
                 price: PriceDeck {
                     in_per_m: 5.0,
                     cached_per_m: 0.5,
+                    cache_write_per_m: None,
                     out_per_m: 25.0,
                 },
                 health: HealthConfig::default(),
@@ -4916,6 +4917,7 @@ fn cfg_with_switch_registry(state_dir: &std::path::Path) -> Config {
                 price: PriceDeck {
                     in_per_m: 1.4,
                     cached_per_m: 0.14,
+                    cache_write_per_m: None,
                     out_per_m: 4.4,
                 },
                 health: HealthConfig::default(),

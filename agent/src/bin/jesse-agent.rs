@@ -165,7 +165,7 @@ usage: jesse-agent turn --wire <messages|chat> --base-url <url> --model <id>
                         [--budget-iterations <n>] [--budget-tool-calls <n>]
                         [--budget-output-tokens <n>] [--budget-input-tokens <n>]
                         [--budget-wall-secs <n>] [--budget-cost-usd <f>]
-                        [--price-in <usd/M>] [--price-cached <usd/M>] [--price-out <usd/M>]
+                        [--price-in <usd/M>] [--price-cached <usd/M>] [--price-cache-write <usd/M>] [--price-out <usd/M>]
                         \"<message>\"
 
   --token-env names the ENVIRONMENT VARIABLE the API key lives in. The key itself is
@@ -258,6 +258,7 @@ fn parse(argv: Vec<String>) -> Result<Args, String> {
             "--budget-cost-usd" => budget.max_cost_usd = Some(float(&arg, &value()?)?),
             "--price-in" => prices.in_per_m = float(&arg, &value()?)?,
             "--price-cached" => prices.cached_per_m = float(&arg, &value()?)?,
+            "--price-cache-write" => prices.cache_write_per_m = Some(float(&arg, &value()?)?),
             "--price-out" => prices.out_per_m = float(&arg, &value()?)?,
             "-h" | "--help" => return Err(USAGE.to_string()),
             other if other.starts_with("--") => {
@@ -602,6 +603,21 @@ fn exit_code(stop: &StopReason) -> ExitCode {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn cache_write_price_cli_is_explicit_and_optional() {
+        let mut args = minimal();
+        args.extend(["--price-cache-write", "2.5"]);
+        assert_eq!(
+            parse(argv(&args)).unwrap().prices.cache_write_per_m,
+            Some(2.5)
+        );
+        assert_eq!(
+            parse(argv(&minimal())).unwrap().prices.cache_write_per_m,
+            None
+        );
+    }
+
     use super::*;
 
     fn argv(args: &[&str]) -> Vec<String> {

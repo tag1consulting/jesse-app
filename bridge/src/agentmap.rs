@@ -101,6 +101,7 @@ pub fn prices_for_agent(deck: &PriceDeck) -> AgentPrices {
     AgentPrices {
         in_per_m: deck.in_per_m,
         cached_per_m: deck.cached_per_m,
+        cache_write_per_m: deck.cache_write_per_m,
         out_per_m: deck.out_per_m,
     }
 }
@@ -162,6 +163,7 @@ mod tests {
         let deck = PriceDeck {
             in_per_m: 3.0,
             cached_per_m: 0.3,
+            cache_write_per_m: None,
             out_per_m: 15.0,
         };
         let agent_deck = prices_for_agent(&deck);

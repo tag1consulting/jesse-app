@@ -443,9 +443,9 @@ wrong in.
 spinner and an overnight batch are three orders of magnitude apart.
 
 `PriceDeck` has the **same field names as `bridge/src/config.rs`'s**, so D4 adopts it rather
-than defining a second deck. Cache writes are priced at the input rate — an approximation
-(the real figure is ~1.25×) taken so this type stays the bridge's deck; a fourth rate belongs
-in whichever change adds it on both sides at once.
+than defining a second deck. Cache creation uses the optional `cache_write_per_m`
+rate. Without that field, it retains the historical input-rate estimate. Configure
+the actual rate for the provider and cache lifetime before using costs for billing.
 
 ## The usage record
 
@@ -927,3 +927,13 @@ Content-Length headers on the upstream request, and the stale one truncates the 
 gateway just grew by injecting its identity notice. `curl` capitalises, so it overwrites
 cleanly and never shows the bug. The fix belongs in that gateway (normalise header names
 before assigning), not here; the D1 live smoke reached `ds4` directly instead.
+
+## Cache creation pricing
+
+Set `cache_write_per_m` in a model price table when cache creation has a different
+rate from ordinary input. Agent and eval CLI runs use `--price-cache-write`.
+The rate is dollars per million tokens for the configured cache lifetime. When
+omitted, the historical input-rate estimate remains; it is not a provider quote.
+For example, a $2 input rate and $2.50 five-minute cache-write rate must be
+configured separately. The bridge, direct-loop ledger, budget and eval report use
+the same configured rate.

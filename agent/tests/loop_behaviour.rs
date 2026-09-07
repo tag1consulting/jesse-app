@@ -452,6 +452,7 @@ async fn the_cost_ceiling_stops_before_the_call_that_would_cross_it() {
     let deck = PriceDeck {
         in_per_m: 1.0,
         cached_per_m: 0.0,
+        cache_write_per_m: None,
         out_per_m: 0.0,
     };
     let (ran, _) = stop_at(

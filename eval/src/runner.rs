@@ -54,7 +54,8 @@ impl From<&Usage> for TokenRecord {
 
 /// The dollar cost of a token record under a deck.
 fn cost_of(t: &TokenRecord, prices: &PriceDeck) -> f64 {
-    ((t.input + t.cache_creation) as f64 * prices.in_per_m
+    (t.input as f64 * prices.in_per_m
+        + t.cache_creation as f64 * prices.cache_write_per_m.unwrap_or(prices.in_per_m)
         + t.cache_read as f64 * prices.cached_per_m
         + t.output as f64 * prices.out_per_m)
         / 1_000_000.0
@@ -390,6 +391,7 @@ mod tests {
         let deck = PriceDeck {
             in_per_m: 3.0,
             cached_per_m: 0.3,
+            cache_write_per_m: None,
             out_per_m: 15.0,
         };
         assert!((cost_of(&t, &deck) - 18.3).abs() < 1e-9);

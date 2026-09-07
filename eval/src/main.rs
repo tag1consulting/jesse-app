@@ -38,7 +38,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Run a suite and write results.json + scorecard.md.
-    Run(RunArgs),
+    Run(Box<RunArgs>),
     /// Judge a candidate run against a baseline run.
     Judge(JudgeArgs),
     /// Compare two runs of the same suite, mechanically and with no model.
@@ -157,6 +157,9 @@ struct RunArgs {
     /// USD per million cache-read tokens.
     #[arg(long, default_value_t = 0.0)]
     price_cached: f64,
+    /// Cache creation USD per million tokens; omit for the legacy input-rate estimate.
+    #[arg(long)]
+    price_cache_write: Option<f64>,
     /// USD per million output tokens.
     #[arg(long, default_value_t = 0.0)]
     price_out: f64,
@@ -197,7 +200,7 @@ struct JudgeArgs {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
-        Commands::Run(a) => match do_run(a) {
+        Commands::Run(a) => match do_run(*a) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("jesse-eval run: {e}");
@@ -292,6 +295,7 @@ fn do_run(a: RunArgs) -> Result<(), String> {
                 prices: PriceDeck {
                     in_per_m: a.price_in,
                     cached_per_m: a.price_cached,
+                    cache_write_per_m: a.price_cache_write,
                     out_per_m: a.price_out,
                 },
                 persona: PersonaPack::default(),
@@ -305,6 +309,7 @@ fn do_run(a: RunArgs) -> Result<(), String> {
         prices: PriceDeck {
             in_per_m: a.price_in,
             cached_per_m: a.price_cached,
+            cache_write_per_m: a.price_cache_write,
             out_per_m: a.price_out,
         },
         out_dir: a.out.clone(),
