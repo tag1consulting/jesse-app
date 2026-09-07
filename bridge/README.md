@@ -2490,6 +2490,104 @@ verbs and **nothing else**. An operator process that refuses to boot is the
 failure this service exists to prevent, so everything except "no token" and "the
 same token as the bridge" is degraded-and-named rather than fatal.
 
+## Shared instruction bundle (`JESSE_RULES_ROOT`)
+
+Claude Code discovers `CLAUDE.md` in its working directory when the process starts. Codex
+discovers `AGENTS.md` in the same place. Two files maintained separately are two sets of rules
+the moment either is edited, and no amount of care keeps them the same. This makes both of
+them **outputs of one generation with a byte-identical shared core**.
+
+**It is off by default.** With `JESSE_RULES_ROOT` unset nothing below runs and every path is
+byte for byte what it was. Unsetting it again is the complete rollback and needs no rebuild.
+
+### The shape
+
+```text
+<root>/
+  jesse-rules.toml          the manifest: sources, sections, outputs, budget, enforceable checks
+  <canonical sources>.md    ordinary Markdown carrying explicitly marked rule blocks
+  CLAUDE.md                 GENERATED  (claude-code, and what the in-process `direct` harness reads)
+  AGENTS.md                 GENERATED  (codex)
+  .jesse-rules/state.json   what was last published: per-output and per-source hashes
+  .jesse-rules/previous/    the recoverable previous generation
+```
+
+A rule is a marked block in a canonical file:
+
+```markdown
+<!-- jesse-rule: id=no-outbound scope=core section="Hard Rules (read first)" -->
+- **Never send outbound communication on the owner's behalf.** Draft it and stop.
+<!-- /jesse-rule -->
+```
+
+`scope` is `core` (the mandatory block both harnesses carry byte-identically), `task` (the
+routed index, which also needs `triggers="a, b"`) or `adapter` (harness-specific, needs
+`adapters="codex"`). **The metadata selects content and never restates it**: the prose between
+the markers is copied verbatim into the generated documents, so there is exactly one place any
+rule is written down and the generated copies are disposable. There is no free-form attribute,
+and an unknown one is an error rather than an ignored field.
+
+Only a file NAMED IN THE MANIFEST can contribute, and only its MARKED blocks do. Ordinary note
+prose is never policy, which is what keeps a vault the model can write from being a vault the
+model can legislate in. A generated output may not also be a source: publishing over an index
+would destroy the rules it carries, so that manifest is refused.
+
+`bridge/tests/fixtures/rules/` is a complete worked example.
+
+### The CLI
+
+```bash
+jesse-rules check     --root ~/rules-root       # every independent problem, exit 1 if any
+jesse-rules generate  --root ~/rules-root       # publish; --dry-run, --adopt, --force
+jesse-rules show      --root ~/rules-root --harness codex
+jesse-rules preflight --root ~/rules-root --harness codex
+jesse-rules rollback  --root ~/rules-root       # restore the previous generation
+```
+
+`--root` defaults to `$JESSE_RULES_ROOT`, and the broker socket to
+`$JESSE_STATE_DIR/writelock.sock`. Exit `0` clean, `1` the root has problems, `2` the
+invocation was wrong. **`--adopt` is the migration switch**: an entry document that exists with
+no record of ever having been generated is refused until someone says explicitly that they have
+compared the old file against the new one. A document that WAS generated and has since been
+edited by hand is refused too, and takes `--force` to discard.
+
+Publication renders both documents before touching anything, takes the bridge's own global
+vault write lock through the existing broker, re-hashes every source and aborts on a concurrent
+edit, saves the outgoing pair, then writes and fsyncs both temp files before either rename.
+Two files cannot be renamed atomically, so a crash between the renames leaves a mixed pair;
+that state is **detected** (different digests, so `check` reports it and a turn is refused) and
+`rollback` restores it.
+
+### What the bridge does with it
+
+* **Before spawning a child** whose working directory is the root, at `Read` or above, the turn
+  verifies the bundle and is refused with an actionable error if it is missing, stale,
+  hand-edited, over budget or half-published. A `Basic` one-shot and a child in a neutral
+  working directory are not gated: they discover no entry document, and a bundle failure is
+  scoped to the work that loads one. `/health` and every unaffected turn keep working.
+* **Each such turn logs one content-free line** naming the bundle digest, the core digest, the
+  document, its size against the budget and the selected rule ids. **A digest proves what was
+  supplied, never that the model obeyed it.**
+* **The turn's prompt gains one sentence** telling the model to re-read the entry document after
+  a context compaction. Not the core, which is already there through discovery: injecting it
+  twice would double it. Neither CLI reports a mid-turn compaction on a channel this bridge
+  reads, so this is an instruction rather than a guarantee.
+* **A write-capable turn's `jesse-hook` gains `--rules <root>`**, and the bundle's enforceable
+  checks then run on every `PreToolUse` before the lock is requested. Five kinds live in the
+  Rust (denied tool names with declared exceptions, writes confined to declared roots, a file
+  name pattern, a forbidden substring, a required marker); their parameters live in the
+  manifest. A denial cites the rule id.
+
+**What the checks do not cover, stated rather than implied:** turns with no write lock reach no
+hook at all; the in-process `direct` harness installs no hooks; a shell command names no path,
+so every path and content check is unobservable for it and `jesse-hook` says so on stderr
+rather than letting the call read as one that passed; a browser click on a webmail compose form
+is indistinguishable from any other click, because the payload carries no page identity; and a
+dispatcher tool that takes its verb as an argument hides it from a name-based check.
+
+**No containment argument, tool grant or MCP server changed for any of this.** It only ever adds
+denials to a boundary that already existed.
+
 ## Prereqs
 
 - Rust toolchain (`rustup`, stable).
@@ -2618,6 +2716,7 @@ produce a persona that disagrees with the file the next restart reads.
 | `JESSE_RETRIEVAL_GRACE_SECS` | `600` | How much longer a reply is kept **after** its first retrieval (a short re-poll window) instead of the full TTL |
 | `JESSE_SESSION_TTL_DAYS` | `90` | Age (days) past which the background session GC sweep reclaims a vault-project Claude Code session jsonl. The sweep keys on file mtime, and resuming a session touches it, so an actively-used thread is never reclaimed — only orphans older than this. Runs once at startup, then every 6h; scoped to the vault project only. See [Session GC sweep](#session-gc-sweep-jesse_session_ttl_days) |
 | `JESSE_STATE_DIR` | `~/.jesse-bridge` | Where completed results are persisted (`<dir>/jobs`), the device token (`<dir>/device.json`, 0600) and the per-turn timing log (`<dir>/turn-timings.jsonl`), so a restart doesn't lose a reply, the token, or the record of where a turn's time went. Empty disables persistence (timing records stay in memory) |
+| `JESSE_RULES_ROOT` | _(off)_ | The [shared instruction bundle](#shared-instruction-bundle-jesse_rules_root)'s source root: the directory holding `jesse-rules.toml`, the canonical rule sources it names, and the two generated entry documents (`CLAUDE.md`, `AGENTS.md`) the harnesses discover. In the deployed shape this is the same directory as `JESSE_VAULT`, because that is the working directory a main turn runs in. It is a **separate setting anyway**: a rules root is something an operator publishes into with `jesse-rules generate`, so defaulting it to the vault would turn "this deployment has not adopted the bundle yet" into "this deployment refuses its own turns". Set → a `Read`-or-above turn whose cwd is this root **verifies the bundle before the child is spawned** and is refused with an actionable error if it is missing, stale, hand-edited, over budget or half-published; a write-capable turn's `jesse-hook` command line carries `--rules <root>`, which puts the bundle's enforceable checks on that turn's tool calls. Unset (default) → **every path is byte for byte what it was before the bundle existed**, which is also the rollback |
 | `JESSE_MAX_ARTIFACTS` | `10` | Max files one turn may return through the [artifact return channel](#artifact-return-channel-get-jesseartifactid). Files are swept in a stable order and the first to breach a cap **stops the sweep**; everything already accepted is kept and the reply names what was dropped |
 | `JESSE_MAX_ARTIFACT_BYTES` | `26214400` (25 MB) | Max size of any one returned file |
 | `JESSE_MAX_ARTIFACTS_TOTAL_BYTES` | `52428800` (50 MB) | Max combined size of one turn's returned files. Three budgets, and none substitutes for the others: a count, a per-file size, and a total |

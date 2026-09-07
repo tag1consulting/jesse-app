@@ -129,6 +129,11 @@ impl Harness for ClaudeCode {
 
 impl SpawnedHarness for ClaudeCode {
     fn build_turn(&self, cfg: &Config, req: &TurnRequest<'_>) -> Result<Command, HarnessError> {
+        // BEFORE the command is built, so a turn whose instruction bundle is missing, stale,
+        // hand-edited, over budget or half-published is refused with an actionable error
+        // rather than spawned against it. Inert unless `JESSE_RULES_ROOT` is set, and skipped
+        // for every child that discovers no entry document. See [`rules_gate`].
+        rules_gate(cfg, req, CLAUDE_CODE_ID)?;
         Ok(self.command(cfg, req))
     }
 
@@ -177,6 +182,27 @@ impl SpawnedHarness for ClaudeCode {
             .then(|| payload.tool_input.get("file_path")?.as_str())
             .flatten()
             .map(|p| resolve_lock_path(Path::new(p), &payload.cwd))
+    }
+
+    /// `Write` shows the whole file; `Edit` shows only what is being inserted.
+    ///
+    /// `NotebookEdit` is deliberately absent: it is on `DEFAULT_DISALLOWED_TOOLS`, so no turn
+    /// this bridge spawns can reach it, and modelling a payload shape nobody produces is how
+    /// an untested branch ends up in a guard.
+    fn observed_content(&self, payload: &HookPayload) -> crate::rules::ObservedContent {
+        use crate::rules::ObservedContent;
+        let field = |k: &str| {
+            payload
+                .tool_input
+                .get(k)
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        };
+        match payload.tool_name.as_str() {
+            "Write" => field("content").map_or(ObservedContent::Opaque, ObservedContent::Full),
+            "Edit" => field("new_string").map_or(ObservedContent::Opaque, ObservedContent::Added),
+            _ => ObservedContent::Opaque,
+        }
     }
 }
 

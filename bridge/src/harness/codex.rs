@@ -1848,6 +1848,10 @@ impl Harness for Codex {
 
 impl SpawnedHarness for Codex {
     fn build_turn(&self, cfg: &Config, req: &TurnRequest<'_>) -> Result<Command, HarnessError> {
+        // BEFORE the per-turn home is prepared, for the same reason `assert_no_user_config`
+        // runs before the argv is built: a turn that is going to be refused must not leave
+        // state behind it. See [`rules_gate`]; inert unless `JESSE_RULES_ROOT` is set.
+        rules_gate(cfg, req, CODEX_ID)?;
         self.command(cfg, req)
     }
 
@@ -1976,6 +1980,66 @@ impl SpawnedHarness for Codex {
     /// Code. Do not paper over it by guessing a path out of a shell command string.
     fn hook_read_target(&self, _payload: &HookPayload) -> Option<PathBuf> {
         None
+    }
+
+    /// A patch envelope's added lines, and whether they are the WHOLE file.
+    ///
+    /// `*** Add File:` creates a file, so its `+` lines are the complete post-write content
+    /// and a "must contain" check can be decided from them. `*** Update File:` is a fragment,
+    /// so the same lines answer a "must not contain" check and nothing more. Anything else
+    /// (a shell call, a multi-file patch, a delete, an unparseable envelope) is
+    /// [`ObservedContent::Opaque`], which is the answer that makes every content check report
+    /// itself as unobservable instead of quietly passing.
+    ///
+    /// A MULTI-FILE PATCH IS OPAQUE ON PURPOSE, for the same reason `hook_write_target` takes
+    /// the global lock for one: the boundary cannot say which of the added lines belong to
+    /// which file, and attributing them to the wrong one is worse than seeing nothing.
+    fn observed_content(&self, payload: &HookPayload) -> crate::rules::ObservedContent {
+        use crate::rules::ObservedContent;
+        if payload.tool_name != "apply_patch" {
+            return ObservedContent::Opaque;
+        }
+        let command = payload
+            .tool_input
+            .get("command")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        if apply_patch_targets(command).len() != 1 {
+            return ObservedContent::Opaque;
+        }
+        let mut whole_file = false;
+        let mut saw_section = false;
+        let mut added = String::new();
+        for line in command.lines() {
+            let t = line.trim_start();
+            if t.starts_with("*** Add File:") {
+                whole_file = true;
+                saw_section = true;
+                continue;
+            }
+            if t.starts_with("*** Update File:") {
+                whole_file = false;
+                saw_section = true;
+                continue;
+            }
+            if t.starts_with("*** ") {
+                continue;
+            }
+            if saw_section {
+                if let Some(rest) = line.strip_prefix('+') {
+                    added.push_str(rest);
+                    added.push('\n');
+                }
+            }
+        }
+        if !saw_section {
+            return ObservedContent::Opaque;
+        }
+        if whole_file {
+            ObservedContent::Full(added)
+        } else {
+            ObservedContent::Added(added)
+        }
     }
 }
 
@@ -3548,6 +3612,7 @@ mod tests {
             turn: "turn-1".to_string(),
             conversation: "conv-1".to_string(),
             helper: dir.join("jesse-hook"),
+            rules_root: None,
         };
         let req = TurnRequest {
             capability: Capability::Write,

@@ -14,7 +14,7 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
-## [agent 0.10.0, bridge 0.122.0, eval 0.6.0] - 2026-09-06
+## [agent 0.10.0, bridge 0.123.0, eval 0.6.0] - 2026-09-06
 
 ### Fixed
 
@@ -26,6 +26,145 @@ mapping and all those calculations. Both agent and eval CLIs accept
 `--price-cache-write`; model environment overrides accept `_PRICE_CACHE_WRITE`.
 Omitting the rate retains the legacy estimate for existing configurations. Configure
 the rate for the provider and cache lifetime in use; no rate is inferred from a wire.
+
+## [bridge 0.122.0] - 2026-09-06
+
+**Two harnesses, one set of rules, and the same mandatory core in both.** Claude Code
+discovers `CLAUDE.md` from its working directory; Codex discovers `AGENTS.md` from the same
+place. Two files, written and maintained separately, are two sets of rules the moment either
+one is edited, and no amount of care keeps them the same. This release makes both of them
+OUTPUTS of one generation with a byte-identical shared core, adds the mechanically enforceable
+subset of those rules as a guard at a real pre-mutation boundary, and refuses a turn whose
+bundle is missing, stale, hand-edited, over budget or half-published rather than running it on
+policy its owner has already replaced.
+
+**It is inert until an operator configures it.** `JESSE_RULES_ROOT` is unset by default and
+every path is byte for byte what it was without it. Unsetting it is also the rollback, and it
+needs no rebuild.
+
+**A digest proves what was supplied, not what a model did.** Every generated document carries
+the bundle digest and every turn logs it. Nothing here measures compliance, and nothing here
+should be read as claiming any.
+
+### Added
+
+- **`jesse_bridge::rules`, the shared source of both entry documents.** Canonical Markdown
+  carries explicitly marked rule blocks (`<!-- jesse-rule: id=… scope=… section=… -->`); a
+  `jesse-rules.toml` manifest at the source root names which files may contribute, in what
+  order, under which headings. The metadata SELECTS content and never restates it: the prose
+  between the markers is copied byte for byte into the generated documents, so there is one
+  place any rule is written down and the generated copies are disposable. A `summary=`
+  attribute would have reintroduced the second handwritten copy the whole design exists to
+  remove, so the schema has no free-form field at all and an unknown attribute is an error.
+
+- **A byte-identical shared core, by construction rather than by hope.** The core is rendered
+  ONCE and spliced into every output, so the two documents differ only in the `harness=`
+  attribute of their header and in an adapter section describing how that harness loaded the
+  file and what it can actually do. The adapter text is rendered from a table in the Rust
+  because every line of it is a statement about a program rather than about the owner; a
+  source may still contribute a harness-specific rule with `scope=adapter adapters=codex`.
+
+- **A task index that preserves every rule the old index carried.** Non-core rules render in
+  full, with their declared routing triggers and an exact source reference. The migration
+  failure this exists to make impossible is a short core published over an index, silently
+  losing everything else in it; `every_rule_in_the_sources_survives_into_the_generated_documents`
+  is the assertion.
+
+- **`jesse-rules`, the maintenance CLI.** `check` reports every independent problem with a
+  root (drift, duplicate ids, broken selections, missing files, invalid metadata, an
+  incomplete output, a hand edit, a budget overrun, an enforcement check citing a rule nothing
+  declares); `generate` publishes, with `--dry-run`, `--adopt` and `--force`; `show` prints
+  what would be written; `preflight` prints exactly what a turn would verify; `rollback`
+  restores the recorded previous generation. Exit `0` clean, `1` the root has problems, `2`
+  the invocation was wrong, because CI reads the difference.
+
+- **Publication as one validated generation.** Both documents are rendered before anything is
+  touched, the bridge's own GLOBAL vault write lock is taken through the existing broker
+  socket (so a publication and a turn's write cannot interleave), every source is re-hashed
+  and a concurrent edit aborts, the outgoing pair is copied into a recoverable previous
+  generation, and every output is written to a temp file and fsynced before any rename
+  happens. **The residual gap is named rather than papered over:** two files cannot be renamed
+  atomically, so a crash between the renames leaves one new document and one old one. That
+  state is DETECTED — the two carry different digests, `check` reports it, `preflight` refuses
+  the turn, and `rollback` restores the pair.
+
+- **A per-turn gate, called from both harnesses' `build_turn`.** `rules_gate` verifies the
+  bundle before the child that would load it is spawned, and refuses the turn with an
+  actionable error naming what is wrong. It reads the filesystem every turn and caches
+  nothing, so a new conversation, a resumed one and the first turn after a restart are all
+  verified identically. **A failure is scoped to the work it affects:** a `Basic` one-shot is
+  not gated, a child in a neutral working directory is not gated (it discovers no entry
+  document), and `/health`, the conversation list, the scheduler and every unaffected turn
+  keep working.
+
+- **The enforceable subset, at the one genuinely pre-mutation boundary both harnesses share.**
+  `jesse-hook`'s `PreToolUse` path now runs the bundle's declared checks BEFORE requesting the
+  lock, so a refused call never takes one. Five check KINDS live in the Rust (a denied tool
+  name with declared exceptions, a write confined to declared roots, a file-name pattern, a
+  forbidden substring, a required marker); their PARAMETERS live in the manifest, which is how
+  a private vault's paths and tool names stay out of this repository while still being
+  enforced by it. Each denial cites the rule id, so the model is refused by an instruction it
+  was actually given.
+
+- **`SpawnedHarness::observed_content`, the second half of the enforcement adapter.** Claude
+  Code's `Write` shows the whole file and its `Edit` shows only the inserted fragment; Codex's
+  `apply_patch` shows a whole file for an `Add File` section and a fragment for an `Update
+  File` one. The default is `Opaque`, which is the honest default: a harness that has not
+  implemented it makes every content check report itself as UNOBSERVABLE rather than as
+  passed. A shell command, a multi-file patch and an unrecognised tool are all opaque, and
+  `jesse-hook` writes the skipped checks to stderr rather than letting the call read as one
+  that passed everything.
+
+- **A compaction pointer in the turn's prompt, and not a second copy of the core.** Both
+  harnesses discover the entry document when the process starts, and the bridge starts a fresh
+  process per turn, so the core is reloaded on a new conversation, a resumed one and after a
+  restart. What that cannot survive is a compaction INSIDE a running turn, which neither CLI
+  reports on a channel this bridge reads. The prompt therefore carries one sentence naming the
+  document and telling the model to re-read it after a compaction. It is an instruction, not a
+  guarantee, and the gap is stated rather than closed.
+
+- **`bridge/tests/rules_scenarios.rs`: one scenario suite, run through both adapters.**
+  Thirty-nine deterministic offline scenarios. The enforcement half drives the REAL
+  `jesse-hook` binary against a real broker over a real unix socket, in each harness's own
+  payload dialect, and applies the tool's effect only if the hook allowed it — so what is
+  asserted is a tool action and a filesystem effect, never a model's claim. Every guard has a
+  NEGATIVE twin that removes the check from the manifest and asserts the effect then happens,
+  because a guard that quietly stopped matching would otherwise keep passing its own test.
+  A fake outbound service records what it was asked to send, and its emptiness is the
+  assertion. `bridge/tests/fixtures/rules/` is the worked example of the schema.
+
+### Changed
+
+- **`WriteLockChild` carries an optional rules root**, appended to the hook command string as
+  `--rules <root>` when the bridge has one. `jesse-hook` FAILS CLOSED on it exactly as it does
+  on an unreachable broker: a root it cannot read denies the call rather than running it
+  unchecked. Without the flag the binary behaves exactly as it did before, which is what makes
+  unsetting `JESSE_RULES_ROOT` a complete rollback.
+
+- **No containment argument, tool grant or MCP server changed.** `Harness::capability_args` is
+  untouched on both harnesses, no allowlist entry was added, and the containment records are
+  unaffected. This release only ever ADDS denials to a boundary that already existed.
+
+### Known gaps, stated
+
+- **Turns with no write lock reach no hook**, so the enforceable checks do not run for a
+  read-level turn, a `Basic` child, or any deployment with the broker unarmed. Those turns
+  also cannot write, which is why it is acceptable, but the tool-name check does not run for
+  them either.
+- **The in-process `direct` harness gets the bundle and none of the enforcement.** It installs
+  no hooks by construction. It reads the claude-code document, which `rules::document_harness`
+  states rather than leaves to be inferred.
+- **A shell command names no path**, so every path and content check is unobservable for it.
+  The write lock's `WriteTarget::Global` is what makes that safe rather than checked.
+- **A browser session is not an outbound surface this can see.** A click on a webmail compose
+  form is indistinguishable from a click on a search result, because the hook payload carries
+  no page identity. The outbound check names TOOLS.
+- **A dispatcher tool hides its verb from a name-based check.** Denying the dispatcher itself
+  is the only name-based answer, and that is a decision for the manifest.
+- **A manifest edited underneath a running turn** is followed by that turn's hooks and caught
+  by the next turn's gate.
+- Pre-existing and unchanged: the containment battery still builds with `write_lock: None`, so
+  no record vouches for the hooked child.
 
 ## [bridge 0.121.0] - 2026-09-06
 

@@ -1,0 +1,94 @@
+# A REPRESENTATIVE RULES ROOT. Test data, not anyone's guidelines.
+#
+# Every rule in `hard.md` and `guides.md` is written for this repository's scenario suite:
+# the wording is generic, the paths are the fixture's own, and nothing here is a copy or a
+# migration of a real vault. The real manifest lives in the private source root, carries the
+# same SHAPE, and is the only place the owner's actual paths, names and tool denylists appear.
+#
+# What this file is for: it is the worked example of the schema, the input the scenario suite
+# drives both harnesses through, and the thing to read before writing the real one.
+
+schema = 1
+title = "Working Rules"
+
+# EXPLICIT AND ORDERED, no globs. A glob would make "which files are policy" a property of
+# the filesystem at generation time, so a note dropped into the right directory would become
+# binding without anyone deciding it. The order here is the order rules render in.
+sources = ["hard.md", "guides.md"]
+
+# The generated documents' section headings, in render order. A rule names one of these, and
+# a rule naming anything else is a broken selection rather than a new heading: the manifest
+# owns the document's shape.
+[[section]]
+title = "Hard Rules (read first)"
+scope = "core"
+
+[[section]]
+title = "Task Guidance"
+scope = "task"
+
+[[section]]
+title = "This Harness"
+scope = "adapter"
+
+# One bundle, two entry documents. Neither may also be a source: a generated file cannot be
+# its own input, and publishing over an index would destroy the rules it carries.
+[outputs]
+claude-code = "CLAUDE.md"
+codex = "AGENTS.md"
+
+# A POLICY BUDGET, not a measured CLI limit. See `rules::DEFAULT_MAX_BYTES`.
+[budget]
+max_bytes = 32768
+
+# ---- The mechanically enforceable subset ------------------------------------------------
+#
+# Each check names the RULE it enforces, so a refusal cites an instruction the model was
+# actually given. A check naming a rule no source declares is a build failure (`check`).
+#
+# The KINDS are mechanism and live in the Rust; the PARAMETERS below are policy and live
+# here. That split is what keeps a private vault's paths and tool names out of this
+# repository while still letting this repository enforce them.
+
+[[enforce]]
+rule = "no-outbound"
+kind = "deny-tools"
+tools = [
+    "mcp__mail__send_*",
+    "mcp__mail__reply",
+    "mcp__mail__forward",
+    "mcp__chat__post_*",
+    "mcp__chat__send_*",
+]
+# The carve-outs, preserved explicitly. An exception that is not written down here is an
+# exception the guard does not have.
+except = [
+    "mcp__forge__open_issue",
+    "mcp__forge__open_pull_request",
+    "mcp__forge__comment_on_pull_request",
+]
+
+[[enforce]]
+rule = "deliverables-land-in-the-vault"
+kind = "write-confined-to"
+paths = ["vault/"]
+
+[[enforce]]
+rule = "draft-naming"
+kind = "filename-pattern"
+paths = ["vault/Projects/drafts/"]
+pattern = "date-time-slug"
+
+[[enforce]]
+rule = "no-dash-punctuation"
+kind = "content-forbid"
+paths = ["vault/"]
+applies_to = ["*.md"]
+needles = ["—", "–"]
+
+[[enforce]]
+rule = "draft-archive-footer"
+kind = "content-require"
+paths = ["vault/Projects/drafts/"]
+applies_to = ["*.md"]
+marker = "## Archive"
