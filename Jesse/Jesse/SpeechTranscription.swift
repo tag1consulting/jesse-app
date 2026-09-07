@@ -1,5 +1,6 @@
 import Foundation
 import Speech
+import JesseSpeech
 
 // Phone-side speech-to-text for watch-relayed audio. The watch captures audio and
 // hands it to the phone; the phone transcribes it HERE (on-device where the
@@ -9,6 +10,16 @@ import Speech
 // Transcription sits behind the `AudioTranscribing` seam so the relay path is
 // testable without a microphone or the Speech framework: a test injects a fake
 // transcriber and asserts the produced text is exactly what gets relayed.
+//
+// THIS IS THE SHORT-FORM PATH, AND IT STAYS THAT WAY. Attaching a recorded FILE — ten to
+// sixty minutes of it, in a language chosen at pick time, with progress and a Cancel —
+// is a different job with different failure modes, and it lives in
+// `JesseSpeech.SpeechAnalyzerFileTranscriber` over iOS 26's long-form
+// `SpeechAnalyzer`/`SpeechTranscriber`. Nothing here changed for it: seconds of speech
+// wanting a prompt answer is exactly what `SFSpeechRecognizer` is right for, and the
+// 30-second bound below is a sensible guard for a relay that must not be parked forever.
+// (It is emphatically NOT a sensible guard for an hour of audio, which is why the file
+// path measures progress instead of wall clock.)
 
 /// Turns compressed audio bytes into text. Returns nil on ANY failure — no
 /// permission, an unavailable recognizer, or audio that couldn't be understood —
@@ -43,7 +54,7 @@ struct SpeechFrameworkTranscriber: AudioTranscribing {
 
     func transcribe(_ audio: Data) async -> String? {
         guard !audio.isEmpty else { return nil }
-        guard await Self.ensureAuthorized() else { return nil }
+        guard await SpeechAuthorization.ensure() else { return nil }
         guard let recognizer = SFSpeechRecognizer(locale: locale) ?? SFSpeechRecognizer(),
               recognizer.isAvailable else { return nil }
 
@@ -84,18 +95,8 @@ struct SpeechFrameworkTranscriber: AudioTranscribing {
         }
     }
 
-    /// Ensure Speech authorization, prompting once if undetermined. Any state other
-    /// than authorized yields false (the relay then answers "couldn't understand").
-    private static func ensureAuthorized() async -> Bool {
-        switch SFSpeechRecognizer.authorizationStatus() {
-        case .authorized:
-            return true
-        case .notDetermined:
-            return await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
-                SFSpeechRecognizer.requestAuthorization { cont.resume(returning: $0 == .authorized) }
-            }
-        default:
-            return false
-        }
-    }
+    // Authorization moved to `JesseSpeech.SpeechAuthorization` when the file path needed
+    // the same question asked. Behaviour is byte for byte what it was: authorized is
+    // true, undetermined prompts once, everything else is false — and the relay still
+    // answers "couldn't understand" for a false.
 }

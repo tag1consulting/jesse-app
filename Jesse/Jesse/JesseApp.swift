@@ -1,5 +1,6 @@
 import SwiftUI
 import SwiftData
+import JesseSpeech
 
 // Thread history + concurrent threads. The thread list is the root; each thread
 // is a SwiftData-persisted conversation. Runs are owned by an app-scoped
@@ -22,6 +23,18 @@ struct JesseApp: App {
     // to be handed the SAME box the tab bar later fills — two separate defaults would
     // give it one nobody ever points at a replayer.
     init() {
+        // Crash recovery for a transcription that was killed mid-run. The composer's
+        // scratch directory holds nothing but working copies of recordings, and nothing
+        // is legitimately in flight at launch, so anything still there is a private
+        // recording an interrupted run failed to delete. This is the ONLY place it is
+        // purged: doing it on foreground instead would delete the file out from under a
+        // transcription that is running perfectly well.
+        //
+        // The share extension's inbox is deliberately NOT purged here — a hand-off
+        // waiting to be picked up is the whole point of it — and is swept by its own
+        // age and orphan rules from `ContentView`.
+        RecordingWorkingCopy.standard().purge()
+
         let box = IntentReplayerBox()
         _replayerBox = State(initialValue: box)
         _coordinator = State(initialValue: RunCoordinator(

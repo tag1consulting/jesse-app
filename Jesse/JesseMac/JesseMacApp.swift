@@ -3,6 +3,7 @@ import SwiftData
 import JesseCore
 import JesseOps
 import JesseConversations
+import JesseSpeech
 
 // The macOS Jesse client — a thin native client that talks to the SAME bridge on the
 // Studio the iPhone uses (see the JESSE-WRAP B3 plan). A SEPARATE app target from the
@@ -22,6 +23,11 @@ struct JesseMacApp: App {
     private let store: (container: ModelContainer, openFailure: Error?)
 
     init() {
+        // Crash recovery for an interrupted transcription: the composer's scratch
+        // directory holds nothing but working copies of recordings, and nothing is
+        // legitimately in flight at launch. Same rule, same reasoning, as the phone's.
+        RecordingWorkingCopy.standard().purge()
+
         let cfg = MacConfigStore()
         _configStore = State(initialValue: cfg)
         _coordinator = State(initialValue: MacCoordinator(configStore: cfg))

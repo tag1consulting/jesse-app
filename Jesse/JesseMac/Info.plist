@@ -17,6 +17,13 @@
 		<key>NSAllowsArbitraryLoads</key>
 		<true/>
 	</dict>
+	<!--
+	  The Mac composer transcribes a recording you attach, using the same on-device
+	  long-form speech engine the iPhone does. Speech authorization is required for it
+	  on macOS exactly as it is on iOS.
+	-->
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>Transcribe a recording you attach to a conversation. It is transcribed on this Mac; no recording is uploaded.</string>
 	<key>CFBundleURLTypes</key>
 	<array>
 		<dict>

@@ -9,6 +9,23 @@
 			<string>Vault Search Jesse</string>
 		</dict>
 	</array>
+	<!--
+	  The share extension's way of bringing the app forward after it has taken custody
+	  of a recording. The URL carries nothing — the hand-off is the file in the app
+	  group — so this scheme is a doorbell, not a payload. (The Mac app registers the
+	  same scheme for its pairing links; they are different platforms and never meet.)
+	-->
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>com.tag1.Jesse.share</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>jesse</string>
+			</array>
+		</dict>
+	</array>
 	<key>BGTaskSchedulerPermittedIdentifiers</key>
 	<array>
 		<string>com.tag1.Jesse.refresh</string>
@@ -44,7 +61,7 @@
 	<key>NSPhotoLibraryAddUsageDescription</key>
 	<string>Save a chart, drawing or photo that Jesse produced into your photo library.</string>
 	<key>NSSpeechRecognitionUsageDescription</key>
-	<string>Transcribe the audio you speak on your Apple Watch, and the request you speak after a hands-free “Vault Search Jesse”, so Jesse can answer it.</string>
+	<string>Transcribe the audio you speak on your Apple Watch, the request you speak after a hands-free “Vault Search Jesse”, and any recording you attach or share into a conversation. Everything is transcribed on this iPhone; no recording is uploaded.</string>
 	<key>NSSupportsLiveActivities</key>
 	<true/>
 	<key>UIBackgroundModes</key>

@@ -3,6 +3,8 @@ import SwiftData
 import JesseCore
 import JesseNetworking
 import JesseConversations
+import JesseSpeech
+import UniformTypeIdentifiers
 
 // One conversation: the transcript (hydrated from the bridge on open, cache-first) plus
 // the live streaming reply and the composer. Resume is implicit — the thread carries a
@@ -16,6 +18,16 @@ struct MacThreadDetailView: View {
 
     @State private var draft: String = ""
     @State private var mode: JesseMode = .ask
+
+    /// Attaching a RECORDING, which on this platform means transcribing it: the Mac has
+    /// no attachment pipeline (it never gained one — the phone's chips and caps are
+    /// iOS-only), and it does not need one here, because audio never crosses the network
+    /// on any platform. What lands in the draft is text.
+    ///
+    /// The same model, the same on-device long-form engine and the same two views as the
+    /// iPhone; only the way a file is chosen differs.
+    @State private var recording = RecordingAttachment()
+    @State private var showAudioImporter = false
 
     private var running: Bool { coordinator.isRunning(thread.id) }
 
@@ -89,9 +101,14 @@ struct MacThreadDetailView: View {
 
     private var composer: some View {
         VStack(spacing: 8) {
-            if let error = coordinator.lastError {
+            if let error = coordinator.lastError ?? recording.errorMessage {
                 Text(error).font(.caption).foregroundStyle(.red)
                     .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            if case .running(let update) = recording.stage {
+                RecordingProgressBar(update: update,
+                                     sourceName: recording.sourceName,
+                                     onCancel: { recording.cancel() })
             }
             // Says why the composer is empty and why Send works with nothing typed — and,
             // for an ask, NAMES the reading it is about, so "this" is never ambiguous. One
@@ -136,6 +153,17 @@ struct MacThreadDetailView: View {
                                    config: coordinator.configStore.config)
                     .disabled(running)
 
+                Button {
+                    recording.dismissError()
+                    showAudioImporter = true
+                } label: {
+                    Image(systemName: "waveform")
+                }
+                .buttonStyle(.plain)
+                .help("Transcribe an audio recording into this message")
+                .accessibilityLabel("Transcribe a recording")
+                .disabled(running || recording.isBusy)
+
                 // An AppKit-backed text view, not a SwiftUI TextField. A `TextField` reports
                 // Return through `.onSubmit`, which is handed no modifier state, so "Return
                 // sends, Return with a modifier makes a newline" cannot be written there at
@@ -158,6 +186,30 @@ struct MacThreadDetailView: View {
             }
         }
         .padding(12)
+        .fileImporter(isPresented: $showAudioImporter,
+                      allowedContentTypes: AudioRecordingTypes.contentTypes,
+                      allowsMultipleSelection: false,
+                      onCompletion: handleAudioImport)
+        .sheet(isPresented: Binding(get: { recording.stage == .choosingLanguage },
+                                    set: { if !$0 { recording.abandon() } })) {
+            RecordingLanguageSheet(model: recording)
+                .frame(minWidth: 380, minHeight: 420)
+        }
+        .onChange(of: recording.completed) { _, value in
+            guard value != nil, let done = recording.takeCompleted() else { return }
+            draft = done.messageBody(typed: draft)
+        }
+    }
+
+    /// A picked recording. Transcribed on this Mac, never uploaded, and the working copy
+    /// is deleted however the run ends — the model owns all three.
+    private func handleAudioImport(_ result: Result<[URL], Error>) {
+        guard case .success(let urls) = result, let url = urls.first else { return }
+        let scoped = url.startAccessingSecurityScopedResource()
+        Task {
+            defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+            await recording.begin(pickedFileAt: url)
+        }
     }
 
     /// An empty composer is normally not a turn — except on a thread a screen OPENED

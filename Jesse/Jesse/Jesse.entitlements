@@ -2,6 +2,16 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+	<!--
+	  The app group exists for ONE thing: the share extension handing a recording to
+	  the app. The URL the extension is given is scoped to its own process, so a
+	  shared container is the only way the bytes can cross. Nothing else is stored in
+	  it, and what is stored is deleted as soon as the transcript exists.
+	-->
+	<key>com.apple.security.application-groups</key>
+	<array>
+		<string>group.com.tag1.Jesse</string>
+	</array>
 	<key>aps-environment</key>
 	<string>development</string>
 	<key>com.apple.developer.healthkit</key>
