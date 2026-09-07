@@ -2,6 +2,7 @@ import SwiftUI
 import SwiftData
 import JesseCore
 import JesseOps
+import JesseSpeech
 
 // Root of the app: a NavigationStack hosting the thread list. Cross-cutting
 // concerns live here — re-attaching to backgrounded runs on foreground, draining
@@ -104,6 +105,7 @@ struct ContentView: View {
             // (cache-first; a star/archive made on the Mac lands here). Best-effort.
             Task { await coordinator.refreshSessions(context: context) }
             inbox.drain()
+            drainSharedRecording()
             PushManager.shared.refreshRegistration()
             reachability.refresh(config: config)
         }
@@ -113,6 +115,12 @@ struct ContentView: View {
                 coordinator.resume(context: context)
                 Task { await coordinator.refreshSessions(context: context) }
                 inbox.drain()
+                // A recording shared while the app was away. Draining on foreground —
+                // and not only on the URL open the extension attempts — is what makes
+                // "the share sheet was dismissed before the app finished opening" a
+                // non-event: the audio is in the app group either way, and the next time
+                // the app is looked at, it is picked up.
+                drainSharedRecording()
                 // Re-register the device token (covers a token change / bridge
                 // restart / host change since last launch).
                 PushManager.shared.refreshRegistration()
@@ -135,6 +143,13 @@ struct ContentView: View {
             guard let wake else { return }
             inbox.pendingWake = nil
             Task { await startWakeCapture(mode: wake.mode) }
+        }
+        // The share extension opens `jesse://share-audio` to bring the app forward. The
+        // URL carries nothing: the hand-off is a file in the app group, and a URL that
+        // named it would be a second source of truth that could disagree with the
+        // directory. Foregrounding is the whole message.
+        .onOpenURL { _ in
+            drainSharedRecording()
         }
         .onChange(of: pushRouter.pendingTap) { _, tap in
             guard let tap else { return }
@@ -220,6 +235,27 @@ struct ContentView: View {
     private func startWakeCapture(mode: JesseMode) async {
         guard let text = await voice.capture() else { return }
         startVoiceThread(PendingVoiceRequest(mode: mode, text: text))
+    }
+
+    /// Pick up a recording the share extension left in the app group.
+    ///
+    /// A shared recording ALWAYS opens a new conversation. Choosing a destination would
+    /// buy a decision screen in exchange for the one gesture that makes this worth
+    /// having — record, Share, Jesse, and the transcript is in a composer.
+    ///
+    /// One at a time, and only when nothing is already staged: a share that arrives while
+    /// the previous one is still transcribing waits in the inbox for the next foreground
+    /// rather than opening a second conversation on top of the first.
+    private func drainSharedRecording() {
+        guard let store = RecordingHandoffStore.shared() else { return }
+        // Cheap, and the only place the shared inbox is tidied on a phone that is used
+        // rather than relaunched. It never touches a hand-off that is still waiting.
+        store.sweep()
+        guard !coordinator.hasStagedRecording, let next = store.pending().first else { return }
+        let thread = JesseThread(mode: .ask)
+        context.insert(thread)
+        coordinator.stage(recording: next, for: thread.id)
+        path = [thread]
     }
 
     // Each voice invocation is its own new thread; the coordinator runs it and

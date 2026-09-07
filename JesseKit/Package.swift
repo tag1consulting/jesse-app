@@ -29,6 +29,7 @@ let package = Package(
         .library(name: "JesseDietDisplay", targets: ["JesseDietDisplay"]),
         .library(name: "JesseTodayDisplay", targets: ["JesseTodayDisplay"]),
         .library(name: "JesseOps", targets: ["JesseOps"]),
+        .library(name: "JesseSpeech", targets: ["JesseSpeech"]),
     ],
     targets: [
         .target(
@@ -234,6 +235,44 @@ let package = Package(
         .testTarget(
             name: "JesseOpsTests",
             dependencies: ["JesseOps", "JesseNetworking"],
+            swiftSettings: [
+                .swiftLanguageMode(.v6),
+            ]
+        ),
+        // Turning a RECORDED FILE into text, on device. It holds the file-transcription
+        // seam (`AudioFileTranscribing`) and its one production implementation over
+        // iOS/macOS 26's `SpeechAnalyzer` + `SpeechTranscriber`, plus everything around
+        // that decision which is pure and therefore assertable: which language a
+        // recording is read in, the progress-based give-up rule that replaces a
+        // wall-clock timeout, how a transcript composes into a message, and the storage
+        // rules that guarantee the working copy is deleted on every exit path.
+        //
+        // It also carries the two small SwiftUI views the flow needs — the language sheet
+        // and the progress row — for the reason JesseDietDisplay carries the health
+        // dashboard: the iPhone composer and the Mac composer show the same two, and a
+        // copy in each app target is two wordings that drift.
+        //
+        // It is a target of its own rather than more of JesseCore because it is the only
+        // place in the package that links Speech and AVFoundation, and because the
+        // watchOS targets must never see it: `SpeechAnalyzer` is explicitly unavailable
+        // on watchOS, and the watch's capture path deliberately keeps the older
+        // short-form recognizer. Nothing in the package depends on this, so the
+        // dependency runs one way — the two app targets link it, and it links nothing.
+        //
+        // Isolation: default (nonisolated), matching JesseNetworking rather than the app
+        // targets' MainActor default. Transcription runs off the main actor for minutes
+        // at a time and publishes progress through a `@Sendable` callback the caller hops
+        // to the main actor itself; a MainActor default here would put an hour of speech
+        // recognition on the same actor as the composer.
+        .target(
+            name: "JesseSpeech",
+            swiftSettings: [
+                .swiftLanguageMode(.v6),
+            ]
+        ),
+        .testTarget(
+            name: "JesseSpeechTests",
+            dependencies: ["JesseSpeech"],
             swiftSettings: [
                 .swiftLanguageMode(.v6),
             ]

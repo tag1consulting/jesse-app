@@ -5,6 +5,7 @@ import UIKit
 import JesseCore
 import JesseNetworking
 import JesseConversations
+import JesseSpeech
 
 // App-scoped run manager. Lives above the views (owned by `JesseApp`) so a run
 // keeps going while you navigate back to the list and start another. Keyed by
@@ -104,6 +105,17 @@ final class RunCoordinator {
     // transcript) and the STARTERS the empty state offers. The Today tab's Discuss is
     // untouched: it attaches a title-less, starter-less value through the same call.
     private var attachedContexts: [UUID: AttachedContext] = [:]
+
+    // A recording the share extension handed over, waiting for the conversation it was
+    // opened into to pick it up.
+    //
+    // It is held HERE for the same reason `attachedContexts` is: the thread list decides
+    // a shared recording opens a new conversation, and the composer inside that
+    // conversation is what runs the transcription — two views that never meet, with an
+    // app-scoped object already between them. Nothing about the audio is stored, only
+    // the app-group record of where it is; the bytes stay in the shared container until
+    // the composer copies and then deletes them.
+    private var stagedRecordings: [UUID: PendingRecording] = [:]
 
     // Not observed by views — just lifecycle bookkeeping.
     @ObservationIgnored private var tasks: [UUID: Task<Void, Never>] = [:]
@@ -534,6 +546,26 @@ final class RunCoordinator {
     func clearAttachedContext(for threadID: UUID) {
         attachedContexts[threadID] = nil
     }
+
+    // MARK: - A shared recording
+
+    /// Hold a shared recording against the conversation just opened for it.
+    func stage(recording: PendingRecording, for threadID: UUID) {
+        stagedRecordings[threadID] = recording
+    }
+
+    /// Take the recording staged against this thread, if any. Clearing on read is what
+    /// makes it fire exactly once: the composer's `.task` runs again on every
+    /// re-appearance, and a hand-off that transcribed an hour ago must not start over.
+    func takeStagedRecording(for threadID: UUID) -> PendingRecording? {
+        defer { stagedRecordings[threadID] = nil }
+        return stagedRecordings[threadID]
+    }
+
+    /// Whether any conversation is already holding a shared recording. The drain reads
+    /// it so a second foreground does not open a second conversation for a hand-off the
+    /// first one has not started on yet.
+    var hasStagedRecording: Bool { !stagedRecordings.isEmpty }
 
     // MARK: - Send
 

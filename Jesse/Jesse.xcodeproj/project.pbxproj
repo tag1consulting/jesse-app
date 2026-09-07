@@ -41,6 +41,11 @@
 		B0D0F7000000000000F70022 /* JesseOps in Frameworks */ = {isa = PBXBuildFile; productRef = B0D0F7000000000000F70021 /* JesseOps */; };
 		B0D0F7000000000000F70032 /* JesseOps in Frameworks */ = {isa = PBXBuildFile; productRef = B0D0F7000000000000F70031 /* JesseOps */; };
 		B0D0F7000000000000F70042 /* JesseOps in Frameworks */ = {isa = PBXBuildFile; productRef = B0D0F7000000000000F70041 /* JesseOps */; };
+		B0D0F8000000000000F80012 /* JesseSpeech in Frameworks */ = {isa = PBXBuildFile; productRef = B0D0F8000000000000F80011 /* JesseSpeech */; };
+		B0D0F8000000000000F80022 /* JesseSpeech in Frameworks */ = {isa = PBXBuildFile; productRef = B0D0F8000000000000F80021 /* JesseSpeech */; };
+		B0D0F8000000000000F80032 /* JesseSpeech in Frameworks */ = {isa = PBXBuildFile; productRef = B0D0F8000000000000F80031 /* JesseSpeech */; };
+		B0D0F8000000000000F80052 /* JesseSpeech in Frameworks */ = {isa = PBXBuildFile; productRef = B0D0F8000000000000F80051 /* JesseSpeech */; };
+		B0D073000000000000007331 /* JesseShareAudio.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = B0D073000000000000007315 /* JesseShareAudio.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -93,6 +98,13 @@
 			remoteGlobalIDString = B0D072000000000000007214;
 			remoteInfo = JesseWatchWidgetsExtension;
 		};
+		B0D073000000000000007341 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = B0D0680D2FE83E3F00C8C4B0 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = B0D073000000000000007314;
+			remoteInfo = JesseShareAudio;
+		};
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXCopyFilesBuildPhase section */
@@ -114,6 +126,7 @@
 			dstSubfolderSpec = 13;
 			files = (
 				B0D06D00000000000000D031 /* JesseWidgetsExtension.appex in Embed Foundation Extensions */,
+				B0D073000000000000007331 /* JesseShareAudio.appex in Embed Foundation Extensions */,
 			);
 			name = "Embed Foundation Extensions";
 			runOnlyForDeploymentPostprocessing = 0;
@@ -145,6 +158,7 @@
 		B0D070000000000000007015 /* Jesse MacTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = "Jesse MacTests.xctest"; sourceTree = BUILT_PRODUCTS_DIR; };
 		B0D071000000000000007115 /* JesseUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = JesseUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		B0D072000000000000007215 /* JesseWatchWidgetsExtension.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = JesseWatchWidgetsExtension.appex; sourceTree = BUILT_PRODUCTS_DIR; };
+		B0D073000000000000007315 /* JesseShareAudio.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = JesseShareAudio.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
@@ -186,6 +200,13 @@
 				WatchTodayModel.swift,
 			);
 			target = B0D072000000000000007214 /* JesseWatchWidgetsExtension */;
+		};
+		B0D07300000000000000732A /* Exceptions for "JesseShareAudio" folder in "JesseShareAudio" target */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			membershipExceptions = (
+				Info.plist,
+			);
+			target = B0D073000000000000007314 /* JesseShareAudio */;
 		};
 /* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
 
@@ -250,6 +271,14 @@
 			path = JesseWatchWidgets;
 			sourceTree = "<group>";
 		};
+		B0D073000000000000007317 /* JesseShareAudio */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			exceptions = (
+				B0D07300000000000000732A /* Exceptions for "JesseShareAudio" folder in "JesseShareAudio" target */,
+			);
+			path = JesseShareAudio;
+			sourceTree = "<group>";
+		};
 /* End PBXFileSystemSynchronizedRootGroup section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -264,6 +293,7 @@
 				B0D0F5000000000000F50012 /* JesseDietDisplay in Frameworks */,
 				B0D0F6000000000000F60012 /* JesseTodayDisplay in Frameworks */,
 				B0D0F7000000000000F70012 /* JesseOps in Frameworks */,
+				B0D0F8000000000000F80012 /* JesseSpeech in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -277,6 +307,7 @@
 				B0D0F5000000000000F50032 /* JesseDietDisplay in Frameworks */,
 				B0D0F6000000000000F60032 /* JesseTodayDisplay in Frameworks */,
 				B0D0F7000000000000F70032 /* JesseOps in Frameworks */,
+				B0D0F8000000000000F80032 /* JesseSpeech in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -312,6 +343,7 @@
 				B0D0F5000000000000F50022 /* JesseDietDisplay in Frameworks */,
 				B0D0F6000000000000F60022 /* JesseTodayDisplay in Frameworks */,
 				B0D0F7000000000000F70022 /* JesseOps in Frameworks */,
+				B0D0F8000000000000F80022 /* JesseSpeech in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -343,6 +375,14 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		B0D073000000000000007312 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				B0D0F8000000000000F80052 /* JesseSpeech in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
@@ -354,6 +394,7 @@
 				B0D06E00000000000000E017 /* JesseMac */,
 				B0D070000000000000007017 /* JesseMacTests */,
 				B0D06D00000000000000D009 /* JesseWidgets */,
+				B0D073000000000000007317 /* JesseShareAudio */,
 				B0D069000000000000000009 /* JesseTests */,
 				B0D071000000000000007117 /* JesseUITests */,
 				B0D06A00000000000000A017 /* JesseWatch */,
@@ -373,6 +414,7 @@
 				B0D06B00000000000000B015 /* Jesse Watch AppTests.xctest */,
 				B0D072000000000000007215 /* JesseWatchWidgetsExtension.appex */,
 				B0D06D00000000000000D015 /* JesseWidgetsExtension.appex */,
+				B0D073000000000000007315 /* JesseShareAudio.appex */,
 				B0D06E00000000000000E015 /* Jesse Mac.app */,
 				B0D070000000000000007015 /* Jesse MacTests.xctest */,
 			);
@@ -408,6 +450,7 @@
 			dependencies = (
 				B0D06A00000000000000A040 /* PBXTargetDependency */,
 				B0D06D00000000000000D040 /* PBXTargetDependency */,
+				B0D073000000000000007340 /* PBXTargetDependency */,
 			);
 			fileSystemSynchronizedGroups = (
 				B0D068172FE83E3F00C8C4B0 /* Jesse */,
@@ -422,6 +465,7 @@
 				B0D0F5000000000000F50011 /* JesseDietDisplay */,
 				B0D0F6000000000000F60011 /* JesseTodayDisplay */,
 				B0D0F7000000000000F70011 /* JesseOps */,
+				B0D0F8000000000000F80011 /* JesseSpeech */,
 			);
 			productName = Jesse;
 			productReference = B0D068152FE83E3F00C8C4B0 /* Jesse.app */;
@@ -451,6 +495,7 @@
 				B0D0F5000000000000F50031 /* JesseDietDisplay */,
 				B0D0F6000000000000F60031 /* JesseTodayDisplay */,
 				B0D0F7000000000000F70031 /* JesseOps */,
+				B0D0F8000000000000F80031 /* JesseSpeech */,
 			);
 			productName = JesseTests;
 			productReference = B0D069000000000000000002 /* JesseTests.xctest */;
@@ -547,6 +592,7 @@
 				B0D0F5000000000000F50021 /* JesseDietDisplay */,
 				B0D0F6000000000000F60021 /* JesseTodayDisplay */,
 				B0D0F7000000000000F70021 /* JesseOps */,
+				B0D0F8000000000000F80021 /* JesseSpeech */,
 			);
 			productName = "Jesse Mac";
 			productReference = B0D06E00000000000000E015 /* Jesse Mac.app */;
@@ -626,6 +672,29 @@
 			productReference = B0D072000000000000007215 /* JesseWatchWidgetsExtension.appex */;
 			productType = "com.apple.product-type.app-extension";
 		};
+		B0D073000000000000007314 /* JesseShareAudio */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = B0D073000000000000007320 /* Build configuration list for PBXNativeTarget "JesseShareAudio" */;
+			buildPhases = (
+				B0D073000000000000007311 /* Sources */,
+				B0D073000000000000007312 /* Frameworks */,
+				B0D073000000000000007313 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			fileSystemSynchronizedGroups = (
+				B0D073000000000000007317 /* JesseShareAudio */,
+			);
+			name = JesseShareAudio;
+			packageProductDependencies = (
+				B0D0F8000000000000F80051 /* JesseSpeech */,
+			);
+			productName = JesseShareAudio;
+			productReference = B0D073000000000000007315 /* JesseShareAudio.appex */;
+			productType = "com.apple.product-type.app-extension";
+		};
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
@@ -664,6 +733,9 @@
 					B0D072000000000000007214 = {
 						CreatedOnToolsVersion = 26.5;
 					};
+					B0D073000000000000007314 = {
+						CreatedOnToolsVersion = 26.5;
+					};
 				};
 			};
 			buildConfigurationList = B0D068102FE83E3F00C8C4B0 /* Build configuration list for PBXProject "Jesse" */;
@@ -690,6 +762,7 @@
 				B0D06B00000000000000B014 /* Jesse Watch AppTests */,
 				B0D072000000000000007214 /* JesseWatchWidgetsExtension */,
 				B0D06D00000000000000D014 /* JesseWidgetsExtension */,
+				B0D073000000000000007314 /* JesseShareAudio */,
 				B0D06E00000000000000E014 /* Jesse Mac */,
 				B0D070000000000000007014 /* Jesse MacTests */,
 			);
@@ -754,6 +827,13 @@
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 		B0D072000000000000007213 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		B0D073000000000000007313 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -830,6 +910,13 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		B0D073000000000000007311 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXSourcesBuildPhase section */
 
 /* Begin PBXTargetDependency section */
@@ -867,6 +954,11 @@
 			isa = PBXTargetDependency;
 			target = B0D072000000000000007214 /* JesseWatchWidgetsExtension */;
 			targetProxy = B0D072000000000000007241 /* PBXContainerItemProxy */;
+		};
+		B0D073000000000000007340 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = B0D073000000000000007314 /* JesseShareAudio */;
+			targetProxy = B0D073000000000000007341 /* PBXContainerItemProxy */;
 		};
 /* End PBXTargetDependency section */
 
@@ -1002,7 +1094,7 @@
 				CLANG_ENABLE_MODULES = YES;
 				CODE_SIGN_ENTITLEMENTS = Jesse/Jesse.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 123;
+				CURRENT_PROJECT_VERSION = 124;
 				DEVELOPMENT_TEAM = C6RPS3BGXX;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
@@ -1038,7 +1130,7 @@
 				CLANG_ENABLE_MODULES = YES;
 				CODE_SIGN_ENTITLEMENTS = Jesse/Jesse.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 123;
+				CURRENT_PROJECT_VERSION = 124;
 				DEVELOPMENT_TEAM = C6RPS3BGXX;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
@@ -1070,7 +1162,7 @@
 			buildSettings = {
 				BUNDLE_LOADER = "$(TEST_HOST)";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 123;
+				CURRENT_PROJECT_VERSION = 124;
 				DEVELOPMENT_TEAM = C6RPS3BGXX;
 				GENERATE_INFOPLIST_FILE = YES;
 				IPHONEOS_DEPLOYMENT_TARGET = 26.5;
@@ -1089,7 +1181,7 @@
 			buildSettings = {
 				BUNDLE_LOADER = "$(TEST_HOST)";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 123;
+				CURRENT_PROJECT_VERSION = 124;
 				DEVELOPMENT_TEAM = C6RPS3BGXX;
 				GENERATE_INFOPLIST_FILE = YES;
 				IPHONEOS_DEPLOYMENT_TARGET = 26.5;
@@ -1111,7 +1203,7 @@
 				CLANG_ENABLE_MODULES = YES;
 				CODE_SIGN_ENTITLEMENTS = JesseWatch/JesseWatch.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 123;
+				CURRENT_PROJECT_VERSION = 124;
 				DEVELOPMENT_TEAM = C6RPS3BGXX;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
@@ -1146,7 +1238,7 @@
 				CLANG_ENABLE_MODULES = YES;
 				CODE_SIGN_ENTITLEMENTS = JesseWatch/JesseWatch.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 123;
+				CURRENT_PROJECT_VERSION = 124;
 				DEVELOPMENT_TEAM = C6RPS3BGXX;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
@@ -1179,7 +1271,7 @@
 			buildSettings = {
 				BUNDLE_LOADER = "$(TEST_HOST)";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 123;
+				CURRENT_PROJECT_VERSION = 124;
 				DEVELOPMENT_TEAM = C6RPS3BGXX;
 				GENERATE_INFOPLIST_FILE = YES;
 				MARKETING_VERSION = 1.0;
@@ -1199,7 +1291,7 @@
 			buildSettings = {
 				BUNDLE_LOADER = "$(TEST_HOST)";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 123;
+				CURRENT_PROJECT_VERSION = 124;
 				DEVELOPMENT_TEAM = C6RPS3BGXX;
 				GENERATE_INFOPLIST_FILE = YES;
 				MARKETING_VERSION = 1.0;
@@ -1221,7 +1313,7 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CLANG_ENABLE_MODULES = YES;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 123;
+				CURRENT_PROJECT_VERSION = 124;
 				DEVELOPMENT_TEAM = C6RPS3BGXX;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = JesseWidgets/Info.plist;
@@ -1253,7 +1345,7 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CLANG_ENABLE_MODULES = YES;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 123;
+				CURRENT_PROJECT_VERSION = 124;
 				DEVELOPMENT_TEAM = C6RPS3BGXX;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = JesseWidgets/Info.plist;
@@ -1288,7 +1380,7 @@
 				CLANG_ENABLE_MODULES = YES;
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 123;
+				CURRENT_PROJECT_VERSION = 124;
 				DEVELOPMENT_TEAM = C6RPS3BGXX;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
@@ -1322,7 +1414,7 @@
 				CLANG_ENABLE_MODULES = YES;
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 123;
+				CURRENT_PROJECT_VERSION = 124;
 				DEVELOPMENT_TEAM = C6RPS3BGXX;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
@@ -1352,7 +1444,7 @@
 			buildSettings = {
 				BUNDLE_LOADER = "$(TEST_HOST)";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 123;
+				CURRENT_PROJECT_VERSION = 124;
 				DEVELOPMENT_TEAM = C6RPS3BGXX;
 				GENERATE_INFOPLIST_FILE = YES;
 				MACOSX_DEPLOYMENT_TARGET = 26.0;
@@ -1371,7 +1463,7 @@
 			buildSettings = {
 				BUNDLE_LOADER = "$(TEST_HOST)";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 123;
+				CURRENT_PROJECT_VERSION = 124;
 				DEVELOPMENT_TEAM = C6RPS3BGXX;
 				GENERATE_INFOPLIST_FILE = YES;
 				MACOSX_DEPLOYMENT_TARGET = 26.0;
@@ -1389,7 +1481,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 123;
+				CURRENT_PROJECT_VERSION = 124;
 				DEVELOPMENT_TEAM = C6RPS3BGXX;
 				GENERATE_INFOPLIST_FILE = YES;
 				IPHONEOS_DEPLOYMENT_TARGET = 26.5;
@@ -1407,7 +1499,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 123;
+				CURRENT_PROJECT_VERSION = 124;
 				DEVELOPMENT_TEAM = C6RPS3BGXX;
 				GENERATE_INFOPLIST_FILE = YES;
 				IPHONEOS_DEPLOYMENT_TARGET = 26.5;
@@ -1428,7 +1520,7 @@
 				CLANG_ENABLE_MODULES = YES;
 				CODE_SIGN_ENTITLEMENTS = JesseWatchWidgets/JesseWatchWidgets.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 123;
+				CURRENT_PROJECT_VERSION = 124;
 				DEVELOPMENT_TEAM = C6RPS3BGXX;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = JesseWatchWidgets/Info.plist;
@@ -1461,7 +1553,7 @@
 				CLANG_ENABLE_MODULES = YES;
 				CODE_SIGN_ENTITLEMENTS = JesseWatchWidgets/JesseWatchWidgets.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 123;
+				CURRENT_PROJECT_VERSION = 124;
 				DEVELOPMENT_TEAM = C6RPS3BGXX;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = JesseWatchWidgets/Info.plist;
@@ -1485,6 +1577,71 @@
 				TARGETED_DEVICE_FAMILY = 4;
 				VALIDATE_PRODUCT = YES;
 				WATCHOS_DEPLOYMENT_TARGET = 11.0;
+			};
+			name = Release;
+		};
+		B0D073000000000000007321 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CLANG_ENABLE_MODULES = YES;
+				CODE_SIGN_ENTITLEMENTS = JesseShareAudio/JesseShareAudio.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 124;
+				DEVELOPMENT_TEAM = C6RPS3BGXX;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = JesseShareAudio/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = Jesse;
+				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				IPHONEOS_DEPLOYMENT_TARGET = 26.5;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.tag1.Jesse.JesseShareAudio;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SKIP_INSTALL = YES;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 6.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		B0D073000000000000007322 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CLANG_ENABLE_MODULES = YES;
+				CODE_SIGN_ENTITLEMENTS = JesseShareAudio/JesseShareAudio.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 124;
+				DEVELOPMENT_TEAM = C6RPS3BGXX;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = JesseShareAudio/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = Jesse;
+				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				IPHONEOS_DEPLOYMENT_TARGET = 26.5;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.tag1.Jesse.JesseShareAudio;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SKIP_INSTALL = YES;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 6.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				VALIDATE_PRODUCT = YES;
 			};
 			name = Release;
 		};
@@ -1577,6 +1734,15 @@
 			buildConfigurations = (
 				B0D072000000000000007221 /* Debug */,
 				B0D072000000000000007222 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		B0D073000000000000007320 /* Build configuration list for PBXNativeTarget "JesseShareAudio" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				B0D073000000000000007321 /* Debug */,
+				B0D073000000000000007322 /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
@@ -1698,6 +1864,22 @@
 		B0D0F7000000000000F70041 /* JesseOps */ = {
 			isa = XCSwiftPackageProductDependency;
 			productName = JesseOps;
+		};
+		B0D0F8000000000000F80011 /* JesseSpeech */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = JesseSpeech;
+		};
+		B0D0F8000000000000F80021 /* JesseSpeech */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = JesseSpeech;
+		};
+		B0D0F8000000000000F80031 /* JesseSpeech */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = JesseSpeech;
+		};
+		B0D0F8000000000000F80051 /* JesseSpeech */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = JesseSpeech;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};

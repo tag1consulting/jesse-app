@@ -14,6 +14,120 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [App 1.0 (124)] - 2026-09-07
+
+**A recording you made on the phone can now be handed to Jesse, and what Jesse receives is
+the transcript.** Record a memo in Voice Memos, tap Share, choose Jesse: a new conversation
+opens with the words already in the composer, ready to send. There is also a file picker in
+the composer's paperclip, on the iPhone and on the Mac, for a recording that is already
+sitting in Files.
+
+**Nothing about this puts audio on the network.** The assistant behind the bridge has no
+audio input, so shipping bytes to it would accomplish nothing; the transcript is the whole
+deliverable. Transcription happens on the device, the bridge's attachment whitelist is
+untouched (a test now pins that it still refuses every audio MIME), and the only network
+traffic anywhere in the feature is Apple's on-device speech model being fetched once per
+language.
+
+**And nothing about it keeps the audio.** Voice Memos holds the authoritative copy; a second
+one here would be a private recording duplicated into an app that has no use for it the
+moment the words are out. Every copy the feature makes is deleted when the run ends — on
+success, on each failure, on cancel, and, for a run the system killed mid-transcription, at
+the next launch.
+
+### Added
+
+- **A share extension, `JesseShareAudio`, and the app group it needs.** Its entire job is
+  taking custody: it copies the incoming audio into a shared container, records the original
+  name, duration and arrival time beside it, opens the app, and finishes. It does not
+  transcribe, and that is not tidiness — a share extension runs under a tight memory budget
+  and is killed as soon as its sheet is dismissed, so an hour of audio would be killed there
+  every time, silently. It copies rather than references for the same kind of reason: the URL
+  it is handed is scoped to its own process and would be unopenable in the app.
+
+  The hand-off therefore survives the app never being opened. The app drains the shared
+  directory at launch and at every foreground, so a share sheet dismissed before the app
+  finishes coming up loses nothing. The extension's `open` is a convenience that saves a tap,
+  not the mechanism.
+
+- **`JesseSpeech`, a new JesseKit module: file transcription and everything around it.** The
+  seam (`AudioFileTranscribing`), its one production implementation, the language policy, the
+  give-up rule, the message composition, the storage rules, and the two SwiftUI views the
+  iPhone and the Mac both show. Everything the flow depends on is injected, so the whole of it
+  is exercised in tests with no microphone, no recognizer, no speech model and no permission
+  prompt.
+
+- **File transcription uses `SpeechAnalyzer` + `SpeechTranscriber`, iOS/macOS 26's long-form
+  API.** `SFSpeechRecognizer` stays exactly where it was, transcribing watch-relayed clips.
+  This is not a preference between two interchangeable APIs. `SFSpeechURLRecognitionRequest`
+  is a short-form dictation interface: it reports one growing result rather than a stream of
+  finalized ranges, so there is nothing to draw a progress bar from and nothing to base a
+  stall rule on, and its on-device path depends on a per-locale recognizer flag rather than on
+  an installable model. `SpeechAnalyzer` takes an `AVAudioFile` directly, installs an
+  on-device model per locale through `AssetInventory`, and emits results each carrying the
+  `CMTimeRange` of audio it covers. That range is what makes the two hard requirements
+  satisfiable at all.
+
+- **A language choice at pick time, remembered.** The picker opens on the last language
+  actually used if the device still supports it, else the first of the device's own configured
+  languages that it does, else anything supported — so an English phone in Italy is one choice
+  away from Italian and then never asked again, and the device's own languages sit at the top
+  of the list rather than twenty places down an alphabet. A language the device cannot
+  transcribe says so plainly instead of producing nothing.
+
+- **Progress, and a Cancel that means it.** The progress bar names its phase, because the
+  three waits are not interchangeable: a first recording in a new language downloads a speech
+  model before a single word is recognized, and a bar that sat at zero through that would read
+  as broken. Cancel stops the engine, deletes the audio, and says nothing — the user already
+  knows.
+
+- **The transcript arrives as a message body with a one-line provenance header** naming the
+  file, its length and the language it was read in. A transcript is a lossy reading of a
+  recording, and knowing it was read as Italian is what makes an odd sentence diagnosable.
+  Anything typed in the composer stays ahead of it, and is composed at the moment the
+  transcript lands rather than when the file was picked — so text typed during an hour of
+  transcription is kept.
+
+### Changed
+
+- **The timeout is a progress rule, not a deadline.** The watch-relay transcriber bounds its
+  wait at 30 seconds of wall clock and cancels the recognition task when that fires, which is
+  a sensible guard for a few seconds of dictation and a guarantee of failure for an hour of
+  audio: transcribing sixty minutes takes many minutes of real time, so a fixed deadline fires
+  on every long recording and discards work that was going perfectly well.
+  `TranscriptionStallDetector` times the gap since progress last ADVANCED and resets on every
+  advance, so a sixty-minute file that keeps producing results never trips it however long it
+  runs, while a wedged recognizer trips it in two minutes whether it wedged at minute one or
+  minute fifty. It is clock-free — the caller passes the time in — so an hour of progress is
+  asserted in microseconds with no sleeping.
+
+- **Speech authorization has one spelling.** It was private to the watch-relay transcriber;
+  the file path needed the same question asked, so it moved to
+  `JesseSpeech.SpeechAuthorization`. Behaviour is unchanged: authorized is true, undetermined
+  prompts once, anything else is false, and the relay still answers "couldn't understand".
+
+- **A shared recording always opens a new conversation.** Deliberately not a thread picker:
+  that would buy a decision screen in exchange for the one gesture that makes this worth
+  having. Choosing a destination is a later enhancement.
+
+- **The Speech usage strings on both platforms now say what they cover**, including that
+  recordings are transcribed on the device and never uploaded. The Mac had no such string at
+  all and needed one.
+
+### Fixed
+
+- **Every failure mode says its own sentence.** Denied permission names the setting to turn
+  on and the file to try again; an unsupported language, an unreadable or corrupt file, an
+  empty result (which points at the language, the likeliest cause), a failed model install and
+  a stall each have their own wording, and a test asserts no two of them collide. A generic
+  "couldn't transcribe that" is the outcome this taxonomy exists to prevent.
+
+- **A late callback cannot resurrect a cancelled run.** An engine callback can be mid-hop to
+  the main actor when Cancel is tapped, and a transcription can finish in the instant between
+  the tap and the cancellation reaching the engine. Runs are generation-stamped, so the first
+  cannot put the progress view back up and the second cannot drop a transcript into a composer
+  the user had already backed out of.
+
 ## [agent 0.10.0, bridge 0.123.0, eval 0.6.0] - 2026-09-06
 
 ### Fixed

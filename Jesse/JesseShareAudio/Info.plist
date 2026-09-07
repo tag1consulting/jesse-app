@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>NSExtension</key>
+	<dict>
+		<key>NSExtensionAttributes</key>
+		<dict>
+			<!--
+			  AUDIO ONLY, AND EXACTLY ONE OF IT. The convenience keys
+			  (NSExtensionActivationSupportsFileWithMaxCount) would put Jesse in the
+			  share sheet for every PDF and screenshot on the phone, which is a
+			  promise this extension cannot keep: it does not attach files, it
+			  transcribes recordings. The predicate form is the only way to say
+			  "audio" — everything else here is already covered by the composer's
+			  own pickers.
+			-->
+			<key>NSExtensionActivationRule</key>
+			<string>SUBQUERY(extensionItems, $extensionItem, SUBQUERY($extensionItem.attachments, $attachment, ANY $attachment.registeredTypeIdentifiers UTI-CONFORMS-TO "public.audio").@count == 1).@count == 1</string>
+		</dict>
+		<key>NSExtensionPointIdentifier</key>
+		<string>com.apple.share-services</string>
+		<key>NSExtensionPrincipalClass</key>
+		<string>$(PRODUCT_MODULE_NAME).ShareAudioViewController</string>
+	</dict>
+</dict>
+</plist>

@@ -7,6 +7,7 @@ import AVFoundation
 import JesseCore
 import JesseNetworking
 import JesseConversations
+import JesseSpeech
 
 // One conversation: the full turn transcript with the composer pinned at the
 // bottom. Being inside a thread *is* continuing it — every send auto-resumes the
@@ -40,7 +41,17 @@ struct ThreadDetailView: View {
     @State private var showPhotoPicker = false
     @State private var showFileImporter = false
     @State private var showCamera = false
+    @State private var showAudioImporter = false
     @State private var attachError: String?
+
+    /// The recording-to-transcript flow, whichever way a recording arrived: the
+    /// paperclip's "Audio Recording", or the share sheet, which opens a conversation and
+    /// leaves the hand-off on the coordinator for this view to pick up.
+    ///
+    /// One model per conversation, held across the whole flow, because the flow outlives
+    /// every individual sheet in it — the language picker, the progress view, and the
+    /// error line are three views of one run.
+    @State private var recording = RecordingAttachment()
     // Whether the composer's frugal glyph has been tapped for its explanation.
     @State private var showFrugalExplanation = false
 
@@ -414,8 +425,11 @@ struct ThreadDetailView: View {
                 .disabled(running)
             }
 
-            if let attachError {
-                Text(attachError)
+            // One error line for the composer, whether the complaint came from an
+            // attachment or from a transcription. Two lines in two places would let a
+            // rejected file and a failed transcript disagree about what went wrong.
+            if let message = attachError ?? recording.errorMessage {
+                Text(message)
                     .font(.caption)
                     .foregroundStyle(.red)
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -450,6 +464,15 @@ struct ThreadDetailView: View {
 
             if !attachments.isEmpty {
                 attachmentChips
+            }
+
+            // Progress sits IN the composer rather than over the screen: an hour of
+            // audio takes minutes to read, the conversation stays usable while it does,
+            // and the transcript is landing in the field directly below this row.
+            if case .running(let update) = recording.stage {
+                RecordingProgressBar(update: update,
+                                     sourceName: recording.sourceName,
+                                     onCancel: { recording.cancel() })
             }
 
             // A UITextView-backed field: native long-press → Paste (text, and a
@@ -488,6 +511,32 @@ struct ThreadDetailView: View {
         .fileImporter(isPresented: $showFileImporter,
                       allowedContentTypes: [.pdf], allowsMultipleSelection: true,
                       onCompletion: handleFileImport)
+        // One recording at a time: transcribing an hour of audio is not something to
+        // start four of, and the composer holds one transcript.
+        .fileImporter(isPresented: $showAudioImporter,
+                      allowedContentTypes: AudioRecordingTypes.contentTypes,
+                      allowsMultipleSelection: false,
+                      onCompletion: handleAudioImport)
+        .sheet(isPresented: Binding(get: { recording.stage == .choosingLanguage },
+                                    set: { if !$0 { recording.abandon() } })) {
+            RecordingLanguageSheet(model: recording)
+        }
+        // A pending share hand-off, picked up by the conversation that was opened for
+        // it. `.task(id:)` rather than `.onAppear` so it also fires for a conversation
+        // that was already on screen, and `takeStagedRecording` clears on read so it
+        // fires exactly once.
+        .task(id: thread.id) {
+            guard let staged = coordinator.takeStagedRecording(for: thread.id) else { return }
+            await recording.begin(handoff: staged)
+        }
+        // The transcript is moved into the composer the moment it exists, composed with
+        // whatever is typed AT THAT MOMENT — so text typed during a long transcription
+        // is kept and stays ahead of the transcript.
+        .onChange(of: recording.completed) { _, value in
+            guard value != nil, let done = recording.takeCompleted() else { return }
+            input = done.messageBody(typed: input)
+            inputFocused = true
+        }
         .onChange(of: photoItems) { _, items in
             guard !items.isEmpty else { return }
             Task { await handlePhotoItems(items) }
@@ -544,6 +593,16 @@ struct ThreadDetailView: View {
                 showFileImporter = true
             } label: {
                 Label("PDF Document", systemImage: "doc")
+            }
+            // Audio is NOT an attachment: the bridge never sees a byte of it. This
+            // transcribes on the device and puts the TEXT in the composer, which is why
+            // it sits here beside the pickers and yet never reaches `addAttachment`.
+            Button {
+                attachError = nil
+                recording.dismissError()
+                showAudioImporter = true
+            } label: {
+                Label("Audio Recording", systemImage: "waveform")
             }
             // Shown only when a camera exists (never on Simulator).
             if UIImagePickerController.isSourceTypeAvailable(.camera) {
@@ -654,6 +713,26 @@ struct ThreadDetailView: View {
                 }
                 addAttachment(data: data, fallbackName: "Document",
                               suggestedName: url.lastPathComponent)
+            }
+        case .failure(let error):
+            attachError = error.localizedDescription
+        }
+    }
+
+    /// A picked recording. It is NOT staged as an attachment — audio never crosses the
+    /// network — so it goes to `RecordingAttachment`, which copies it, transcribes it on
+    /// this device, and deletes its copy however the run ends.
+    private func handleAudioImport(_ result: Result<[URL], Error>) {
+        switch result {
+        case .success(let urls):
+            guard let url = urls.first else { return }
+            attachError = nil
+            // The security scope is held only while the bytes are copied out; the
+            // transcriber reads the app's own copy for however many minutes it takes.
+            let scoped = url.startAccessingSecurityScopedResource()
+            Task {
+                defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+                await recording.begin(pickedFileAt: url)
             }
         case .failure(let error):
             attachError = error.localizedDescription
