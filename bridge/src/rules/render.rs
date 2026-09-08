@@ -89,6 +89,13 @@ fn canonical_digest(manifest: &Manifest, rules: &[Rule], sources: &[SourceFile])
     s.push_str(&format!("schema {}\n", manifest.schema));
     s.push_str(&format!("title {}\n", manifest.title));
     s.push_str(&format!("budget {}\n", manifest.max_bytes));
+    // OMITTED WHEN IT IS THE DEFAULT, and the condition is on the EFFECTIVE reference rather
+    // than on whether the table was written: a root that declares nothing and a root that
+    // spells out the default render identically, so they must hash identically too. That is
+    // also what keeps every already-published document's digest valid across this change.
+    if manifest.reference != SourceReference::default() {
+        s.push_str(&format!("reference {}\n", manifest.reference.canonical()));
+    }
     for sec in &manifest.sections {
         s.push_str(&format!("section {} {}\n", sec.scope.as_str(), sec.title));
     }
@@ -158,9 +165,9 @@ fn render_task_index(manifest: &Manifest, rules: &[Rule]) -> String {
             out.push_str(&r.body);
             out.push('\n');
             out.push_str(&format!(
-                "  *Load when:* {}. *Source:* `{}` (rule `{}`).\n\n",
+                "  *Load when:* {}. *Source:* {} (rule `{}`).\n\n",
                 r.triggers.join(", "),
-                r.source,
+                manifest.reference.render(&r.source),
                 r.id
             ));
         }
@@ -303,8 +310,9 @@ pub fn render_for(bundle: &Bundle, harness: &str) -> Result<String, RuleError> {
         {
             s.push_str(&r.body);
             s.push_str(&format!(
-                "\n  *Source:* `{}` (rule `{}`).\n\n",
-                r.source, r.id
+                "\n  *Source:* {} (rule `{}`).\n\n",
+                bundle.manifest.reference.render(&r.source),
+                r.id
             ));
         }
     }
@@ -537,7 +545,14 @@ codex = "AGENTS.md"
 "#;
 
     fn bundle() -> Bundle {
-        let manifest = Manifest::parse(FIXTURE_MANIFEST).expect("manifest");
+        bundle_with(FIXTURE_MANIFEST, "guides.md")
+    }
+
+    /// The same two fixture sources, under a manifest and a task-source path the caller
+    /// chooses. Parameterised so the reference-style tests can put the routed rule in a
+    /// NESTED file and then move it, which is the case a bare path reference gets wrong.
+    fn bundle_with(manifest_src: &str, guides_rel: &str) -> Bundle {
+        let manifest = Manifest::parse(manifest_src).expect("manifest");
         let hard = "<!-- jesse-rule: id=no-outbound scope=core section=\"Hard Rules (read first)\" -->\n- **Never send outbound communication.** Draft it and stop.\n<!-- /jesse-rule -->\n";
         let guides = "<!-- jesse-rule: id=meeting-agendas scope=task section=\"Task Guidance\" triggers=\"meeting, agenda\" -->\n- **Meeting agendas:** keep them fresh until the meeting starts.\n<!-- /jesse-rule -->\n<!-- jesse-rule: id=codex-shell scope=adapter section=\"This Harness\" adapters=\"codex\" -->\n- The sandbox refusal is the boundary.\n<!-- /jesse-rule -->\n";
         let sources = vec![
@@ -547,7 +562,7 @@ codex = "AGENTS.md"
                 text: hard.to_string(),
             },
             SourceFile {
-                rel: "guides.md".to_string(),
+                rel: guides_rel.to_string(),
                 sha256: crate::sha256_hex(guides.as_bytes()),
                 text: guides.to_string(),
             },
@@ -563,6 +578,19 @@ codex = "AGENTS.md"
             core_digest,
         }
     }
+
+    /// `FIXTURE_MANIFEST` with the task source moved to `rel` and `extra` appended.
+    fn manifest_src(rel: &str, extra: &str) -> String {
+        format!(
+            "{}{extra}",
+            FIXTURE_MANIFEST.replace(
+                "sources = [\"hard.md\", \"guides.md\"]",
+                &format!("sources = [\"hard.md\", \"{rel}\"]"),
+            )
+        )
+    }
+
+    const WIKI: &str = "\n[reference]\nstyle = \"wiki-link\"\n";
 
     #[test]
     fn core_is_byte_identical_across_harnesses() {
@@ -645,6 +673,139 @@ codex = "AGENTS.md"
     fn the_direct_harness_reads_the_claude_code_document() {
         assert_eq!(document_harness(crate::DIRECT_ID), crate::CLAUDE_CODE_ID);
         assert_eq!(document_harness(crate::CODEX_ID), crate::CODEX_ID);
+    }
+
+    // ---- The reference a rendered rule carries ------------------------------------
+
+    #[test]
+    fn a_root_that_declares_nothing_keeps_the_bare_path_reference() {
+        let b = bundle();
+        let cc = render_for(&b, "claude-code").expect("renders");
+        // The exact string the release before this field shipped; the byte-for-byte proof
+        // over whole documents is `the_default_reference_renders_both_documents_byte_for_byte`
+        // in tests/rules_scenarios.rs.
+        assert!(
+            cc.contains("*Source:* `guides.md` (rule `meeting-agendas`)."),
+            "{cc}"
+        );
+    }
+
+    #[test]
+    fn a_declared_wiki_link_style_renders_a_followable_reference() {
+        let src = manifest_src("Knowledge/Guides/Meeting-Agendas.md", WIKI);
+        let b = bundle_with(&src, "Knowledge/Guides/Meeting-Agendas.md");
+        let cc = render_for(&b, "claude-code").expect("renders");
+        assert!(
+            cc.contains("*Source:* [[Knowledge/Guides/Meeting-Agendas]] (rule `meeting-agendas`)."),
+            "the nested source did not render as a link with its extension dropped:\n{cc}"
+        );
+        assert!(
+            !cc.contains("*Source:* `"),
+            "a bare path reference survived alongside the link:\n{cc}"
+        );
+
+        // THE CASE THIS FIELD EXISTS FOR: the same rule moved to a different source file
+        // still renders a reference a reader can follow, rather than inert prose.
+        let moved = "Knowledge/Guides/Meetings/Agendas.md";
+        let b = bundle_with(&manifest_src(moved, WIKI), moved);
+        let cc = render_for(&b, "claude-code").expect("renders");
+        assert!(
+            cc.contains(
+                "*Source:* [[Knowledge/Guides/Meetings/Agendas]] (rule `meeting-agendas`)."
+            ),
+            "{cc}"
+        );
+
+        // Both render sites, not just the routed index: the adapter section carries the same
+        // reference and would otherwise keep emitting a bare path.
+        let cx = render_for(&b, "codex").expect("renders");
+        assert!(
+            cx.contains("*Source:* [[Knowledge/Guides/Meetings/Agendas]] (rule `codex-shell`)."),
+            "the adapter section kept the old reference:\n{cx}"
+        );
+    }
+
+    #[test]
+    fn the_affixes_rewrite_the_leading_segment_of_the_link() {
+        let rel = "notes/Guides/Agendas.md";
+        let src = manifest_src(
+            rel,
+            "\n[reference]\nstyle = \"wiki-link\"\nstrip_prefix = \"notes/\"\nprefix = \"collection/\"\n",
+        );
+        let b = bundle_with(&src, rel);
+        let cc = render_for(&b, "claude-code").expect("renders");
+        assert!(
+            cc.contains("*Source:* [[collection/Guides/Agendas]] "),
+            "{cc}"
+        );
+    }
+
+    #[test]
+    fn declaring_a_reference_style_moves_the_bundle_digest() {
+        // Otherwise identical inputs: same sources, same sections, same outputs.
+        let plain = bundle_with(&manifest_src("guides.md", ""), "guides.md");
+        let linked = bundle_with(&manifest_src("guides.md", WIKI), "guides.md");
+        assert_eq!(
+            plain.sources, linked.sources,
+            "the inputs must be identical"
+        );
+        assert_ne!(
+            plain.digest, linked.digest,
+            "a turn reading a stale bundle could not tell the reference style had changed"
+        );
+
+        // And the digest is over the EFFECTIVE reference, not over whether the table exists:
+        // spelling out the default renders the same bytes, so it must hash the same.
+        let spelled = bundle_with(
+            &manifest_src("guides.md", "\n[reference]\nstyle = \"path\"\n"),
+            "guides.md",
+        );
+        assert_eq!(plain.digest, spelled.digest);
+        assert_eq!(
+            render_for(&plain, "claude-code").expect("renders"),
+            render_for(&spelled, "claude-code").expect("renders")
+        );
+    }
+
+    #[test]
+    fn an_unusable_reference_declaration_is_refused_by_name() {
+        for (extra, needle) in [
+            (
+                "\n[reference]\nstyle = \"obsidian\"\n",
+                "\"obsidian\" is not one of path/wiki-link",
+            ),
+            (
+                "\n[reference]\nstyle = \"wiki-link\"\nlink = \"x\"\n",
+                "unknown key `link`",
+            ),
+            ("\n[reference]\nstyle = 3\n", "`style` is not a string"),
+            ("\n[reference]\nprefix = 3\n", "`prefix` is not a string"),
+            ("\n[reference]\nprefix = \"a\\nb\"\n", "control character"),
+        ] {
+            let e = Manifest::parse(&manifest_src("guides.md", extra))
+                .expect_err("the manifest is refused");
+            assert!(
+                e.to_string().contains(needle),
+                "expected `{needle}`, got: {e}"
+            );
+        }
+        // A bare key rather than a table. Written at the TOP, because appending it would
+        // make it a key of whichever table the manifest ends with.
+        let e = Manifest::parse(&format!("reference = \"wiki-link\"{FIXTURE_MANIFEST}"))
+            .expect_err("the manifest is refused");
+        assert!(e.to_string().contains("must be a table"), "{e}");
+    }
+
+    #[test]
+    fn only_the_last_extension_of_the_last_segment_is_dropped() {
+        let r = SourceReference {
+            style: ReferenceStyle::WikiLink,
+            ..Default::default()
+        };
+        assert_eq!(r.render("a.b/Notes.v2.md"), "[[a.b/Notes.v2]]");
+        assert_eq!(r.render("Guides/README"), "[[Guides/README]]");
+        // A dotfile's leading dot is its whole name, not an extension to strip.
+        assert_eq!(r.render("Guides/.keep"), "[[Guides/.keep]]");
     }
 
     #[test]

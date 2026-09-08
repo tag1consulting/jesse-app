@@ -14,6 +14,64 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [bridge 0.124.0] - 2026-09-08
+
+**A source reference is only useful if the reader can follow it, and which form does that is
+a property of the collection, not of this program.** Every routed rule in a generated entry
+document ends with a reference naming the file it came from, and until now that reference was
+always a bare filesystem path in backticks. That is the right answer exactly where the
+filesystem layout is also the link syntax. In a notes collection it usually is not: the path
+is inert text sitting next to prose that links, and a reader who wants the full rule has to go
+find the file by hand.
+
+The consequence was about to be worse than cosmetic. Moving a rule out of an aggregate index
+file into its own source file replaces an index entry that carried a working link with
+generated prose that does not link to itself, so the redistribution silently drops a pointer.
+`check` cannot see that happen, because `check` compares rendered output against sources,
+never against the previous generation.
+
+### Added
+
+- **`[reference]` in `jesse-rules.toml`: how a source path becomes a reference.** One optional
+  table with `style` (`path` or `wiki-link`), plus `strip_prefix` and `prefix` for the case
+  where a source path is relative to the RULES ROOT but a link resolves against whatever the
+  collection calls its own root. `wiki-link` renders `[[…]]` with the file extension dropped,
+  so a rule declared in `Knowledge/Guides/Meeting-Agendas.md` renders a reference the reader
+  can follow, and still does after the rule is moved to a different file.
+
+  **Declared by the root, never compiled in.** No particular collection's convention appears
+  anywhere in this repository; the manifest is the only place the choice is made, and the
+  fixtures under `bridge/tests/fixtures/rules/` declare nothing, which is how the default
+  stays the tested path.
+
+- **The declaration enters the bundle digest, and it is the EFFECTIVE declaration that does.**
+  Changing the reference style changes what is published, so a turn reading a stale bundle has
+  to be able to tell. The digest line is omitted when the reference is the default rather than
+  keyed on whether the table was written, so a root that declares nothing and a root that
+  spells out `style = "path"` render the same bytes AND hash the same, which is also what
+  keeps every already-published document's digest valid across this release.
+
+- **Refused at `check` time, not rendered as a broken link.** An unrecognised style, an
+  unknown key in the table, a non-string value, or a control character in an affix (which
+  would split the line the digest is taken over) each fail `jesse-rules check` with exit `1`
+  and a message naming the offending value.
+
+### Unchanged, deliberately
+
+- **A root that declares nothing renders both documents byte for byte as before**, so no
+  deployed root is forced to regenerate. This is asserted as bytes rather than described:
+  `the_default_reference_renders_both_documents_byte_for_byte` compares whole generated
+  documents against goldens captured from the previous release, and the goldens are now the
+  fixture root's pinned output.
+
+- **One blank line still separates consecutive routed rules.** The separation turns a tight
+  single-line bullet list in a source into a loose list in the output, which was worth
+  re-examining while the rendering was open. It stays: the entries are multi-line (prose, then
+  an indented `*Load when:* … *Source:* …` line), so a tight list would run them together, and
+  every entry document in existence would have to be regenerated to change it. The golden test
+  above now pins the separation, so it is a declared choice rather than an accident of the
+  format string.
+
 ## [App 1.0 (125)] - 2026-09-08
 
 **A reply can be selected across paragraphs.** Long-press anywhere in one of Jesse's answers

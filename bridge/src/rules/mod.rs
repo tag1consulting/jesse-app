@@ -284,6 +284,160 @@ pub struct SectionSpec {
     pub scope: RuleScope,
 }
 
+/// How a source path becomes the reference a generated rule carries.
+///
+/// **A PROPERTY OF THE SOURCE ROOT, NOT OF THIS PROGRAM.** A path is the right reference only
+/// where the filesystem layout is also the link syntax, and in a notes collection it usually
+/// is not: there the reader follows a link, and a bare path is inert text beside it. Which
+/// convention applies is something only the root knows, so it is declared in the manifest and
+/// no particular one is compiled in here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReferenceStyle {
+    /// The source path verbatim, in backticks. THE DEFAULT, and what a root that declares
+    /// nothing keeps: every document already published renders unchanged.
+    #[default]
+    Path,
+    /// A wiki link to the source with its file extension dropped, which is what makes the
+    /// reference followable in a collection that links that way.
+    WikiLink,
+}
+
+impl ReferenceStyle {
+    /// The accepted values, in the order an error message lists them.
+    pub const NAMES: &'static [&'static str] = &["path", "wiki-link"];
+
+    pub fn parse(s: &str) -> Option<ReferenceStyle> {
+        match s {
+            "path" => Some(ReferenceStyle::Path),
+            "wiki-link" => Some(ReferenceStyle::WikiLink),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ReferenceStyle::Path => "path",
+            ReferenceStyle::WikiLink => "wiki-link",
+        }
+    }
+}
+
+/// The whole rule for turning a declared source path into a rendered reference.
+///
+/// The two affixes exist because a source path is relative to the RULES ROOT while a link is
+/// resolved against whatever the collection calls its own root, and those are not required to
+/// be the same directory. Rewriting the leading segment is the general mechanism for that; it
+/// carries no knowledge of any particular collection, and a root that needs neither leaves
+/// both empty.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SourceReference {
+    pub style: ReferenceStyle,
+    /// Removed from the front of a source path before the reference is built, when present.
+    pub strip_prefix: String,
+    /// Prepended to what is left.
+    pub prefix: String,
+}
+
+impl SourceReference {
+    /// Parse the optional `[reference]` table. Absent means the default, which is today's
+    /// bare backtick path.
+    fn parse(doc: &toml::Table) -> Result<SourceReference, RuleError> {
+        let Some(v) = doc.get("reference") else {
+            return Ok(SourceReference::default());
+        };
+        let t = v.as_table().ok_or_else(|| {
+            RuleError::InvalidManifest("`reference` must be a table ([reference])".to_string())
+        })?;
+        for k in t.keys() {
+            if k != "style" && k != "strip_prefix" && k != "prefix" {
+                return Err(RuleError::InvalidManifest(format!(
+                    "[reference] carries unknown key `{k}`"
+                )));
+            }
+        }
+        let style = match t.get("style") {
+            None => ReferenceStyle::default(),
+            Some(toml::Value::String(s)) => ReferenceStyle::parse(s).ok_or_else(|| {
+                RuleError::InvalidManifest(format!(
+                    "[reference] style = \"{s}\" is not one of {}",
+                    ReferenceStyle::NAMES.join("/")
+                ))
+            })?,
+            Some(_) => {
+                return Err(RuleError::InvalidManifest(
+                    "[reference] `style` is not a string".to_string(),
+                ))
+            }
+        };
+        Ok(SourceReference {
+            style,
+            strip_prefix: affix(t, "strip_prefix")?,
+            prefix: affix(t, "prefix")?,
+        })
+    }
+
+    /// The reference text for one source path, delimiters included.
+    pub fn render(&self, source: &str) -> String {
+        let stripped = match self.strip_prefix.is_empty() {
+            true => source,
+            false => source
+                .strip_prefix(self.strip_prefix.as_str())
+                .unwrap_or(source),
+        };
+        let target = format!("{}{stripped}", self.prefix);
+        match self.style {
+            ReferenceStyle::Path => format!("`{target}`"),
+            ReferenceStyle::WikiLink => format!("[[{}]]", drop_extension(&target)),
+        }
+    }
+
+    /// The canonical one-line form that enters the bundle digest, in the shape
+    /// [`EnforceSpec::canonical`] uses.
+    pub fn canonical(&self) -> String {
+        format!(
+            "{} strip_prefix={} prefix={}",
+            self.style.as_str(),
+            self.strip_prefix,
+            self.prefix
+        )
+    }
+}
+
+/// A `[reference]` affix: a string with no control character in it.
+///
+/// The control-character refusal is not decoration. The bundle digest is taken over a
+/// LINE-ORIENTED serialisation, so a newline smuggled into an affix would split the line that
+/// records this declaration and let two different declarations hash the same.
+fn affix(t: &toml::Table, key: &str) -> Result<String, RuleError> {
+    match t.get(key) {
+        None => Ok(String::new()),
+        Some(toml::Value::String(s)) => {
+            if s.chars().any(char::is_control) {
+                return Err(RuleError::InvalidManifest(format!(
+                    "[reference] `{key}` contains a control character"
+                )));
+            }
+            Ok(s.clone())
+        }
+        Some(_) => Err(RuleError::InvalidManifest(format!(
+            "[reference] `{key}` is not a string"
+        ))),
+    }
+}
+
+/// Drop the last extension from the final segment of a path, and only from there.
+///
+/// Hand-walked rather than `Path::with_extension`, which would apply this platform's path
+/// semantics to a declared, always-slash-separated manifest path.
+fn drop_extension(p: &str) -> &str {
+    let seg = p.rfind('/').map_or(0, |i| i + 1);
+    match p[seg..].rfind('.') {
+        // A leading dot is the whole name of a dotfile, not an extension.
+        Some(0) | None => p,
+        Some(i) => &p[..seg + i],
+    }
+}
+
 /// The manifest at the source root: what may contribute, in what order, and what is checked.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Manifest {
@@ -300,6 +454,8 @@ pub struct Manifest {
     pub max_bytes: usize,
     /// The document title rendered as the `#` heading of both outputs.
     pub title: String,
+    /// How a source path is turned into the reference each rendered rule carries.
+    pub reference: SourceReference,
     /// The mechanically enforceable checks, with their parameters.
     pub enforce: Vec<EnforceSpec>,
 }
@@ -456,11 +612,14 @@ impl Manifest {
             None => DEFAULT_MAX_BYTES,
         };
 
+        let reference = SourceReference::parse(&doc)?;
+
         let enforce = EnforceSpec::parse_all(&doc)?;
 
         for k in doc.keys() {
             match k.as_str() {
-                "schema" | "title" | "sources" | "section" | "outputs" | "budget" | "enforce" => {}
+                "schema" | "title" | "sources" | "section" | "outputs" | "budget" | "reference"
+                | "enforce" => {}
                 other => {
                     return Err(RuleError::InvalidManifest(format!(
                         "unknown top-level key `{other}`"
@@ -484,6 +643,7 @@ impl Manifest {
             outputs,
             max_bytes,
             title,
+            reference,
             enforce,
         })
     }
