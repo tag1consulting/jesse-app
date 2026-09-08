@@ -221,4 +221,39 @@ final class MarkdownDocumentTests: XCTestCase {
     func testEmptySelectionCopiesNothing() {
         XCTAssertEqual(document().plainText(for: NSRange(location: 4, length: 0)), "")
     }
+
+    // MARK: - Dynamic Type
+
+    /// The fonts are resolved into the storage, so a Dynamic Type change has to
+    /// produce a NEW document — nothing in an `NSAttributedString` rescales itself.
+    /// Same characters, same structure, larger type, and tab stops that moved with
+    /// it because they are measured from the cells as rendered.
+    func testAnAccessibilitySizeProducesTheSameTextSetLarger() {
+        func build(_ category: UIContentSizeCategory) -> MarkdownDocument {
+            MarkdownDocument.build(MarkdownReplyFixture.raw,
+                                   traits: UITraitCollection(preferredContentSizeCategory: category))
+        }
+        let normal = build(.large)
+        let accessible = build(.accessibilityExtraExtraExtraLarge)
+
+        XCTAssertEqual(accessible.attributed.string, normal.attributed.string)
+        XCTAssertEqual(accessible.blocks, normal.blocks)
+        XCTAssertEqual(accessible.decorations, normal.decorations)
+
+        func bodyPointSize(_ doc: MarkdownDocument) -> CGFloat {
+            let at = (doc.attributed.string as NSString).range(of: "You logged").location
+            let font = doc.attributed.attribute(.font, at: at, effectiveRange: nil) as? UIFont
+            return font?.pointSize ?? 0
+        }
+        XCTAssertGreaterThan(bodyPointSize(accessible), bodyPointSize(normal) * 1.5)
+
+        func secondColumnStop(_ doc: MarkdownDocument) -> CGFloat {
+            let at = (doc.attributed.string as NSString).range(of: "\tDay\tProtein\tMet").location
+            let style = doc.attributed.attribute(.paragraphStyle, at: at,
+                                                 effectiveRange: nil) as? NSParagraphStyle
+            return style?.tabStops.dropFirst().first?.location ?? 0
+        }
+        XCTAssertGreaterThan(secondColumnStop(accessible), secondColumnStop(normal),
+                             "table columns must be measured at the size they are drawn at")
+    }
 }

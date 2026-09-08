@@ -35,10 +35,12 @@ final class ReplySelectionTextViewTests: XCTestCase {
 
     /// Render the real reply view at a phone-ish width and return every
     /// `UITextView` UIKit made for it.
-    private func renderReply(_ raw: String = MarkdownReplyFixture.raw) -> [UITextView] {
+    private func renderReply(_ raw: String = MarkdownReplyFixture.raw,
+                             typeSize: DynamicTypeSize = .large) -> [UITextView] {
         let host = UIHostingController(rootView:
             MarkdownText(raw)
-                .frame(width: 340, alignment: .leading))
+                .frame(width: 340, alignment: .leading)
+                .environment(\.dynamicTypeSize, typeSize))
         let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 340, height: 4000))
         window.rootViewController = host
         window.isHidden = false
@@ -182,6 +184,34 @@ final class ReplySelectionTextViewTests: XCTestCase {
                                      length: last.location + last.length - first.location)
         XCTAssertGreaterThan(view.selectedRange.length, 1000)
         XCTAssertTrue(try XCTUnwrap(copyText(from: view)).contains("Paragraph number 40"))
+    }
+
+    // MARK: - Dynamic Type
+
+    /// At a large accessibility size the reply is STILL one text view and still
+    /// selectable end to end. The document's fonts are baked in, so this is the
+    /// check that the rebuild-on-size-change path actually fires — if it did not,
+    /// the reply would render at the default size and this height would not move.
+    func testLargeAccessibilityTextKeepsOneSelectableReply() throws {
+        let normalHeight = try XCTUnwrap(renderReply().first).bounds.height
+
+        let views = renderReply(typeSize: .accessibility3)
+        XCTAssertEqual(views.count, 1, "accessibility sizing must not split the reply")
+        let view = try XCTUnwrap(views.first)
+        XCTAssertGreaterThan(view.bounds.height, normalHeight,
+                             "the reply did not grow — Dynamic Type never reached the document")
+
+        view.selectAll(nil)
+        XCTAssertEqual(copyText(from: view), MarkdownReplyFixture.expectedFullCopy,
+                       "the text is the same text however large it is set")
+    }
+
+    /// SwiftUI's size is carried to UIKit as the category the fonts resolve at.
+    func testDynamicTypeSizeMapsToAContentSizeCategory() {
+        XCTAssertEqual(SelectableDocumentText.contentSizeCategory(.xSmall), .extraSmall)
+        XCTAssertEqual(SelectableDocumentText.contentSizeCategory(.large), .large)
+        XCTAssertEqual(SelectableDocumentText.contentSizeCategory(.accessibility5),
+                       .accessibilityExtraExtraExtraLarge)
     }
 
     // MARK: - Selection stability
