@@ -1354,6 +1354,56 @@ fn cli(args: &[&str]) -> (i32, String, String) {
 }
 
 #[test]
+fn the_default_reference_renders_both_documents_byte_for_byte() {
+    // THE WHOLE DOCUMENT, byte for byte, against a copy taken from the release before the
+    // `[reference]` field existed. The fixture root declares nothing, so this is the property
+    // that lets every deployed root skip a regeneration: not "the reference looks the same",
+    // but "the bytes are the same".
+    //
+    // Regenerate deliberately, never to make this pass:
+    //   cargo run --bin jesse-rules -- show --root tests/fixtures/rules --harness claude-code \
+    //     > tests/fixtures/rules/golden/CLAUDE.md
+    //   cargo run --bin jesse-rules -- show --root tests/fixtures/rules --harness codex \
+    //     > tests/fixtures/rules/golden/AGENTS.md
+    let w = World::new("golden");
+    assert_eq!(
+        w.read("CLAUDE.md"),
+        include_str!("fixtures/rules/golden/CLAUDE.md"),
+        "CLAUDE.md no longer renders the bytes the previous release published"
+    );
+    assert_eq!(
+        w.read("AGENTS.md"),
+        include_str!("fixtures/rules/golden/AGENTS.md"),
+        "AGENTS.md no longer renders the bytes the previous release published"
+    );
+}
+
+#[test]
+fn an_unusable_reference_style_fails_the_check_naming_the_value() {
+    let w = World::new("badref");
+    let root = w.root.display().to_string();
+    let (code, stdout, _) = cli(&["check", "--root", &root]);
+    assert_eq!(code, 0, "{stdout}");
+
+    let manifest = w.read("jesse-rules.toml");
+    w.write(
+        "jesse-rules.toml",
+        &format!("{manifest}\n[reference]\nstyle = \"obsidian\"\n"),
+    );
+    let (code, stdout, _) = cli(&["check", "--root", &root]);
+    assert_eq!(code, 1, "a root problem is exit 1: {stdout}");
+    assert!(
+        stdout.contains("\"obsidian\""),
+        "the report must name the offending value: {stdout}"
+    );
+    assert!(stdout.contains("path/wiki-link"), "{stdout}");
+
+    // Refused at CHECK time rather than published as a broken link.
+    let e = rules::publish(&w.root, &rules::PublishOptions::default()).expect_err("refused");
+    assert!(e.to_string().contains("\"obsidian\""), "{e}");
+}
+
+#[test]
 fn the_cli_separates_a_broken_root_from_a_bad_invocation() {
     let w = World::new("cli");
     let root = w.root.display().to_string();
