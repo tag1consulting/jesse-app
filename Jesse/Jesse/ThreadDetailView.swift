@@ -968,6 +968,11 @@ private struct OutboxFailedControls: View {
 /// Copy / Select All menu. There is no per-message "…" affordance and no custom
 /// long-press-to-copy gesture — the whole point is to stop fighting the native
 /// selection gesture. Whole-conversation Share still lives in the toolbar.
+///
+/// ONE text view per bubble, including a multi-block Jesse reply: a selection
+/// cannot span two text views, so a reply rendered as one view per Markdown block
+/// could not be selected across paragraphs at all. See `MarkdownDocument`.
+/// Selection still stops at the bubble — spanning two turns is a separate thing.
 private struct TurnRow: View {
     let turn: Turn
 
