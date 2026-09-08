@@ -291,20 +291,28 @@ final class MarkdownStreamRenderer {
     func hasRendered(_ text: String) -> Bool { text == cachedSource }
 }
 
-/// Renders parsed markdown blocks as native SwiftUI views.
+/// Renders parsed markdown blocks.
 ///
 /// Two rendering modes, chosen by `selectable`:
-/// - **Selectable** (persisted turns): each text block is a `SelectableText`
-///   (`UITextView`), so a long-press starts a real native selection the user can
-///   drag by word / sentence, plus Select All and the system Copy menu — what a
-///   SwiftUI `Text` with `.textSelection` did not reliably give inside the
-///   scrolling transcript.
+/// - **Selectable** (persisted turns): the whole reply is composed into ONE
+///   `MarkdownDocument` and rendered by ONE text view, so a selection is a plain
+///   character range over one text storage — it spans paragraphs, headings, list
+///   items, code and table cells, and `Select All` covers the reply. This is the
+///   fix for the selection islands the old per-block `SelectableText` layout
+///   created; `MarkdownDocument` carries the full explanation.
 /// - **Non-selectable** (the live streaming partial): the lightweight SwiftUI
 ///   `Text` path, unchanged — the growing partial re-renders ~10×/s and needs no
-///   selection, so it avoids a fleet of `UITextView`s churning mid-stream.
+///   selection, so it avoids rebuilding an attributed document mid-stream. When
+///   the turn finishes, `TurnRow` renders the persisted `Turn` through the
+///   selectable path above.
 struct MarkdownText: View {
     let blocks: [MarkdownBlock]
     let selectable: Bool
+
+    /// The document's fonts are resolved at this size and rebuilt when it
+    /// changes — a baked `NSAttributedString` cannot rescale itself, and the
+    /// table's tab stops are measured from the text at a specific size.
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
 
     init(_ raw: String, selectable: Bool = true) {
         self.blocks = parseMarkdownBlocks(raw)
@@ -320,78 +328,53 @@ struct MarkdownText: View {
     }
 
     var body: some View {
-        let stack = VStack(alignment: .leading, spacing: 8) {
-            ForEach(Array(blocks.enumerated()), id: \.offset) { _, block in
-                view(for: block)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            }
-        }
-        // The selectable path gets native selection from its `SelectableText`
-        // leaves; the streaming path keeps the SwiftUI container selection.
         if selectable {
-            stack
+            SelectableDocumentText(blocks: blocks, typeSize: dynamicTypeSize)
+                .frame(maxWidth: .infinity, alignment: .leading)
         } else {
-            stack.textSelection(.enabled)
+            VStack(alignment: .leading, spacing: 8) {
+                ForEach(Array(blocks.enumerated()), id: \.offset) { _, block in
+                    view(for: block)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+            .textSelection(.enabled)
         }
     }
 
+    /// The streaming path's per-block SwiftUI views. The selectable path does not
+    /// come through here at all — it has no per-block views to build.
     @ViewBuilder
     private func view(for block: MarkdownBlock) -> some View {
         switch block {
         case let .heading(level, text):
-            if selectable {
-                SelectableText(attributed: MarkdownInline.attributed(
-                    text, font: headingUIFont(level), color: .label))
-            } else {
-                inline(text).font(headingFont(level))
-            }
+            inline(text).font(headingFont(level))
 
         case let .bullet(text):
-            if selectable {
-                SelectableText(attributed: MarkdownInline.listItem(
-                    marker: "•", text: text, font: bodyUIFont, color: .label))
-            } else {
-                HStack(alignment: .firstTextBaseline, spacing: 6) {
-                    Text("•")
-                    inline(text)
-                }
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                Text("•")
+                inline(text)
             }
 
         case let .numbered(number, text):
-            if selectable {
-                SelectableText(attributed: MarkdownInline.listItem(
-                    marker: "\(number).", text: text, font: bodyUIFont, color: .label))
-            } else {
-                HStack(alignment: .firstTextBaseline, spacing: 6) {
-                    Text("\(number).")
-                    inline(text)
-                }
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                Text("\(number).")
+                inline(text)
             }
 
         case let .code(code):
             codeBlock {
-                if selectable {
-                    SelectableText(attributed: NSAttributedString(
-                        string: code,
-                        attributes: [.font: monospacedBodyUIFont, .foregroundColor: UIColor.label]))
-                } else {
-                    Text(code)
-                        .font(.system(.body, design: .monospaced))
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .textSelection(.enabled)
-                }
+                Text(code)
+                    .font(.system(.body, design: .monospaced))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .textSelection(.enabled)
             }
 
         case let .table(headers, rows, alignments):
             tableView(headers: headers, rows: rows, alignments: alignments)
 
         case let .paragraph(text):
-            if selectable {
-                SelectableText(attributed: MarkdownInline.attributed(
-                    text, font: bodyUIFont, color: .label))
-            } else {
-                inline(text)
-            }
+            inline(text)
         }
     }
 
@@ -407,29 +390,9 @@ struct MarkdownText: View {
             )
     }
 
-    // Concrete UIKit fonts for the selectable (`SelectableText`) path, mirroring
-    // the SwiftUI text styles the non-selectable path uses.
-    private var bodyUIFont: UIFont { UIFont.preferredFont(forTextStyle: .body) }
-
-    private var monospacedBodyUIFont: UIFont {
-        UIFont.monospacedSystemFont(
-            ofSize: UIFont.preferredFont(forTextStyle: .body).pointSize, weight: .regular)
-    }
-
-    private func headingUIFont(_ level: Int) -> UIFont {
-        let style: UIFont.TextStyle
-        switch level {
-        case 1:  style = .title3
-        case 2:  style = .headline   // already semibold
-        default: style = .subheadline
-        }
-        let base = UIFont.preferredFont(forTextStyle: style)
-        if level == 2 { return base }
-        if let descriptor = base.fontDescriptor.withSymbolicTraits(.traitBold) {
-            return UIFont(descriptor: descriptor, size: base.pointSize)
-        }
-        return base
-    }
+    // The equivalent UIKit fonts for the selectable path live in
+    // `MarkdownDocument`'s builder, which needs them as concrete `UIFont`s to
+    // bake into the attributed string.
 
     /// Render a GFM pipe table as a SwiftUI `Grid` inside a horizontal
     /// `ScrollView` so a wide table scrolls rather than truncating. Ragged rows

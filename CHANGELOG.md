@@ -14,6 +14,109 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [App 1.0 (125)] - 2026-09-08
+
+**A reply can be selected across paragraphs.** Long-press anywhere in one of Jesse's answers
+and the selection now extends wherever you drag it — through paragraph breaks, through a
+bullet list, through a code block, into a table — and Select All takes the whole reply. Word
+and sentence selection are unchanged, because they were never the broken part.
+
+### Root cause
+
+The renderer built a reply as a `VStack` with one `SelectableText` per Markdown block, and a
+`SelectableText` is one `UITextView`. **A `UITextView`'s selection cannot leave its own text
+storage.** Both ends of a selection are `UITextPosition`s belonging to a single text view,
+`UITextInteraction` resolves a handle drag against that one view's layout, and nothing in
+UIKit joins two of them. So every paragraph, heading, bullet, numbered item and code block
+was a separate SELECTION ISLAND: a long-press picked a word inside one block, dragging a
+handle past that block's last glyph clamped there, and `Select All` — which UIKit routes to
+`-selectAll:` on the *first responder*, i.e. one text view — reached only the block that had
+been touched. A word worked, a paragraph worked, and anything larger was not merely awkward
+but unrepresentable.
+
+Tables were worse than an island. They rendered as a SwiftUI `Grid` of `Text`, which is not
+inside any text view, so their contents took part in no selection at all and could not be
+copied by selecting them.
+
+Measured, on the fixture added with this change: the old renderer produced **13 text views**
+for one reply, and `Select All` on the first of them copied `"Weekly summary"` — the heading,
+and nothing else.
+
+### The fix
+
+**One reply is one document in one text view.** `MarkdownDocument` composes the parsed blocks
+into a single `NSAttributedString`; `MarkdownDocumentTextView` renders it. A selection is then
+an ordinary character range over one text storage, so it spans blocks by construction, and the
+native gestures keep working unchanged — they are the same gestures on the same kind of view,
+there is just one of it now.
+
+What was view structure had to become typography, which is most of the new code:
+
+- Block spacing is `paragraphSpacing` on the **last line of each block**, not on every line —
+  a code block's interior newlines are paragraph breaks too, and would otherwise get eight
+  points of air between every line of code.
+- List markers are real text (`•\t`, `1.\t`) with a hanging `headIndent`, so a marker selects
+  and copies with its item.
+- Code and table cards are recorded as decorations and drawn behind the text from line-fragment
+  geometry; their padding is real paragraph spacing, so the card has somewhere to be.
+- Table columns are per-column `NSTextTab` stops measured from the widest cell, honouring the
+  delimiter row's alignments. Every row starts with a tab, which is what lets the *first*
+  column honour its alignment; copy strips it back off.
+
+Copy is deliberate rather than inherited. The storage separates blocks with a single newline,
+because the visible gap between them is paragraph spacing and real blank lines would double
+it on screen — right for layout, wrong for the pasteboard. `MarkdownDocument.plainText(for:)`
+re-joins the selected slice of each block with the separator that boundary implies: one
+newline between items of one list, a blank line everywhere else, tab-separated table cells,
+code verbatim. Nothing but the selected text goes on the pasteboard.
+
+The streaming partial is untouched. It stays on the lightweight SwiftUI `Text` path — it
+re-renders about ten times a second, needs no selection, and should not be rebuilding an
+attributed document while it grows. The transition is the same as before: when the turn
+finishes, `TurnRow` renders the persisted `Turn` through the selectable path.
+
+### The one thing that got worse
+
+A wide table used to sit in a horizontal `ScrollView` and scroll sideways with its columns
+intact. A document has one text container and no sideways axis, so a table wider than the
+bubble now wraps at the container edge instead. Nothing is truncated, nothing is lost, and
+every cell stays selectable and in reading order — a very wide table is just less tidy than
+it was. Selection islands were the worse of the two problems.
+
+### Changed
+
+- **`MarkdownText`'s selectable path renders one `SelectableDocumentText`** instead of a stack
+  of per-block `SelectableText`s. The non-selectable (streaming) path is unchanged, and its
+  per-block SwiftUI views are now the only thing `view(for:)` builds.
+- **`SelectableText` is unchanged and still used for the user bubble**, which was always a
+  single run of plain text in a single text view.
+- **The document is rebuilt only when the reply text or the Dynamic Type size changes.** Any
+  other SwiftUI update leaves the storage — and a selection in progress — alone. Reassigning
+  `attributedText` necessarily drops the selection, so the wrapper compares a cheap fingerprint
+  of the blocks rather than the built string.
+- **Dynamic Type is resolved explicitly.** The fonts are baked into the storage and cannot
+  rescale themselves, and the table's tab stops are measured from text at a specific size, so
+  the view reads `\.dynamicTypeSize` and rebuilds rather than leaving it to
+  `adjustsFontForContentSizeCategory`.
+
+### Added
+
+- **`MarkdownReplyFixture`** — one reply carrying a heading, three prose paragraphs (the first
+  itself two source lines), three bullets, three numbered items one of which holds a link, a
+  fenced code block with meaningful leading whitespace, a GFM table using all three column
+  alignments, and emoji in prose, in a bullet and in a table cell.
+- **`MarkdownDocumentTests`** — document assembly and copy: block map, range tiling, cards,
+  verbatim code whitespace, inline attributes, where the block gap lives, tab stops and
+  alignments, and the copied text for a cross-paragraph range, a single word, a table and the
+  whole document.
+- **`ReplySelectionTextViewTests`** — the same behaviour at the real text view, driven through
+  `UIHostingController` and the real `MarkdownText`: one text view per reply, a selection from
+  inside the first paragraph to inside the third (crossing the bullet list) copied and compared
+  exactly, single-word selection, `selectAll(_:)` over the whole reply, code and table cells
+  participating in one range, a long reply taller than the viewport, and a selection surviving
+  an unrelated SwiftUI update. All seven of the tests that can be compiled against the old
+  renderer fail against it.
+
 ## [App 1.0 (124)] - 2026-09-07
 
 **A recording you made on the phone can now be handed to Jesse, and what Jesse receives is
