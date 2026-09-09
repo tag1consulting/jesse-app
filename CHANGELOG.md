@@ -14,6 +14,73 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [bridge 0.126.0] - 2026-09-09
+
+**A screenshot now arrives on the phone as a picture, and the transport it arrived on is not
+the one this was planned against.** `browser_take_screenshot` hands its PNG back as a tool
+RESULT, not as a file the model wrote, so the artifact sweep — which looks in
+`<vault>/.jesse-artifacts/<job_id>/` and nowhere else — had never seen one. Every browser turn
+delivered the model's prose description of an image it could not show.
+
+**The plan was to copy the file out of the browser server's `--output-dir`. The measurement
+retired it.** `--output-format stream-json` already carries the image itself, base64, on the
+synthetic `user` line that reports the tool result (verified against claude 2.1.266; the same
+shape is in every transcript on disk back to 2.1.226). Reading the bytes off a line the bridge
+is already parsing beats copying a file on three counts: it is GENERAL, so a `Read` of a PNG, a
+rasterized PDF page and an MCP server nobody has written yet are all carried by one rule with
+no tool name anywhere in the module; it touches nothing the browser server owns, so "copy,
+never move" is a property rather than a rule to remember; and it does not depend on
+`/tmp/jesse-browser`, a literal pinned inside six MCP config consts because the containment
+record compares argv by strict equality.
+
+**One argument decides whether the picture exists at all, and that is the finding worth
+keeping.** Measured against `@playwright/mcp` 0.0.80:
+
+- With **no** `filename`, the PNG comes back as a base64 image block. A full-page Wikipedia
+  article measured 185,408 base64 characters (~139 KB decoded) — comfortably inside the 25 MB
+  per-file cap.
+- With a `filename`, the server writes the file and returns a **markdown link**. No bytes cross
+  the stream, so there is nothing to stage.
+
+The second is not hypothetical: asked plainly to take a full-page screenshot, the model supplied
+`filename: "./rust-wikipedia-fullpage.png"` unprompted, and the picture was lost. So the artifact
+prompt fragment gained one sentence asking that an image be returned rather than saved. It is a
+nudge, not a guarantee — a model that saves anyway costs the picture, not the turn.
+
+**Not added, deliberately: a mid-turn event.** The contract above `harness` is explicit that tool
+RESULTS are not in the mid-turn vocabulary, and an image is the largest possible tool result. This
+is a SINK the driver feeds as it reads, so the two mid-turn events are untouched and a client that
+does not know this shipped renders the same turn it rendered before. **Also not added: a second
+set of caps.** The two bounds are the sweep's own `max_files` and `max_file_bytes`, applied
+earlier only because a decoder cannot honestly wait for a sweep that runs when the turn ends —
+`max_file_bytes` is checked against the ENCODED length before anything is allocated, the same
+pre-check `attachments` makes for the same reason.
+
+**Containment: nothing moves.** No containment record, no tool grant, no MCP server and no
+acceptance signature — verified byte-unchanged on the branch. The staging directory is already
+writable at `Capability::Write`, the bytes were already in the bridge's address space on their
+way to the model, and the decoder makes no read and no network call. A `url` image source is
+skipped rather than fetched. A turn routed `ArtifactRoute::None` constructs no sink at all, so a
+read-level turn and a bridge with no state directory both stage nothing — the negative twin is a
+test, not a comment. The tool's own name is sanitized to `[A-Za-z0-9_-]` before it can become a
+filename, which is the one place stream content could have reached a path.
+
+### Added
+- `artifacts`: `ReturnedImages`, the per-turn sink that stages images tool results carried, plus
+  the pure `tool_result_images` / `tool_use_names` extractors it is built from. Staged files are
+  named for the tool that produced them, zero-padded because the sweep processes files sorted by
+  name, with the extension the BYTES imply rather than the `media_type` the line claimed.
+- `artifacts`: one sentence in `artifact_prompt_suffix` asking that a returned image be returned
+  rather than saved to a filename.
+
+### Changed
+- `claude`: the spawned-turn read loop offers each line to the sink before the parser sees it.
+  Built once per turn rather than per attempt, so a retry's sequence numbers continue the first
+  attempt's instead of overwriting its files; two attempts that screenshot the same page stage two
+  identical files, which the sweep's content hashing already stores once.
+- `SECURITY.md`: the Artifacts section states why staging a returned image adds no capability,
+  and that a `url` source is never fetched.
+
 ## [bridge 0.125.0] - 2026-09-09
 
 **Six unscoped `Bash` read verbs are gone from the write-level allowlist, and the measurement
