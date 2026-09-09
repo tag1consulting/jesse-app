@@ -1822,14 +1822,37 @@ mod tests {
             "a bare Skill scope (any-skill from a phone request) must never be allowed: {tools:?}"
         );
 
-        // The scoped read-only helpers backing the clock header + file inspection
-        // are present, and each is the `Bash(<verb>:*)` scoped form — never a bare
-        // verb or unscoped Bash. These are read-only / pure-compute (no write, no
-        // network), so they widen the read surface only.
-        for verb in ["date", "cal", "head", "tail", "wc"] {
+        // The scoped helpers backing the clock header are present, and each is the
+        // `Bash(<verb>:*)` scoped form — never a bare verb or unscoped Bash. Both
+        // are pure computation (no write, no network, no read).
+        for verb in ["date", "cal"] {
             assert!(
                 tools.contains(&format!("Bash({verb}:*)").as_str()),
                 "expected scoped Bash({verb}:*) in: {tools:?}"
+            );
+        }
+
+        // THE SIX READ VERBS MUST STAY OUT. `ls`, `cat`, `find`, `head`, `tail` and
+        // `wc` were granted here until 0.125.0. They were verb scopes with a free
+        // path tail — the allowlist constrained the command name and said nothing
+        // about which file was opened — while `Read`/`Grep`/`Glob` beside them are
+        // anchored to `//${WORKSPACE}/**`.
+        //
+        // Removing them closed nothing, and this assertion is not pretending it
+        // did: measurement on claude 2.1.266 showed the CLI auto-approves read-only
+        // shell verbs whether or not this list names them, and bounds them to the
+        // session's working directory either way. The escape was denied with the
+        // grants present AND with them absent. What the grants did was leave six
+        // unscoped verb entries in the record that a future CLI heuristic could
+        // make load-bearing again — 0.67.0 observed exactly that route succeeding.
+        //
+        // So this guards a decision rather than a boundary: re-adding any of them
+        // must be a deliberate act that fails a test first, not a quiet edit.
+        for verb in ["ls", "cat", "find", "head", "tail", "wc"] {
+            assert!(
+                !tools.contains(&format!("Bash({verb}:*)").as_str()),
+                "Bash({verb}:*) was removed in 0.125.0 and must not come back \
+                 without a re-record: {tools:?}"
             );
         }
 
