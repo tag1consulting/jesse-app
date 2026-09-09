@@ -2693,6 +2693,25 @@ phone. Handled with the same posture.
 - **Nothing is dropped silently.** A rejected or capped file appends a line to the reply
   the user sees. A dropped artifact the user is not told about is a wrong answer they
   cannot detect.
+- **An image a TOOL returned is staged too, and that adds no capability.** A screenshot
+  comes back as a base64 `image` block on the tool-result line rather than as a file the
+  model wrote, so the sweep never saw one. The bridge now decodes it off the stream it is
+  already parsing and writes it into the same staging directory. **No containment record
+  moves, no grant widens, no MCP server changes and no acceptance signature is orphaned**
+  — verified byte-unchanged on the branch that added it. The reasoning, rather than the
+  assertion: the staging directory is one the turn can already write (see the first bullet),
+  the bytes were already in the bridge's own address space on their way to the model, the
+  store is reached over the same bearer-authenticated route by the operator's own paired
+  client, and the decoder makes no read and no network call — it never touches the browser
+  server's `--output-dir`, so nothing outside the bridge is read or mutated. Every guarantee
+  above applies unchanged: the bytes are sniffed (a non-image `image` block, and a `#!`
+  script inside one, are both dropped), the tool's own name is sanitized to
+  `[A-Za-z0-9_-]` before it becomes a filename, the caps are the same three, and a turn
+  routed no staging directory constructs no decoder at all.
+- **A `url` image source is never fetched.** Only `type: "base64"` is staged. A source the
+  bridge would have to go and GET is skipped, because that would be a network read on a
+  model-supplied URL, made by the bridge rather than by the child — a new capability, and
+  not one this channel needs.
 
 ## Recent-workouts context (`health_context`)
 

@@ -180,12 +180,35 @@ fn write_staging_gitignore(parent: &Path) -> std::io::Result<()> {
 /// Short on purpose, and in the same spirit as [`attachment_prompt_suffix`]: it names
 /// one directory and one rule. It is appended ONLY on a turn that actually has a staging
 /// directory, so an ordinary turn's prompt is byte-for-byte what it was.
+///
+/// # The second sentence, and the measurement that forced it
+///
+/// [`ReturnedImages`] carries an image a tool HANDED BACK, which needs no directory and no
+/// cooperation — except that a tool can be asked not to hand it back. Measured against
+/// `@playwright/mcp` 0.0.80 on 2026-09-09, `browser_take_screenshot` has two behaviours and
+/// ONE argument decides which:
+///
+///   * with NO `filename` — the PNG comes back as a base64 image block, which the sink
+///     stages. A full-page Wikipedia article measured 185,408 base64 characters (~139 KB).
+///   * with a `filename` — the server writes the file and returns a MARKDOWN LINK to it.
+///     No bytes cross the stream, so there is nothing to stage and the phone gets prose.
+///
+/// The second is not hypothetical: asked plainly to "take a full-page screenshot", the model
+/// supplied `filename: "./rust-wikipedia-fullpage.png"` unprompted. So the sentence below
+/// tells it not to, phrased about IMAGES generally rather than about one server's argument —
+/// the rule is true of any tool that offers to save instead of return, and naming the
+/// browser here would date the moment the server set changes.
+///
+/// A NUDGE, NOT A GUARANTEE, and deliberately not treated as one: a model that saves anyway
+/// costs the picture, not the turn, and the file it wrote is still the model's own business.
 pub fn artifact_prompt_suffix(dir: &Path, caps: &ArtifactCaps) -> String {
     format!(
         "\n\n(If this turn produces a file for the user — a chart, a PDF, a CSV export, a \
          rendered page — write it into {} and it is returned with your reply. A file \
          written anywhere else is NOT returned. Up to {} file(s), {} MB each. Accepted: \
-         PNG, JPEG, PDF, SVG, plain text, CSV, JSON, Markdown, HTML.)",
+         PNG, JPEG, PDF, SVG, plain text, CSV, JSON, Markdown, HTML. An image a TOOL hands \
+         back — a screenshot, a rendered page — is returned automatically, so ask the tool \
+         to return the image rather than to save it to a filename.)",
         dir.display(),
         caps.max_files,
         caps.max_file_bytes / (1024 * 1024),
@@ -1035,6 +1058,297 @@ pub fn content_disposition(filename: &str) -> String {
     format!("attachment; filename=\"{ascii}\"; filename*=UTF-8''{encoded}")
 }
 
+// ---- Images a tool RETURNED ------------------------------------------------
+//
+// Everything above serves a file the MODEL WROTE: it is told a directory, it writes into
+// it, the sweep finds it. A browser screenshot is not that shape. `browser_take_screenshot`
+// hands its PNG back as a tool RESULT, so nothing is ever written where the sweep looks and
+// the phone got the model's prose description of a picture it could not see.
+//
+// ---- WHY THIS IS NOT A COPY OUT OF THE BROWSER'S OUTPUT DIRECTORY -----------------
+//
+// The obvious fix is to copy the file the browser server left in its `--output-dir`. That
+// was the plan, and the stream measurement retired it. `--output-format stream-json` carries
+// the image ITSELF, base64, on the synthetic `user` line that reports the tool result
+// (verified against claude 2.1.266 on 2026-09-09; the same shape is in every transcript on
+// disk going back to 2.1.226):
+//
+//     {"type":"user","message":{"role":"user","content":[
+//       {"type":"tool_result","tool_use_id":"toolu_…",
+//        "content":[{"type":"image",
+//                    "source":{"type":"base64","media_type":"image/png","data":"iVBOR…"}}]}]}}
+//
+// Reading the bytes off the line the bridge is ALREADY parsing is better than copying a file
+// on three counts, and the third is the one that decides it:
+//
+//   * It is GENERAL. Any tool that returns an image is carried by one rule — a browser
+//     screenshot, a `Read` of a PNG, a rasterized PDF page, an MCP server nobody has
+//     written yet. No tool name appears anywhere in this module.
+//   * It touches NOTHING the browser server owns. The server evicts from its own output
+//     directory under its own `--output-max-size`; a bridge that reached in there would be
+//     mutating another program's state, and "copy, never move" would be a rule this code
+//     had to remember rather than a property it has.
+//   * IT DOES NOT DEPEND ON A PATH. `/tmp/jesse-browser` is a literal inside six pinned
+//     MCP config consts because the containment record compares argv by strict equality.
+//     A copier keyed on that path would be a seventh reader of the literal, and would
+//     silently return nothing the day the server set changes — the exact failure this
+//     channel exists to end.
+//
+// ---- WHAT IS NOT ADDED, deliberately ---------------------------------------------
+//
+// NO MID-TURN EVENT. The contract above [`crate::harness`] is explicit that tool RESULTS
+// are not in the mid-turn vocabulary, and an image is the largest possible tool result. So
+// this is a SINK, not a [`StreamEvent`]: the driver hands each line here as it reads it,
+// bytes land in the staging directory, and the phone learns about them exactly the way it
+// learns about a file the model wrote — from the sweep's metadata on the finished reply.
+// The two mid-turn events are untouched, and a client that does not know this shipped
+// renders the same turn it rendered before.
+//
+// NO SECOND SET OF CAPS. The two bounds here are the sweep's OWN caps, applied earlier
+// because a decoder cannot honestly be asked to wait: the sweep runs when the turn ENDS, so
+// deferring entirely to it would mean decoding a 200 MB base64 blob into memory and writing
+// it to disk in order to be told it was too big. `max_file_bytes` is checked against the
+// ENCODED length first (the bound is exact enough to refuse before allocating, the same
+// pre-check `attachments` makes for the same reason), and `max_files` stops the staging.
+// Neither is a new policy number: change the cap and both move with it.
+
+/// One image lifted off a tool result, decoded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolResultImage {
+    /// The call this was the result of, used only to name the file after the tool that
+    /// produced it. Never used as a path component.
+    pub tool_use_id: String,
+    pub bytes: Vec<u8>,
+}
+
+/// How many `tool_use_id` → tool-name pairs are remembered at once.
+///
+/// A MEMORY bound, not a policy one: the map exists only to give a staged file a
+/// meaningful name, so overflowing it costs a good filename and nothing else. A turn makes
+/// tool calls without limit and the ids of calls that returned no image are never dropped
+/// by anything else, so without a ceiling this grows for the length of the turn.
+const MAX_REMEMBERED_TOOL_NAMES: usize = 512;
+
+/// Pull every `(tool_use_id, tool_name)` pair out of one line of the stream.
+///
+/// Pure, so the shape is testable against a captured line rather than inferred from a live
+/// child. Anything unrecognized yields an empty vec — this is handed EVERY line of EVERY
+/// harness's stdout, so being wrong about a line has to be free.
+pub fn tool_use_names(line: &str) -> Vec<(String, String)> {
+    let Ok(v) = serde_json::from_str::<Value>(line) else {
+        return Vec::new();
+    };
+    if v.get("type").and_then(|t| t.as_str()) != Some("assistant") {
+        return Vec::new();
+    }
+    let Some(content) = v.pointer("/message/content").and_then(|c| c.as_array()) else {
+        return Vec::new();
+    };
+    content
+        .iter()
+        .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_use"))
+        .filter_map(|b| {
+            let id = b.get("id").and_then(|i| i.as_str())?;
+            let name = b.get("name").and_then(|n| n.as_str())?;
+            (!id.is_empty() && !name.is_empty()).then(|| (id.to_string(), name.to_string()))
+        })
+        .collect()
+}
+
+/// Pull every base64 image out of the tool results on one line of the stream.
+///
+/// `max_bytes` refuses an image by its ENCODED length before the decode allocates; see the
+/// caps note above for why that check is here and not left to the sweep. Pure apart from
+/// that arithmetic, and tolerant of every other line shape for the same reason
+/// [`tool_use_names`] is.
+pub fn tool_result_images(line: &str, max_bytes: u64) -> Vec<ToolResultImage> {
+    let Ok(v) = serde_json::from_str::<Value>(line) else {
+        return Vec::new();
+    };
+    // The tool-result line is a SYNTHETIC user turn: the harness reports what came back
+    // from a tool as if the user had said it. Nothing else carries a `tool_result`.
+    if v.get("type").and_then(|t| t.as_str()) != Some("user") {
+        return Vec::new();
+    }
+    let Some(content) = v.pointer("/message/content").and_then(|c| c.as_array()) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for block in content {
+        if block.get("type").and_then(|t| t.as_str()) != Some("tool_result") {
+            continue;
+        }
+        let tool_use_id = block
+            .get("tool_use_id")
+            .and_then(|i| i.as_str())
+            .unwrap_or_default()
+            .to_string();
+        // A tool result's `content` is a STRING for an ordinary textual result and an
+        // ARRAY of content blocks when it carries anything richer. Only the array shape
+        // can hold an image.
+        let Some(blocks) = block.get("content").and_then(|c| c.as_array()) else {
+            continue;
+        };
+        for inner in blocks {
+            if inner.get("type").and_then(|t| t.as_str()) != Some("image") {
+                continue;
+            }
+            let source = inner.get("source");
+            // `type: "base64"` is the only source shape whose bytes are in hand. A `url`
+            // source would have to be FETCHED, which is a network read this code does not
+            // have and must not invent.
+            if source.and_then(|s| s.get("type")).and_then(|t| t.as_str()) != Some("base64") {
+                continue;
+            }
+            let Some(data) = source.and_then(|s| s.get("data")).and_then(|d| d.as_str()) else {
+                continue;
+            };
+            if base64_decoded_len_bound(data.len()) as u64 > max_bytes {
+                eprintln!(
+                    "jesse-bridge: a returned image was not staged: it decodes to about \
+                     {} MB and the per-file limit is {} MB",
+                    base64_decoded_len_bound(data.len()) / (1024 * 1024),
+                    max_bytes / (1024 * 1024),
+                );
+                continue;
+            }
+            // The declared `media_type` is NOT trusted and NOT kept: the sweep sniffs
+            // every staged file from its bytes, so a line claiming `image/png` over JPEG
+            // bytes is corrected there rather than believed here.
+            match base64_decode(data) {
+                Ok(bytes) if !bytes.is_empty() => out.push(ToolResultImage {
+                    tool_use_id: tool_use_id.clone(),
+                    bytes,
+                }),
+                Ok(_) => {}
+                Err(e) => eprintln!("jesse-bridge: a returned image did not decode: {e}"),
+            }
+        }
+    }
+    out
+}
+
+/// The per-turn sink that stages images tool results returned.
+///
+/// Created ONCE PER TURN rather than per attempt, so the sequence numbers a retry produces
+/// continue the first attempt's instead of overwriting its files. Two attempts that both
+/// screenshot the same page therefore stage two identical files, which the sweep's
+/// content-hash deduplication stores once and references once — the correct outcome, and
+/// reached without this sink knowing anything about retries.
+pub struct ReturnedImages {
+    dir: PathBuf,
+    /// `tool_use_id` → the tool that made the call, harvested from the `assistant` lines
+    /// that precede the results. Bounded by [`MAX_REMEMBERED_TOOL_NAMES`].
+    tool_names: HashMap<String, String>,
+    staged: usize,
+    caps: ArtifactCaps,
+}
+
+impl ReturnedImages {
+    /// One sink for the staging directory `dir`.
+    ///
+    /// Takes the directory rather than an `Option`, so "this turn has no artifact channel"
+    /// is expressed by having no sink at all. That is the same exclusivity
+    /// [`artifact_route`] states: a turn routed `None` never constructs one of these, and
+    /// so cannot write a byte into a directory the route said it does not have.
+    pub fn new(dir: &Path, caps: ArtifactCaps) -> Self {
+        Self {
+            dir: dir.to_path_buf(),
+            tool_names: HashMap::new(),
+            staged: 0,
+            caps,
+        }
+    }
+
+    /// How many images have been staged. For tests and for the turn's own accounting.
+    pub fn staged(&self) -> usize {
+        self.staged
+    }
+
+    /// Offer one line of the child's stdout. Records the tool names it announces and
+    /// stages any image its tool results carried.
+    ///
+    /// Infallible BY DESIGN: this runs inside the driver's read loop, where the turn's
+    /// visible answer is streaming, and a failed screenshot must degrade to the turn's text
+    /// rather than take the turn down with it. Every failure is a log line.
+    pub fn on_line(&mut self, line: &str) {
+        for (id, name) in tool_use_names(line) {
+            if self.tool_names.len() >= MAX_REMEMBERED_TOOL_NAMES {
+                break;
+            }
+            self.tool_names.insert(id, name);
+        }
+        for image in tool_result_images(line, self.caps.max_file_bytes) {
+            if self.staged >= self.caps.max_files {
+                // The sweep would refuse it with this same number; not writing it first is
+                // the only difference. Logged once per excess image, which is bounded by
+                // the turn's own tool calls.
+                eprintln!(
+                    "jesse-bridge: a returned image was not staged: this turn has already \
+                     staged the maximum of {} file(s)",
+                    self.caps.max_files
+                );
+                continue;
+            }
+            // Sniffed HERE as well as in the sweep, for the extension: the sweep decides
+            // the MIME it reports, but the on-disk name is chosen before it runs, and a
+            // JPEG called `.png` would be a filename that lies to the phone. The same one
+            // function answers both, so the two can never disagree. A non-image is
+            // dropped rather than staged — an `image` block whose bytes are not an image
+            // is a malformed result, not a file the user asked for.
+            let Some((_, ext)) = sniff_artifact(&image.bytes, "")
+                .filter(|(mime, _)| matches!(*mime, "image/png" | "image/jpeg" | "image/svg+xml"))
+            else {
+                eprintln!(
+                    "jesse-bridge: a returned image was not staged: its bytes are not an \
+                     image the channel carries"
+                );
+                continue;
+            };
+            let name = self.filename_for(&image.tool_use_id, ext);
+            let path = self.dir.join(&name);
+            match std::fs::write(&path, &image.bytes) {
+                Ok(()) => self.staged += 1,
+                Err(e) => {
+                    eprintln!("jesse-bridge: a returned image could not be staged as {name}: {e}")
+                }
+            }
+        }
+    }
+
+    /// The display name a staged image takes, and the only thing `tool_use_id` is used for.
+    ///
+    /// Zero-padded because THE SWEEP PROCESSES FILES SORTED BY NAME: unpadded, a turn with
+    /// ten screenshots would return the tenth between the first and the second, and the cap
+    /// would drop whichever the sort put last rather than the one that actually arrived
+    /// last.
+    ///
+    /// The tool name is sanitized to `[A-Za-z0-9_-]` rather than trusted. It reaches a path
+    /// and it comes off the child's stdout, so `..` or a `/` in it would be a directory
+    /// traversal written by whatever the model called — the one place in this module where
+    /// stream content could become a path component, closed here.
+    fn filename_for(&self, tool_use_id: &str, ext: &str) -> String {
+        let tool = self
+            .tool_names
+            .get(tool_use_id)
+            .map(|n| {
+                n.chars()
+                    .map(|c| {
+                        if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                            c
+                        } else {
+                            '-'
+                        }
+                    })
+                    .take(60)
+                    .collect::<String>()
+            })
+            .filter(|n| !n.trim_matches('-').is_empty())
+            .unwrap_or_else(|| "image".to_string());
+        format!("{tool}-{:02}.{ext}", self.staged + 1)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1071,6 +1385,310 @@ mod tests {
 
     fn write(dir: &Path, name: &str, bytes: &[u8]) {
         std::fs::write(dir.join(name), bytes).expect("staged file");
+    }
+
+    // ---- Images a tool returned --------------------------------------------
+    //
+    // The end-to-end property is the FIRST test: a tool result carrying a base64 image
+    // becomes an artifact the phone renders inline, with no file written by the model
+    // anywhere. That is the whole point of the section, and it fails against a bridge
+    // without it because nothing ever puts a byte in the staging directory.
+
+    /// A real `--output-format stream-json` tool-result line, with `bytes` as its image.
+    /// The shape is the one measured against claude 2.1.266 on 2026-09-09, not invented.
+    fn image_result_line(tool_use_id: &str, media_type: &str, bytes: &[u8]) -> String {
+        format!(
+            r#"{{"type":"user","message":{{"role":"user","content":[{{"tool_use_id":"{}","type":"tool_result","content":[{{"type":"image","source":{{"type":"base64","media_type":"{}","data":"{}"}}}}]}}]}},"session_id":"s1"}}"#,
+            tool_use_id,
+            media_type,
+            base64_encode(bytes)
+        )
+    }
+
+    /// The `assistant` line that announced the call, which is where the tool's NAME is.
+    fn tool_use_line(tool_use_id: &str, name: &str) -> String {
+        format!(
+            r#"{{"type":"assistant","message":{{"role":"assistant","content":[{{"type":"tool_use","id":"{tool_use_id}","name":"{name}","input":{{}}}}]}},"session_id":"s1"}}"#
+        )
+    }
+
+    #[test]
+    fn a_returned_image_becomes_an_inline_artifact() {
+        let root = temp_dir("returned-store");
+        let staging = temp_dir("returned-staging");
+        let mut sink = ReturnedImages::new(&staging, caps());
+
+        // Exactly what the driver hands it, in stream order: the call, then its result.
+        sink.on_line(&tool_use_line(
+            "toolu_1",
+            "mcp__browser__browser_take_screenshot",
+        ));
+        sink.on_line(&image_result_line("toolu_1", "image/png", PNG));
+        assert_eq!(sink.staged(), 1, "the image was staged");
+
+        // Named after the tool that produced it, sequence-numbered, and with the
+        // extension the BYTES imply.
+        let names = list_regular_files(&staging)
+            .expect("staging listed")
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["mcp__browser__browser_take_screenshot-01.png"]);
+
+        // And the EXISTING sweep carries it, unchanged, as an inline-renderable image.
+        let store = ArtifactStore::for_test(root, 60_000, 1 << 30);
+        let out = store.sweep(&ctx("job1", "conv1", caps()), &staging);
+        assert_eq!(out.artifacts.len(), 1, "swept: {out:?}");
+        assert!(out.notes.is_empty(), "nothing dropped: {:?}", out.notes);
+        assert_eq!(
+            out.artifacts[0].mime, "image/png",
+            "the app inlines this mime"
+        );
+        assert_eq!(out.artifacts[0].sha256, sha256_hex(PNG));
+        assert_eq!(out.artifacts[0].bytes, PNG.len() as u64);
+    }
+
+    #[test]
+    fn a_turn_with_no_staging_directory_stages_nothing() {
+        // THE NEGATIVE TWIN. A read-level turn, and a turn on a bridge with no state dir,
+        // both route to `None` — and the sink is `Option`al for exactly that reason, so
+        // "no channel" is the absence of a sink rather than a flag inside one.
+        assert_eq!(
+            artifact_route(Capability::Read, true),
+            ArtifactRoute::None,
+            "a read turn has no channel"
+        );
+        assert_eq!(
+            artifact_route(Capability::Write, false),
+            ArtifactRoute::None,
+            "no store means no channel"
+        );
+
+        // The driver builds the sink from `Option<&Path>`, so a `None` route yields no
+        // sink; mirror that here and assert the line is inert.
+        let dir: Option<&Path> = None;
+        let mut sink = dir.map(|d| ReturnedImages::new(d, caps()));
+        let line = image_result_line("toolu_1", "image/png", PNG);
+        if let Some(s) = sink.as_mut() {
+            s.on_line(&line);
+        }
+        assert!(sink.is_none(), "no staging directory means no sink at all");
+
+        // And nothing anywhere claims an artifact: an empty staging dir sweeps to nothing.
+        let root = temp_dir("none-store");
+        let empty = temp_dir("none-staging");
+        let store = ArtifactStore::for_test(root, 60_000, 1 << 30);
+        let out = store.sweep(&ctx("job1", "conv1", caps()), &empty);
+        assert!(out.artifacts.is_empty(), "no artifacts: {out:?}");
+        assert!(
+            out.notes.is_empty(),
+            "and nothing to explain: {:?}",
+            out.notes
+        );
+    }
+
+    #[test]
+    fn a_jpeg_returned_image_is_named_for_its_real_bytes() {
+        let staging = temp_dir("returned-jpeg");
+        let mut sink = ReturnedImages::new(&staging, caps());
+        // The line CLAIMS png; the bytes are JPEG. The bytes win, so the filename does
+        // not lie to the phone.
+        sink.on_line(&tool_use_line("toolu_1", "Read"));
+        sink.on_line(&image_result_line("toolu_1", "image/png", JPEG));
+        assert!(staging.join("Read-01.jpg").exists(), "named from the bytes");
+    }
+
+    #[test]
+    fn a_returned_image_with_no_announced_tool_still_stages() {
+        // The `assistant` line can be missed (a resumed stream, an unrecognized shape).
+        // The image is the payload; the name is a nicety, so a missing name must not
+        // cost the picture.
+        let staging = temp_dir("returned-noname");
+        let mut sink = ReturnedImages::new(&staging, caps());
+        sink.on_line(&image_result_line("toolu_unknown", "image/png", PNG));
+        assert_eq!(sink.staged(), 1);
+        assert!(staging.join("image-01.png").exists(), "staged unnamed");
+    }
+
+    #[test]
+    fn a_tool_name_cannot_become_a_path() {
+        // The name comes off the child's stdout and reaches a filename, so it is the one
+        // place stream content could traverse a directory. It is sanitized, not trusted.
+        let staging = temp_dir("returned-traversal");
+        let mut sink = ReturnedImages::new(&staging, caps());
+        sink.on_line(&tool_use_line("toolu_1", "../../etc/passwd"));
+        sink.on_line(&image_result_line("toolu_1", "image/png", PNG));
+        assert_eq!(sink.staged(), 1);
+        let files = list_regular_files(&staging).expect("listed");
+        assert_eq!(files.len(), 1, "one file, inside the staging dir");
+        assert_eq!(
+            files[0].parent().expect("parent"),
+            staging.as_path(),
+            "never escaped the staging directory"
+        );
+        let name = files[0].file_name().unwrap().to_string_lossy().to_string();
+        assert!(
+            !name.contains('/') && !name.contains(".."),
+            "sanitized: {name}"
+        );
+    }
+
+    #[test]
+    fn returned_images_stop_at_the_file_count_cap() {
+        // The sweep's OWN cap, applied earlier so the bytes are never written. Not a
+        // second bound: the number is `caps.max_files`.
+        let staging = temp_dir("returned-cap");
+        let small = ArtifactCaps {
+            max_files: 2,
+            ..caps()
+        };
+        let mut sink = ReturnedImages::new(&staging, small);
+        for i in 0..5 {
+            let id = format!("toolu_{i}");
+            sink.on_line(&tool_use_line(&id, "screenshot"));
+            // Distinct bytes per image, so nothing is deduplicated away and the count
+            // being 2 is the cap rather than an accident.
+            let mut bytes = PNG.to_vec();
+            bytes.push(i as u8);
+            sink.on_line(&image_result_line(&id, "image/png", &bytes));
+        }
+        assert_eq!(sink.staged(), 2, "stopped at the cap");
+        assert_eq!(list_regular_files(&staging).expect("listed").len(), 2);
+    }
+
+    #[test]
+    fn an_oversize_returned_image_is_refused_before_it_is_decoded() {
+        let staging = temp_dir("returned-big");
+        let tiny = ArtifactCaps {
+            max_file_bytes: 8,
+            ..caps()
+        };
+        let mut sink = ReturnedImages::new(&staging, tiny);
+        let big = vec![0x89u8; 4096];
+        sink.on_line(&image_result_line("toolu_1", "image/png", &big));
+        assert_eq!(sink.staged(), 0, "refused");
+        assert!(list_regular_files(&staging).expect("listed").is_empty());
+    }
+
+    #[test]
+    fn a_non_image_in_an_image_block_is_not_staged() {
+        let staging = temp_dir("returned-notimage");
+        let mut sink = ReturnedImages::new(&staging, caps());
+        sink.on_line(&image_result_line(
+            "toolu_1",
+            "image/png",
+            b"just some text",
+        ));
+        assert_eq!(sink.staged(), 0, "text in an image block is malformed");
+        assert!(list_regular_files(&staging).expect("listed").is_empty());
+    }
+
+    #[test]
+    fn an_executable_in_an_image_block_is_not_staged() {
+        // The sniff refuses a program before any accepting branch, and the staging path
+        // goes through the same one function rather than a looser copy of it.
+        let staging = temp_dir("returned-exe");
+        let mut sink = ReturnedImages::new(&staging, caps());
+        sink.on_line(&image_result_line(
+            "toolu_1",
+            "image/png",
+            b"#!/bin/sh\nrm -rf /\n",
+        ));
+        assert_eq!(sink.staged(), 0, "a script is not an image");
+        assert!(list_regular_files(&staging).expect("listed").is_empty());
+    }
+
+    #[test]
+    fn lines_that_are_not_image_results_are_inert() {
+        let staging = temp_dir("returned-inert");
+        let mut sink = ReturnedImages::new(&staging, caps());
+        for line in [
+            "",
+            "   ",
+            "not json at all",
+            r#"{"type":"system","subtype":"init","session_id":"s1"}"#,
+            // A TEXTUAL tool result: `content` is a string, not an array of blocks.
+            r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"t","type":"tool_result","content":"ok"}]}}"#,
+            // An image the model SENT (a user attachment), not one a tool returned.
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBORw=="}}]}}"#,
+            // A `url` source, whose bytes are not in hand and must not be fetched.
+            r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"t","type":"tool_result","content":[{"type":"image","source":{"type":"url","url":"https://example.com/a.png"}}]}]}}"#,
+            // The terminal line.
+            r#"{"type":"result","subtype":"success","result":"done"}"#,
+        ] {
+            sink.on_line(line);
+        }
+        assert_eq!(
+            sink.staged(),
+            0,
+            "nothing in any of those was a returned image"
+        );
+        assert!(list_regular_files(&staging).expect("listed").is_empty());
+    }
+
+    #[test]
+    fn two_images_on_one_line_both_stage_in_order() {
+        // A parallel tool call reports several results on one synthetic user turn.
+        let staging = temp_dir("returned-two");
+        let mut sink = ReturnedImages::new(&staging, caps());
+        let mut second = PNG.to_vec();
+        second.push(0xAB);
+        let line = format!(
+            r#"{{"type":"user","message":{{"role":"user","content":[{{"tool_use_id":"a","type":"tool_result","content":[{{"type":"image","source":{{"type":"base64","media_type":"image/png","data":"{}"}}}}]}},{{"tool_use_id":"b","type":"tool_result","content":[{{"type":"image","source":{{"type":"base64","media_type":"image/png","data":"{}"}}}}]}}]}}}}"#,
+            base64_encode(PNG),
+            base64_encode(&second)
+        );
+        sink.on_line(&tool_use_line("a", "first"));
+        sink.on_line(&tool_use_line("b", "second"));
+        sink.on_line(&line);
+        assert_eq!(sink.staged(), 2);
+        assert!(
+            staging.join("first-01.png").exists(),
+            "first, in arrival order"
+        );
+        assert!(staging.join("second-02.png").exists(), "second");
+    }
+
+    #[test]
+    fn the_remembered_tool_name_map_is_bounded() {
+        let staging = temp_dir("returned-bound");
+        let mut sink = ReturnedImages::new(&staging, caps());
+        for i in 0..(MAX_REMEMBERED_TOOL_NAMES + 50) {
+            sink.on_line(&tool_use_line(&format!("toolu_{i}"), "Bash"));
+        }
+        assert_eq!(
+            sink.tool_names.len(),
+            MAX_REMEMBERED_TOOL_NAMES,
+            "a long turn cannot grow this without limit"
+        );
+        // And an image whose name was never remembered still lands.
+        sink.on_line(&image_result_line("toolu_9999", "image/png", PNG));
+        assert_eq!(sink.staged(), 1);
+    }
+
+    #[test]
+    fn tool_use_names_reads_only_assistant_tool_use_blocks() {
+        assert_eq!(
+            tool_use_names(&tool_use_line("t1", "Read")),
+            vec![("t1".to_string(), "Read".to_string())]
+        );
+        // A text block on the same line is not a tool call.
+        let mixed = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"hi"},{"type":"tool_use","id":"t2","name":"Bash","input":{}}]}}"#;
+        assert_eq!(
+            tool_use_names(mixed),
+            vec![("t2".to_string(), "Bash".to_string())]
+        );
+        assert!(tool_use_names("garbage").is_empty());
+        assert!(tool_use_names(r#"{"type":"user","message":{"content":[]}}"#).is_empty());
+    }
+
+    #[test]
+    fn tool_result_images_decodes_the_measured_shape() {
+        let line = image_result_line("toolu_x", "image/png", PNG);
+        let got = tool_result_images(&line, DEFAULT_MAX_ARTIFACT_BYTES);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].tool_use_id, "toolu_x");
+        assert_eq!(got[0].bytes, PNG, "the bytes round-trip through base64");
     }
 
     // ---- The route decision, at every capability level ----------------------
@@ -1602,6 +2220,14 @@ mod tests {
         assert!(s.contains("10 file(s)"));
         assert!(s.contains("25 MB each"));
         assert!(s.contains("NOT returned"));
+        // And the sentence that keeps a returned image from being saved away instead: a
+        // `filename` argument suppresses the bytes the sink needs. See the doc comment for
+        // the measurement.
+        assert!(
+            s.contains("returned automatically"),
+            "the returned-image sentence is present: {s}"
+        );
+        assert!(s.contains("rather than to save it to a filename"));
     }
 
     #[test]

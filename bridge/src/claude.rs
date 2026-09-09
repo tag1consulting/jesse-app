@@ -714,6 +714,21 @@ async fn run_spawned_turn(
 ) -> Result<(String, Option<String>, ShadowUsage), ApiError> {
     const MAX_ATTEMPTS: u32 = 3; // 1 try + 2 retries
 
+    // IMAGES A TOOL RETURNED, staged onto the artifact channel as the stream goes by. A
+    // browser screenshot comes back as a tool RESULT rather than a file the model wrote, so
+    // without this the sweep finds nothing and the phone gets prose about a picture.
+    //
+    // `Some` exactly when this turn was granted a staging directory, so the sink cannot
+    // write into a directory `artifact_route` declined to give it. Built ONCE, outside the
+    // retry loop, so a second attempt's sequence numbers continue the first's rather than
+    // overwriting its files — see [`ReturnedImages`].
+    //
+    // NOT a mid-turn event: see the contract above `crate::harness` and the module note in
+    // `crate::artifacts`. Ignored by the duplex arm, whose harness reports tool calls as
+    // App Server items and never as an Anthropic content block.
+    let mut returned_images =
+        artifact_dir.map(|dir| ReturnedImages::new(dir, ArtifactCaps::from_cfg(cfg)));
+
     // A manual `loop` (not `for attempt in 1..=MAX_ATTEMPTS`) so the terminal
     // outcome is the loop's `break` value and the function is statically total:
     // every path breaks or `continue`s, so there is no post-loop `unreachable!()`
@@ -853,6 +868,13 @@ async fn run_spawned_turn(
                             (StatusCode::BAD_GATEWAY, format!("claude io error: {e}"))
                         })?;
                         let Some(line) = next else { break };
+                        // Before the parser, and independent of what it makes of the line:
+                        // the two are answering different questions about the same bytes,
+                        // and an image block is invisible to the mid-turn vocabulary by
+                        // design.
+                        if let Some(images) = returned_images.as_mut() {
+                            images.on_line(&line);
+                        }
                         match parser.on_line(&line) {
                             StreamEvent::TextDelta(t) => {
                                 // The trace sees the SAME delta the live stream does, into its
