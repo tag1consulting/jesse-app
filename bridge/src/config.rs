@@ -106,7 +106,7 @@ pub const DEFAULT_MAX_ATTACHMENTS_TOTAL_BYTES: usize = 20 * 1024 * 1024;
 // Least-privilege default tool allowlist for the headless agent. Scoped to what
 // the vault's Ask/Tell workflows actually need: file read/write/search, the
 // read-only QMD vault-search MCP tools, and a few scoped shell verbs (git for
-// vault history, mv/ls/cat/find for file wrangling). Bare `Bash` is deliberately
+// vault history, mv for moving files about). Bare `Bash` is deliberately
 // absent — only the `Bash(<verb>:*)` scopes below are allowed. Override with
 // JESSE_ALLOWED_TOOLS. Keep in sync with the table in SECURITY.md.
 //
@@ -114,11 +114,36 @@ pub const DEFAULT_MAX_ATTACHMENTS_TOTAL_BYTES: usize = 20 * 1024 * 1024;
 // (see `prompt::clock_line`) for on-demand relative date math and alternate
 // formats — both are pure computation with no side effect reachable as a
 // non-privileged user (`date -s` needs root and simply fails; `cal` only prints).
-// The `Bash(head:*)` / `Bash(tail:*)` / `Bash(wc:*)` scopes are strictly
-// read-only, no writes and no network — they round out the existing read set
-// (`cat`, `ls`, `find`, plus `Grep`/`Glob`) so the agent can inspect the large
-// diet CSVs and logs without slurping a whole file. None of the five can write,
-// send, or reach the network, so the action surface is unchanged.
+//
+// SIX READ VERBS WERE REMOVED HERE, AND NOT BECAUSE THEY CLOSED AN ESCAPE.
+// `Bash(ls:*)`, `Bash(cat:*)`, `Bash(find:*)`, `Bash(head:*)`, `Bash(tail:*)` and
+// `Bash(wc:*)` used to sit on this line. They were a *verb* scope with a free path
+// tail, so unlike `Read`/`Grep`/`Glob` — which are anchored to `//${WORKSPACE}/**`
+// — nothing in this list constrained which file they opened. That is the shape
+// that made `read_escape_parent` an `allowed`/`known_open` baseline in 0.67.0.
+//
+// WHAT ACTUALLY BOUNDS THEM TODAY IS THE CLI, NOT THIS LIST, and that was measured
+// rather than assumed (claude 2.1.266, 2026-09-09, four scratch-tree turns):
+//
+//   * With these six grants REMOVED, a child still ran `ls -la`, `cat`, `head`,
+//     `tail`, `wc` and `find` against files in its own working directory. The CLI
+//     auto-approves read-only shell verbs; the grants bought no capability.
+//   * With them removed, `cat ../secret.txt` and `head ../secret.txt` came back
+//     "blocked … Claude Code may only concatenate files from the allowed working
+//     directories for this session". That is a PATH refusal from the CLI, on a
+//     verb this list no longer names at all.
+//   * With them PRESENT, the same escape was refused the same way. Both postures
+//     denied it, so removing them neither opened nor closed the route.
+//
+// So this is dead weight being removed, and the honest claim is the narrow one:
+// the six grants gave the child nothing it does not already have, while leaving
+// six unscoped verb grants in the record that a future CLI heuristic could make
+// load-bearing again. `Read`, `Grep` and `Glob` cover in-workspace reads and are
+// path-anchored, which is the boundary this project is willing to stand behind.
+// The CLI's own working-directory check is NOT that boundary: it is undocumented,
+// it has already changed once (0.67.0 observed the escape succeeding), and it can
+// change back without a version bump we control. Do not re-add these verbs to buy
+// back a capability the CLI already grants.
 //
 // The three `Bash(node vault/<script>.js:*)` scopes let a food/exercise/
 // weigh-in log REGENERATE the dashboard cache (`diet-today.js`) from the CSV
@@ -766,8 +791,8 @@ Read(//${WORKSPACE}/**),Edit(//${WORKSPACE}/**),\
 Grep(//${WORKSPACE}/**),Glob(//${WORKSPACE}/**),\
 mcp__qmd__query,mcp__qmd__get,mcp__qmd__multi_get,mcp__qmd__status,\
 Skill(diet-logging),\
-Bash(git:*),Bash(mv:*),Bash(ls:*),Bash(cat:*),Bash(find:*),\
-Bash(date:*),Bash(cal:*),Bash(head:*),Bash(tail:*),Bash(wc:*),\
+Bash(git:*),Bash(mv:*),\
+Bash(date:*),Bash(cal:*),\
 Bash(node vault/generate-diet-today.js:*),\
 Bash(node vault/validate-diet-today.js:*),\
 Bash(node vault/verify-diet-consistency.js:*),\

@@ -454,9 +454,11 @@ fn sb_quote(p: &Path) -> String {
 ///     that is actually green. Found by bisecting the profile, not by reading a doc.
 ///   * `file-read*` — UNRESTRICTED, and named as an open risk rather than a decision made
 ///     quietly. Restricting it was attempted and abandoned: the toolchain reads from enough
-///     places that an allowlist was fragile, and it buys little here because the allowlist
-///     already grants the child unscoped `Bash(cat:*)`, `Bash(head:*)` and `Bash(tail:*)` —
-///     so the build adds no read class the child did not already have.
+///     places that an allowlist was fragile. This bullet used to add "and it buys little
+///     here because the allowlist already grants the child unscoped `Bash(cat:*)`,
+///     `Bash(head:*)` and `Bash(tail:*)`". That is no longer true: 0.125.0 removed those six
+///     read verbs, so a build's host-wide read IS a broader read class than the rest of the
+///     turn, whose shell reads the CLI bounds to the working directory.
 ///   * the three `/dev` nodes — `/dev/null` above all; a toolchain that cannot open it dies
 ///     in ways that look like anything but the real cause.
 ///
