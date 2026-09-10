@@ -2081,7 +2081,7 @@ expect_output = ["Inbox/{date}-vault-lint.md"]
 ### Per-job `model`
 
 ```toml
-model = "glm-5.2"     # any id from GET /jesse/models
+model = "glm"          # any id from GET /jesse/models (an old alias resolves too)
 ```
 
 Validated **at load** against the model registry, so a typo disables that one entry

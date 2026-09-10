@@ -362,6 +362,8 @@ mod tests {
         let registry = ModelRegistry {
             models: vec![
                 RegistryModel {
+                    version: None,
+                    aliases: Vec::new(),
                     codex: Default::default(),
                     id: "opus".into(),
                     label: "Claude Opus".into(),
@@ -381,6 +383,8 @@ mod tests {
                     vision_complementary: false,
                 },
                 RegistryModel {
+                    version: None,
+                    aliases: Vec::new(),
                     codex: Default::default(),
                     id: "glm-5.2".into(),
                     label: "GLM 5.2".into(),
