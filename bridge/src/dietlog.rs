@@ -1637,9 +1637,9 @@ pub fn build_meal_log_from_food_rows(
     }))
 }
 
-// ---- Deterministic ASCII dashboard (rendered from the CSVs) -----------------
+// ---- The totals line (the reply to a local log, derived from the logs) ------
 
-/// The day's macro totals, summed from the food rows.
+/// Totals summed from food rows — the whole day's, or one entry's.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct MacroTotals {
     pub kcal: f64,
@@ -1647,21 +1647,31 @@ pub struct MacroTotals {
     pub carbs_g: f64,
     pub fat_g: f64,
     pub fiber_g: f64,
+    /// The two ceilings the totals line can name. A blank cell adds nothing, so these are
+    /// sums of what is KNOWN.
+    pub satfat_g: f64,
+    pub sodium_mg: f64,
 }
 
-/// The day's targets, read from `daily-targets.csv` (all optional — a day with no
-/// targets row renders totals without bars).
+/// The day's targets (all optional — an absent target is a segment the line cannot
+/// judge, so it is left out).
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct DietTargets {
+    /// The calorie target, already exercise-ADJUSTED when it comes from `diet-today.js`.
     pub cal: Option<f64>,
+    /// How much of `cal` is logged exercise added back, when that can be said honestly.
+    pub add_back: Option<f64>,
     pub protein: Option<f64>,
+    /// The carb FLOOR: `carbsBase` when the day carries an optional fuel band above it.
     pub carbs: Option<f64>,
     pub fat: Option<f64>,
     pub fiber: Option<f64>,
+    pub satfat: Option<f64>,
+    pub sodium: Option<f64>,
 }
 
 /// Sum `food-log.csv` into the day's macro totals for `date` — the source of truth
-/// the dashboard renders from (the whole day, not just this turn's rows). Columns
+/// the totals line reads (the whole day, not just this turn's rows). Columns
 /// are addressed by header NAME; a blank `Calories` is derived from
 /// `Cal_per_100g × Grams / 100` (the generator's own rule); blank macros count as 0.
 /// A row that fails to parse is skipped, never fatal.
@@ -1709,6 +1719,8 @@ pub fn sum_food_csv_for_date(food_csv: &str, date: &str) -> MacroTotals {
         t.carbs_g += num(&cell(&rec, "Carbs_g"));
         t.fat_g += num(&cell(&rec, "Fat_g"));
         t.fiber_g += num(&cell(&rec, "Fiber_g"));
+        t.satfat_g += num(&cell(&rec, "SatFat_g"));
+        t.sodium_mg += num(&cell(&rec, "Sodium_mg"));
     }
     t
 }
@@ -1722,6 +1734,8 @@ pub fn sum_food_macros(rows: &[FoodEntry]) -> MacroTotals {
         t.carbs_g += r.carbs_g.unwrap_or(0.0);
         t.fat_g += r.fat_g.unwrap_or(0.0);
         t.fiber_g += r.fiber_g.unwrap_or(0.0);
+        t.satfat_g += r.satfat_g.unwrap_or(0.0);
+        t.sodium_mg += r.sodium_mg.unwrap_or(0.0);
     }
     t
 }
@@ -1762,207 +1776,271 @@ pub fn targets_for_date(targets_csv: &str, date: &str) -> DietTargets {
                 carbs: get(&rec, "Carb_Target_g"),
                 fat: get(&rec, "Fat_Target_g"),
                 fiber: get(&rec, "Fiber_Target_g"),
+                ..DietTargets::default()
             };
         }
     }
     DietTargets::default()
 }
 
-const BAR_WIDTH: usize = 20;
-
-/// Fat window edges (grams), mirroring the app's `DietSemantics`: hormonal floor,
-/// working cap. The 70g hard cap is a firmer line the wording notes but the bar
-/// doesn't need its own edge for.
-const FAT_FLOOR_G: f64 = 50.0;
-const FAT_CAP_G: f64 = 65.0;
-
-/// A 20-char progress bar filled proportionally to `pct` (0–100+, clamped to 100).
-/// Deliberately MONOCHROME — a single meaning, "how far along", carried by one fill
-/// glyph. The old pass/fail color emoji made one color mean three different things
-/// across rows (too-low on a floor, too-high on a ceiling, both on the fat window);
-/// the status now lives in the trailing words, so the bar can stay neutral.
-fn progress_bar(pct: f64) -> String {
-    let filled = ((pct / 100.0) * BAR_WIDTH as f64)
-        .round()
-        .clamp(0.0, BAR_WIDTH as f64) as usize;
-    let mut s = String::new();
-    for _ in 0..filled {
-        s.push('█');
+/// The day's targets from the regenerated `vault/diet-today.js` — the file the vault skill
+/// reads for its own totals line, rewritten by the hooks this pipeline has just run.
+/// `None` when it cannot be parsed or describes a day other than `date`; the caller then
+/// falls back to `daily-targets.csv`.
+///
+/// `targets.calories` there is already the exercise-ADJUSTED target, computed by the
+/// generator, and the line never recomputes the formula. The add-back is that target minus
+/// `base` (the day's `calorie-base.csv` figure), named only when exercise is logged and the
+/// day is a normal one: a carb-load or recovery day moves the target for reasons that are
+/// not an add-back, and calling the difference one would be wrong.
+pub fn targets_from_diet_today(
+    content: &str,
+    date: &str,
+    base: Option<f64>,
+) -> Option<DietTargets> {
+    let v = crate::diet::extract_js_literal(content).ok()?;
+    if v.get("date").and_then(Value::as_str) != Some(date) {
+        return None;
     }
-    for _ in 0..(BAR_WIDTH - filled) {
-        s.push('░');
+    let t = v.get("targets").filter(|t| t.is_object())?;
+    let num = |k: &str| t.get(k).and_then(Value::as_f64);
+    let cal = num("calories");
+    let exercise_logged = v
+        .get("exercise")
+        .and_then(Value::as_array)
+        .is_some_and(|a| !a.is_empty());
+    let normal_day = v
+        .get("dayStyle")
+        .and_then(Value::as_str)
+        .is_none_or(|s| s == "normal");
+    let add_back = match (cal, base) {
+        (Some(c), Some(b)) if exercise_logged && normal_day && c > b => Some(c - b),
+        _ => None,
+    };
+    Some(DietTargets {
+        cal,
+        add_back,
+        protein: num("protein"),
+        carbs: num("carbsBase").or_else(|| num("carbs")),
+        fat: num("fat"),
+        fiber: num("fiber"),
+        satfat: num("satFat"),
+        sodium: num("sodium"),
+    })
+}
+
+/// The day's calorie base from `calorie-base.csv` (`Start,End,Base`; a blank `End` is
+/// open-ended): the target before any exercise is added back.
+pub fn calorie_base_for_date(csv_content: &str, date: &str) -> Option<f64> {
+    let mut rdr = csv::ReaderBuilder::new()
+        .has_headers(true)
+        .flexible(true)
+        .from_reader(csv_content.as_bytes());
+    let idx: HashMap<String, usize> = rdr
+        .headers()
+        .ok()?
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (s.trim().to_string(), i))
+        .collect();
+    let (start, end, base) = (*idx.get("Start")?, *idx.get("End")?, *idx.get("Base")?);
+    rdr.records().flatten().find_map(|rec| {
+        let s = rec.get(start)?.trim();
+        let e = rec.get(end).unwrap_or("").trim();
+        if s.is_empty() || date < s || (!e.is_empty() && date > e) {
+            return None;
+        }
+        rec.get(base)?.trim().parse::<f64>().ok()
+    })
+}
+
+/// Before roughly midday the calorie segment is the whole line: everything is low in the
+/// morning, and saying so is noise.
+const LINE_MIDDAY_MIN: u32 = 12 * 60;
+/// A floor can be BEHIND only from 16:00 — an unfilled floor mid-day is expected.
+const LINE_AFTERNOON_MIN: u32 = 16 * 60;
+/// A floor this entry carried roughly a quarter or more of, in one go, has MOVED.
+const FLOOR_MOVED_SHARE: f64 = 0.25;
+/// A floor under about 70% of its target after 16:00 is behind.
+const FLOOR_BEHIND_SHARE: f64 = 0.70;
+/// A ceiling is CLOSE from 90% of its limit, and past it above 100%.
+const CEILING_CLOSE_SHARE: f64 = 0.90;
+
+/// The reply to a local log: ONE plain totals line, the shape the vault's `diet-logging`
+/// skill writes. No bars, no colors, no flags, no per-nutrient grid.
+///
+///   * Calories, always and first: intake against target, then what is left (or over),
+///     with the exercise add-back in parentheses when there is one to name.
+///   * Then zero to two of protein, carbs and fiber, and nothing else. A floor earns a
+///     place if THIS entry carried about a quarter of its target or more, or — after 16:00
+///     only — if it is the one floor furthest behind and under about 70%. Before midday
+///     there are no floors at all.
+///   * A ceiling (sat fat, sodium) appears at any hour, but only when this entry pushed it
+///     into "close" or past it.
+///
+/// The one or two written observations the skill adds after this line need judgement and
+/// belong to the model path; this pipeline answers with the line alone.
+///
+/// `day` is the whole day's totals including this entry, `entry` this entry's own, and
+/// `minutes` how far into the diet day the reply is written ([`line_clock_minutes`]).
+pub fn render_totals_line(
+    day: &MacroTotals,
+    entry: &MacroTotals,
+    targets: &DietTargets,
+    minutes: u32,
+) -> String {
+    let mut parts = vec![calorie_segment(day.kcal, targets)];
+    if minutes >= LINE_MIDDAY_MIN {
+        parts.extend(floor_segments(
+            day,
+            entry,
+            targets,
+            minutes >= LINE_AFTERNOON_MIN,
+        ));
+    }
+    parts.extend(ceiling_segments(day, entry, targets));
+    parts.join(", ")
+}
+
+/// `1,240 of 2,181 kcal, 941 left (481 added back)` — or just `1,240 kcal` with no target.
+fn calorie_segment(kcal: f64, targets: &DietTargets) -> String {
+    let intake = kcal.round();
+    let Some(target) = targets.cal.filter(|t| *t > 0.0).map(f64::round) else {
+        return format!("{} kcal", thousands(intake));
+    };
+    let rest = if intake <= target {
+        format!("{} left", thousands(target - intake))
+    } else {
+        format!("{} over", thousands(intake - target))
+    };
+    let mut s = format!(
+        "{} of {} kcal, {rest}",
+        thousands(intake),
+        thousands(target)
+    );
+    if let Some(added) = targets.add_back.map(f64::round).filter(|a| *a > 0.0) {
+        s.push_str(&format!(" ({} added back)", thousands(added)));
     }
     s
 }
 
-/// The kind status word for a FLOOR metric — action-first and never punitive, mirroring
-/// the app's `floorRemaining`. Reached: "there — nice"; short: "Xg to go".
-fn floor_word(intake: f64, target: f64) -> String {
-    if intake >= target {
-        "there — nice".to_string()
-    } else {
-        format!("{}g to go", fmt_g((target - intake).round()))
-    }
-}
+/// The floors worth naming: those this entry MOVED (largest share first), then — in the
+/// afternoon, with room left — the single floor furthest behind. At most two, rendered in
+/// the fixed protein, carbs, fiber order.
+fn floor_segments(
+    day: &MacroTotals,
+    entry: &MacroTotals,
+    targets: &DietTargets,
+    afternoon: bool,
+) -> Vec<String> {
+    let floors: Vec<(&str, f64, f64, f64)> = [
+        ("protein", day.protein_g, entry.protein_g, targets.protein),
+        ("carbs", day.carbs_g, entry.carbs_g, targets.carbs),
+        ("fiber", day.fiber_g, entry.fiber_g, targets.fiber),
+    ]
+    .into_iter()
+    .filter_map(|(name, d, e, t)| t.filter(|t| *t > 0.0).map(|t| (name, d, e, t)))
+    .collect();
 
-/// The kind status word for the CALORIE ceiling, mirroring `ceilingRemaining`: headroom
-/// framed as room, not a limit — "room for X" / "right on target" / "X over".
-fn ceiling_word(intake: f64, target: f64) -> String {
-    if intake < target {
-        format!("room for {}", fmt_g((target - intake).round()))
-    } else if intake > target {
-        format!("{} over", fmt_g((intake - target).round()))
-    } else {
-        "right on target".to_string()
-    }
-}
+    let mut moved: Vec<(usize, f64)> = floors
+        .iter()
+        .enumerate()
+        .map(|(i, (_, _, e, t))| (i, e / t))
+        .filter(|(_, share)| *share >= FLOOR_MOVED_SHARE)
+        .collect();
+    moved.sort_by(|a, b| b.1.total_cmp(&a.1));
+    let mut picked: Vec<usize> = moved.into_iter().take(2).map(|(i, _)| i).collect();
 
-/// The kind status word for the FAT window, mirroring `fatWindowRemaining`: direction in
-/// words, no "cap" language — "Xg to the 50g floor" / "in range" / "Xg above the range".
-fn fat_word(grams: f64) -> String {
-    if grams < FAT_FLOOR_G {
-        format!("{}g to the 50g floor", fmt_g((FAT_FLOOR_G - grams).round()))
-    } else if grams <= FAT_CAP_G {
-        "in range".to_string()
-    } else {
-        format!("{}g above the range", fmt_g((grams - FAT_CAP_G).round()))
-    }
-}
-
-fn pct_of(intake: f64, target: f64) -> f64 {
-    if target > 0.0 {
-        intake / target * 100.0
-    } else {
-        0.0
-    }
-}
-
-/// The plain summary line that LEADS the dashboard — "how am I doing / what would help
-/// next" — the same supportive-coach opening the app's Health tab uses. Deterministic and
-/// gentle: it names the one or two floors most worth topping up, flags calories only when
-/// genuinely over, and otherwise says the day's on track. Empty string when there are no
-/// targets to judge against (the bars render as plain totals then).
-fn summary_line(totals: &MacroTotals, targets: &DietTargets) -> String {
-    // Genuinely-short floors (below 80% of target — the app's "basically there" cutoff),
-    // worst-first, named for the "what would help next" line.
-    let mut shorts: Vec<(&str, f64)> = Vec::new();
-    for (label, intake, target) in [
-        ("protein", totals.protein_g, targets.protein),
-        ("carbs", totals.carbs_g, targets.carbs),
-        ("fiber", totals.fiber_g, targets.fiber),
-    ] {
-        if let Some(t) = target {
-            if t > 0.0 && intake < 0.8 * t {
-                shorts.push((label, (t - intake) / t));
+    if afternoon && picked.len() < 2 {
+        let behind = floors
+            .iter()
+            .enumerate()
+            .map(|(i, (_, d, _, t))| (i, d / t))
+            .filter(|(_, ratio)| *ratio < FLOOR_BEHIND_SHARE)
+            .min_by(|a, b| a.1.total_cmp(&b.1));
+        if let Some((i, _)) = behind {
+            if !picked.contains(&i) {
+                picked.push(i);
             }
         }
     }
-    // Fat below its 50g floor is a floor-like concern too.
-    if targets.fat.is_some() && totals.fat_g < FAT_FLOOR_G {
-        shorts.push(("fat", (FAT_FLOOR_G - totals.fat_g) / FAT_FLOOR_G));
-    }
-    shorts.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    picked.sort_unstable();
+    picked
+        .into_iter()
+        .map(|i| {
+            let (name, d, _, t) = floors[i];
+            format!("{name} {} of {}", thousands(d), thousands(t))
+        })
+        .collect()
+}
 
-    let calories_over = matches!(targets.cal, Some(t) if t > 0.0 && totals.kcal > t);
+/// The ceilings this entry pushed into "close" (≥ 90%) or past (> 100%). One already in a
+/// band before the entry is not named again unless the entry moved it a band further.
+/// Alcohol is a ceiling the skill names too, but `food-log.csv` has no alcohol column, so
+/// nothing here can see it.
+fn ceiling_segments(day: &MacroTotals, entry: &MacroTotals, targets: &DietTargets) -> Vec<String> {
+    [
+        ("sat fat", day.satfat_g, entry.satfat_g, targets.satfat),
+        ("sodium", day.sodium_mg, entry.sodium_mg, targets.sodium),
+    ]
+    .into_iter()
+    .filter_map(|(name, d, e, t)| {
+        let t = t.filter(|t| *t > 0.0)?;
+        (e > 0.0 && ceiling_band(d, t) > ceiling_band(d - e, t))
+            .then(|| format!("{name} {} of {}", thousands(d), thousands(t)))
+    })
+    .collect()
+}
 
-    if calories_over {
-        return "A little over on calories today — easy to ease back tomorrow.".to_string();
-    }
-    match shorts.len() {
-        0 if targets.cal.is_some() || targets.protein.is_some() => {
-            "You're on track — nicely balanced.".to_string()
-        }
-        0 => String::new(),
-        1 => format!(
-            "Coming together. A bit more {} rounds out the day.",
-            shorts[0].0
-        ),
-        _ => format!(
-            "Coming together. Some {} and some {} rounds out the day.",
-            shorts[0].0, shorts[1].0
-        ),
+/// 0 = comfortably under, 1 = close, 2 = past.
+fn ceiling_band(value: f64, limit: f64) -> u8 {
+    if value > limit {
+        2
+    } else if value >= CEILING_CLOSE_SHARE * limit {
+        1
+    } else {
+        0
     }
 }
 
-/// Render the deterministic ASCII dashboard for `date` from the day's totals and targets.
-/// A plain-language summary leads; then one row per metric — its goal glyph for direction
-/// (≤ ceiling, ≥ floor, ↕ window), a neutral progress bar, the numbers, and a kind status
-/// word. Color no longer carries meaning (the words do), so the same green that meant
-/// "too low" on a floor and "too high" on a ceiling is gone. When a target is absent the
-/// metric renders its plain total. The child never writes this — it is derived from the
-/// CSVs, and it tells the same story as the app's Health tab.
-pub fn render_diet_dashboard(date: &str, totals: &MacroTotals, targets: &DietTargets) -> String {
-    let mut out = format!("=== Diet — {date} ===\n\n");
-
-    let summary = summary_line(totals, targets);
-    if !summary.is_empty() {
-        out.push_str(&summary);
-        out.push_str("\n\n");
+/// A whole number with thousands separators, the way the line reads: `2,181`.
+fn thousands(n: f64) -> String {
+    let n = n.round() as i64;
+    let digits = n.unsigned_abs().to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3 + 1);
+    if n < 0 {
+        out.push('-');
     }
-
-    // Calories — a ceiling metric (round to whole numbers, like the generator).
-    match targets.cal {
-        Some(t) => {
-            let pct = pct_of(totals.kcal, t);
-            out.push_str(&format!(
-                "Cal      ≤ {}   {}  {} / {}   {}\n",
-                t.round() as i64,
-                progress_bar(pct),
-                totals.kcal.round() as i64,
-                t.round() as i64,
-                ceiling_word(totals.kcal, t),
-            ));
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
         }
-        None => out.push_str(&format!(
-            "Cal          {} kcal\n",
-            totals.kcal.round() as i64
-        )),
+        out.push(c);
     }
-
-    // Floor metrics: protein, carbs, fiber.
-    for (label, intake, target) in [
-        ("Protein", totals.protein_g, targets.protein),
-        ("Carbs", totals.carbs_g, targets.carbs),
-        ("Fiber", totals.fiber_g, targets.fiber),
-    ] {
-        match target {
-            Some(t) => {
-                let pct = pct_of(intake, t);
-                out.push_str(&format!(
-                    "{label:<8} ≥ {}   {}  {} / {}g   {}\n",
-                    fmt_g(t),
-                    progress_bar(pct),
-                    fmt_g(intake),
-                    fmt_g(t),
-                    floor_word(intake, t),
-                ));
-            }
-            None => out.push_str(&format!("{label:<8}     {}g\n", fmt_g(intake))),
-        }
-    }
-
-    // Fat — a window metric. Direction (too low vs too high) is in the words, never color.
-    match targets.fat {
-        Some(t) => {
-            let pct = pct_of(totals.fat_g, t);
-            out.push_str(&format!(
-                "Fat      ↕ 50–65 {}  {} / {}g   {}\n",
-                progress_bar(pct),
-                fmt_g(totals.fat_g),
-                fmt_g(t),
-                fat_word(totals.fat_g),
-            ));
-        }
-        None => out.push_str(&format!("Fat          {}g\n", fmt_g(totals.fat_g))),
-    }
-
     out
 }
 
-/// Render a gram value like the vault does: whole numbers without a trailing `.0`,
-/// one decimal otherwise.
-fn fmt_g(n: f64) -> String {
-    format!("{n}")
+/// How far into `date`'s diet day `now` falls, in minutes from 00:00. The diet day runs
+/// 04:00 to 04:00, so 01:30 reads as 25:30 — late in the day it belongs to, not early in
+/// the next — and a log that lands on a day that has already ended reads as its end. An
+/// unreadable `now` reads as the start of the day: calories alone, the smallest claim.
+pub fn line_clock_minutes(date: &str, now: &str, zone: &SchedulerZone) -> u32 {
+    let (Some(today), Some((h, m))) = (
+        diet_day_of(now, zone),
+        clock_hhmm_in(now, zone).and_then(|c| parse_hhmm(&c)),
+    ) else {
+        return 0;
+    };
+    let start = DIET_DAY_START_HOUR as u32;
+    if date < today.as_str() {
+        return (24 + start) * 60;
+    }
+    let minutes = h * 60 + m;
+    if h < start {
+        minutes + 24 * 60
+    } else {
+        minutes
+    }
 }
 
 // ---- Atomic append + rollback ----------------------------------------------
@@ -2499,7 +2577,7 @@ fn wall_clock_on(
 /// its `eaten_at` cannot disagree, so the CSV `Date`/`Time`/`TZ` triple and the mirror's
 /// `consumedAt` are three renderings of one fact instead of three independent claims.
 /// Runs at APPEND, before rows are built, so the filled instant flows through the normal
-/// row + mirror + dashboard path.
+/// row + mirror + totals-line path.
 pub fn stamp_entry_clocks(entries: &mut [DietEntry], reference: &str, zone: &SchedulerZone) {
     for e in entries.iter_mut() {
         let (eaten_at, time) = match e {
@@ -3045,17 +3123,14 @@ impl MicroStats {
 
 /// The outcome of the local pipeline for one turn.
 pub enum DietPipelineOutcome {
-    /// Logged locally: the ASCII dashboard reply plus the derived directives (mirror).
+    /// Logged locally: the totals-line reply plus the derived directives (mirror).
     Logged {
-        dashboard: String,
+        reply: String,
         directives: Directives,
         micros: MicroStats,
     },
     /// Logged locally but the mirror was omitted (rung 5): CSV committed, no directive.
-    LoggedNoMirror {
-        dashboard: String,
-        micros: MicroStats,
-    },
+    LoggedNoMirror { reply: String, micros: MicroStats },
     /// Fall through to the hosted turn at the given rung (2–4). `reason` carries the
     /// machine-readable [`Rung2Reason`] on a rung-2 fall-through (the only rung with a
     /// reason taxonomy); `None` for rungs 3–4.
@@ -3323,7 +3398,7 @@ pub async fn run_diet_pipeline(
     // Stage 2b — micronutrient completion. Runs AFTER the correction pass (so a
     // corrected macro is already in place and a filled cell is never re-filled) and
     // BEFORE rows are built, so a completed value flows through the normal row +
-    // mirror + dashboard path. Degrade-only: with the flag off, an errored/timed-out
+    // mirror + totals-line path. Degrade-only: with the flag off, an errored/timed-out
     // verify (which never reaches here), or an unusable completion block, the rows are
     // appended EXACTLY as the extract produced them and the reason code records why.
     let mut any_micro_malformed = false;
@@ -3417,18 +3492,43 @@ pub async fn run_diet_pipeline(
         };
     }
 
-    // Stage 4 — dashboard + mirror. Both are DERIVED from the committed CSVs: the
-    // dashboard reflects the whole DAY's totals (re-read from food-log.csv), while
-    // the mirror is per just-appended item.
+    // Stage 4 — totals line + mirror. Both are DERIVED from the committed files: the line
+    // reads the whole DAY's totals (re-read from food-log.csv) against the targets the
+    // hooks just regenerated, while the mirror is per just-appended item.
     let totals = std::fs::read_to_string(logs_dir.join("food-log.csv"))
         .ok()
         .map(|c| sum_food_csv_for_date(&c, &date))
         .unwrap_or_else(|| sum_food_macros(&food));
-    let targets = std::fs::read_to_string(logs_dir.join("daily-targets.csv"))
+    // What THIS entry carried on the day the line is about — the "did it move a floor" and
+    // "did it push a ceiling" tests read it. A turn that spans two days contributes only
+    // its rows for this one.
+    let entry_food: Vec<FoodEntry> = verified
+        .iter()
+        .filter(|e| entry_diet_day(e, zone, &fallback_day) == date)
+        .filter_map(|e| match e {
+            DietEntry::Food(f) => Some(f.clone()),
+            _ => None,
+        })
+        .collect();
+    let entry_totals = sum_food_macros(&entry_food);
+    let calorie_base = std::fs::read_to_string(logs_dir.join("calorie-base.csv"))
         .ok()
-        .map(|c| targets_for_date(&c, &date))
-        .unwrap_or_default();
-    let dashboard = render_diet_dashboard(&date, &totals, &targets);
+        .and_then(|c| calorie_base_for_date(&c, &date));
+    let targets = std::fs::read_to_string(
+        vault
+            .join(crate::config::VAULT_SUBDIR)
+            .join("diet-today.js"),
+    )
+    .ok()
+    .and_then(|c| targets_from_diet_today(&c, &date, calorie_base))
+    .or_else(|| {
+        std::fs::read_to_string(logs_dir.join("daily-targets.csv"))
+            .ok()
+            .map(|c| targets_for_date(&c, &date))
+    })
+    .unwrap_or_default();
+    let minutes = line_clock_minutes(&date, &now_rfc3339_in(zone), zone);
+    let reply = render_totals_line(&totals, &entry_totals, &targets, minutes);
 
     // The turn's nutrient-completeness accounting over the rows just appended. Emitted
     // on the provenance line and threaded to the metrics record; the audit aggregates it.
@@ -3456,7 +3556,7 @@ pub async fn run_diet_pipeline(
         Ok(Some(meal_log)) => {
             prov_local(None, true);
             DietPipelineOutcome::Logged {
-                dashboard,
+                reply,
                 directives: Directives {
                     needs_health: None,
                     needs_location: None,
@@ -3470,7 +3570,7 @@ pub async fn run_diet_pipeline(
             // local success, not a failure.
             prov_local(None, false);
             DietPipelineOutcome::Logged {
-                dashboard,
+                reply,
                 directives: Directives {
                     needs_health: None,
                     needs_location: None,
@@ -3484,7 +3584,7 @@ pub async fn run_diet_pipeline(
             // omit the mirror (matches today's malformed-directive fail-safe).
             eprintln!("jesse-bridge: diet mirror build failed: {e}");
             prov_local(Some(5), false);
-            DietPipelineOutcome::LoggedNoMirror { dashboard, micros }
+            DietPipelineOutcome::LoggedNoMirror { reply, micros }
         }
     }
 }
@@ -4657,7 +4757,7 @@ mod tests {
     fn unstated_time_flows_through_row_and_mirror_as_received_at() {
         // End to end at the append layer: an unstated-time item, once stamped, carries
         // received-at into BOTH the CSV Time column and the derived mirror `consumedAt`
-        // — the normal row path, so dashboard re-derivation is unchanged by the fill.
+        // — the normal row path, so totals re-derivation is unchanged by the fill.
         let mut entries = parse_diet_entries(
             r#"{"entries":[{"kind":"food","name":"almond","meal":"Snack","kcal":7}]}"#,
         )
@@ -5867,45 +5967,256 @@ mod tests {
     }
 
     #[test]
-    fn dashboard_renders_totals_and_bars_from_fixture_csv() {
-        // Render straight from a food-log.csv fixture — the source of truth.
+    fn sums_the_two_ceilings_from_csv_counting_a_blank_as_nothing() {
         let csv = format!(
             "{}\n\
-             2026-07-13,Breakfast,Eggs,3,ea,,,210,10,15,1,,08:00,Breakfast,0\n\
-             2026-07-13,Snack,Banana,1,ea,,,105,10,0,27,,10:00,Snack,3\n",
+             2026-07-13,Lunch,Soup,1,bowl,,,400,20,12,50,,13:00,Lunch,6,900,4\n\
+             2026-07-13,Snack,Crisps,1,bag,,,150,2,9,15,,16:00,Snack,1,,\n",
             food_log_header()
         );
-        let totals = sum_food_csv_for_date(&csv, "2026-07-13");
-        assert_eq!(totals.kcal, 315.0);
-        assert_eq!(totals.protein_g, 20.0); // 10 + 10
-        let t = targets_for_date(TARGETS_CSV, "2026-07-13");
-        let dash = render_diet_dashboard("2026-07-13", &totals, &t);
-        assert!(dash.contains("2026-07-13"), "header carries the date");
-        assert!(
-            dash.contains("315") && dash.contains("2100"),
-            "cal intake / target: {dash}"
+        let t = sum_food_csv_for_date(&csv, "2026-07-13");
+        assert_eq!(t.sodium_mg, 900.0, "the blank sodium adds nothing");
+        assert_eq!(t.satfat_g, 4.0);
+    }
+
+    fn day_totals(kcal: f64, protein_g: f64, carbs_g: f64, fiber_g: f64) -> MacroTotals {
+        MacroTotals {
+            kcal,
+            protein_g,
+            carbs_g,
+            fiber_g,
+            ..MacroTotals::default()
+        }
+    }
+
+    fn line_targets(cal: f64) -> DietTargets {
+        DietTargets {
+            cal: Some(cal),
+            protein: Some(140.0),
+            carbs: Some(139.0),
+            fiber: Some(38.0),
+            satfat: Some(22.0),
+            sodium: Some(2000.0),
+            ..DietTargets::default()
+        }
+    }
+
+    #[test]
+    fn before_midday_the_line_is_calories_alone() {
+        // A breakfast that carried half the protein target still says only calories:
+        // everything is low in the morning.
+        let breakfast = day_totals(619.0, 70.0, 40.0, 5.0);
+        let line = render_totals_line(&breakfast, &breakfast, &line_targets(1700.0), 9 * 60);
+        assert_eq!(line, "619 of 1,700 kcal, 1,081 left");
+    }
+
+    #[test]
+    fn a_floor_this_entry_moved_follows_calories_and_the_add_back() {
+        let mut t = line_targets(2181.0);
+        t.add_back = Some(481.0);
+        // 40 g of protein is over a quarter of 140; 30 g of carbs and 4 g of fiber are not.
+        let line = render_totals_line(
+            &day_totals(1240.0, 96.0, 120.0, 20.0),
+            &day_totals(520.0, 40.0, 30.0, 4.0),
+            &t,
+            13 * 60,
         );
-        assert!(dash.contains("190"), "protein target shown");
-        // Words-first, single-meaning: a neutral progress bar, never pass/fail color emoji.
-        assert!(
-            dash.contains('█') && !dash.contains("🟩") && !dash.contains("🟥"),
-            "bars are monochrome, no color emoji: {dash}"
+        assert_eq!(
+            line,
+            "1,240 of 2,181 kcal, 941 left (481 added back), protein 96 of 140"
         );
-        // Calories comfortably under the ceiling reads as room, not a grade.
-        assert!(
-            dash.contains("room for"),
-            "calorie headroom framed kindly: {dash}"
+    }
+
+    #[test]
+    fn after_four_only_the_floor_furthest_behind_is_named() {
+        // Protein at 64% and fiber at 50% are both behind; only fiber, the further, is named.
+        let day = day_totals(1690.0, 90.0, 120.0, 19.0);
+        let snack = day_totals(150.0, 5.0, 10.0, 1.0);
+        let t = line_targets(1700.0);
+        assert_eq!(
+            render_totals_line(&day, &snack, &t, 18 * 60),
+            "1,690 of 1,700 kcal, 10 left, fiber 19 of 38"
         );
-        // Floors far short read as "to go" — kind and action-first, never "need X".
-        assert!(
-            dash.contains("to go") && !dash.contains("need "),
-            "floor shortfall is action-first: {dash}"
+        // The same day at 15:00 is behind on nothing yet.
+        assert_eq!(
+            render_totals_line(&day, &snack, &t, 15 * 60),
+            "1,690 of 1,700 kcal, 10 left"
         );
-        // A leading plain summary answers "how am I doing / what would help next".
-        assert!(
-            dash.contains("Coming together") || dash.contains("on track"),
-            "a plain summary leads the dashboard: {dash}"
+    }
+
+    #[test]
+    fn never_more_than_two_floors() {
+        // One meal that carried over a quarter of every floor (36%, 43%, 50%): the two
+        // largest shares are named, in the fixed protein, carbs, fiber order.
+        let meal = day_totals(900.0, 50.0, 60.0, 19.0);
+        assert_eq!(
+            render_totals_line(&meal, &meal, &line_targets(1700.0), 13 * 60),
+            "900 of 1,700 kcal, 800 left, carbs 60 of 139, fiber 19 of 38"
         );
+    }
+
+    #[test]
+    fn a_ceiling_appears_only_when_this_entry_pushed_it() {
+        let t = line_targets(1700.0);
+        let mut day = day_totals(1500.0, 60.0, 100.0, 10.0);
+        let mut entry = day_totals(500.0, 10.0, 20.0, 2.0);
+        // 1,250 (62%) → 1,850 (92%): pushed close, so named — even at 09:00.
+        day.sodium_mg = 1850.0;
+        entry.sodium_mg = 600.0;
+        assert_eq!(
+            render_totals_line(&day, &entry, &t, 9 * 60),
+            "1,500 of 1,700 kcal, 200 left, sodium 1,850 of 2,000"
+        );
+        // Already close before this entry and still only close: not this entry's doing.
+        entry.sodium_mg = 50.0;
+        assert_eq!(
+            render_totals_line(&day, &entry, &t, 9 * 60),
+            "1,500 of 1,700 kcal, 200 left"
+        );
+        // Close to past is a band further, so it is named.
+        day.satfat_g = 23.0;
+        entry.satfat_g = 3.0;
+        assert_eq!(
+            render_totals_line(&day, &entry, &t, 9 * 60),
+            "1,500 of 1,700 kcal, 200 left, sat fat 23 of 22"
+        );
+    }
+
+    #[test]
+    fn over_target_and_no_target_read_plainly() {
+        assert_eq!(
+            render_totals_line(
+                &day_totals(1850.0, 0.0, 0.0, 0.0),
+                &MacroTotals::default(),
+                &line_targets(1700.0),
+                9 * 60
+            ),
+            "1,850 of 1,700 kcal, 150 over"
+        );
+        // No targets at all: nothing to judge a floor against, so calories alone.
+        assert_eq!(
+            render_totals_line(
+                &day_totals(1240.0, 96.0, 0.0, 0.0),
+                &day_totals(300.0, 50.0, 0.0, 0.0),
+                &DietTargets::default(),
+                18 * 60
+            ),
+            "1,240 kcal"
+        );
+    }
+
+    #[test]
+    fn the_reply_is_one_plain_line_with_no_dashboard_in_it() {
+        let mut t = line_targets(2320.0);
+        t.add_back = Some(620.0);
+        let line = render_totals_line(
+            &day_totals(1987.0, 118.0, 210.0, 42.0),
+            &day_totals(706.0, 32.0, 100.0, 22.6),
+            &t,
+            18 * 60,
+        );
+        assert!(!line.contains('\n'), "{line}");
+        for glyph in ['█', '░', '≤', '≥', '↕', '=', '🟩', '🟥'] {
+            assert!(!line.contains(glyph), "{glyph} in {line}");
+        }
+    }
+
+    const DIET_TODAY_JS: &str = r#"// Diet tracking data — rewritten on each food/exercise log
+window.DIET_TODAY = {
+  date: "2026-09-10",
+  dayStyle: "normal",
+  exercise: [
+    { type: "Swim", time: "08:52", desc: "Morning swim", distance: 1.1, calories: 588 }
+  ],
+  targets: { calories: 1921, protein: 140, fat: 65, carbs: 194, carbsBase: 139, fiber: 38, sodium: 2000, satFat: 22, selenium: {"floor":55,"ceiling":300} },
+};
+"#;
+
+    #[test]
+    fn targets_come_from_the_regenerated_day_file() {
+        let t = targets_from_diet_today(DIET_TODAY_JS, "2026-09-10", Some(1700.0)).unwrap();
+        assert_eq!(
+            t.cal,
+            Some(1921.0),
+            "the ADJUSTED target, as the generator wrote it"
+        );
+        assert_eq!(t.add_back, Some(221.0));
+        assert_eq!(
+            t.carbs,
+            Some(139.0),
+            "the carb floor, not the fuel band above it"
+        );
+        assert_eq!(
+            (t.protein, t.fiber, t.satfat, t.sodium),
+            (Some(140.0), Some(38.0), Some(22.0), Some(2000.0))
+        );
+        // A file describing another day is not this day's targets.
+        assert_eq!(
+            targets_from_diet_today(DIET_TODAY_JS, "2026-09-11", Some(1700.0)),
+            None
+        );
+        // No base, no exercise, or not a normal day: no add-back to name.
+        assert_eq!(
+            targets_from_diet_today(DIET_TODAY_JS, "2026-09-10", None)
+                .unwrap()
+                .add_back,
+            None
+        );
+        let rest = DIET_TODAY_JS.replace(
+            r#"{ type: "Swim", time: "08:52", desc: "Morning swim", distance: 1.1, calories: 588 }"#,
+            "",
+        );
+        assert_eq!(
+            targets_from_diet_today(&rest, "2026-09-10", Some(1700.0))
+                .unwrap()
+                .add_back,
+            None
+        );
+        let load =
+            DIET_TODAY_JS.replace(r#"dayStyle: "normal""#, r#"dayStyle: "carb-load-training""#);
+        assert_eq!(
+            targets_from_diet_today(&load, "2026-09-10", Some(1700.0))
+                .unwrap()
+                .add_back,
+            None
+        );
+    }
+
+    #[test]
+    fn calorie_base_is_the_row_whose_range_holds_the_date() {
+        let csv = "Start,End,Base,Note\n\
+                   2026-06-03,2026-06-27,1700,Phase 2\n\
+                   2026-08-15,2026-09-07,2300,Maintenance\n\
+                   2026-09-08,,1700,Phase 2 resumes\n";
+        assert_eq!(calorie_base_for_date(csv, "2026-09-01"), Some(2300.0));
+        assert_eq!(
+            calorie_base_for_date(csv, "2026-09-07"),
+            Some(2300.0),
+            "End is inclusive"
+        );
+        assert_eq!(
+            calorie_base_for_date(csv, "2026-09-10"),
+            Some(1700.0),
+            "a blank End is open"
+        );
+        assert_eq!(calorie_base_for_date(csv, "2026-07-01"), None, "a gap");
+    }
+
+    #[test]
+    fn the_line_clock_runs_on_the_diet_day() {
+        let z = test_zone();
+        assert_eq!(
+            line_clock_minutes("2026-09-10", "2026-09-10T09:15:00+02:00", &z),
+            9 * 60 + 15
+        );
+        // 01:30 on the 11th is still the 10th's diet day, and late in it.
+        assert_eq!(
+            line_clock_minutes("2026-09-10", "2026-09-11T01:30:00+02:00", &z),
+            25 * 60 + 30
+        );
+        // A log that lands on a day already over reads as its end.
+        assert!(line_clock_minutes("2026-09-09", "2026-09-10T09:15:00+02:00", &z) >= 16 * 60);
+        assert_eq!(line_clock_minutes("2026-09-10", "not a time", &z), 0);
     }
 
     // ---- Atomic append + rollback ------------------------------------------

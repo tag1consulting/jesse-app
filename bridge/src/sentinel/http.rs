@@ -124,7 +124,7 @@ async fn restart(
     let who = caller(connect.as_ref());
     let Some(slot) = ServiceSlot::from_slug(&service) else {
         // Audited by SLUG, never echoed back verbatim into the log line beyond the closed
-        // set check — the 404 body names the five that exist, which is the useful answer.
+        // set check — the 404 body names the four that exist, which is the useful answer.
         sen.audit(&who, "restart/?", "404 unknown service");
         return (
             StatusCode::NOT_FOUND,
@@ -349,13 +349,7 @@ mod tests {
         // guessing at labels.
         assert_eq!(
             body["services"],
-            json!([
-                "bridge",
-                "autocommit",
-                "lock-reaper",
-                "qmd-update",
-                "miniserve"
-            ])
+            json!(["bridge", "autocommit", "lock-reaper", "qmd-update"])
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

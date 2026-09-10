@@ -450,7 +450,6 @@ enum OpsAction: Equatable, Identifiable {
             .restart(.autocommit, label: labels["autocommit"] ?? "the autocommit job"),
             .restart(.lockReaper, label: labels["lock-reaper"] ?? "the lock reaper"),
             .restart(.qmdUpdate, label: labels["qmd-update"] ?? "the QMD index job"),
-            .restart(.miniserve, label: labels["miniserve"] ?? "the dashboard server"),
             .unlockGit,
             .prune,
         ]

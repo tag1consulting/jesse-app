@@ -551,7 +551,7 @@ async fn proxy_verbs_reject_an_id_the_schedule_does_not_have() {
 async fn status_degrades_a_hung_probe_to_unknown_and_still_answers() {
     let sc = Scratch::new("hung");
     let record = sc.path("launchctl.log");
-    // A `launchctl` that never returns. The services probe is the one that shells out five
+    // A `launchctl` that never returns. The services probe is the one that shells out four
     // times, so this is the worst case for the whole document.
     let launchctl = shim(&sc.path("launchctl"), &record, 0, 300);
     let (url, _) = start_fake_bridge(json!({ "jobs": [] })).await;
@@ -582,11 +582,74 @@ async fn status_degrades_a_hung_probe_to_unknown_and_still_answers() {
         body["sentinel"]["version"],
         json!(env!("CARGO_PKG_VERSION"))
     );
-    // The whole document lands in about one probe timeout, not five of them in series.
+    // The whole document lands in about one probe timeout, not four of them in series.
     assert!(
         took < Duration::from_secs(15),
         "status took {took:?} — a wedged probe must not hang the one request an operator has"
     );
+}
+
+/// The services check passes on a machine where the retired miniserve diet dashboard has been
+/// unloaded. Before its removal the probe asked `launchctl` about that label on every status
+/// read, so once the job was gone the check would have reported "one or more services are not
+/// loaded" forever. The shim answers for any label EXCEPT the retired one, exactly as launchd
+/// would after the job is booted out: the check must never ask about it, and must be green.
+#[tokio::test]
+async fn services_check_passes_with_only_the_four_remaining_jobs_loaded() {
+    use std::os::unix::fs::PermissionsExt;
+    let sc = Scratch::new("four");
+    let record = sc.path("launchctl.log");
+    let launchctl = sc.path("launchctl");
+    std::fs::write(
+        &launchctl,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n\
+             case \"$*\" in *miniserve*) echo 'Could not find service' >&2; exit 113;; esac\n\
+             printf '%s = {{\\n\\tstate = running\\n\\tpid = 4242\\n\\truns = 1\\n}}\\n' \"$2\"\n",
+            record.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&launchctl, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let (url, _) = start_fake_bridge(json!({ "jobs": [] })).await;
+    let mut cfg = config(&sc, &url);
+    cfg.bins.launchctl = Some(launchctl);
+    let sen = Sentinel::new(cfg, None);
+
+    let (status, body) = call(
+        sentinel_app(sen),
+        "GET",
+        "/sentinel/status",
+        Some(SENTINEL_TOKEN),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(body["services"]["ok"], json!(true), "{}", body["services"]);
+    assert_eq!(body["services"]["state"], json!("ok"));
+    assert_eq!(body["services"]["error"], Value::Null);
+    let mut slugs: Vec<&str> = body["services"]["detail"]
+        .as_object()
+        .expect("services detail is an object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    slugs.sort();
+    assert_eq!(
+        slugs,
+        vec!["autocommit", "bridge", "lock-reaper", "qmd-update"]
+    );
+    for slug in &slugs {
+        assert_eq!(
+            body["services"]["detail"][slug]["state"],
+            json!("running"),
+            "{slug}"
+        );
+    }
+    // Exactly one `launchctl print` per remaining slot, and none for the retired label.
+    let lines = recorded(&record);
+    assert_eq!(lines.len(), 4, "{lines:?}");
+    assert!(lines.iter().all(|l| l.starts_with("print gui/501/")));
+    assert!(!lines.iter().any(|l| l.contains("miniserve")), "{lines:?}");
 }
 
 /// Every restart verb addresses the CONFIGURED label for its slot, and nothing else.

@@ -14,6 +14,99 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [bridge 0.134.0] - 2026-09-10
+
+**The miniserve diet dashboard is retired, so the sentinel stops supervising it; and the local
+diet pipeline answers a log with one plain totals line instead of the ASCII macro dashboard.**
+
+### Removed — the `miniserve` service slot
+- **Root cause: the service was retired.** `com.jeremy.miniserve-diet-dashboard` served a
+  static HTML diet dashboard over the tailnet. Nothing consumes it any more: the app's Health
+  tab renders natively from `GET /jesse/diet`, and the HTML file is deleted. Its launchd job is
+  removed from the machine once this ships. This is not a failing check being silenced — with
+  the job gone, the services probe would have asked launchd about a label that no longer
+  exists on every status read and reported "one or more services are not loaded" forever.
+- `ServiceSlot::Miniserve` is gone and `SERVICE_SLOTS` has four entries.
+  `POST /sentinel/restart/miniserve` is now a `404` that lists the four, and
+  `JESSE_SENTINEL_LABEL_MINISERVE` is no longer read. The installer and the plist template stop
+  writing it. An installed sentinel plist that still carries the variable is harmless: nothing
+  reads it.
+- Every count of the services moves from five to four: code comments, the `404` vocabulary
+  test, the README verb and environment tables, and SECURITY.md.
+- **Tests.** `the_retired_dashboard_server_is_not_supervised` pins the slot table: no
+  `miniserve` slug, default label or env name. `services_check_passes_with_only_the_four_remaining_jobs_loaded`
+  drives `GET /sentinel/status` through a `launchctl` shim that answers every label except the
+  retired one, as launchd will once the job is booted out. It asserts the check is `ok`, reports
+  exactly the four slots, and never asked about miniserve.
+- **Live only through `scripts/install-sentinel.sh`.** The sentinel is not in the deploy set
+  (`deploy-bins.toml`), so a deploy from the Ops card does not replace it.
+
+### Changed — the local diet pipeline replies with a totals line
+- **Which logs reach it.** `run_diet_pipeline` runs for a Tell the diet gate matches, when
+  `offload_order` names a healthy model for diet extraction. The app's quick log button sends a
+  Tell. A quick log captured offline replays as a Tell with an `(eaten at …)` stamp. A typed or
+  spoken Tell is a Tell. All three go through the same gate. The pipeline is not a fallback for
+  when the model path is down: when the gate is off or the pipeline falls through, the hosted
+  turn answers. **On the current deployment `offload_order` is empty, so the gate is shut and
+  every log takes the hosted path.** The bridge log's last local diet reply is from early
+  August. The path is wired, tested and one config line from serving again, and it was the
+  last place still answering a log with the old dashboard.
+- `render_diet_dashboard` produced a header, a coaching sentence and a bar per macro. It is
+  replaced by `render_totals_line`, the shape the vault's `diet-logging` skill writes:
+  ```
+  619 of 1,700 kcal, 1,081 left
+  1,240 of 2,181 kcal, 941 left (481 added back), protein 96 of 140
+  ```
+  - **Calories come first, always:** intake against target, then what is left (or over). The
+    target comes from the regenerated `vault/diet-today.js`, the file the skill reads, where the
+    generator has already adjusted it for exercise. It falls back to `daily-targets.csv` only
+    when that file describes another day. When exercise is logged on a normal day, the add-back
+    follows in parentheses: that target minus the day's `calorie-base.csv` base.
+  - **Then zero to two of protein, carbs and fiber.** A floor qualifies if this entry carried
+    about a quarter of its target or more. After 16:00, the one floor furthest behind and under
+    70% also qualifies. Before midday the line is calories alone. The carb floor is
+    `carbsBase`, not the fuel band above it.
+  - **Sat fat and sodium** appear at any hour, but only when this entry pushed one into close
+    (≥ 90%) or past it.
+  - No bars, colors, flags or grid.
+- **The skill's one or two written observations are deliberately not generated.** They need
+  judgement about what was just eaten and belong to the model path. Canned sentences would only
+  approximate them. The totals line alone is this pipeline's complete output. The old
+  dashboard's lead sentence ("Coming together. A bit more fiber rounds out the day.") was that
+  kind of canned approximation, and it is gone with the bars.
+- **Known limits:**
+  - Alcohol is one of the skill's ceilings, but `food-log.csv` has no alcohol column, so the
+    line cannot see it.
+  - Carb-load days are not special-cased. The skill opens with `CARB-LOAD DAY N of M` and
+    treats calories as a window. Here the line reads the target the generator wrote and names
+    no add-back.
+  - A weigh-in-only log gets the totals line, where the skill would render the weight tracker.
+- `DietPipelineOutcome::{Logged, LoggedNoMirror}` carry `reply`, not `dashboard`.
+  `MacroTotals` gains sat fat and sodium, summed from the cells that are known.
+- **Tests** replace the dashboard test:
+  - calories alone before midday
+  - a moved floor with the add-back
+  - only the furthest-behind floor after 16:00
+  - never more than two floors
+  - ceilings only when this entry crossed a band
+  - over target, and no target
+  - one line with no dashboard glyphs
+  - targets from a `diet-today.js` fixture
+  - the calorie-base range lookup
+  - the diet-day clock (01:30 counts as late in the previous diet day)
+
+## [App 1.0 (128)] - 2026-09-10
+
+### Removed
+- **The Ops card's "Restart dashboard server" button.** Root cause: the service it restarted,
+  the miniserve diet dashboard, was retired. The Health tab renders natively from
+  `GET /jesse/diet`, the HTML it served is deleted, and bridge 0.134.0's sentinel no longer
+  accepts the `miniserve` slug, so the button could only fail. `SentinelClient.Service` and the
+  status card's slot order now list the four remaining services. `OpsServiceTableTests` pins
+  them and checks the button is gone.
+  - It is compiled locally with `swift build --build-tests`. The Swift suite runs through the
+    `ios-ci` dispatch.
+
 ## [App 1.0 (127)] - 2026-09-10
 
 **Two things the picker menu was supposed to show and did not, and the test layer that let

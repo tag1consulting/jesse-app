@@ -179,10 +179,9 @@ if [ -z "$AUTOCOMMIT_LOG" ] && [ -f "$AGENTS_DIR/$LABEL_AUTOCOMMIT.plist" ]; the
   AUTOCOMMIT_LOG="$(plist_value "$AGENTS_DIR/$LABEL_AUTOCOMMIT.plist" StandardOutPath)"
 fi
 
-# The remaining three labels follow the same namespace as the bridge's unless named.
+# The remaining two labels follow the same namespace as the bridge's unless named.
 LABEL_LOCK_REAPER="${LABEL_LOCK_REAPER:-${LABEL_BRIDGE%-bridge}-lock-reaper}"
 LABEL_QMD_UPDATE="${LABEL_QMD_UPDATE:-com.qmd.update}"
-LABEL_MINISERVE="${LABEL_MINISERVE:-${LABEL_BRIDGE%-bridge}-miniserve-diet-dashboard}"
 
 # ---- Remote deploy ---------------------------------------------------------------------
 
@@ -316,7 +315,6 @@ subst LABEL_BRIDGE       "$LABEL_BRIDGE"
 subst LABEL_AUTOCOMMIT   "$LABEL_AUTOCOMMIT"
 subst LABEL_LOCK_REAPER  "$LABEL_LOCK_REAPER"
 subst LABEL_QMD_UPDATE   "$LABEL_QMD_UPDATE"
-subst LABEL_MINISERVE    "$LABEL_MINISERVE"
 subst APNS_KEY_PATH      "$APNS_KEY_PATH"
 subst APNS_KEY_ID        "$APNS_KEY_ID"
 subst APNS_TEAM_ID       "$APNS_TEAM_ID"
@@ -416,7 +414,6 @@ Services it will address:
     autocommit   $LABEL_AUTOCOMMIT
     lock-reaper  $LABEL_LOCK_REAPER
     qmd-update   $LABEL_QMD_UPDATE
-    miniserve    $LABEL_MINISERVE
 
 Remote deploy:
     clone        $DEPLOY_CLONE

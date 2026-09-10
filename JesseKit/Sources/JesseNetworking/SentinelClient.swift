@@ -130,14 +130,13 @@ public struct SentinelClient: Sendable {
 
     // MARK: - The verbs
 
-    /// The five restartable services, spelled the way the route does. An enum rather than a
+    /// The four restartable services, spelled the way the route does. An enum rather than a
     /// string because this is the one parameter that names a launchd job, and a free-text
     /// path segment is how a named-operation surface turns into a command surface.
     public enum Service: String, CaseIterable, Sendable {
         case bridge, autocommit
         case lockReaper = "lock-reaper"
         case qmdUpdate = "qmd-update"
-        case miniserve
 
         /// What the confirmation dialog and the row call it.
         public var label: String {
@@ -146,7 +145,6 @@ public struct SentinelClient: Sendable {
             case .autocommit: return "autocommit"
             case .lockReaper: return "lock reaper"
             case .qmdUpdate: return "QMD index"
-            case .miniserve: return "dashboard server"
             }
         }
     }

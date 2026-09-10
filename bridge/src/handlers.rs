@@ -1448,7 +1448,7 @@ pub async fn start_turn(
             // Local diet pipeline: extract → verify → append → derive mirror.
             match run_diet_pipeline(&cfg, &st.health, &raw_text, &zone, &turn_sent_at).await {
                 DietPipelineOutcome::Logged {
-                    dashboard,
+                    reply,
                     directives,
                     micros,
                 } => {
@@ -1457,17 +1457,14 @@ pub async fn start_turn(
                     route = MetricsRoute::DietLocal;
                     m_model = diet_model();
                     m_diet_micros = Some(micros.into());
-                    (
-                        Ok((dashboard, None, Some(directives))),
-                        BadgeSource::DietVerify,
-                    )
+                    (Ok((reply, None, Some(directives))), BadgeSource::DietVerify)
                 }
-                DietPipelineOutcome::LoggedNoMirror { dashboard, micros } => {
+                DietPipelineOutcome::LoggedNoMirror { reply, micros } => {
                     hosted_succeeded = true;
                     route = MetricsRoute::DietLocal;
                     m_model = diet_model();
                     m_diet_micros = Some(micros.into());
-                    (Ok((dashboard, None, None)), BadgeSource::DietVerify)
+                    (Ok((reply, None, None)), BadgeSource::DietVerify)
                 }
                 DietPipelineOutcome::VerifyUnavailable {
                     err,
