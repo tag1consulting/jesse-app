@@ -1287,12 +1287,15 @@ private struct ModelPickerMenu: View {
                 if let model = state.offered.first(where: { $0.id == row.id }) { select(model) }
             } label: {
                 if row.isSelected, let subtitle = row.subtitle {
-                    Label {
-                        Text(row.title)
-                        Text(subtitle)
-                    } icon: {
-                        Image(systemName: "checkmark")
-                    }
+                    // Title, subtitle and icon as three SIBLINGS of the Button's own label,
+                    // which is the only shape UIKit maps to `UIAction.subtitle`. Nesting the
+                    // pair in `Label { Text; Text } icon: { … }` type-checks, renders in a
+                    // Form, and silently drops the second `Text` in a menu — which is how
+                    // this shipped with `ModelMenuTests` green. `ModelPickerMenuUITests`
+                    // asserts on the presented menu so it cannot happen again.
+                    Text(row.title)
+                    Text(subtitle)
+                    Image(systemName: "checkmark")
                 } else if row.isSelected {
                     Label(row.title, systemImage: "checkmark")
                 } else {
@@ -1303,18 +1306,31 @@ private struct ModelPickerMenu: View {
         }
     }
 
-    /// The effort control the resolved model declared: an inline picker over a graded scale, or
-    /// a single switch for thinking on/off. Inline, so choosing costs the same one tap a model
-    /// pick does.
+    /// The effort control the resolved model declared: one row per value of a graded scale,
+    /// or a single switch for thinking on/off. Inline either way, so choosing costs the same
+    /// one tap a model pick does.
+    ///
+    /// A graded scale renders as plain rows with a checkmark rather than as an inline
+    /// `Picker`. An inline picker inside a menu supplies its OWN section and replaces the
+    /// enclosing `Section("Effort")`, so the values arrived on screen under a bare divider
+    /// with nothing saying what they were — indistinguishable from model rows. Rows keep the
+    /// header, and they spell the selected value exactly the way the model rows above spell
+    /// the selected model.
     @ViewBuilder
     private func effortControl(_ control: ModelEffortControl, on model: ModelInfo) -> some View {
         switch control {
         case .picker(let values, let selected):
-            Picker("Effort", selection: Binding(get: { selected },
-                                                set: { selectEffort($0, on: model) })) {
-                ForEach(values, id: \.self) { Text($0).tag($0) }
+            ForEach(values, id: \.self) { value in
+                Button {
+                    selectEffort(value, on: model)
+                } label: {
+                    if value == selected {
+                        Label(value, systemImage: "checkmark")
+                    } else {
+                        Text(value)
+                    }
+                }
             }
-            .pickerStyle(.inline)
         case .toggle(let off, let on, let isOn):
             Toggle("Thinking", isOn: Binding(get: { isOn },
                                              set: { selectEffort($0 ? on : off, on: model) }))

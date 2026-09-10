@@ -715,7 +715,36 @@ enum ConfigStore {
         KeychainConfigStore(service: service, add: addItem, copy: copyItem, delete: deleteItem)
     }
 
-    static func load() -> JesseConfig { store.load() }
+    static func load() -> JesseConfig { uiTestOverride ?? store.load() }
+
+    /// The UI-test bridge override, or `nil` in every ordinary run.
+    ///
+    /// A UI test cannot pair through Settings: `ios-ci.yml` (and `local-ci-macos.sh`)
+    /// build with `CODE_SIGNING_ALLOWED=NO`, and an UNSIGNED app cannot write the
+    /// Keychain — `SecItemAdd` returns `errSecMissingEntitlement`, so Save surfaces
+    /// "your token couldn't be saved" and the app stays unconfigured. That leaves the
+    /// model picker permanently in its "list has not loaded" state, which is precisely
+    /// the state a menu test must get past.
+    ///
+    /// This substitutes the CREDENTIAL STORE and nothing else: the real `JesseClient`,
+    /// the real `GET /jesse/models` request, the real decode and the real retry policy
+    /// all still run, against whatever the test points it at. Compiled out of Release
+    /// entirely, and a launch environment can only be set by a debugger or an XCTest
+    /// runner, never by anything a shipped build meets.
+    ///
+    /// Format: `host,port,token`.
+    private static var uiTestOverride: JesseConfig? {
+        #if DEBUG
+        guard let raw = ProcessInfo.processInfo.environment["JESSE_UITEST_BRIDGE"] else {
+            return nil
+        }
+        let parts = raw.split(separator: ",", maxSplits: 2, omittingEmptySubsequences: false)
+        guard parts.count == 3, let port = Int(parts[1]) else { return nil }
+        return JesseConfig(host: String(parts[0]), port: port, token: String(parts[2]))
+        #else
+        return nil
+        #endif
+    }
 
     /// The sentinel's own host/port/token, in the SAME Keychain service under one extra
     /// account. Empty (and `isConfigured == false`) when no sentinel has ever been paired,
