@@ -159,7 +159,8 @@ Answer the question I asked, not the one you wish I had asked.
 # The registry is MERGED from three sources, later overriding earlier BY ID:
 #   1. the built-in ambient `opus` — ALWAYS present, needs no config, is never
 #      configurable here, and is byte-for-byte today's behavior (normal allowlist,
-#      writes-on). A bridge with NO model config is opus-only.
+#      writes-on). A bridge with NO model config is opus-only. Its one env knob is a slug
+#      pin for the subscription login (JESSE_MODEL_OPUS_MODEL — see below).
 #   2. the legacy `JESSE_MODEL_GLM_* / _KIMI_* / _LOCAL_*` env triples (still supported).
 #   3. these `[[models]]` entries.
 #
@@ -210,6 +211,30 @@ Answer the question I asked, not the one you wish I had asked.
 # `qwen3p8-max` IS NOT `qwen3p8-2p4t-a95b`. Both are in the Fireworks catalog as separate
 # resources; the first is "Qwen 3.8 Max" and has the published price, the second
 # ("Qwen3.8-2.4T-A95B") is a text-only FP8 resource with no row on the pricing page.
+#
+# THE SUBSCRIPTION LOGIN CAN RUN MORE THAN ONE CLAUDE MODEL, WITH NO API KEY. Two built-in
+# entries sit on the bridge's OWN login — no base_url, no token, nothing metered, no second
+# billing relationship:
+#
+#   * `opus`  — the ambient default. Unset, it sets nothing on the child and runs whatever
+#               the CLI's default is (measured 2026-09-10: `claude-opus-5[1m]`, the
+#               1M-context variant), exactly as it always has.
+#                   JESSE_MODEL_OPUS_MODEL=claude-opus-5[1m]   # pin it (sent as ANTHROPIC_MODEL)
+#                   JESSE_MODEL_OPUS_VERSION=5                 # picker reads "Claude Opus 5"
+#               Pin the [1m] form: the bare `claude-opus-5` narrows the window.
+#   * `fable` — Claude Fable on the same login (kind "subscription"). ARMED BY ITS SLUG,
+#               because there is no token to set:
+#                   JESSE_MODEL_FABLE_MODEL=claude-fable-5-1
+#                   JESSE_MODEL_FABLE_VERSION=5.1              # picker reads "Claude Fable 5.1"
+#               Unset, it is listed and disabled as "not configured". Verified on the
+#               subscription login 2026-09-10: a real turn ran `claude-fable-5-1` with
+#               apiKeySource "none". Level `write`, like opus: same harness, same record.
+#
+# Pin opus when you arm fable, so "Claude Opus" in the picker stays Opus if the CLI's own
+# default ever moves. A subscription entry is NOT health-probed (the login has no endpoint
+# to probe), so a slug the login does not serve shows up as a failed turn, not a red row.
+# Its deck (Fable 5.1: 10.00 / 0.25 / 50.00) is what the turn WOULD cost on the metered API,
+# the same thing the badge reports for opus; override with JESSE_MODEL_FABLE_PRICE_*.
 #
 # Adding a model is a PURE CONFIG EDIT here plus ONE env var for its token — no bridge
 # code change. Each model is health-probed on an interval; the apps only offer a model

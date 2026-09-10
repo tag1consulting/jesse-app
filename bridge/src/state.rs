@@ -362,6 +362,7 @@ mod tests {
         let registry = ModelRegistry {
             models: vec![
                 RegistryModel {
+                    login_model: None,
                     version: None,
                     aliases: Vec::new(),
                     codex: Default::default(),
@@ -383,6 +384,7 @@ mod tests {
                     vision_complementary: false,
                 },
                 RegistryModel {
+                    login_model: None,
                     version: None,
                     aliases: Vec::new(),
                     codex: Default::default(),

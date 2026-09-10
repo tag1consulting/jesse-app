@@ -72,6 +72,19 @@ pub const OPUS_IN_PER_M: f64 = 5.00;
 pub const OPUS_CACHED_PER_M: f64 = 0.50;
 pub const OPUS_OUT_PER_M: f64 = 25.00;
 
+/// Claude Fable 5.1 prices: $10 in / $0.25 cached / $50 out (Anthropic pricing page,
+/// 2026-09-10). The DEFAULT deck for the `fable` registry entry, overridable via
+/// `JESSE_MODEL_FABLE_PRICE_{IN,CACHED,OUT}`.
+///
+/// **The cached rate is NOT a tenth of input**, unlike Opus's two lines up: cache hits on
+/// Fable 5.1 are priced at 0.025x input, and a deck derived by the usual rule would read
+/// $1.00 and over-report every cache read four-fold. On the subscription login none of this
+/// is billed per token; the badge reports what the turn would have cost on the metered API,
+/// the same thing it reports for ambient Opus.
+pub const FABLE_5_1_IN_PER_M: f64 = 10.00;
+pub const FABLE_5_1_CACHED_PER_M: f64 = 0.25;
+pub const FABLE_5_1_OUT_PER_M: f64 = 50.00;
+
 /// Tripwire ceiling: Fireworks spend above this many dollars in a day fires a
 /// disarm tripwire in the daily audit note.
 pub const SHADOW_SPEND_CAP_USD: f64 = 5.0;
