@@ -202,6 +202,8 @@ pub struct ConversationStore {
     inner: Mutex<Inner>,
     // Where the records are persisted. `None` -> in-memory only.
     path: Option<PathBuf>,
+    // Orders the disk writes, so the file only ever moves forward (see `atomicfile`).
+    writer: SnapshotWriter,
 }
 
 impl ConversationStore {
@@ -224,13 +226,23 @@ impl ConversationStore {
         ConversationStore {
             inner: Mutex::new(inner),
             path,
+            writer: SnapshotWriter::new(),
         }
     }
 
-    /// Persist a snapshot taken under the lock. Called off the lock by every mutator.
-    fn persist(&self, snapshot: &HashMap<String, ConversationRecord>, migrated: bool) {
+    /// Write the records as they are now, after any write already in progress. Every mutator
+    /// calls this AFTER releasing the lock; the snapshot is taken inside the writer's turn, so
+    /// two turns finishing together can neither tear the file nor leave an older registry on
+    /// disk after a newer one (see `atomicfile`).
+    fn persist(&self) {
         if let Some(path) = &self.path {
-            persist_conversations(path, snapshot, migrated);
+            self.writer.persist(
+                || {
+                    let inner = self.inner.lock_ok();
+                    (inner.snapshot(), inner.migrated)
+                },
+                |(records, migrated)| persist_conversations(path, records, *migrated),
+            );
         }
     }
 
@@ -244,7 +256,7 @@ impl ConversationStore {
         origin: Option<&str>,
         now_ms: u64,
     ) -> ConversationRecord {
-        let (rec, snapshot) = {
+        let rec = {
             let mut inner = self.inner.lock_ok();
             if let Some(existing) = inner.map.get(conversation_id) {
                 return existing.clone();
@@ -257,10 +269,9 @@ impl ConversationStore {
                 origin: origin.map(str::to_string),
             };
             inner.map.insert(conversation_id.to_string(), rec.clone());
-            let snapshot = inner.snapshot();
-            (rec, snapshot)
+            rec
         };
-        self.persist(&snapshot, self.migration_done());
+        self.persist();
         rec
     }
 
@@ -296,7 +307,7 @@ impl ConversationStore {
         if conversation_id.is_empty() || session_id.is_empty() {
             return;
         }
-        let snapshot = {
+        {
             let mut inner = self.inner.lock_ok();
             // Nothing to bind to: a conversation must be registered first.
             if !inner.map.contains_key(conversation_id) {
@@ -311,9 +322,7 @@ impl ConversationStore {
                     }
                     rec.session_ids.retain(|s| s != session_id);
                     rec.session_ids.push(session_id.to_string());
-                    let snapshot = inner.snapshot();
                     inner.reindex();
-                    snapshot
                 } else {
                     eprintln!(
                         "jesse-bridge: session {session_id} is already bound to conversation \
@@ -327,10 +336,9 @@ impl ConversationStore {
                 inner
                     .by_session
                     .insert(session_id.to_string(), conversation_id.to_string());
-                inner.snapshot()
             }
-        };
-        self.persist(&snapshot, self.migration_done());
+        }
+        self.persist();
     }
 
     /// The conversation a Claude session id belongs to, if any.
@@ -374,7 +382,7 @@ impl ConversationStore {
     where
         I: IntoIterator<Item = &'a str>,
     {
-        let (ids, changed, snapshot) = {
+        let (ids, changed) = {
             let mut inner = self.inner.lock_ok();
             let mut ids = Vec::new();
             let mut changed = false;
@@ -405,33 +413,24 @@ impl ConversationStore {
                 ids.push(cid);
                 changed = true;
             }
-            let snapshot = if changed {
-                Some(inner.snapshot())
-            } else {
-                None
-            };
-            (ids, changed, snapshot)
+            (ids, changed)
         };
         if changed {
-            if let Some(snapshot) = snapshot {
-                self.persist(&snapshot, self.migration_done());
-            }
+            self.persist();
         }
         ids
     }
 
     /// Drop a conversation record and every reverse-index entry pointing at it.
     pub fn forget(&self, conversation_id: &str) {
-        let snapshot = {
+        {
             let mut inner = self.inner.lock_ok();
             if inner.map.remove(conversation_id).is_none() {
                 return;
             }
-            let snapshot = inner.snapshot();
             inner.reindex();
-            snapshot
-        };
-        self.persist(&snapshot, self.migration_done());
+        }
+        self.persist();
     }
 
     // ---- The in-flight claim table ----------------------------------------
@@ -514,15 +513,14 @@ impl ConversationStore {
 
     /// Record that the key migration has run, and persist.
     pub fn mark_migration_done(&self) {
-        let snapshot = {
+        {
             let mut inner = self.inner.lock_ok();
             if inner.migrated {
                 return;
             }
             inner.migrated = true;
-            inner.snapshot()
-        };
-        self.persist(&snapshot, true);
+        }
+        self.persist();
     }
 
     /// Number of records. For tests / introspection only.
@@ -578,24 +576,8 @@ pub fn persist_conversations(
     migrated: bool,
 ) {
     let value = json!({ "v": 1, "migrated": migrated, "conversations": conversations });
-    let tmp = path.with_extension("json.tmp");
-    let write = || -> std::io::Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&tmp)?;
-        f.write_all(value.to_string().as_bytes())?;
-        f.sync_all()?;
-        std::fs::rename(&tmp, path)
-    };
-    if let Err(e) = write() {
+    if let Err(e) = write_atomic(path, value.to_string().as_bytes()) {
         eprintln!("warning: could not persist conversations: {e}");
-        let _ = std::fs::remove_file(&tmp);
     }
 }
 
@@ -702,6 +684,49 @@ mod tests {
     /// A canonical v4 id, for tests that need a well-formed client-minted id.
     fn cid() -> String {
         uuid::Uuid::new_v4().hyphenated().to_string()
+    }
+
+    /// THE REGRESSION (2026-09-10: "could not persist conversations: No such file or
+    /// directory", four times in one burst of five concurrent turns). Many turns register and
+    /// bind at once; every write lands, and the file on disk ends up holding every record the
+    /// store holds — never a torn file, never an older registry written last.
+    #[test]
+    fn concurrent_turns_never_tear_or_roll_back_the_registry() {
+        let path = temp_conversations_path();
+        let store = std::sync::Arc::new(ConversationStore::new(Some(path.clone())));
+        let handles: Vec<_> = (0..8)
+            .map(|t| {
+                let store = store.clone();
+                std::thread::spawn(move || {
+                    for i in 0..20 {
+                        let id = cid();
+                        store.register(&id, Some("app"), 1_700_000_000_000);
+                        store.bind_session(&id, &format!("sess-{t}-{i}"));
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("no turn panicked");
+        }
+        let reloaded = ConversationStore::new(Some(path.clone()));
+        assert_eq!(reloaded.len(), 160, "the last write carried every record");
+        for rec in store.all() {
+            assert_eq!(
+                reloaded.get(&rec.conversation_id).map(|r| r.session_ids),
+                Some(rec.session_ids),
+                "a record on disk is older than the one in memory"
+            );
+        }
+        let dir = path.parent().unwrap();
+        let strays: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(strays.is_empty(), "a temp file was left behind: {strays:?}");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

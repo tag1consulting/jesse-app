@@ -1217,29 +1217,14 @@ fn persist_glances(path: &Path, map: &HashMap<String, GlanceFlag>) {
     persist_day_store(path, map, "glance");
 }
 
-/// Persist one day-scoped store atomically (temp + rename), mode 0600 — the same
-/// discipline as [`persist_flags`]. Best-effort: a failure is logged, never
+/// Persist one day-scoped store with [`write_atomic`] (a unique temp file + rename, mode
+/// 0600) — the same discipline as [`persist_flags`]. Best-effort: a failure is logged, never
 /// fatal, because neither store holds anything a user cannot re-state with one
 /// tap.
 fn persist_day_store<V: serde::Serialize>(path: &Path, map: &HashMap<String, V>, what: &str) {
-    let tmp = path.with_extension("json.tmp");
-    let write = || -> std::io::Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&tmp)?;
-        f.write_all(serde_json::to_string(map).unwrap_or_default().as_bytes())?;
-        f.sync_all()?;
-        std::fs::rename(&tmp, path)
-    };
-    if let Err(e) = write() {
+    let body = serde_json::to_string(map).unwrap_or_default();
+    if let Err(e) = write_atomic(path, body.as_bytes()) {
         eprintln!("warning: could not persist the {what} store: {e}");
-        let _ = std::fs::remove_file(&tmp);
     }
 }
 

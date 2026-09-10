@@ -259,6 +259,18 @@ pub fn run_session_gc(
             cfg.session_ttl_days
         );
     }
+    // What a home keeps for the TTL is its CONVERSATION, not codex-cli's downloads: ~43 MB
+    // of plugin catalog and plugin cache per home, re-fetched by Codex whenever it wants
+    // them. See `strip_codex_plugin_caches`.
+    let (stripped, bytes) =
+        strip_codex_plugin_caches(&codex_home_base(cfg), now, CODEX_CACHE_IDLE_SECS);
+    if stripped > 0 {
+        eprintln!(
+            "jesse-bridge: session GC stripped codex-cli's plugin caches from {stripped} idle \
+             codex home(s), reclaiming {} MB",
+            bytes / (1024 * 1024)
+        );
+    }
 
     let in_flight = conversations.in_flight_conversations();
     let mut dropped = 0usize;

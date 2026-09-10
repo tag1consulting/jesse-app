@@ -498,6 +498,8 @@ pub struct ArtifactStore {
     root: Option<PathBuf>,
     ttl_ms: u64,
     max_bytes: u64,
+    /// Orders the index writes, so the file only ever moves forward (see `atomicfile`).
+    writer: SnapshotWriter,
 }
 
 #[derive(Default)]
@@ -546,6 +548,7 @@ impl ArtifactStore {
             root,
             ttl_ms: cfg.artifact_ttl_days.saturating_mul(24 * 60 * 60 * 1000),
             max_bytes: cfg.artifact_store_max_bytes,
+            writer: SnapshotWriter::new(),
         }
     }
 
@@ -558,6 +561,7 @@ impl ArtifactStore {
             root: Some(root),
             ttl_ms,
             max_bytes,
+            writer: SnapshotWriter::new(),
         }
     }
 
@@ -743,9 +747,8 @@ impl ArtifactStore {
             for r in fresh {
                 g.records.insert(r.id.clone(), r);
             }
-            let snapshot = g.clone_for_persist();
             drop(g);
-            self.persist(&snapshot);
+            self.persist();
         }
         out
     }
@@ -788,13 +791,12 @@ impl ArtifactStore {
             g.records.remove(&r.id);
             g.tombstones.insert(r.id.clone(), now_ms);
         }
-        let snapshot = g.clone_for_persist();
         drop(g);
         for r in &doomed {
             self.unlink(r);
         }
         if !doomed.is_empty() {
-            self.persist(&snapshot);
+            self.persist();
         }
         doomed.len()
     }
@@ -843,10 +845,9 @@ impl ArtifactStore {
             //    bounded memory rather than a set that grows for the life of the deploy.
             g.tombstones
                 .retain(|_, at| now_ms.saturating_sub(*at) <= self.ttl_ms);
-            let snapshot = g.clone_for_persist();
             drop(g);
             if report.removed() > 0 {
-                self.persist(&snapshot);
+                self.persist();
             }
         }
         for r in &doomed {
@@ -879,11 +880,17 @@ impl ArtifactStore {
         let _ = std::fs::remove_dir(&dir); // only when empty
     }
 
-    fn persist(&self, snapshot: &ArtifactIndex) {
+    /// Write the index as it is now, after any write already in progress. Every caller has
+    /// released the lock first; the snapshot is taken inside the writer's turn, so the file only
+    /// ever moves forward (see `atomicfile`).
+    fn persist(&self) {
         let Some(path) = self.index_path() else {
             return;
         };
-        persist_index(&path, snapshot);
+        self.writer.persist(
+            || self.inner.lock_ok().clone_for_persist(),
+            |index| persist_index(&path, index),
+        );
     }
 }
 
@@ -994,7 +1001,8 @@ fn persist_index(path: &Path, index: &ArtifactIndex) {
     let mut records: Vec<&ArtifactRecord> = index.records.values().collect();
     records.sort_by(|a, b| (a.created_ms, &a.id).cmp(&(b.created_ms, &b.id)));
     let value = json!({ "v": 1, "artifacts": records, "tombstones": index.tombstones });
-    let tmp = path.with_extension("json.tmp");
+    // The artifacts directory is private (0700), so it is created that way HERE, before
+    // `write_atomic` would create it with the default mode.
     let write = || -> std::io::Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::DirBuilder::new()
@@ -1002,19 +1010,10 @@ fn persist_index(path: &Path, index: &ArtifactIndex) {
                 .mode(0o700)
                 .create(parent)?;
         }
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&tmp)?;
-        f.write_all(value.to_string().as_bytes())?;
-        f.sync_all()?;
-        std::fs::rename(&tmp, path)
+        write_atomic(path, value.to_string().as_bytes())
     };
     if let Err(e) = write() {
         eprintln!("warning: could not persist the artifact index: {e}");
-        let _ = std::fs::remove_file(&tmp);
     }
 }
 
@@ -1976,6 +1975,7 @@ mod tests {
             root: None,
             ttl_ms: 60_000,
             max_bytes: 1 << 30,
+            writer: SnapshotWriter::new(),
         };
         assert!(!store.is_available());
         let out = store.sweep(&ctx("job1", "conv1", caps()), &staging);

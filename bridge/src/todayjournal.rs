@@ -269,8 +269,8 @@ pub fn load_intents(path: &Path) -> Vec<Intent> {
     out
 }
 
-/// Persist the journal atomically (temp + rename), mode 0600 — the same
-/// discipline [`persist_flags`] uses, for the same reason: a half-written journal
+/// Persist the journal with [`write_atomic`] (a unique temp file + rename, mode 0600) — the
+/// same discipline [`persist_flags`] uses, for the same reason: a half-written journal
 /// read after a crash would be worse than no journal at all.
 ///
 /// Best-effort. A failure is logged and never fatal: the alternative is failing
@@ -278,24 +278,8 @@ pub fn load_intents(path: &Path) -> Vec<Intent> {
 /// matters more than the record of it.
 pub fn persist_intents(path: &Path, intents: &[Intent]) {
     let value = json!({ "v": 1, "intents": intents });
-    let tmp = path.with_extension("json.tmp");
-    let write = || -> std::io::Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&tmp)?;
-        f.write_all(value.to_string().as_bytes())?;
-        f.sync_all()?;
-        std::fs::rename(&tmp, path)
-    };
-    if let Err(e) = write() {
+    if let Err(e) = write_atomic(path, value.to_string().as_bytes()) {
         eprintln!("warning: could not persist the day-file intent journal: {e}");
-        let _ = std::fs::remove_file(&tmp);
     }
 }
 

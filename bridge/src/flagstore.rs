@@ -85,6 +85,8 @@ pub struct FlagStore {
     map: Mutex<HashMap<String, SessionFlags>>,
     // Where the map is persisted. `None` -> in-memory only.
     path: Option<PathBuf>,
+    // Orders the disk writes, so the file only ever moves forward (see `atomicfile`).
+    writer: SnapshotWriter,
 }
 
 impl FlagStore {
@@ -95,6 +97,18 @@ impl FlagStore {
         FlagStore {
             map: Mutex::new(map),
             path,
+            writer: SnapshotWriter::new(),
+        }
+    }
+
+    /// Write the map as it is now, after any write already in progress. Every mutator calls
+    /// this AFTER releasing the lock. No-op without a path.
+    fn persist(&self) {
+        if let Some(path) = &self.path {
+            self.writer.persist(
+                || self.map.lock_ok().clone(),
+                |flags| persist_flags(path, flags),
+            );
         }
     }
 
@@ -119,7 +133,7 @@ impl FlagStore {
         if session_id.is_empty() {
             return SessionFlags::default();
         }
-        let (result, changed, snapshot) = {
+        let (result, changed) = {
             let mut map = self.map.lock_ok();
             let entry = map.entry(session_id.to_string()).or_default();
             let mut changed = false;
@@ -129,15 +143,11 @@ impl FlagStore {
             if let Some(value) = update.archived {
                 changed |= entry.apply_archived(value, update.archived_updated_ms.unwrap_or(0));
             }
-            let result = entry.clone();
-            // Snapshot only when we will actually persist, to keep the lock hold tiny.
-            let snapshot = if changed { Some(map.clone()) } else { None };
-            (result, changed, snapshot)
+            (entry.clone(), changed)
         };
+        // Persist only when a flag actually changed.
         if changed {
-            if let (Some(path), Some(snapshot)) = (&self.path, snapshot) {
-                persist_flags(path, &snapshot);
-            }
+            self.persist();
         }
         result
     }
@@ -151,16 +161,10 @@ impl FlagStore {
         if session_id.is_empty() {
             return;
         }
-        let snapshot = {
-            let mut map = self.map.lock_ok();
-            if map.remove(session_id).is_none() {
-                return;
-            }
-            map.clone()
-        };
-        if let Some(path) = &self.path {
-            persist_flags(path, &snapshot);
+        if self.map.lock_ok().remove(session_id).is_none() {
+            return;
         }
+        self.persist();
     }
 
     /// A copy of the whole map. Needed by the one-time key migration, which has to
@@ -175,14 +179,8 @@ impl FlagStore {
     /// last-writer-wins clock and convergence is unaffected by the re-keying. Not for
     /// ordinary use: `apply` / `remove` are the per-entry API.
     pub fn replace(&self, flags: HashMap<String, SessionFlags>) {
-        let snapshot = {
-            let mut map = self.map.lock_ok();
-            *map = flags;
-            map.clone()
-        };
-        if let Some(path) = &self.path {
-            persist_flags(path, &snapshot);
-        }
+        *self.map.lock_ok() = flags;
+        self.persist();
     }
 
     /// Number of stored flag rows. For tests/introspection only.
@@ -229,24 +227,8 @@ pub fn load_flags(path: &Path) -> HashMap<String, SessionFlags> {
 /// The parent dir is created if missing so the store works regardless of init order.
 pub fn persist_flags(path: &Path, flags: &HashMap<String, SessionFlags>) {
     let value = json!({ "v": 1, "flags": flags });
-    let tmp = path.with_extension("json.tmp");
-    let write = || -> std::io::Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&tmp)?;
-        f.write_all(value.to_string().as_bytes())?;
-        f.sync_all()?;
-        std::fs::rename(&tmp, path)
-    };
-    if let Err(e) = write() {
+    if let Err(e) = write_atomic(path, value.to_string().as_bytes()) {
         eprintln!("warning: could not persist flags: {e}");
-        let _ = std::fs::remove_file(&tmp);
     }
 }
 

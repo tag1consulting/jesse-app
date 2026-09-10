@@ -154,6 +154,8 @@ pub struct ProfileStore {
     /// Where it is persisted. `None` → in-memory only, so an away profile set on a bridge
     /// with no state dir is lost on restart (the same degradation every other store has).
     path: Option<PathBuf>,
+    /// Orders the disk writes, so the file only ever moves forward (see `atomicfile`).
+    writer: SnapshotWriter,
 }
 
 impl ProfileStore {
@@ -164,6 +166,7 @@ impl ProfileStore {
         ProfileStore {
             state: Mutex::new(state),
             path,
+            writer: SnapshotWriter::new(),
         }
     }
 
@@ -248,16 +251,16 @@ impl ProfileStore {
         self.state.lock_ok().returned_ms
     }
 
-    /// Mutate and persist under one lock, so two concurrent writes can never leave a file
-    /// reflecting neither.
+    /// Mutate under the lock, then persist the state as it stands once this store's earlier
+    /// writes have finished — so two concurrent writes can never leave a file reflecting
+    /// neither, nor an older state after a newer one.
     fn write(&self, f: impl FnOnce(&mut ProfileState)) {
-        let snapshot = {
-            let mut state = self.state.lock_ok();
-            f(&mut state);
-            state.clone()
-        };
+        f(&mut self.state.lock_ok());
         if let Some(path) = &self.path {
-            persist_profile(path, &snapshot);
+            self.writer.persist(
+                || self.state.lock_ok().clone(),
+                |state| persist_profile(path, state),
+            );
         }
     }
 }
@@ -332,24 +335,8 @@ pub fn load_profile(path: &Path) -> Option<ProfileState> {
 /// [`persist_selection`]. Best-effort: a failure is logged, never fatal.
 pub fn persist_profile(path: &Path, state: &ProfileState) {
     let value = json!({ "v": 1, "profile": state.profile, "returned_ms": state.returned_ms });
-    let tmp = path.with_extension("json.tmp");
-    let write = || -> std::io::Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&tmp)?;
-        f.write_all(value.to_string().as_bytes())?;
-        f.sync_all()?;
-        std::fs::rename(&tmp, path)
-    };
-    if let Err(e) = write() {
+    if let Err(e) = write_atomic(path, value.to_string().as_bytes()) {
         eprintln!("warning: could not persist the away profile: {e}");
-        let _ = std::fs::remove_file(&tmp);
     }
 }
 

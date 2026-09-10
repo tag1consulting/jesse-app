@@ -365,17 +365,43 @@ pub trait HealthProbe: Send + Sync {
     fn probe(&self, target: &ProbeTarget) -> Pin<Box<dyn Future<Output = ProbeOutcome> + Send>>;
 }
 
+/// The budget of the ONE confirming re-probe a timeout gets before it counts.
+///
+/// A timeout is the only probe failure that can mean "busy" rather than "down". The local
+/// gateway on :9100 serves one request at a time, so a probe that arrives behind a long
+/// generation waits in its queue. Measured 2026-09-10: the gateway logged two Codex probes at
+/// 20.4 s behind a 26.5 s request and at 3.2 s behind an 8.3 s one, while the bridge had given
+/// up at 3 s and marked both models unhealthy — refusing every turn on them with a 409 for ten
+/// minutes, on a backend that answered the same probe in 0.2 s once its queue drained.
+///
+/// A refused connection, an HTTP error or an auth failure is an ANSWER and is recorded at once.
+/// Only a timeout is asked twice, and the second time with a budget long enough to outlast a
+/// queued generation (the longest in that burst ran 31 s). A backend that is really hung times
+/// out again and is recorded unhealthy one confirmation later — it costs detection time, never
+/// a false "healthy".
+pub const TIMEOUT_CONFIRM_SECS: u64 = 45;
+// The confirmation only helps if it is more patient than every probe it confirms, and it is
+// held to the same ceiling an operator's timeout override is.
+const _: () = assert!(TIMEOUT_CONFIRM_SECS > REASONING_HEALTH_TIMEOUT_SECS);
+const _: () = assert!(TIMEOUT_CONFIRM_SECS <= MAX_HEALTH_TIMEOUT_SECS);
+
 /// Run ONE probe of a target and record its status under `now_ms`. This is the whole prober
 /// body per tick — factored out so the tests drive it directly with a mock probe and an
 /// injected clock (the spawned loop just calls it on each interval tick). Never blocks a
-/// turn; never panics.
+/// turn; never panics. A timeout is re-asked once with [`TIMEOUT_CONFIRM_SECS`] before it is
+/// recorded; every other outcome is recorded as it came.
 pub async fn probe_and_record(
     target: &ProbeTarget,
     probe: &dyn HealthProbe,
     store: &HealthStore,
     now_ms: u64,
 ) {
-    let outcome = probe.probe(target).await;
+    let mut outcome = probe.probe(target).await;
+    if outcome.error_class.as_deref() == Some("timeout") {
+        let mut patient = target.clone();
+        patient.health.timeout_secs = target.health.timeout_secs.max(TIMEOUT_CONFIRM_SECS);
+        outcome = probe.probe(&patient).await;
+    }
     store.set(
         &target.id,
         HealthStatus {
@@ -926,5 +952,132 @@ mod tests {
             probe_targets(&registry).is_empty(),
             "an unconfigured model is not probed"
         );
+    }
+
+    /// A probe that answers from a script, in order, and records the timeout each attempt was
+    /// given — so a test can see both what was recorded and how patiently it was asked.
+    struct ScriptedProbe {
+        outcomes: Mutex<std::collections::VecDeque<ProbeOutcome>>,
+        timeouts: Mutex<Vec<u64>>,
+    }
+
+    impl ScriptedProbe {
+        fn new(outcomes: Vec<ProbeOutcome>) -> Self {
+            ScriptedProbe {
+                outcomes: Mutex::new(outcomes.into()),
+                timeouts: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn timeouts(&self) -> Vec<u64> {
+            self.timeouts.lock_ok().clone()
+        }
+    }
+
+    impl HealthProbe for ScriptedProbe {
+        fn probe(&self, t: &ProbeTarget) -> Pin<Box<dyn Future<Output = ProbeOutcome> + Send>> {
+            self.timeouts.lock_ok().push(t.health.timeout_secs);
+            let outcome =
+                self.outcomes.lock_ok().pop_front().expect(
+                    "the script ran out: the prober asked more often than the test expects",
+                );
+            Box::pin(async move { outcome })
+        }
+    }
+
+    fn outcome(ok: bool, latency_ms: u64, error_class: Option<&str>) -> ProbeOutcome {
+        ProbeOutcome {
+            ok,
+            latency_ms,
+            error_class: error_class.map(str::to_string),
+        }
+    }
+
+    /// THE REGRESSION (2026-09-10): a probe queued behind a long generation on the local
+    /// gateway timed out at 3 s, and a reachable model was marked unhealthy for ten minutes.
+    /// Now a timeout is asked once more, patiently, and the answer is what gets recorded.
+    #[tokio::test]
+    async fn a_timeout_is_confirmed_with_a_patient_budget_before_it_counts() {
+        let store = HealthStore::new();
+        let probe = ScriptedProbe::new(vec![
+            outcome(false, 3001, Some("timeout")),
+            outcome(true, 213, None),
+        ]);
+        probe_and_record(&target("codex-write"), &probe, &store, 1_000).await;
+        let s = store.get("codex-write").expect("status recorded");
+        assert!(s.healthy, "a busy backend is not a down one");
+        assert_eq!(
+            s.latency_ms,
+            Some(213),
+            "the confirming probe's latency is recorded"
+        );
+        assert_eq!(s.last_error_class, None);
+        assert_eq!(
+            probe.timeouts(),
+            vec![DEFAULT_HEALTH_TIMEOUT_SECS, TIMEOUT_CONFIRM_SECS]
+        );
+    }
+
+    /// A backend that is really hung times out twice and is recorded unhealthy.
+    #[tokio::test]
+    async fn a_timeout_that_repeats_is_recorded_unhealthy() {
+        let store = HealthStore::new();
+        let probe = ScriptedProbe::new(vec![
+            outcome(false, 3001, Some("timeout")),
+            outcome(false, 45_001, Some("timeout")),
+        ]);
+        probe_and_record(&target("codex"), &probe, &store, 1_000).await;
+        let s = store.get("codex").expect("status recorded");
+        assert!(!s.healthy);
+        assert_eq!(s.last_error_class.as_deref(), Some("timeout"));
+        assert_eq!(
+            probe.timeouts().len(),
+            2,
+            "confirmed exactly once, never looped"
+        );
+    }
+
+    /// A refused connection, an HTTP error and an auth failure are ANSWERS: recorded at once,
+    /// with no second attempt.
+    #[tokio::test]
+    async fn an_answered_failure_is_recorded_without_a_retry() {
+        for failure in [
+            outcome(false, 2, Some("connect")),
+            classify_probe_status(500),
+            classify_probe_status(401),
+        ] {
+            let store = HealthStore::new();
+            let class = failure.error_class.clone();
+            let probe = ScriptedProbe::new(vec![failure]);
+            probe_and_record(&target("glm"), &probe, &store, 1_000).await;
+            let s = store.get("glm").expect("status recorded");
+            assert!(!s.healthy);
+            assert_eq!(s.last_error_class, class);
+            assert_eq!(probe.timeouts().len(), 1, "{class:?} is not re-asked");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_success_is_never_re_probed() {
+        let store = HealthStore::new();
+        let probe = ScriptedProbe::new(vec![outcome(true, 40, None)]);
+        probe_and_record(&target("qwen"), &probe, &store, 1_000).await;
+        assert!(store.get("qwen").expect("status recorded").healthy);
+        assert_eq!(probe.timeouts(), vec![DEFAULT_HEALTH_TIMEOUT_SECS]);
+    }
+
+    /// A model configured MORE patient than the confirmation keeps its own budget: the
+    /// confirmation only ever widens.
+    #[tokio::test]
+    async fn a_per_model_budget_above_the_confirmation_is_kept() {
+        let store = HealthStore::new();
+        let mut t = target("slow");
+        t.health.timeout_secs = 55;
+        let probe = ScriptedProbe::new(vec![
+            outcome(false, 55_001, Some("timeout")),
+            outcome(true, 900, None),
+        ]);
+        probe_and_record(&t, &probe, &store, 1_000).await;
+        assert_eq!(probe.timeouts(), vec![55, 55]);
     }
 }
