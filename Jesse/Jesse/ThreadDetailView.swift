@@ -55,6 +55,27 @@ struct ThreadDetailView: View {
     // Whether the composer's frugal glyph has been tapped for its explanation.
     @State private var showFrugalExplanation = false
 
+    // ── The DURABLE half of the composer ────────────────────────────────────────────
+    //
+    // Everything above is view state, and view state is exactly what this screen keeps
+    // losing: navigating away destroys this view (the iPhone pops it, the iPad's detail
+    // column carries `.id(thread.id)`), and process termination takes it regardless. So
+    // `input` and `attachments` are now a MIRROR of `thread`'s persisted draft —
+    // restored from it on appearance, written through to it on every edit.
+    //
+    // The autosaver debounces only the DISK write; the model-side write happens on the
+    // keystroke itself. See `ComposerDraftAutosave`.
+    @State private var drafts = ComposerDraftAutosave()
+    /// Guards the restore so it happens exactly once per composer, whatever SwiftUI does
+    /// with `onAppear` — a second restore would overwrite live typing with a stale value.
+    @State private var didRestoreDraft = false
+    /// The one-line honesty notice for a restored draft that lost something: a recording
+    /// mid-transcription, or the screen context the conversation was opened about. Nil
+    /// almost always. See `ComposerDraftNotice`.
+    @State private var draftNotice: String?
+
+    @Environment(\.scenePhase) private var scenePhase
+
     /// The frugal decision this composer is drawing: the live path plus the Settings
     /// toggle.
     ///
@@ -161,7 +182,18 @@ struct ThreadDetailView: View {
         // turn is only an improvement if the user's first move is to type. (A thread
         // opened any other way keeps the keyboard down, as before.)
         .onAppear {
+            // BEFORE the focus decision and before any edit can be recorded: the composer
+            // has to hold the user's unsent text again the instant this view exists.
+            restoreDraft()
             if attachedContext != nil && turns.isEmpty { inputFocused = true }
+        }
+        // Close the pending-write window at every point where this composer is about to
+        // stop being reachable. Neither of these is the durability mechanism — the debounce
+        // is, and the model-side write has already happened — they just make the window
+        // zero at the two moments it would otherwise matter most.
+        .onDisappear { drafts.flush() }
+        .onChange(of: scenePhase) { _, phase in
+            if phase != .active { drafts.flush() }
         }
         // DECLARATION ORDER IS LEFT-TO-RIGHT, ordered by taps per day: the star is a
         // one-tap toggle that undoes itself, so it is declared LAST and sits farthest
@@ -425,6 +457,28 @@ struct ThreadDetailView: View {
                 .disabled(running)
             }
 
+            // What a restored draft LOST, named. Separate from the error line below on
+            // purpose: nothing has gone wrong, and the text is right there — a recording
+            // or an attached reading simply is not coming back with it, and saying so is
+            // the difference between a restored draft and a quietly different message.
+            if let draftNotice {
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    Image(systemName: "exclamationmark.circle")
+                    Text(draftNotice)
+                    Spacer(minLength: 0)
+                    Button {
+                        self.draftNotice = nil
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Dismiss")
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .accessibilityElement(children: .combine)
+            }
+
             // One error line for the composer, whether the complaint came from an
             // attachment or from a transcription. Two lines in two places would let a
             // rejected file and a failed transcript disagree about what went wrong.
@@ -537,6 +591,19 @@ struct ThreadDetailView: View {
             input = done.messageBody(typed: input)
             inputFocused = true
         }
+        // ── Every path into the composer ends up here ──────────────────────────────────
+        // `input` is written by the text view's delegate on every keystroke, paste and
+        // dictation update, and by the transcript landing above — so watching the binding
+        // itself catches all of them, with no per-gesture hooks to keep in sync.
+        .onChange(of: input) { _, _ in recordDraft() }
+        // Keyed on the IDs, not the values: `JesseAttachment` is Equatable over its bytes,
+        // and `onChange` compares on every body evaluation — which during a streaming reply
+        // would mean memcmp-ing up to 20 MB many times a second. A staged file is immutable
+        // once created, so the id list changes exactly when the set does.
+        .onChange(of: attachments.map(\.id)) { _, _ in recordDraftFiles() }
+        // A recording in flight is part of the pending message; the draft records its name
+        // so a composer restored without it can say so.
+        .onChange(of: recording.stage) { _, _ in recordDraft() }
         .onChange(of: photoItems) { _, items in
             guard !items.isEmpty else { return }
             Task { await handlePhotoItems(items) }
@@ -853,14 +920,65 @@ struct ThreadDetailView: View {
         running || (input.trimmingCharacters(in: .whitespaces).isEmpty && attachedContext == nil)
     }
 
+    // MARK: - The durable draft
+
+    /// Put the composer back the way the user left it. Runs once, before any edit can be
+    /// recorded, so the first `onChange` never writes an empty `input` over a real draft.
+    private func restoreDraft() {
+        guard !didRestoreDraft else { return }
+        didRestoreDraft = true
+        let saved = ComposerDraft.snapshot(of: thread)
+        input = saved.text
+        attachments = saved.files.map {
+            JesseAttachment(filename: $0.filename, mime: $0.mime, data: $0.data)
+        }
+        // Say what did NOT come back, if anything did not. Both markers are one-shot: they
+        // describe the moment the composer was lost, so they are reported once and cleared.
+        draftNotice = ComposerDraftNotice.message(for: saved,
+                                                  contextStillAttached: attachedContext != nil)
+        if saved.pendingRecording != nil || saved.contextLabel != nil {
+            ComposerDraft.clearNotices(on: thread)
+            drafts.arm { persistDraft() }
+        }
+    }
+
+    /// Record the composer's text (and its two situational markers) against THIS thread.
+    /// The model write is immediate; the save trails the last keystroke.
+    private func recordDraft() {
+        guard didRestoreDraft else { return }
+        let changed = ComposerDraft.write(
+            text: input,
+            pendingRecording: recording.isInFlight ? recording.sourceName : nil,
+            contextLabel: attachment?.contextLabel,
+            to: thread, in: context)
+        if changed { drafts.arm { persistDraft() } }
+    }
+
+    /// Record the composer's staged files. Separate from `recordDraft` because it is the
+    /// expensive half and it changes on a picker, never on a keystroke.
+    private func recordDraftFiles() {
+        guard didRestoreDraft else { return }
+        let files = attachments.map {
+            ComposerDraftFile(filename: $0.filename, mime: $0.mime, data: $0.data)
+        }
+        if ComposerDraft.writeFiles(files, to: thread, in: context) {
+            drafts.arm { persistDraft() }
+        }
+    }
+
+    private func persistDraft() {
+        do {
+            try context.save()
+        } catch {
+            Log.run.error("composer draft save failed: \(error.localizedDescription)")
+        }
+    }
+
     private func send() {
         inputFocused = false
         sendHaptic &+= 1
         let text = input
         let outgoing = attachments
-        input = ""
-        attachments = []
-        attachError = nil
         // The user just spoke — re-enable follow so the appended turn (and the
         // reply that streams after it) jumps to the bottom, even if they'd
         // scrolled up to read history. This is the `.userSentTurn` semantics:
@@ -870,8 +988,28 @@ struct ThreadDetailView: View {
         // `coordinator.send` clears the thread's error itself. Don't clear it here
         // first: while a recoverable error is showing, the retained job_id would
         // otherwise make `isRunning` read true and silently drop this new send.
-        coordinator.send(thread: thread, text: text, voice: false, context: context,
-                         attachments: outgoing)
+        //
+        // THE COMPOSER IS CLEARED ONLY ON A DURABLE STAGE. `send` returns true once the
+        // user turn and its outbox item are on disk — and that same save is where the
+        // thread's draft was released, so ownership moves in one transaction. A refused
+        // send (empty, or a turn already running) and a staging save that threw both
+        // return false, leave the draft in place, and leave the text on screen.
+        guard coordinator.send(thread: thread, text: text, voice: false, context: context,
+                               attachments: outgoing) else {
+            // The draft is still the truth, and `send` may just have put it back after a
+            // failed save. Get it to disk now rather than wait on a debounce that this
+            // send's arrival may have already consumed.
+            drafts.disarm()
+            persistDraft()
+            return
+        }
+        // Staged. The staging save persisted the release, so any armed draft write is both
+        // stale and unnecessary — drop it rather than let it fire after the handoff.
+        drafts.disarm()
+        input = ""
+        attachments = []
+        attachError = nil
+        draftNotice = nil
     }
 }
 

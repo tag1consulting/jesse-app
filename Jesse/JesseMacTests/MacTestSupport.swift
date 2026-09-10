@@ -86,6 +86,9 @@ final class MacFakeBridgeClient: BridgeClientProtocol, @unchecked Sendable {
     /// Awaited at the top of `send`, before anything is recorded. A test that needs to observe the
     /// in-flight state (the send gate while a turn runs) holds the send open here.
     private let beforeSend: (@Sendable () async -> Void)?
+    /// When set, every `send` throws it instead of answering — the delivery-failure seam.
+    /// The text is still recorded, so a test can assert what was attempted.
+    private let sendError: (any Error)?
 
     nonisolated init(
         conversations: ConversationsResult = .notModified,
@@ -93,12 +96,14 @@ final class MacFakeBridgeClient: BridgeClientProtocol, @unchecked Sendable {
                                             jobId: nil, conversationId: nil),
         hydrate: @escaping (String, String?) throws -> (turns: [HydratedTurn], nextCursor: String)
             = { _, after in ([], after ?? "0:0") },
-        beforeSend: (@Sendable () async -> Void)? = nil
+        beforeSend: (@Sendable () async -> Void)? = nil,
+        sendError: (any Error)? = nil
     ) {
         self.conversations = conversations
         self.sendResult = sendResult
         self.hydrateHandler = hydrate
         self.beforeSend = beforeSend
+        self.sendError = sendError
     }
 
     nonisolated var config: JesseConfig { JesseConfig(host: "studio", port: 8765, token: "tok") }
@@ -121,6 +126,15 @@ final class MacFakeBridgeClient: BridgeClientProtocol, @unchecked Sendable {
                           attachments: [JesseRequest.Attachment], requestId: String,
                           model: String?, effort: String?) async throws -> JesseSendResult {
         await beforeSend?()
+        if let sendError {
+            lock.withLock {
+                _sentConversationIds.append(conversationId)
+                _sentTexts.append(text)
+                _sentModes.append(mode)
+                _sentSessionIds.append(sessionId)
+            }
+            throw sendError
+        }
         return lock.withLock {
             _sentConversationIds.append(conversationId)
             _sentTexts.append(text)
@@ -158,6 +172,7 @@ enum MacTestFixtures {
     static func context() throws -> ModelContext {
         let container = try ModelContainer(
             for: JesseThread.self, Turn.self, TurnAttachment.self, TurnArtifact.self,
+            DraftAttachment.self,
             configurations: ModelConfiguration(isStoredInMemoryOnly: true))
         return ModelContext(container)
     }

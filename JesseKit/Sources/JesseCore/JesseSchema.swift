@@ -55,6 +55,14 @@ import SwiftData
 //     by the sync's merge pass instead.
 //   • the `PendingIntent` entity (the offline capture queue) — one new entity with every
 //     property defaulted and no relationship to anything that already exists
+//   • `JesseThread.draftText` (String?), `draftUpdatedAt` (Date?),
+//     `draftPendingRecording` (String?), `draftContextLabel` (String?), and
+//     `JesseThread.draftAttachments` → the `DraftAttachment` entity (to-many, cascade,
+//     empty default)  ← the composer's UNSENT DRAFT, per conversation and per device.
+//     Four additive optionals with nil defaults plus one new entity and one new empty
+//     relationship: the same shape as `Turn.attachments` → `TurnAttachment`. Local and
+//     unsynced by construction — no reconciler, hydration pass or flag sync reads or
+//     writes any of them
 //
 // Each is a new property with a default, a new optional/relationship, or a new entity:
 // nothing renamed, retyped, or dropped. A store written before any of them opens under
@@ -113,10 +121,7 @@ public enum JesseSchemaV3: VersionedSchema {
     }
 }
 
-/// **The current entity set**: `PendingIntent` (the OFFLINE CAPTURE QUEUE) added to V3.
-/// `jesseCurrentSchema` is derived from this, so the container and every migration test
-/// can never drift from the model list.
-///
+/// V4: `PendingIntent` (the OFFLINE CAPTURE QUEUE) added to V3.
 /// Additive in exactly the way the header describes — one new entity, every property
 /// defaulted, no relationship to anything that already exists — so it lightweight-
 /// migrates with no migration code, and `AppModelContainerMigrationTests` opens a
@@ -136,8 +141,32 @@ public enum JesseSchemaV4: VersionedSchema {
     }
 }
 
+/// **The current entity set**: `DraftAttachment` (the COMPOSER'S UNSENT DRAFT files) added
+/// to V4. `jesseCurrentSchema` is derived from this, so the container and every migration
+/// test can never drift from the model list.
+///
+/// Additive in exactly the way the header describes — one new entity with every property
+/// defaulted, plus one new empty to-many relationship on `JesseThread` and four new
+/// optional attributes beside it — so it lightweight-migrates with no migration code, and
+/// `AppModelContainerMigrationTests` opens a V4-shaped store to prove it.
+///
+/// The draft fields deliberately hang off `JesseThread` rather than living in an entity of
+/// their own: a draft has exactly one owner, its lifetime is its conversation's lifetime,
+/// and putting it on the thread row is what makes "deleting a conversation deletes its
+/// draft" a schema guarantee instead of a cleanup pass. Only the FILES need a row each,
+/// because only they carry bytes worth `.externalStorage`.
+public enum JesseSchemaV5: VersionedSchema {
+    public static let versionIdentifier = Schema.Version(5, 0, 0)
+
+    public static var models: [any PersistentModel.Type] {
+        [JesseThread.self, Turn.self, TurnAttachment.self, WrittenMeal.self,
+         OutboxItem.self, OutboxAttachment.self, TurnArtifact.self, PendingIntent.self,
+         DraftAttachment.self]
+    }
+}
+
 /// The app's live schema, derived from the current `VersionedSchema`. The container
 /// and every migration-test open the store through THIS value so they can never drift
 /// from the model list. Opened with automatic lightweight migration (no staged plan);
 /// see the header note and `AppModelContainer.load`.
-public var jesseCurrentSchema: Schema { Schema(versionedSchema: JesseSchemaV4.self) }
+public var jesseCurrentSchema: Schema { Schema(versionedSchema: JesseSchemaV5.self) }
