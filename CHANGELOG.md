@@ -14,6 +14,62 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [bridge 0.130.0] - 2026-09-10
+
+**Every model is READ-WRITE by default, and read-only is an optional per-model flag.** This
+hands a third-party hosted provider WRITE ACCESS TO THE VAULT the moment its token is set,
+unless that model's entry says `read_only = true`. That is the operator's decision and it has
+been made; this entry records it rather than reopening it.
+
+**What it means on a deploy running this build, concretely:**
+
+- **The built-in `glm`, `kimi` and `qwen` entries become read-write**, as does `local`. On a
+  deploy that already exports `JESSE_MODEL_GLM_AUTH_TOKEN` or `JESSE_MODEL_KIMI_AUTH_TOKEN` —
+  the Studio exports both — GLM 5.3 and Kimi K3 on Fireworks gain vault writes at the restart
+  that loads this binary, with no configuration change. `JESSE_MODEL_<ID>_READ_ONLY=1` keeps
+  one read-only.
+- **A `[[models]]` entry with no `level` becomes read-write.** One that declared `level` keeps
+  its posture, mapped (below).
+- **Diet extraction verification follows.** `skips_verification` trusts an extraction from a
+  model at `Write`, so a newly armed model that serves an extraction is taken as-is unless it
+  is `read_only = true`. The level-as-accuracy proxy is unchanged and still documented as a
+  deliberate approximation; what changed is how many models clear it by default.
+
+**The config surface: `read_only`, and `level` retired but still loading.**
+
+| was | now | warning |
+|-|-|-|
+| (no `level`) | read-write | none |
+| `level = "write"` | read-write | yes: the key says nothing any more |
+| `level = "read"` | `read_only = true` | yes |
+| `level = "basic"` | `read_only = true` | yes |
+| `level = "wrote"` (anything else) | STARTUP ERROR, as before | — |
+
+`basic` maps to read-only rather than read-write because it is the nearest posture that still
+exists and it can never widen a model someone deliberately kept narrow into one that writes.
+`basic` was already unusable on the codex harness; it is not a posture a model is configured at
+any more, though the no-tools posture itself still exists for the JOBS that need it (titles,
+diet extraction) and nothing about those changes. A `read_only` beside a `level` wins, and the
+`level` warns. One warning per mapped value, once, at startup.
+
+**The internal ceiling is still `Capability` (Basic / Read / Write).** It is the containment
+vocabulary — the battery's rows, the records, the agent crate's identity-mapped `Level` — and
+routed jobs still need `Basic`. What changed is that configuration can only produce `Read` or
+`Write` for a model.
+
+**The startup gate: every refusal kept, in the new vocabulary.** An unparseable `level` is still
+refused rather than defaulted (the message now names `read_only`); a leftover `default_writes`
+is still refused and now names `read_only` as its replacement; a posture above a harness's
+passing battery row is still refused naming the highest that passed; a harness that cannot
+express a posture is still refused in those words. What moved is that `level = "basic"` on a
+codex model no longer reaches that last check — it loads as read-only — so the test now asserts
+both halves: the declaration loads, and a registry entry built at `Basic` on codex is still
+refused.
+
+**Containment: nothing moves in any record.** Both the claude-code and codex records already
+pass `write` (the codex record's highest passing level is `Write`), so no deploy stops booting
+because of the flip. No battery was re-run and no acceptance block touched.
+
 ## [bridge 0.129.0] - 2026-09-10
 
 **Opus and Fable are both selectable on the subscription login — no API key, no second

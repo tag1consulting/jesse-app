@@ -2186,8 +2186,10 @@ pub struct RegistryModel {
     pub configured: bool,
     /// The MOST this model may be granted — a CEILING, not a grant. `Write` means it may
     /// change the vault; `Read` that it may read and search; `Basic` that it may have no
-    /// tools at all. Absent from config it is [`Capability::Read`], the safe direction: a
-    /// newly declared model can be asked questions but cannot change anything.
+    /// tools at all. Absent from config it is [`Capability::Write`]: every model is
+    /// READ-WRITE by default and `read_only = true` narrows it (see [`DEFAULT_MODEL_LEVEL`]).
+    /// Configuration can produce only `Read` or `Write` for a model; `Basic` is a JOB posture
+    /// (titles, diet extraction), reached through [`RoutedJob::required`], never a model's.
     ///
     /// It is a ceiling because the JOB sets the actual grant beneath it — see
     /// [`turn_capability`] and [`RoutedJob::required`]. A `Write` model serving a title runs
@@ -2268,12 +2270,93 @@ pub struct ModelRegistry {
 /// behavior byte-for-byte (no overrides, normal allowlist, writes-on).
 pub const DEFAULT_MODEL_ID: &str = "opus";
 
-/// The level a model gets when its config declares none: [`Capability::Read`].
+/// The level a model gets when its config says nothing about access: [`Capability::Write`].
 ///
-/// The safe direction, and the reason the default is not `Write`: a model that appears in
-/// the config without anyone deciding what it may touch can be asked questions and cannot
-/// change anything. Raising it is an explicit `level = "write"`.
-pub const DEFAULT_MODEL_LEVEL: Capability = Capability::Read;
+/// **READ-WRITE BY DEFAULT, AND READ-ONLY AS AN OPT-IN FLAG** (`read_only = true`, or
+/// `JESSE_MODEL_<ID>_READ_ONLY=1` for a built-in). This was `Read` — "the safe direction" —
+/// until the operator decided otherwise: every model is trusted with the vault unless its
+/// entry narrows it. The consequence is stated where it bites, in `jesse.example.toml` and the
+/// changelog: a third-party hosted model gets vault writes the moment its token is set.
+///
+/// Still a CEILING, never a grant: the JOB sets the actual grant beneath it (see
+/// [`turn_capability`] and [`RoutedJob::required`]), so a read-write model serving a title
+/// still runs with no tools at all.
+pub const DEFAULT_MODEL_LEVEL: Capability = Capability::Write;
+
+/// What a model may touch, resolved from its declaration: READ-WRITE unless it says
+/// `read_only = true`.
+///
+/// **THE DEFAULT IS WRITE.** Every model an operator arms can change the vault unless its
+/// entry opts out; read-only is the flag, not the starting point. That is a deliberate
+/// inversion of the old `level` key, whose absent value was `read`, and it means a
+/// third-party hosted provider gets vault write access the moment its token is set.
+///
+/// **The old `level` key still loads**, mapped to its nearest new meaning, with ONE warning
+/// per mapped value so an operator learns the key is retired without the bridge refusing a
+/// config that used to start:
+///
+/// | `level`   | becomes             | why                                                     |
+/// |-----------|---------------------|---------------------------------------------------------|
+/// | `"write"` | read-write          | the new default, so the key says nothing any more       |
+/// | `"read"`  | `read_only = true`  | the same posture, spelled the new way                   |
+/// | `"basic"` | `read_only = true`  | no-tools is not a model posture any more; read-only is  |
+/// |           |                     | the nearest one that exists, and it never WIDENS a      |
+/// |           |                     | model an operator deliberately kept narrow into writes  |
+///
+/// `read_only` wins when both are present (it is the key that is not retired), and that too
+/// warns, because two keys disagreeing is the operator's to resolve. An unrecognised `level`
+/// is still a startup ERROR — see `validate_model_config` — so a typo is never a silent
+/// widening to write; here it resolves to `None` and the caller falls back to the default,
+/// which the gate then refuses to let start.
+///
+/// Returns the level and, when a retired value was mapped, the one warning to print.
+pub fn resolve_model_access(
+    read_only: Option<bool>,
+    level: Option<&str>,
+) -> (Option<Capability>, Option<String>) {
+    let level = level.map(str::trim).filter(|s| !s.is_empty());
+    let mapped = level.and_then(|raw| match raw.to_ascii_lowercase().as_str() {
+        "write" => Some((raw, Capability::Write)),
+        "read" | "basic" => Some((raw, Capability::Read)),
+        _ => None,
+    });
+    match (read_only, mapped) {
+        (Some(ro), None) => (Some(access_level(ro)), None),
+        (Some(ro), Some((raw, _))) => (
+            Some(access_level(ro)),
+            Some(format!(
+                "`level = \"{raw}\"` is retired and is IGNORED here because `read_only = {ro}` \
+                 is also set; delete `level`."
+            )),
+        ),
+        (None, Some((raw, cap))) => (
+            Some(cap),
+            Some(format!(
+                "`level = \"{raw}\"` is retired; it was read as {}. {}",
+                if cap == Capability::Write {
+                    "read-write, which is now the default"
+                } else {
+                    "`read_only = true`"
+                },
+                if cap == Capability::Write {
+                    "Delete the key."
+                } else {
+                    "Replace it with `read_only = true`."
+                }
+            )),
+        ),
+        (None, None) => (None, None),
+    }
+}
+
+/// The level a `read_only` flag names.
+pub fn access_level(read_only: bool) -> Capability {
+    if read_only {
+        Capability::Read
+    } else {
+        Capability::Write
+    }
+}
 
 impl ModelRegistry {
     /// Look up an entry by its canonical id, then — only if nothing matched — by ALIAS.
@@ -2584,9 +2667,9 @@ fn glm_env_entry(default_interval_secs: u64, global_timeout_secs: Option<u64>) -
         subagent_model: backend.as_ref().map(|(_, _, m)| m.clone()),
         configured: backend.is_some(),
         backend,
-        // No declarative entry, so no `level` key: the default applies. A deploy that wants
-        // one of these at Write says so in the `[[models]]` array.
-        level: Capability::Read,
+        // READ-WRITE unless `JESSE_MODEL_GLM_READ_ONLY` says otherwise — the same default
+        // every model has. See [`DEFAULT_MODEL_LEVEL`].
+        level: access_level(env_flag_true("JESSE_MODEL_GLM_READ_ONLY")),
         harness: CLAUDE_CODE_ID.to_string(),
         auth_scheme: None,
         quirks: DirectQuirks::default(),
@@ -2676,9 +2759,9 @@ fn kimi_env_entry(default_interval_secs: u64, global_timeout_secs: Option<u64>) 
         subagent_model: backend.as_ref().map(|(_, _, m)| m.clone()),
         configured: backend.is_some(),
         backend,
-        // No declarative entry, so no `level` key: the default applies. A deploy that wants
-        // one of these at Write says so in the `[[models]]` array.
-        level: Capability::Read,
+        // READ-WRITE unless `JESSE_MODEL_KIMI_READ_ONLY` says otherwise — the same default
+        // every model has. See [`DEFAULT_MODEL_LEVEL`].
+        level: access_level(env_flag_true("JESSE_MODEL_KIMI_READ_ONLY")),
         harness: CLAUDE_CODE_ID.to_string(),
         auth_scheme: None,
         quirks: DirectQuirks::default(),
@@ -2758,9 +2841,9 @@ fn qwen_env_entry(default_interval_secs: u64, global_timeout_secs: Option<u64>) 
         subagent_model: backend.as_ref().map(|(_, _, m)| m.clone()),
         configured: backend.is_some(),
         backend,
-        // No declarative entry, so no `level` key: the default applies. A deploy that wants
-        // one of these at Write says so in the `[[models]]` array.
-        level: Capability::Read,
+        // READ-WRITE unless `JESSE_MODEL_QWEN_READ_ONLY` says otherwise — the same default
+        // every model has. See [`DEFAULT_MODEL_LEVEL`].
+        level: access_level(env_flag_true("JESSE_MODEL_QWEN_READ_ONLY")),
         harness: CLAUDE_CODE_ID.to_string(),
         auth_scheme: None,
         quirks: DirectQuirks::default(),
@@ -2851,9 +2934,9 @@ fn local_env_entry(default_interval_secs: u64, global_timeout_secs: Option<u64>)
         subagent_model: backend.as_ref().map(|(_, _, m)| m.clone()),
         configured: backend.is_some(),
         backend,
-        // No declarative entry, so no `level` key: the default applies. A deploy that wants
-        // one of these at Write says so in the `[[models]]` array.
-        level: Capability::Read,
+        // READ-WRITE unless `JESSE_MODEL_LOCAL_READ_ONLY` says otherwise — the same default
+        // every model has. See [`DEFAULT_MODEL_LEVEL`].
+        level: access_level(env_flag_true("JESSE_MODEL_LOCAL_READ_ONLY")),
         harness: CLAUDE_CODE_ID.to_string(),
         auth_scheme: None,
         quirks: DirectQuirks::default(),
@@ -3181,8 +3264,13 @@ pub struct ModelToml {
     /// `claude-code`. An id no harness is registered under is a startup ERROR, never a
     /// silent fallback — see [`validate_model_config`].
     pub harness: Option<String>,
-    /// The CEILING this model may be granted: `basic` | `read` | `write`. Absent means
-    /// `read`. See [`RegistryModel::level`].
+    /// `true` keeps this model READ-ONLY. Absent (or `false`) means READ-WRITE, which is the
+    /// default for every model — see [`DEFAULT_MODEL_LEVEL`] and [`resolve_model_access`].
+    pub read_only: Option<bool>,
+    /// RETIRED: `basic` | `read` | `write`. Still parsed so a config written against it keeps
+    /// loading, mapped to its nearest new meaning with one startup warning — see
+    /// [`resolve_model_access`] for the table. An unrecognised value is still a startup error
+    /// (`validate_model_config`), never a silent widening to read-write.
     pub level: Option<String>,
     /// `bearer` | `x-api-key`. Absent means the per-host default. Read by `direct` only.
     pub auth_scheme: Option<String>,
@@ -3432,15 +3520,17 @@ pub fn registry_model_from_toml(
         backend,
         subagent_model,
         configured,
-        // A bad/absent `level` resolves to the safe default here; `validate_model_config`
-        // is what REFUSES an unparseable one at startup, so a typo is never a silent
-        // downgrade to Read.
-        level: t
-            .level
-            .as_deref()
-            .map(str::trim)
-            .and_then(parse_capability)
-            .unwrap_or(DEFAULT_MODEL_LEVEL),
+        // `read_only`, else the retired `level` mapped (with its one warning, printed here
+        // because this runs once per entry at startup), else the read-write default. An
+        // unparseable `level` resolves to the default here and `validate_model_config` is
+        // what REFUSES it, so a typo never starts a model read-write unnoticed.
+        level: {
+            let (level, warning) = resolve_model_access(t.read_only, t.level.as_deref());
+            if let Some(w) = warning {
+                eprintln!("jesse-bridge: WARNING model '{id}': {w}");
+            }
+            level.unwrap_or(DEFAULT_MODEL_LEVEL)
+        },
         harness: t
             .harness
             .as_deref()
@@ -4149,6 +4239,104 @@ mod tests {
     /// always was — no slug, no subagent model, the same label — which is the byte-for-byte
     /// property the no-config bridge depends on. Set, it names a slug and a version and stays
     /// the ambient default in every other respect.
+    /// THE RETIRED `level` KEY STILL LOADS, mapped to its nearest new meaning, and each mapped
+    /// value yields exactly ONE warning. `basic` maps to read-only, not read-write: it is the
+    /// nearest posture that still exists, and it must never widen a model someone kept narrow
+    /// into one that writes. An unknown value maps to nothing here — the startup gate refuses
+    /// it — so a typo cannot land on the read-write default.
+    #[test]
+    fn a_retired_level_maps_to_its_nearest_access_with_one_warning() {
+        let cases = [
+            (None, None, None, false),
+            (Some(true), None, Some(Capability::Read), false),
+            (Some(false), None, Some(Capability::Write), false),
+            (None, Some("write"), Some(Capability::Write), true),
+            (None, Some("read"), Some(Capability::Read), true),
+            (None, Some("basic"), Some(Capability::Read), true),
+            (None, Some(" READ "), Some(Capability::Read), true),
+            (None, Some("wrote"), None, false),
+            (None, Some("  "), None, false),
+            // Both present: the flag that is not retired wins, and the retired one warns.
+            (Some(true), Some("write"), Some(Capability::Read), true),
+        ];
+        for (read_only, level, want, warns) in cases {
+            let (got, warning) = resolve_model_access(read_only, level);
+            assert_eq!(got, want, "read_only={read_only:?} level={level:?}");
+            assert_eq!(
+                warning.is_some(),
+                warns,
+                "read_only={read_only:?} level={level:?}: {warning:?}"
+            );
+        }
+        // The warning says what to write instead.
+        let (_, w) = resolve_model_access(None, Some("basic"));
+        assert!(w.expect("a warning").contains("read_only = true"));
+    }
+
+    /// EVERY MODEL IS READ-WRITE BY DEFAULT — declared or built in — and read-only is the flag.
+    /// This is the inversion stated as a test: a model that says nothing about access can
+    /// change the vault, and `read_only` / `JESSE_MODEL_<ID>_READ_ONLY` is how one is narrowed.
+    #[test]
+    fn a_model_that_says_nothing_about_access_is_read_write() {
+        let _g = ENV_LOCK.lock_ok();
+        let m = registry_model_from_toml(&model_toml("x", "hosted", None), None, None)
+            .expect("a model");
+        assert_eq!(m.level, Capability::Write, "no key at all: read-write");
+        let mut narrowed = model_toml("x", "hosted", None);
+        narrowed.read_only = Some(true);
+        assert_eq!(
+            registry_model_from_toml(&narrowed, None, None)
+                .expect("a model")
+                .level,
+            Capability::Read
+        );
+
+        let vars = [
+            "JESSE_MODEL_GLM_READ_ONLY",
+            "JESSE_MODEL_KIMI_READ_ONLY",
+            "JESSE_MODEL_QWEN_READ_ONLY",
+            "JESSE_MODEL_LOCAL_READ_ONLY",
+        ];
+        let saved: Vec<(&str, Option<String>)> =
+            vars.iter().map(|k| (*k, std::env::var(k).ok())).collect();
+        for k in vars {
+            std::env::remove_var(k);
+        }
+        let built_ins = || {
+            [
+                glm_env_entry(DEFAULT_HEALTH_INTERVAL_SECS, None),
+                kimi_env_entry(DEFAULT_HEALTH_INTERVAL_SECS, None),
+                qwen_env_entry(DEFAULT_HEALTH_INTERVAL_SECS, None),
+                local_env_entry(DEFAULT_HEALTH_INTERVAL_SECS, None),
+            ]
+        };
+        for e in built_ins() {
+            assert_eq!(
+                e.level,
+                Capability::Write,
+                "{} is read-write by default",
+                e.id
+            );
+        }
+        for k in vars {
+            std::env::set_var(k, "1");
+        }
+        for e in built_ins() {
+            assert_eq!(
+                e.level,
+                Capability::Read,
+                "{} honours its READ_ONLY flag",
+                e.id
+            );
+        }
+        for (k, v) in saved {
+            match v {
+                Some(val) => std::env::set_var(k, val),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+
     #[test]
     fn opus_pins_a_login_model_only_when_asked() {
         let _g = ENV_LOCK.lock_ok();
@@ -5037,6 +5225,7 @@ mod tests {
         let _g = ENV_LOCK.lock_ok();
         std::env::set_var("JESSE_TEST_DECL_TOKEN2", "tok");
         let t = ModelToml {
+            read_only: None,
             family: None,
             version: None,
             aliases: None,
