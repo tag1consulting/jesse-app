@@ -178,6 +178,8 @@ pub struct ContextLedger {
     inner: Mutex<HashMap<String, ThreadEntry>>,
     path: Option<PathBuf>,
     enabled: bool,
+    // Orders the disk writes, so the file only ever moves forward (see `atomicfile`).
+    writer: SnapshotWriter,
 }
 
 impl ContextLedger {
@@ -191,6 +193,7 @@ impl ContextLedger {
                 inner: Mutex::new(HashMap::new()),
                 path: None,
                 enabled: false,
+                writer: SnapshotWriter::new(),
             };
         }
         let map = path.as_deref().map(load_context).unwrap_or_default();
@@ -198,6 +201,7 @@ impl ContextLedger {
             inner: Mutex::new(map),
             path,
             enabled: true,
+            writer: SnapshotWriter::new(),
         }
     }
 
@@ -214,7 +218,7 @@ impl ContextLedger {
             return;
         }
         let now_secs = unix_secs(now);
-        let snapshot = {
+        {
             let mut map = self.inner.lock_ok();
             let entry = map.entry(thread_key.to_string()).or_insert(ThreadEntry {
                 last_activity_secs: now_secs,
@@ -231,9 +235,8 @@ impl ContextLedger {
             }
             entry.last_activity_secs = now_secs;
             gc(&mut map, now_secs);
-            map.clone()
-        };
-        self.persist(&snapshot);
+        }
+        self.persist();
     }
 
     /// Record one delivered turn (live clock). See [`Self::record_at`].
@@ -285,7 +288,7 @@ impl ContextLedger {
         if !self.enabled || ids.is_empty() {
             return;
         }
-        let snapshot = {
+        {
             let mut map = self.inner.lock_ok();
             let Some(entry) = map.get_mut(thread_key) else {
                 return;
@@ -300,9 +303,8 @@ impl ContextLedger {
             if !changed {
                 return;
             }
-            map.clone()
-        };
-        self.persist(&snapshot);
+        }
+        self.persist();
     }
 
     /// Re-key a thread's ledger entries from `from` to `to`, merging into any entries
@@ -315,7 +317,7 @@ impl ContextLedger {
         if !self.enabled || from == to {
             return;
         }
-        let snapshot = {
+        {
             let mut map = self.inner.lock_ok();
             let Some(moved) = map.remove(from) else {
                 return;
@@ -336,9 +338,8 @@ impl ContextLedger {
                     map.insert(to.to_string(), moved);
                 }
             }
-            map.clone()
-        };
-        self.persist(&snapshot);
+        }
+        self.persist();
     }
 
     /// Number of turns stored under a thread. Tests/introspection only.
@@ -355,11 +356,15 @@ impl ContextLedger {
         self.inner.lock_ok().len()
     }
 
-    /// Persist the whole map atomically (temp + rename, mode 0600), off the lock. A
-    /// failure logs to stderr and never affects the reply. No-op without a path.
-    fn persist(&self, snapshot: &HashMap<String, ThreadEntry>) {
+    /// Persist the whole map (a unique temp file + rename, mode 0600) as it is now, after any
+    /// write already in progress. Every mutator calls this AFTER releasing the lock. A failure
+    /// logs to stderr and never affects the reply. No-op without a path.
+    fn persist(&self) {
         if let Some(path) = &self.path {
-            persist_context(path, snapshot);
+            self.writer.persist(
+                || self.inner.lock_ok().clone(),
+                |threads| persist_context(path, threads),
+            );
         }
     }
 }
@@ -427,24 +432,8 @@ fn load_context(path: &Path) -> HashMap<String, ThreadEntry> {
 /// `persist_titles`. Best-effort: a failure is logged and never fatal.
 fn persist_context(path: &Path, threads: &HashMap<String, ThreadEntry>) {
     let value = json!({ "v": 1, "threads": threads });
-    let tmp = path.with_extension("json.tmp");
-    let write = || -> std::io::Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&tmp)?;
-        f.write_all(value.to_string().as_bytes())?;
-        f.sync_all()?;
-        std::fs::rename(&tmp, path)
-    };
-    if let Err(e) = write() {
+    if let Err(e) = write_atomic(path, value.to_string().as_bytes()) {
         eprintln!("warning: could not persist context ledger: {e}");
-        let _ = std::fs::remove_file(&tmp);
     }
 }
 

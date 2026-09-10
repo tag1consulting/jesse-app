@@ -1064,24 +1064,8 @@ fn read_home_index(path: &Path) -> std::collections::BTreeMap<String, String> {
 /// here, and it is why nothing downstream trusts a row without re-verifying it.
 fn persist_home_index(path: &Path, homes: &std::collections::BTreeMap<String, String>) {
     let value = json!({ "v": 1, "homes": homes });
-    let tmp = path.with_extension("json.tmp");
-    let write = || -> std::io::Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&tmp)?;
-        f.write_all(value.to_string().as_bytes())?;
-        f.sync_all()?;
-        std::fs::rename(&tmp, path)
-    };
-    if let Err(e) = write() {
+    if let Err(e) = write_atomic(path, value.to_string().as_bytes()) {
         eprintln!("jesse-bridge: could not persist the codex home index: {e}");
-        let _ = std::fs::remove_file(&tmp);
     }
 }
 
@@ -1373,6 +1357,9 @@ pub fn codex_home_for_turn(
 /// home in use is young by definition and a live conversation cannot be reclaimed out from
 /// under itself — the TTL is measured in days and the conversation lock is held for seconds.
 /// An empty or unreadable home is left alone: `0` would make "cannot tell" mean "delete".
+/// codex-cli's own downloads ([`CODEX_REGENERABLE_CACHES`]) do NOT count toward the age:
+/// they say nothing about whether the conversation is alive, and a refreshed catalog must
+/// not keep a dead conversation on disk.
 ///
 /// Takes `now_secs` rather than reading the clock so it is testable against a fixed one,
 /// exactly like [`crate::sessions::sweep_expired_sessions`]. Returns the home names removed.
@@ -1404,18 +1391,123 @@ pub fn sweep_expired_codex_homes(base: &Path, now_secs: u64, ttl_days: u64) -> V
     reclaimed
 }
 
+/// codex-cli's own downloads inside a home, relative to it: the remote plugin catalog (~17 MB)
+/// and the plugin cache (~26 MB), fetched on a conversation's first turn and fetched again
+/// whenever they are missing. They were nearly all of what made 132 homes weigh 5.6 GB on
+/// 2026-09-10; a conversation's own state — its sqlite files and rollouts — is a few MB.
+/// Paths, not patterns: nothing outside these two directories is ever removed.
+///
+/// Turning the downloads off (`features.plugins`, `features.remote_plugin`) would be tidier,
+/// but those are `-c` flags on the child's argv, and the startup gate compares a Codex child's
+/// argv with the `toolset_args` its containment record was taken with — so that route runs
+/// through a Codex re-record. Stripping the caches changes nothing the child is launched with.
+pub const CODEX_REGENERABLE_CACHES: [&str; 2] = ["cache/remote_plugin_catalog", "plugins/cache"];
+
+/// How long a home's CONVERSATION must have been idle before its regenerable caches are
+/// stripped. A turn rewrites the home's sqlite files and appends to its rollout as it runs, so
+/// an hour of silence means no turn is using it. The session GC that calls this runs every six
+/// hours, so a finished conversation sheds its downloads within one cycle of going quiet.
+pub const CODEX_CACHE_IDLE_SECS: u64 = 3600;
+
+/// Remove codex-cli's regenerable downloads ([`CODEX_REGENERABLE_CACHES`]) from every home
+/// under `base` whose conversation has been idle at least `idle_secs`, keeping everything a
+/// resume needs. The sweep above decides when a CONVERSATION may go; this decides that its
+/// downloads need not wait that long.
+///
+/// Never follows a link: only a real directory at one of the named paths is removed, and its
+/// parent (`cache/`, `plugins/`) goes only when that leaves it empty. A home whose age cannot
+/// be read is left alone, exactly as the sweep leaves it. Takes `now_secs` for the same
+/// testability reason. Returns how many homes were touched and how many bytes were reclaimed.
+pub fn strip_codex_plugin_caches(base: &Path, now_secs: u64, idle_secs: u64) -> (usize, u64) {
+    let Ok(rd) = std::fs::read_dir(base) else {
+        return (0, 0);
+    };
+    let (mut homes, mut bytes) = (0usize, 0u64);
+    for e in rd.flatten() {
+        if !e.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        let home = e.path();
+        let Some(newest) = newest_mtime_secs(&home) else {
+            continue;
+        };
+        if now_secs.saturating_sub(newest) < idle_secs {
+            continue;
+        }
+        let mut touched = false;
+        for rel in CODEX_REGENERABLE_CACHES {
+            let dir = home.join(rel);
+            if !std::fs::symlink_metadata(&dir).is_ok_and(|m| m.is_dir()) {
+                continue;
+            }
+            let size = tree_bytes(&dir);
+            match std::fs::remove_dir_all(&dir) {
+                Ok(()) => {
+                    bytes += size;
+                    touched = true;
+                }
+                Err(err) => eprintln!(
+                    "jesse-bridge: codex cache strip could not remove {}: {err}",
+                    dir.display()
+                ),
+            }
+            // `remove_dir` refuses a directory that still holds anything, so a parent carrying
+            // something besides the cache stays.
+            if let Some(parent) = dir.parent().filter(|p| *p != home) {
+                let _ = std::fs::remove_dir(parent);
+            }
+        }
+        if touched {
+            homes += 1;
+        }
+    }
+    (homes, bytes)
+}
+
+/// Total size of the regular files under `dir`, never following a link. Only for the log line,
+/// so an unreadable entry simply counts as nothing.
+fn tree_bytes(dir: &Path) -> u64 {
+    let mut total = 0;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+            match e.file_type() {
+                Ok(t) if t.is_dir() => stack.push(e.path()),
+                Ok(t) if t.is_file() => total += e.metadata().map(|m| m.len()).unwrap_or(0),
+                _ => {}
+            }
+        }
+    }
+    total
+}
+
 /// The newest mtime under `home`, in unix seconds: its top-level entries (Codex's sqlite and
-/// `-wal` files, rewritten every turn) and its rollouts (appended every turn). `None` when
-/// the directory yields nothing readable, which the caller treats as "leave it alone".
+/// `-wal` files, rewritten every turn) and its rollouts (appended every turn). The top-level
+/// directories holding [`CODEX_REGENERABLE_CACHES`] count only when the home holds nothing
+/// else — a refreshed download is not the conversation being used, but a home that never got
+/// further than its downloads must still age out. `None` when the directory yields nothing
+/// readable, which the caller treats as "leave it alone".
 fn newest_mtime_secs(home: &Path) -> Option<u64> {
     let mut newest: Option<SystemTime> = None;
+    let mut cache_newest: Option<SystemTime> = None;
     let mut note = |t: SystemTime| {
         if newest.is_none_or(|cur| t > cur) {
             newest = Some(t);
         }
     };
     for e in std::fs::read_dir(home).ok()?.flatten() {
-        if let Ok(t) = e.metadata().and_then(|m| m.modified()) {
+        let Ok(t) = e.metadata().and_then(|m| m.modified()) else {
+            continue;
+        };
+        let name = e.file_name();
+        let is_cache = CODEX_REGENERABLE_CACHES
+            .iter()
+            .any(|rel| rel.split('/').next() == name.to_str());
+        if is_cache {
+            if cache_newest.is_none_or(|cur| t > cur) {
+                cache_newest = Some(t);
+            }
+        } else {
             note(t);
         }
     }
@@ -1439,7 +1531,9 @@ fn newest_mtime_secs(home: &Path) -> Option<u64> {
             }
         }
     }
-    newest.and_then(|t| t.duration_since(UNIX_EPOCH).ok().map(|d| d.as_secs()))
+    newest
+        .or(cache_newest)
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok().map(|d| d.as_secs()))
 }
 
 /// Drop cache entries pointing at homes the sweep removed, so the file does not grow one
@@ -3807,6 +3901,121 @@ mod tests {
         assert!(
             after.contains_key("still-here"),
             "and only that one: {after:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Plant codex-cli's two download trees in a home, 4 KiB each.
+    fn plant_caches(home: &Path) {
+        for (dir, file) in [
+            ("cache/remote_plugin_catalog", "catalog.json"),
+            ("plugins/cache/some-plugin", "blob"),
+        ] {
+            std::fs::create_dir_all(home.join(dir)).expect("a cache dir");
+            std::fs::write(home.join(dir).join(file), vec![b'x'; 4096]).expect("a cache file");
+        }
+    }
+
+    fn unix_now() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("after the epoch")
+            .as_secs()
+    }
+
+    /// An idle conversation keeps everything a resume needs and sheds codex-cli's downloads,
+    /// parents and all.
+    #[test]
+    fn an_idle_homes_plugin_caches_are_stripped_and_its_conversation_kept() {
+        let (cfg, dir) = home_scratch("strip-idle");
+        let base = codex_home_base(&cfg);
+        let home = base.join("idle");
+        std::fs::create_dir_all(&home).expect("a home");
+        let rollout = plant_rollout(&home, "01a07364-0000-7ca2-be08-00000000idle");
+        std::fs::write(home.join("state_5.sqlite"), b"state").expect("conversation state");
+        plant_caches(&home);
+        let now = unix_now();
+        backdate_tree(&home, now - 2 * 3600);
+
+        let (touched, bytes) = strip_codex_plugin_caches(&base, now, CODEX_CACHE_IDLE_SECS);
+        assert_eq!(touched, 1, "one home shed its downloads");
+        assert_eq!(bytes, 2 * 4096, "and it reports what it reclaimed");
+        assert!(
+            !home.join("cache").exists(),
+            "the catalog tree is gone, parent too"
+        );
+        assert!(
+            !home.join("plugins").exists(),
+            "the plugin cache tree is gone, parent too"
+        );
+        assert!(rollout.is_file(), "the rollout a resume needs is untouched");
+        assert!(home.join("state_5.sqlite").is_file(), "and so is the state");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A home a turn is using right now keeps its downloads.
+    #[test]
+    fn a_home_in_use_keeps_its_downloads() {
+        let (cfg, dir) = home_scratch("strip-live");
+        let base = codex_home_base(&cfg);
+        let home = base.join("live");
+        std::fs::create_dir_all(&home).expect("a home");
+        plant_rollout(&home, "01a07364-0000-7ca2-be08-00000000live");
+        plant_caches(&home);
+
+        let (touched, bytes) = strip_codex_plugin_caches(&base, unix_now(), CODEX_CACHE_IDLE_SECS);
+        assert_eq!((touched, bytes), (0, 0));
+        assert!(home
+            .join("cache/remote_plugin_catalog/catalog.json")
+            .is_file());
+        assert!(home.join("plugins/cache/some-plugin/blob").is_file());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A download codex-cli refreshed today is not the conversation being used: a home whose
+    /// rollout and state are past the TTL is reclaimed even though its catalog is brand new.
+    #[test]
+    fn a_refreshed_catalog_does_not_keep_a_dead_conversation_on_disk() {
+        let (cfg, dir) = home_scratch("strip-age");
+        let base = codex_home_base(&cfg);
+        let home = base.join("dead");
+        std::fs::create_dir_all(&home).expect("a home");
+        plant_rollout(&home, "01a07364-0000-7ca2-be08-00000000dead");
+        let now = unix_now();
+        backdate_tree(&home, now - 40 * 86_400);
+        plant_caches(&home); // fresh, AFTER the backdate
+
+        let reclaimed = sweep_expired_codex_homes(&base, now, 30);
+        assert_eq!(reclaimed, vec!["dead".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Only a real directory at a named cache path is removed: a link there is left alone, and
+    /// what it points at is never touched.
+    #[test]
+    fn a_cache_path_that_is_a_link_is_never_followed() {
+        let (cfg, dir) = home_scratch("strip-link");
+        let base = codex_home_base(&cfg);
+        let home = base.join("linked");
+        std::fs::create_dir_all(home.join("cache")).expect("a home");
+        plant_rollout(&home, "01a07364-0000-7ca2-be08-00000000link");
+        let outside = dir.join("outside");
+        std::fs::create_dir_all(&outside).expect("a directory outside every home");
+        std::fs::write(outside.join("precious"), b"keep me").expect("a file outside");
+        std::os::unix::fs::symlink(&outside, home.join("cache/remote_plugin_catalog"))
+            .expect("a link where the catalog would be");
+        let now = unix_now();
+        backdate_tree(&home, now - 2 * 3600);
+
+        let (touched, _) = strip_codex_plugin_caches(&base, now, CODEX_CACHE_IDLE_SECS);
+        assert_eq!(touched, 0, "nothing real was there to strip");
+        assert!(
+            outside.join("precious").is_file(),
+            "the link was never followed"
+        );
+        assert!(
+            std::fs::symlink_metadata(home.join("cache/remote_plugin_catalog")).is_ok(),
+            "and the link itself is left for a human to look at"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

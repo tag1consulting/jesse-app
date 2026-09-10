@@ -1636,6 +1636,14 @@ session jsonl whose **last-modified time is older than `JESSE_SESSION_TTL_DAYS`*
   `<home>/.claude/projects/<escaped-vault>/` (the same scoping as
   `GET /jesse/conversations`); subdirs, other files, and a non-plain stem are skipped.
 - **Every reclaim is logged** with the session id and its age.
+- **Codex homes age out on the same TTL, and their downloads sooner.** A Codex
+  conversation's durable state is its per-conversation `CODEX_HOME`
+  (`<state dir>/codex-homes/<id>`), reclaimed on the same horizon. Each home also
+  collects codex-cli's remote plugin catalog and plugin cache (~43 MB), which Codex
+  fetches again whenever they are missing, so the sweep strips `cache/remote_plugin_catalog`
+  and `plugins/cache` from any home whose conversation has been idle for an hour —
+  keeping its sqlite state and rollouts, never following a link — and logs what it
+  reclaimed. A refreshed download does not count toward a home's age.
 - **Conversation records are swept too.** After the transcript sweep, a conversation
   record whose bound transcripts are **all** gone and whose own `registered_ms` is
   past the TTL is dropped, together with its title and flag rows. A conversation

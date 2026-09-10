@@ -9,12 +9,18 @@ use crate::*;
 // no state dir configured the store is in-memory only — the same degradation the
 // job store and device store have — so titles are lost on restart in that mode.
 // Only the title text is ever written; never a secret.
+//
+// Writes go through `write_atomic` and take turns through a `SnapshotWriter`: two turns
+// minting titles at once can neither tear the file nor leave an older map on disk after a
+// newer one (see `atomicfile`).
 
 /// The conversation_id -> title map. Cheaply shared behind an `Arc` in `AppState`.
 pub struct TitleStore {
     map: Mutex<HashMap<String, String>>,
     // Where the map is persisted. `None` → in-memory only.
     path: Option<PathBuf>,
+    // Orders the disk writes, so the file only ever moves forward.
+    writer: SnapshotWriter,
 }
 
 impl TitleStore {
@@ -25,6 +31,7 @@ impl TitleStore {
         TitleStore {
             map: Mutex::new(map),
             path,
+            writer: SnapshotWriter::new(),
         }
     }
 
@@ -39,15 +46,8 @@ impl TitleStore {
         if session_id.is_empty() || title.is_empty() {
             return;
         }
-        // Snapshot under the lock, persist off it (mirrors the device store).
-        let snapshot = {
-            let mut map = self.map.lock_ok();
-            map.insert(session_id.to_string(), title);
-            map.clone()
-        };
-        if let Some(path) = &self.path {
-            persist_titles(path, &snapshot);
-        }
+        self.map.lock_ok().insert(session_id.to_string(), title);
+        self.persist();
     }
 
     /// The stored title for a session, if any.
@@ -65,17 +65,14 @@ impl TitleStore {
         if from.is_empty() || to.is_empty() || from == to {
             return;
         }
-        let snapshot = {
+        {
             let mut map = self.map.lock_ok();
             let Some(title) = map.remove(from) else {
                 return;
             };
             map.insert(to.to_string(), title);
-            map.clone()
-        };
-        if let Some(path) = &self.path {
-            persist_titles(path, &snapshot);
         }
+        self.persist();
     }
 
     /// Drop the title for a session and persist, if one was stored (session
@@ -87,16 +84,10 @@ impl TitleStore {
         if session_id.is_empty() {
             return;
         }
-        let snapshot = {
-            let mut map = self.map.lock_ok();
-            if map.remove(session_id).is_none() {
-                return;
-            }
-            map.clone()
-        };
-        if let Some(path) = &self.path {
-            persist_titles(path, &snapshot);
+        if self.map.lock_ok().remove(session_id).is_none() {
+            return;
         }
+        self.persist();
     }
 
     /// A copy of the whole map. Needed by the one-time key migration, which has to
@@ -110,14 +101,8 @@ impl TitleStore {
     /// migrated file can never be observed. Not for ordinary use: `set` / `remove`
     /// are the per-entry API.
     pub fn replace(&self, titles: HashMap<String, String>) {
-        let snapshot = {
-            let mut map = self.map.lock_ok();
-            *map = titles;
-            map.clone()
-        };
-        if let Some(path) = &self.path {
-            persist_titles(path, &snapshot);
-        }
+        *self.map.lock_ok() = titles;
+        self.persist();
     }
 
     /// Number of stored titles. For tests/introspection only.
@@ -128,6 +113,17 @@ impl TitleStore {
     /// Whether the store holds no titles. For tests/introspection only.
     pub fn is_empty(&self) -> bool {
         self.map.lock_ok().is_empty()
+    }
+
+    /// Write the map as it is now, after any write already in progress. Every mutator calls
+    /// this AFTER releasing the lock. No-op without a path.
+    fn persist(&self) {
+        if let Some(path) = &self.path {
+            self.writer.persist(
+                || self.map.lock_ok().clone(),
+                |titles| persist_titles(path, titles),
+            );
+        }
     }
 }
 
@@ -160,29 +156,13 @@ pub fn load_titles(path: &Path) -> HashMap<String, String> {
     out
 }
 
-/// Persist the title map atomically (temp + rename), mode 0600 — same discipline
-/// as `persist_device_token`. Best-effort: a failure is logged, never fatal. The
-/// parent dir is created if missing so the store works regardless of init order.
+/// Persist the title map with [`write_atomic`] (a unique temp file + rename, mode 0600).
+/// Best-effort: a failure is logged, never fatal. The parent dir is created if missing so
+/// the store works regardless of init order.
 pub fn persist_titles(path: &Path, titles: &HashMap<String, String>) {
     let value = json!({ "v": 1, "titles": titles });
-    let tmp = path.with_extension("json.tmp");
-    let write = || -> std::io::Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&tmp)?;
-        f.write_all(value.to_string().as_bytes())?;
-        f.sync_all()?;
-        std::fs::rename(&tmp, path)
-    };
-    if let Err(e) = write() {
+    if let Err(e) = write_atomic(path, value.to_string().as_bytes()) {
         eprintln!("warning: could not persist titles: {e}");
-        let _ = std::fs::remove_file(&tmp);
     }
 }
 
@@ -306,6 +286,31 @@ mod tests {
         store.set("sess", "Recovered");
         let reloaded = TitleStore::new(Some(path.clone()));
         assert_eq!(reloaded.get("sess").as_deref(), Some("Recovered"));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// Titles minted by concurrent turns: every write lands, and the file on disk ends up
+    /// holding every title the store holds — never an older snapshot written last.
+    #[test]
+    fn concurrent_sets_all_reach_the_file() {
+        let path = temp_titles_path();
+        let store = std::sync::Arc::new(TitleStore::new(Some(path.clone())));
+        let handles: Vec<_> = (0..8)
+            .map(|t| {
+                let store = store.clone();
+                std::thread::spawn(move || {
+                    for i in 0..25 {
+                        store.set(&format!("sess-{t}-{i}"), &format!("Title {t} {i}"));
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("no setter panicked");
+        }
+        let reloaded = TitleStore::new(Some(path.clone()));
+        assert_eq!(reloaded.len(), 200, "the last write carried every title");
+        assert_eq!(reloaded.snapshot(), store.snapshot());
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }

@@ -14,6 +14,77 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [bridge 0.133.0] - 2026-09-10
+
+**Four findings from deploying 0.132.0, fixed: store files written through one shared temp
+name, codex-cli's plugin downloads kept for a conversation's whole lifetime, a health probe
+that took a busy gateway for a dead one, and a Claude Code containment record one CLI release
+behind.**
+
+**Every store file gets its own temp file per write, and a store's writes take turns.**
+Thirteen writers rewrote their JSON through `path.with_extension("json.tmp")`. The in-memory
+stores among them — conversations, context, titles, flags, deletions, the model selection,
+the profile and the artifact index — snapshot under their lock and write off it, so two turns
+finishing together wrote the same file at once through the same temp name. Five concurrent
+turns on the live bridge produced `could not persist conversations: No such file or directory
+(os error 2)` four times. The warning hid two worse outcomes: the losing write's bytes landed
+in the file the winner had just installed, so a shorter snapshot could leave invalid JSON
+behind — which every store loads as EMPTY on the next start — and an older snapshot could land
+after a newer one.
+- `write_atomic` (new, `atomicfile.rs`) writes through a unique `.<name>.<pid>.<random>.tmp`,
+  mode 0600, fsync, rename, and removes its temp file on failure. All thirteen writers use it,
+  including the day stores, the day-file intent journal, the Codex home index, the direct
+  usage log and the Places ledger.
+- `SnapshotWriter` makes each in-memory store's writes wait their turn and take the snapshot
+  inside it, so the file only ever moves forward. It never holds the store's own lock across
+  the write, so readers still never wait on the disk. Every mutator now mutates, releases the
+  lock, then calls `persist()`.
+- The Places ledger and the direct usage log used the default file mode; they are 0600 now,
+  like every other store file. The artifact index still creates its directory 0700 first.
+
+**codex-cli's plugin downloads no longer live as long as the conversation.** Each
+per-conversation `CODEX_HOME` carried ~43 MB of codex-cli's remote plugin catalog and plugin
+cache; 132 homes weighed 5.6 GB. The homes were not leaking — the session GC already reclaims
+them at `JESSE_SESSION_TTL_DAYS` (90), and they hold what a resume needs — but those two
+downloads are fetched again whenever they are missing. The session GC (at startup, then every
+six hours) now strips `cache/remote_plugin_catalog` and `plugins/cache` from any home whose
+conversation has been idle for an hour, keeping its sqlite state and rollouts and never
+following a link. A refreshed download no longer counts toward a home's age either, so it
+cannot keep a dead conversation on disk. Turning the downloads off (`features.plugins`,
+`features.remote_plugin`) was deliberately not done: those are `-c` flags on the child's argv,
+and the startup gate compares a Codex child's argv with the `toolset_args` its containment
+record was taken with, so that route runs through a Codex re-record.
+
+**A health-probe timeout is confirmed before it counts.** The local gateway on :9100 serves
+one request at a time. Right after 0.132.0 was deployed, a burst of about fifty streaming
+requests queued the Codex rows' probes behind a 26.5 s and an 8.3 s generation; they timed out
+at 3 s, and both Codex models were marked unhealthy and refused turns with a 409 for about ten
+minutes — on a backend that answered the same probe in 0.2 s once its queue drained. A timeout
+is now re-asked once with `TIMEOUT_CONFIRM_SECS` (45 s, checked at compile time to exceed the
+reasoning budget and to stay within the override ceiling). A refused connection, an HTTP error
+or an auth failure is still recorded at once, and a success is never re-asked. A backend that
+is really hung is recorded unhealthy one confirmation later.
+
+**The Claude Code containment record is re-recorded against claude 2.1.267.** All 64 probes
+across the four rows returned the verdicts recorded against 2.1.266 on 2026-09-09:
+`containment-probe` reported that nothing moved, and a probe-by-probe comparison of class,
+verdict, required level and status agreed. Only the header, the attempt counts and the scratch
+paths in the evidence changed. The two known-open baselines at `write` (`network_outbound`,
+`background_process`) are unchanged and, as before, carry no `[[accepted]]` entry. Several
+toolless-row probes waited out the 300 s probe timeout with no model reply before a retry
+answered; the battery discards a retry that proves less, so the verdicts stand. The CLI still
+auto-updates, so this record goes stale again at its next release unless the CLI is pinned.
+
+**Tests.** `atomicfile`: a private write that leaves no temp file, no temp file left by a
+failed rename, sixteen concurrent writers that never fail or tear the file, and a snapshot
+writer that never writes an older state after a newer one. The stores:
+`concurrent_turns_never_tear_or_roll_back_the_registry` and
+`concurrent_sets_all_reach_the_file`. The probe, on a scripted probe: a timeout confirmed with
+the patient budget, a repeated timeout recorded unhealthy, answered failures not retried, a
+success not re-probed, and a longer per-model budget kept. Codex homes: an idle home loses its
+downloads and keeps its conversation, a home in use keeps them, a refreshed catalog does not
+keep a dead conversation, and a link at a cache path is never followed.
+
 ## [bridge 0.132.0] - 2026-09-10
 
 **Every main-turn MCP server is spelled once, and the three Codex does not get are named in

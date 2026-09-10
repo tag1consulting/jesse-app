@@ -515,6 +515,11 @@ Answer the question I asked, not the one you wish I had asked.
 #                  before its first token even at max_tokens 1, and nothing bounds how long
 #                  that takes. Kimi K3 on Fireworks was measured at 1.2–5.4s (2026-08-04).
 #                  The built-in glm, kimi and qwen entries all think, and all set 15.
+#                  A TIMEOUT is confirmed before it counts: the probe is asked once more
+#                  with at least 45s, and only that answer is recorded. A backend queued
+#                  behind a long generation (the single-request local gateway) is busy, not
+#                  down; one that times out again is marked unhealthy. A refused
+#                  connection or an HTTP error is recorded at once, never re-asked.
 #
 # JESSE_HEALTH_INTERVAL_SECS (env var, optional): a GLOBAL override for the DEFAULT probe
 #   interval, so an operator can probe idle configured models less often without writing a

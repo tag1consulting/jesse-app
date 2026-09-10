@@ -42,6 +42,8 @@ pub struct ModelStore {
     state: Mutex<ModelSelection>,
     // Where the selection is persisted. `None` -> in-memory only.
     path: Option<PathBuf>,
+    // Orders the disk writes, so the file only ever moves forward (see `atomicfile`).
+    writer: SnapshotWriter,
 }
 
 impl ModelStore {
@@ -53,6 +55,7 @@ impl ModelStore {
         ModelStore {
             state: Mutex::new(state),
             path,
+            writer: SnapshotWriter::new(),
         }
     }
 
@@ -71,15 +74,14 @@ impl ModelStore {
     /// strings and cannot know the registry). A no-op write (same id) still persists
     /// harmlessly. Returns the id now active.
     pub fn set_active(&self, id: &str) -> String {
-        let snapshot = {
-            let mut state = self.state.lock_ok();
-            state.active = id.to_string();
-            state.clone()
-        };
+        self.state.lock_ok().active = id.to_string();
         if let Some(path) = &self.path {
-            persist_selection(path, &snapshot);
+            self.writer.persist(
+                || self.state.lock_ok().clone(),
+                |selection| persist_selection(path, selection),
+            );
         }
-        snapshot.active
+        id.to_string()
     }
 }
 
@@ -118,24 +120,8 @@ pub fn load_selection(path: &Path) -> Option<ModelSelection> {
 /// created if missing so the store works regardless of init order.
 pub fn persist_selection(path: &Path, selection: &ModelSelection) {
     let value = json!({ "v": 1, "active": selection.active });
-    let tmp = path.with_extension("json.tmp");
-    let write = || -> std::io::Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&tmp)?;
-        f.write_all(value.to_string().as_bytes())?;
-        f.sync_all()?;
-        std::fs::rename(&tmp, path)
-    };
-    if let Err(e) = write() {
+    if let Err(e) = write_atomic(path, value.to_string().as_bytes()) {
         eprintln!("warning: could not persist model selection: {e}");
-        let _ = std::fs::remove_file(&tmp);
     }
 }
 

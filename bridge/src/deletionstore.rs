@@ -61,6 +61,8 @@ pub struct DeletionStore {
     // Tombstones older than this (relative to a supplied "now") are pruned and are
     // never reported by `recent`.
     retention_ms: u64,
+    // Orders the disk writes, so the file only ever moves forward (see `atomicfile`).
+    writer: SnapshotWriter,
 }
 
 impl DeletionStore {
@@ -76,6 +78,7 @@ impl DeletionStore {
             map: Mutex::new(map),
             path,
             retention_ms,
+            writer: SnapshotWriter::new(),
         }
     }
 
@@ -88,15 +91,23 @@ impl DeletionStore {
         if session_id.is_empty() {
             return;
         }
-        let snapshot = {
+        {
             let mut map = self.map.lock_ok();
             map.insert(session_id.to_string(), now_ms);
             // Prune on every write so `deletions.json` stays bounded.
             prune_map(&mut map, now_ms, self.retention_ms);
-            map.clone()
-        };
+        }
+        self.persist();
+    }
+
+    /// Write the map as it is now, after any write already in progress. Every mutator calls
+    /// this AFTER releasing the lock. No-op without a path.
+    fn persist(&self) {
         if let Some(path) = &self.path {
-            persist_deletions(path, &snapshot);
+            self.writer.persist(
+                || self.map.lock_ok().clone(),
+                |deletions| persist_deletions(path, deletions),
+            );
         }
     }
 
@@ -135,15 +146,12 @@ impl DeletionStore {
     /// use: `record` is the per-entry API.
     pub fn replace(&self, deletions: HashMap<String, u64>) {
         let now_ms = system_time_to_ms(SystemTime::now());
-        let snapshot = {
+        {
             let mut map = self.map.lock_ok();
             *map = deletions;
             prune_map(&mut map, now_ms, self.retention_ms);
-            map.clone()
-        };
-        if let Some(path) = &self.path {
-            persist_deletions(path, &snapshot);
         }
+        self.persist();
     }
 
     /// Number of stored tombstones (including any not yet pruned). For
@@ -198,24 +206,8 @@ pub fn load_deletions(path: &Path) -> HashMap<String, u64> {
 /// The parent dir is created if missing so the store works regardless of init order.
 pub fn persist_deletions(path: &Path, deletions: &HashMap<String, u64>) {
     let value = json!({ "v": 1, "deletions": deletions });
-    let tmp = path.with_extension("json.tmp");
-    let write = || -> std::io::Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&tmp)?;
-        f.write_all(value.to_string().as_bytes())?;
-        f.sync_all()?;
-        std::fs::rename(&tmp, path)
-    };
-    if let Err(e) = write() {
+    if let Err(e) = write_atomic(path, value.to_string().as_bytes()) {
         eprintln!("warning: could not persist deletions: {e}");
-        let _ = std::fs::remove_file(&tmp);
     }
 }
 

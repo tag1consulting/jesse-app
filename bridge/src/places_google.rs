@@ -622,9 +622,7 @@ impl CallLedger {
         if window.total > LEDGER_REWRITE_LINES {
             // Rewrite through a sibling temp file so a crash mid-write cannot leave a
             // half-ledger that reads as "nothing spent".
-            let tmp = path.with_extension("log.tmp");
-            std::fs::write(&tmp, format!("{}{line}", window.fresh))?;
-            std::fs::rename(&tmp, path)?;
+            crate::write_atomic(path, format!("{}{line}", window.fresh).as_bytes())?;
             return Ok(());
         }
         use std::io::Write;

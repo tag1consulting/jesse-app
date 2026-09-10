@@ -1691,13 +1691,9 @@ fn prune_usage_log(path: &Path, now: SystemTime) {
     if kept.len() == text.lines().filter(|l| !l.trim().is_empty()).count() {
         return; // nothing to drop; do not rewrite a file for no reason
     }
-    let tmp = path.with_extension("jsonl.tmp");
     let body = kept.join("\n") + if kept.is_empty() { "" } else { "\n" };
-    if std::fs::write(&tmp, body).is_ok() {
-        if let Err(e) = std::fs::rename(&tmp, path) {
-            eprintln!("jesse-bridge: usage-log prune failed: {e} — continuing");
-            let _ = std::fs::remove_file(&tmp);
-        }
+    if let Err(e) = write_atomic(path, body.as_bytes()) {
+        eprintln!("jesse-bridge: usage-log prune failed: {e} — continuing");
     }
 }
 
