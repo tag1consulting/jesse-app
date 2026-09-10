@@ -16,6 +16,11 @@ import JesseAsk
 
 enum OpsAsk {
 
+    /// A card's title, derived from the area's OWN label rather than spelled again here: a
+    /// title that said "Bridge" while the section header said something else would name a
+    /// card the user is not looking at.
+    static func cardTitle(_ area: OpsAskArea) -> String { "\(area.label) · Ops" }
+
     // MARK: - The page
 
     /// The whole Bridge ops screen, for the toolbar's Ask entry.
@@ -66,7 +71,7 @@ enum OpsAsk {
                                      lines: ["the sentinel has not answered the deploy card yet"]))
         }
         return AskContext(scope: .page, area: .ops, reading: reading,
-                          title: "Bridge ops", subject: "this screen",
+                          title: OpsAskArea.ops.label, subject: "this screen",
                           facts: AskFacts(children: children),
                           related: deployIdentifiers(deploy),
                           suggestedQuestions: OpsAskStarters.page)
@@ -77,7 +82,7 @@ enum OpsAsk {
     static func bridgeCard(_ status: SentinelStatusDocument?,
                            reading: OpsAskReading) -> AskContext {
         AskContext(scope: .section, area: .bridge, reading: reading,
-                   title: "Bridge · Ops", subject: "the Bridge card",
+                   title: cardTitle(.bridge), subject: "the Bridge card",
                    facts: OpsFacts.bridge(status?.bridge),
                    suggestedQuestions: OpsAskStarters.bridge)
     }
@@ -85,7 +90,7 @@ enum OpsAsk {
     static func servicesCard(_ status: SentinelStatusDocument?,
                              reading: OpsAskReading) -> AskContext {
         AskContext(scope: .section, area: .services, reading: reading,
-                   title: "Services · Ops", subject: "the Services card",
+                   title: cardTitle(.services), subject: "the Services card",
                    facts: OpsFacts.services(status?.services, rows: status?.serviceRows ?? []),
                    suggestedQuestions: OpsAskStarters.services)
     }
@@ -102,14 +107,14 @@ enum OpsAsk {
     static func tailscaleCard(_ status: SentinelStatusDocument?,
                               reading: OpsAskReading) -> AskContext {
         AskContext(scope: .section, area: .tailscale, reading: reading,
-                   title: "Tailscale · Ops", subject: "the Tailscale card",
+                   title: cardTitle(.tailscale), subject: "the Tailscale card",
                    facts: OpsFacts.tailscale(status?.tailscale))
     }
 
     static func diskCard(_ status: SentinelStatusDocument?,
                          reading: OpsAskReading) -> AskContext {
         AskContext(scope: .section, area: .disk, reading: reading,
-                   title: "Disk · Ops", subject: "the Disk card",
+                   title: cardTitle(.disk), subject: "the Disk card",
                    facts: OpsFacts.disk(status?.disk),
                    suggestedQuestions: OpsAskStarters.disk)
     }
@@ -117,7 +122,7 @@ enum OpsAsk {
     static func gitCard(_ status: SentinelStatusDocument?,
                         reading: OpsAskReading) -> AskContext {
         AskContext(scope: .section, area: .git, reading: reading,
-                   title: "Git · Ops", subject: "the Git card",
+                   title: cardTitle(.git), subject: "the Git card",
                    facts: OpsFacts.git(status?.git),
                    suggestedQuestions: OpsAskStarters.git)
     }
@@ -125,14 +130,14 @@ enum OpsAsk {
     static func qmdCard(_ status: SentinelStatusDocument?,
                         reading: OpsAskReading) -> AskContext {
         AskContext(scope: .section, area: .qmd, reading: reading,
-                   title: "QMD · Ops", subject: "the QMD card",
+                   title: cardTitle(.qmd), subject: "the QMD card",
                    facts: OpsFacts.qmd(status?.qmd))
     }
 
     static func watchdogCard(_ status: SentinelStatusDocument?,
                              reading: OpsAskReading) -> AskContext {
         AskContext(scope: .section, area: .watchdog, reading: reading,
-                   title: "Watchdog · Ops", subject: "the Watchdog card",
+                   title: cardTitle(.watchdog), subject: "the Watchdog card",
                    facts: OpsFacts.watchdog(status?.sentinel, now: reading.taken),
                    suggestedQuestions: OpsAskStarters.watchdog)
     }
@@ -142,7 +147,7 @@ enum OpsAsk {
     static func actionsSection(verbs: [OpsAction], last: OpsModel.VerbOutcome?,
                                isRunning: Bool, reading: OpsAskReading) -> AskContext {
         AskContext(scope: .section, area: .actions, reading: reading,
-                   title: "Actions · Ops", subject: "these actions",
+                   title: cardTitle(.actions), subject: "these actions",
                    facts: OpsFacts.actions(verbs, last: last, isRunning: isRunning),
                    suggestedQuestions: ["What does each of these do?",
                                         "Which one would you press here?",
@@ -153,7 +158,7 @@ enum OpsAsk {
 
     static func ledgerSection(_ rows: [LedgerRow], reading: OpsAskReading) -> AskContext {
         AskContext(scope: .section, area: .ledger, reading: reading,
-                   title: "Ledger · Ops", subject: "the ledger",
+                   title: cardTitle(.ledger), subject: "the ledger",
                    facts: OpsFacts.ledger(rows, bridgeTz: nil),
                    suggestedQuestions: OpsAskStarters.ledger)
     }
@@ -175,14 +180,14 @@ enum OpsAsk {
     static func deployCard(_ doc: DeployStatusDocument?, reading: OpsAskReading) -> AskContext {
         guard let doc else {
             return AskContext(scope: .section, area: .deploy, reading: reading,
-                              title: "Deploy · Ops", subject: "the Deploy card",
+                              title: cardTitle(.deploy), subject: "the Deploy card",
                               facts: AskFacts(heading: "Deploy",
                                               lines: ["the sentinel has not answered the "
                                                   + "deploy card yet"]),
                               suggestedQuestions: OpsAskStarters.deploy)
         }
         return AskContext(scope: .section, area: .deploy, reading: reading,
-                          title: "Deploy · Ops", subject: "the Deploy card",
+                          title: cardTitle(.deploy), subject: "the Deploy card",
                           facts: OpsFacts.deploy(doc),
                           related: deployIdentifiers(doc),
                           suggestedQuestions: OpsAskStarters.deploy)
@@ -270,7 +275,7 @@ enum OpsAsk {
                 lines: invalid.map { "\($0.id): \($0.reason)" }))
         }
         return AskContext(scope: .page, area: .schedule, reading: reading,
-                          title: "Schedule", subject: "this schedule",
+                          title: OpsAskArea.schedule.label, subject: "this schedule",
                           facts: AskFacts(children: children),
                           suggestedQuestions: OpsAskStarters.schedule)
     }
@@ -299,7 +304,7 @@ enum OpsAsk {
     static func awayPage(_ profile: ProfileDocument?, loadError: String?,
                          reading: OpsAskReading) -> AskContext {
         AskContext(scope: .page, area: .away, reading: reading,
-                   title: "Away mode", subject: "this screen",
+                   title: OpsAskArea.away.label, subject: "this screen",
                    facts: OpsFacts.profile(profile, error: loadError, zone: reading.zone),
                    suggestedQuestions: OpsAskStarters.away)
     }
