@@ -34,7 +34,7 @@ final class RunCoordinatorFinishTests: XCTestCase {
                   conversationId: String, voice: Bool,
                   instructions: String?, floorOverride: String?,
                   attachments: [JesseAttachment], requestId: UUID,
-                  model: String?) async throws -> JesseSendResult {
+                  model: String?, effort: String?) async throws -> JesseSendResult {
             sendCount += 1
             return .running(jobId: "job-finish", conversationId: nil)
         }

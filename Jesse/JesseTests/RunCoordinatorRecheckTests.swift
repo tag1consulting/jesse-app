@@ -27,7 +27,7 @@ final class RunCoordinatorRecheckTests: XCTestCase {
                   conversationId: String, voice: Bool,
                   instructions: String?, floorOverride: String?,
                   attachments: [JesseAttachment], requestId: UUID,
-                  model: String?) async throws -> JesseSendResult {
+                  model: String?, effort: String?) async throws -> JesseSendResult {
             // Always outruns the grace window so the coordinator persists a job
             // and enters the poll loop (where recoverable failures are retained).
             .running(jobId: "job-recheck", conversationId: nil)
@@ -152,7 +152,7 @@ final class RunCoordinatorRecheckTests: XCTestCase {
                   conversationId: String, voice: Bool,
                   instructions: String?, floorOverride: String?,
                   attachments: [JesseAttachment], requestId: UUID,
-                  model: String?) async throws -> JesseSendResult {
+                  model: String?, effort: String?) async throws -> JesseSendResult {
             .running(jobId: "job-gone", conversationId: nil)
         }
         func result(jobId: String) async throws -> JesseResultState {

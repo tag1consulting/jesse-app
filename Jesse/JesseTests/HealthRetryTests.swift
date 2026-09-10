@@ -30,7 +30,7 @@ final class HealthRetryTests: XCTestCase {
                   conversationId: String, voice: Bool,
                   instructions: String?, floorOverride: String?,
                   attachments: [JesseAttachment], requestId: UUID,
-                  model: String?) async throws -> JesseSendResult {
+                  model: String?, effort: String?) async throws -> JesseSendResult {
             sendCalls += 1
             return .running(jobId: "job-sentinel", conversationId: nil)
         }
@@ -38,7 +38,7 @@ final class HealthRetryTests: XCTestCase {
         func sendFulfilling(_ request: DeviceContextRequest, mode: JesseMode, text: String,
                             sessionId: String?, conversationId: String, voice: Bool,
                             instructions: String?, floorOverride: String?,
-                            model: String?) async throws -> JesseSendResult {
+                            model: String?, effort: String?) async throws -> JesseSendResult {
             fulfillCalls.append((request, sessionId))
             return .running(jobId: "job-answer", conversationId: nil)
         }

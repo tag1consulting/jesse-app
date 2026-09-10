@@ -610,6 +610,11 @@ public struct JesseRequest: Encodable, Equatable, Sendable {
     // and per device and send it on every turn; a nil field omits the key, so the bridge
     // uses its stored default (byte-for-byte today's behavior for an older client).
     public let model: String?
+    // Per-turn effort: one of the values the turn's model DECLARES (`ModelInfo.effort`), sent
+    // only when it differs from that model's default. nil omits the key, and the model's
+    // default runs — byte-for-byte a turn from before effort existed. The bridge refuses a
+    // value the model does not declare with a 400 rather than ignoring it.
+    public let effort: String?
     // The IANA zone the DEVICE is standing in ("Europe/London"), stamped onto every turn by
     // `JesseBridgeClient.sendPrepared` rather than by each caller — see `stamped(clientTz:sentAt:)`.
     // The bridge lets it outrank the away profile for that one request, because the phone's own
@@ -633,7 +638,7 @@ public struct JesseRequest: Encodable, Equatable, Sendable {
                 locationContextUnavailable: Bool? = nil,
                 locationContextUnavailableReason: String? = nil,
                 mealCorrectionsAck: Int?, requestId: String?,
-                model: String? = nil) {
+                model: String? = nil, effort: String? = nil) {
         self.mode = mode
         self.text = text
         self.sessionId = sessionId
@@ -652,6 +657,7 @@ public struct JesseRequest: Encodable, Equatable, Sendable {
         self.mealCorrectionsAck = mealCorrectionsAck
         self.requestId = requestId
         self.model = model
+        self.effort = effort
         self.clientTz = nil
         self.sentAt = nil
     }
@@ -702,7 +708,7 @@ public struct JesseRequest: Encodable, Equatable, Sendable {
         case locationContextUnavailableReason = "location_context_unavailable_reason"
         case mealCorrectionsAck = "meal_corrections_ack"
         case requestId = "request_id"
-        case model
+        case model, effort
         case clientTz = "client_tz"
         case sentAt = "sent_at"
     }
@@ -955,8 +961,9 @@ public struct ModelInfo: Decodable, Equatable, Sendable, Identifiable {
     public let id: String
     /// The human label shown in the switcher.
     public let label: String
-    /// `ambient` | `hosted` | `local` — kept as the raw string so an unknown future kind
-    /// still decodes and renders rather than failing.
+    /// `ambient` | `subscription` | `hosted` | `local` | `openai` — kept as the raw string so an
+    /// unknown future kind still decodes and renders rather than failing. Only `ambient` means
+    /// anything to the client (it is the always-available default — see `isDefault`).
     public let kind: String
     /// Whether this model may be selected RIGHT NOW: the bridge's `available` = `configured`
     /// AND `healthy`. The switcher renders an unavailable model disabled with `unavailableReason`.
@@ -989,11 +996,32 @@ public struct ModelInfo: Decodable, Equatable, Sendable, Identifiable {
     /// spinner rather than an empty bubble, so the client needs to be told. Defaults to `true`
     /// — the streaming assumption every client already made — against a bridge that omits it.
     public let streamsText: Bool
+    /// The family's display name (`Claude`, `GLM`), which the picker GROUPS by: a family with
+    /// more than one model gets a section header, a family of one gets none. Defaults to the id
+    /// against a bridge that omits it, which makes every model a family of one — exactly the
+    /// flat list an older bridge rendered.
+    public let family: String
+    /// Which harness runs this model (`claude-code`, `codex`, `direct`). Information the picker
+    /// shows beside the version, never a choice: a model is registered on one harness. nil
+    /// against an older bridge.
+    public let harness: String?
+    /// The backend version this entry points at (`5.3`, `K3`), or nil when it declares none.
+    public let version: String?
+    /// The effort scale this model DECLARES, or nil — in which case the picker renders no
+    /// effort control at all. Decoded, never inferred: a client that guessed would offer a
+    /// control that silently does nothing the first time a provider changed.
+    public let effort: ModelEffortScale?
 
     public init(id: String, label: String, kind: String, available: Bool, writesAllowed: Bool,
                 level: String? = nil, streamsText: Bool? = nil,
                 configured: Bool? = nil, healthy: Bool? = nil,
-                lastCheckedMs: UInt64? = nil, latencyMs: UInt64? = nil) {
+                lastCheckedMs: UInt64? = nil, latencyMs: UInt64? = nil,
+                family: String? = nil, harness: String? = nil, version: String? = nil,
+                effort: ModelEffortScale? = nil) {
+        self.family = family ?? id
+        self.harness = harness
+        self.version = version
+        self.effort = effort
         self.id = id
         self.label = label
         self.kind = kind
@@ -1011,6 +1039,7 @@ public struct ModelInfo: Decodable, Equatable, Sendable, Identifiable {
 
     enum CodingKeys: String, CodingKey {
         case id, label, kind, available, configured, healthy, level
+        case family, harness, version, effort
         case lastCheckedMs = "last_checked_ms"
         case latencyMs = "latency_ms"
         case writesAllowed = "writes_allowed"
@@ -1035,6 +1064,13 @@ public struct ModelInfo: Decodable, Equatable, Sendable, Identifiable {
         // predates levels omits both, and the defaults reproduce what the client assumed.
         level = try c.decodeIfPresent(String.self, forKey: .level) ?? (writesAllowed ? "write" : "read")
         streamsText = try c.decodeIfPresent(Bool.self, forKey: .streamsText) ?? true
+        // The picker's grouping and secondary text, additive like everything above: a bridge
+        // that predates them omits all four, and every model is then its own family with no
+        // detail line and no effort control — today's picker exactly.
+        family = try c.decodeIfPresent(String.self, forKey: .family) ?? id
+        harness = try c.decodeIfPresent(String.self, forKey: .harness)
+        version = try c.decodeIfPresent(String.self, forKey: .version)
+        effort = try c.decodeIfPresent(ModelEffortScale.self, forKey: .effort)
     }
 
     /// What this model may touch, for the switcher subtitle. `nil` for a Write model (the
@@ -1059,6 +1095,32 @@ public struct ModelInfo: Decodable, Equatable, Sendable, Identifiable {
         if available { return nil }
         if !configured { return "not configured" }
         return "unreachable"
+    }
+}
+
+/// The effort scale a model DECLARES in its `GET /jesse/models` row: the exact values that do
+/// something on its backend, weakest first, and the one a turn runs at when it names none.
+///
+/// `kind` is `scale` (a graded choice, one inline picker) or `toggle` (thinking on/off, a
+/// single switch over exactly `[off, on]`). The bridge says which; this side never decides
+/// from the values alone.
+public struct ModelEffortScale: Decodable, Equatable, Sendable {
+    public let kind: String
+    public let values: [String]
+    public let defaultValue: String
+
+    public init(kind: String = "scale", values: [String], defaultValue: String) {
+        self.kind = kind
+        self.values = values
+        self.defaultValue = defaultValue
+    }
+
+    /// A switch rather than a picker: the bridge declared a toggle, and it has its two values.
+    public var isToggle: Bool { kind == "toggle" && values.count == 2 }
+
+    enum CodingKeys: String, CodingKey {
+        case kind, values
+        case defaultValue = "default"
     }
 }
 

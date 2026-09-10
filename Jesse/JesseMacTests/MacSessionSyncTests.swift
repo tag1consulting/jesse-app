@@ -31,7 +31,7 @@ final class MacSessionSyncTests: XCTestCase {
                               conversationId: String, voice: Bool,
                               instructions: String?, floorOverride: String?,
                               attachments: [JesseRequest.Attachment], requestId: String,
-                              model: String?) async throws -> JesseSendResult {
+                              model: String?, effort: String?) async throws -> JesseSendResult {
             throw JesseError.notConfigured
         }
         nonisolated func result(jobId: String) async throws -> JesseResultState { throw JesseError.notConfigured }

@@ -1240,20 +1240,22 @@ private struct ModelPickerMenu: View {
     var body: some View {
         Group {
             if let modelState {
+                // ONE menu, and the whole of it fits in one menu. What goes in it, and in which
+                // order, is `ModelMenuLayout`'s — shared with the Mac so the two cannot drift.
                 Menu {
-                    ForEach(modelState.offered) { model in
-                        Button {
-                            select(model)
-                        } label: {
-                            if model.id == selectedID {
-                                Label(model.label, systemImage: "checkmark")
-                            } else {
-                                // A disabled row still explains WHY (not configured /
-                                // unreachable) via the shared `menuRowLabel`.
-                                Text(model.menuRowLabel)
-                            }
+                    // Families are SECTIONS, never submenus: a header costs no tap, a submenu
+                    // costs one. A family of one has no header and is a plain row.
+                    ForEach(layout.sections) { section in
+                        if let header = section.header {
+                            Section(header) { rows(section, in: modelState) }
+                        } else {
+                            rows(section, in: modelState)
                         }
-                        .disabled(!model.available)
+                    }
+                    // Effort: ONE inline control for the resolved model, and only when that
+                    // model declares a scale. Absent otherwise — not disabled, absent.
+                    if let control = layout.effort, let resolved {
+                        Section("Effort") { effortControl(control, on: resolved) }
                     }
                 } label: {
                     buttonLabel
@@ -1269,20 +1271,64 @@ private struct ModelPickerMenu: View {
         .task { await loadWithRetry() }
     }
 
-    private var buttonLabel: some View { Label(currentLabel, systemImage: "cpu") }
+    /// Everything the menu renders, from the loaded list and this thread's selection.
+    private var layout: ModelMenuLayout {
+        ModelMenuLayout(state: modelState, threadModelID: thread.selectedModelID,
+                        deviceDefaultID: LastUsedModelStore.id, threadEffort: thread.selectedEffort)
+    }
+
+    /// One family's rows. The resolved model carries the checkmark and, as secondary text, the
+    /// harness and version it runs on — information, never a control. A disabled row still
+    /// explains WHY (not configured / unreachable): an outage must not look like a deletion.
+    @ViewBuilder
+    private func rows(_ section: ModelMenuSection, in state: ModelSwitchState) -> some View {
+        ForEach(section.rows) { row in
+            Button {
+                if let model = state.offered.first(where: { $0.id == row.id }) { select(model) }
+            } label: {
+                if row.isSelected, let subtitle = row.subtitle {
+                    Label {
+                        Text(row.title)
+                        Text(subtitle)
+                    } icon: {
+                        Image(systemName: "checkmark")
+                    }
+                } else if row.isSelected {
+                    Label(row.title, systemImage: "checkmark")
+                } else {
+                    Text(row.title)
+                }
+            }
+            .disabled(!row.isEnabled)
+        }
+    }
+
+    /// The effort control the resolved model declared: an inline picker over a graded scale, or
+    /// a single switch for thinking on/off. Inline, so choosing costs the same one tap a model
+    /// pick does.
+    @ViewBuilder
+    private func effortControl(_ control: ModelEffortControl, on model: ModelInfo) -> some View {
+        switch control {
+        case .picker(let values, let selected):
+            Picker("Effort", selection: Binding(get: { selected },
+                                                set: { selectEffort($0, on: model) })) {
+                ForEach(values, id: \.self) { Text($0).tag($0) }
+            }
+            .pickerStyle(.inline)
+        case .toggle(let off, let on, let isOn):
+            Toggle("Thinking", isOn: Binding(get: { isOn },
+                                             set: { selectEffort($0 ? on : off, on: model) }))
+        }
+    }
+
+    /// The label carries the model name, plus the effort only when it is not the default.
+    private var buttonLabel: some View { Label(layout.buttonLabel, systemImage: "cpu") }
 
     /// The model the next turn will run on: the thread's own selection, else this device's
     /// default, else opus. Nil only before the list loads.
     private var resolved: ModelInfo? {
         modelState?.resolvedModel(threadModelID: thread.selectedModelID,
                                   deviceDefaultID: LastUsedModelStore.id)
-    }
-    private var selectedID: String? { resolved?.id }
-    /// The button label, resolvable even before the list loads (falls back to the resolved id).
-    private var currentLabel: String {
-        ModelSelectionResolver.resolvedLabel(state: modelState,
-                                             threadModelID: thread.selectedModelID,
-                                             deviceDefaultID: LastUsedModelStore.id)
     }
 
     /// Populate the list with ONE bounded, backed-off burst of attempts (`loadModelList`), so a
@@ -1296,19 +1342,48 @@ private struct ModelPickerMenu: View {
             isConfigured: cfg.isConfigured,
             fetch: { try? await JesseClient(config: cfg).fetchModels() },
             sleep: { try? await Task.sleep(for: .seconds($0)) })
+        // A stored effort the resolved model no longer declares (a provider change since it was
+        // chosen) is dropped now, so the next turn never sends a value the bridge would refuse.
+        if let modelState {
+            let kept = ModelMenuAction.sanitizedEffort(
+                state: modelState, threadModelID: thread.selectedModelID,
+                deviceDefaultID: LastUsedModelStore.id, threadEffort: thread.selectedEffort)
+            if kept != thread.selectedEffort {
+                thread.selectedEffort = kept
+                save("clearing a stale effort")
+            }
+        }
     }
 
     /// Pick a model for THIS conversation: store it on the thread and make it this device's
     /// default for the next new conversation. No bridge write — the selection is entirely
-    /// local, so another device is unaffected.
+    /// local, so another device is unaffected. A different model clears the thread's effort,
+    /// which belonged to the model it was chosen on.
     private func select(_ model: ModelInfo) {
         guard model.available, model.id != thread.selectedModelID else { return }
-        thread.selectedModelID = model.id
+        let next = ModelMenuAction.pick(model, currentModelID: thread.selectedModelID,
+                                        currentEffort: thread.selectedEffort)
+        thread.selectedModelID = next.modelID
+        thread.selectedEffort = next.effort
         LastUsedModelStore.id = model.id
+        save("selecting model \(model.id)")
+    }
+
+    /// Pick an EFFORT for the resolved model. It pins that model to the thread, because an effort
+    /// is only ever sent with the model it was chosen for.
+    private func selectEffort(_ value: String, on model: ModelInfo) {
+        let next = ModelMenuAction.pickEffort(value, on: model)
+        thread.selectedModelID = next.modelID
+        thread.selectedEffort = next.effort
+        LastUsedModelStore.id = next.modelID
+        save("selecting effort \(value) on \(model.id)")
+    }
+
+    private func save(_ what: String) {
         do {
             try context.save()
         } catch {
-            Log.run.error("selecting model \(model.id) for thread \(thread.id): \(error.localizedDescription)")
+            Log.run.error("\(what) for thread \(thread.id): \(error.localizedDescription)")
         }
     }
 }

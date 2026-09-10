@@ -119,7 +119,7 @@ final class MacFakeBridgeClient: BridgeClientProtocol, @unchecked Sendable {
                           conversationId: String, voice: Bool,
                           instructions: String?, floorOverride: String?,
                           attachments: [JesseRequest.Attachment], requestId: String,
-                          model: String?) async throws -> JesseSendResult {
+                          model: String?, effort: String?) async throws -> JesseSendResult {
         await beforeSend?()
         return lock.withLock {
             _sentConversationIds.append(conversationId)

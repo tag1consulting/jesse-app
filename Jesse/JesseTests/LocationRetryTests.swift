@@ -43,7 +43,7 @@ final class LocationRetryTests: XCTestCase {
                   conversationId: String, voice: Bool,
                   instructions: String?, floorOverride: String?,
                   attachments: [JesseAttachment], requestId: UUID,
-                  model: String?) async throws -> JesseSendResult {
+                  model: String?, effort: String?) async throws -> JesseSendResult {
             sendCalls += 1
             return .running(jobId: "job-sentinel", conversationId: nil)
         }
@@ -51,7 +51,7 @@ final class LocationRetryTests: XCTestCase {
         func sendFulfilling(_ request: DeviceContextRequest, mode: JesseMode, text: String,
                             sessionId: String?, conversationId: String, voice: Bool,
                             instructions: String?, floorOverride: String?,
-                            model: String?) async throws -> JesseSendResult {
+                            model: String?, effort: String?) async throws -> JesseSendResult {
             fulfillCalls.append((request, sessionId))
             answerJobs += 1
             return .running(jobId: "job-answer-\(answerJobs)", conversationId: nil)
@@ -171,13 +171,13 @@ final class LocationRetryTests: XCTestCase {
                   conversationId: String, voice: Bool,
                   instructions: String?, floorOverride: String?,
                   attachments: [JesseAttachment], requestId: UUID,
-                  model: String?) async throws -> JesseSendResult {
+                  model: String?, effort: String?) async throws -> JesseSendResult {
             .running(jobId: "job-sentinel", conversationId: nil)
         }
         func sendFulfilling(_ request: DeviceContextRequest, mode: JesseMode, text: String,
                             sessionId: String?, conversationId: String, voice: Bool,
                             instructions: String?, floorOverride: String?,
-                            model: String?) async throws -> JesseSendResult {
+                            model: String?, effort: String?) async throws -> JesseSendResult {
             // What the real client does when the channel cannot be fulfilled: it does
             // NOT throw and does NOT return early — it re-sends the turn marked
             // unavailable, and the bridge answers it.

@@ -2069,6 +2069,192 @@ pub fn parse_reasoning_effort(raw: &str) -> Option<ReasoningEffort> {
     }
 }
 
+// ---- Per-turn effort: the model DECLARES it, the app never infers it --------------
+
+/// Whether a model's effort control is a graded scale or a thinking on/off switch.
+///
+/// Carried to the client so it can render the right control WITHOUT inferring anything: a
+/// scale is one inline picker, a toggle is a single switch. A client that looked at two values
+/// and decided "that must be on/off" would be guessing, and the guess breaks the first time a
+/// provider ships a two-step scale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EffortKind {
+    Scale,
+    Toggle,
+}
+
+/// A model's DECLARED effort capability: the exact values that do something on this backend,
+/// and the one a turn runs at when it names none.
+///
+/// **DECLARED FROM MEASUREMENT, NEVER FROM A VENDOR TABLE ALONE.** A control that cannot change
+/// the outcome must not be offered, so a value belongs here only when sending it was observed to
+/// move the model's behaviour on this surface. Kimi K3 is the case that makes the rule bite: its
+/// vendor documents `low` / `high` / `max`, and on Fireworks' Anthropic surface `low` against
+/// `max` moved nothing measurable (2026-09-10, two prompts, two samples each). So it declares no
+/// scale, and the app renders no effort control for it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct EffortScale {
+    pub kind: EffortKind,
+    /// The values, weakest first. For a toggle exactly two: `[off, on]`.
+    pub values: Vec<String>,
+    /// What the harness sends when a turn names no effort — measured on the wire, not assumed.
+    /// The claude CLI sends `high` by itself (captured 2026-09-10), so a claude-code scale's
+    /// default is `high` and an app that shows no effort in the button label is telling the
+    /// truth about what runs.
+    pub default: String,
+}
+
+impl EffortScale {
+    /// A graded scale over `values`, running at `default` when a turn names none.
+    pub fn scale(values: &[&str], default: &str) -> Self {
+        EffortScale {
+            kind: EffortKind::Scale,
+            values: values.iter().map(|v| v.to_string()).collect(),
+            default: default.to_string(),
+        }
+    }
+
+    /// Whether `value` is one this model declared.
+    pub fn accepts(&self, value: &str) -> bool {
+        self.values.iter().any(|v| v == value)
+    }
+}
+
+/// The values the claude CLI's `--effort` accepts (measured on 2.1.267: its own warning lists
+/// exactly these). Anything else is IGNORED with a warning and the default is sent instead — a
+/// silent no-op on the wire — so a claude-code model may declare only these, and the startup
+/// gate refuses one that declares anything else. There is no `none`: thinking cannot be switched
+/// off through this flag, which is why no claude-code model can declare a toggle over it.
+pub const CLAUDE_CODE_EFFORT_VALUES: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+
+/// The per-turn effort values a harness can DELIVER, or `None` when it has no per-turn effort
+/// path at all. Codex's are its `model_reasoning_effort` set ([`ReasoningEffort`]); `direct`
+/// has none, so a direct model declaring effort is a startup error.
+pub fn harness_effort_values(harness: &str) -> Option<Vec<&'static str>> {
+    match harness {
+        CLAUDE_CODE_ID => Some(CLAUDE_CODE_EFFORT_VALUES.to_vec()),
+        CODEX_ID => Some(ReasoningEffort::ALL.iter().map(|e| e.as_str()).collect()),
+        _ => None,
+    }
+}
+
+/// The effort scale a BUILT-IN declares, overridable from the launch environment as
+/// `<prefix>_EFFORT=low,high,max` (the values, weakest first). An EMPTY value declares no scale,
+/// which takes the effort control out of the picker for that model.
+///
+/// **THE BUILT-IN SCALES ARE MEASURED, AND THEY ARE NOT THE VENDOR TABLES.** Each was set from
+/// live turns on 2026-09-10 — the same hard reasoning prompt at each level, two samples per
+/// level — and a value is in a scale only when it moved output measurably against its
+/// neighbours:
+///
+/// | model        | low          | high (default) | max              | declared          |
+/// |--------------|--------------|----------------|------------------|-------------------|
+/// | GLM 5.3      | 1,176 / 2,824| 6,234 / 5,976  | 16,000+ / 10,531 | low, high, max    |
+/// | Qwen 3.8 Max | 4,197 / 6,286| 8,365 / 8,953  | 9,580 / 11,803   | low, high, max    |
+/// | Opus 5       | 976 / 1,164  | 682 / 1,774    | 4,974 / 4,095    | high, max         |
+/// | Fable 5.1    | 973 / 3,470  | 3,949 / 2,087  | 5,635 / 5,547    | high, max         |
+/// | Kimi K3      | 6,039 / 3,035| —              | 3,575 / 10,694   | none              |
+///
+/// (Output tokens. GLM's `medium` measured with its `high`, 5,462 / 3,646, so it is left out.
+/// Opus and Fable were re-run on a second prompt with the same result: `low` indistinguishable
+/// from the default, `max` two to four times the output.) Kimi declares nothing because
+/// `low` and `max` overlapped completely on two prompts — its vendor documents three levels,
+/// and on this surface they did not do anything a person could see.
+///
+/// **The default is always `high`**: it is what the claude CLI sends when a turn names no
+/// effort (captured on the wire), so an override that leaves `high` out is refused with a
+/// warning and the built-in scale stands. A picker that did not list the value a turn actually
+/// runs at would be describing a model that is not the one answering. The values themselves are
+/// held to what the harness can deliver by the startup gate.
+fn effort_from_env(prefix: &str, id: &str, built_in: Option<EffortScale>) -> Option<EffortScale> {
+    let Ok(raw) = std::env::var(format!("{prefix}_EFFORT")) else {
+        return built_in;
+    };
+    let values: Vec<String> = raw
+        .split(',')
+        .map(|v| v.trim().to_ascii_lowercase())
+        .filter(|v| !v.is_empty())
+        .collect();
+    if values.is_empty() {
+        return None;
+    }
+    if !values.iter().any(|v| v == "high") {
+        eprintln!(
+            "jesse-bridge: WARNING {prefix}_EFFORT leaves out 'high', the value a turn that \
+             names no effort runs at; keeping model '{id}''s built-in effort scale."
+        );
+        return built_in;
+    }
+    Some(EffortScale {
+        kind: EffortKind::Scale,
+        values,
+        default: "high".to_string(),
+    })
+}
+
+/// The optional `effort = { kind, values, default }` sub-table of a `[[models]]` entry.
+#[derive(Deserialize, Debug, Default, Clone)]
+pub struct EffortToml {
+    pub kind: Option<String>,
+    pub values: Option<Vec<String>>,
+    pub default: Option<String>,
+}
+
+/// Build an [`EffortScale`] from its declaration, or say what is wrong with it. Checked here for
+/// SHAPE only (kind, non-empty, no duplicates, default among the values, a toggle has two); the
+/// startup gate checks the values against what the model's HARNESS can deliver, because only it
+/// knows the harness.
+pub fn parse_effort_toml(t: &EffortToml) -> Result<EffortScale, String> {
+    let kind = match t.kind.as_deref().map(str::trim).unwrap_or("scale") {
+        k if k.eq_ignore_ascii_case("scale") => EffortKind::Scale,
+        k if k.eq_ignore_ascii_case("toggle") => EffortKind::Toggle,
+        other => {
+            return Err(format!(
+                "effort kind '{other}' (expected \"scale\" or \"toggle\")"
+            ))
+        }
+    };
+    let values: Vec<String> = t
+        .values
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .map(|v| v.trim().to_ascii_lowercase())
+        .filter(|v| !v.is_empty())
+        .collect();
+    if values.is_empty() {
+        return Err(
+            "effort has no values — delete the key rather than declare an empty scale".into(),
+        );
+    }
+    let mut seen = std::collections::HashSet::new();
+    if let Some(dup) = values.iter().find(|v| !seen.insert(v.as_str())) {
+        return Err(format!("effort value '{dup}' is declared twice"));
+    }
+    if kind == EffortKind::Toggle && values.len() != 2 {
+        return Err(format!(
+            "an effort toggle has exactly two values [off, on]; this one has {}",
+            values.len()
+        ));
+    }
+    let default = t
+        .default
+        .as_deref()
+        .map(|d| d.trim().to_ascii_lowercase())
+        .ok_or("effort needs a `default` — the value a turn runs at when it names none")?;
+    if !values.contains(&default) {
+        return Err(format!(
+            "effort default '{default}' is not one of its values {values:?}"
+        ));
+    }
+    Ok(EffortScale {
+        kind,
+        values,
+        default,
+    })
+}
+
 /// The per-model tuning the `codex` harness turns into `-c` overrides, each `None` unless the
 /// operator set it.
 ///
@@ -2257,6 +2443,15 @@ pub struct RegistryModel {
     /// codex harness closed the same gap for its subscription posture in `codex_model_args`;
     /// this is the claude-code half.
     pub login_model: Option<String>,
+    /// The family's DISPLAY name (`GLM`, `Claude`), or `None` to let the id stand in for it.
+    ///
+    /// Reported on the wire so a client can GROUP the picker by family without parsing it back
+    /// out of a label: two entries of one family (Opus and Fable, both `Claude`) get a section
+    /// header, and a family of one gets none. Nothing in the bridge keys on it.
+    pub family: Option<String>,
+    /// The effort scale this model DECLARES, or `None` when effort does nothing measurable on it
+    /// — in which case the app renders no effort control at all. See [`EffortScale`].
+    pub effort: Option<EffortScale>,
 }
 
 /// The set of models the conversation can be switched onto. Ordered as presented to the
@@ -2657,6 +2852,12 @@ fn glm_env_entry(default_interval_secs: u64, global_timeout_secs: Option<u64>) -
     );
     let version = model_version_from_env("JESSE_MODEL_GLM", Some("5.3"));
     RegistryModel {
+        family: Some("GLM".to_string()),
+        effort: effort_from_env(
+            "JESSE_MODEL_GLM",
+            "glm",
+            Some(EffortScale::scale(&["low", "high", "max"], "high")),
+        ),
         codex: CodexTuning::default(),
         id: "glm".to_string(),
         label: derive_model_label("GLM", version.as_deref(), None),
@@ -2740,6 +2941,8 @@ fn kimi_env_entry(default_interval_secs: u64, global_timeout_secs: Option<u64>) 
     );
     let version = model_version_from_env("JESSE_MODEL_KIMI", Some("K3"));
     RegistryModel {
+        family: Some("Kimi".to_string()),
+        effort: effort_from_env("JESSE_MODEL_KIMI", "kimi", None),
         codex: CodexTuning::default(),
         id: "kimi".to_string(),
         // No surface note any more: the note existed to tell two Kimi entries apart, and there
@@ -2830,6 +3033,12 @@ fn qwen_env_entry(default_interval_secs: u64, global_timeout_secs: Option<u64>) 
     // hard-coded label note would go on saying "Max" after a repoint at a smaller size.
     let version = model_version_from_env("JESSE_MODEL_QWEN", Some("3.8 Max"));
     RegistryModel {
+        family: Some("Qwen".to_string()),
+        effort: effort_from_env(
+            "JESSE_MODEL_QWEN",
+            "qwen",
+            Some(EffortScale::scale(&["low", "high", "max"], "high")),
+        ),
         codex: CodexTuning::default(),
         id: "qwen".to_string(),
         label: derive_model_label("Qwen", version.as_deref(), None),
@@ -2923,6 +3132,8 @@ fn local_env_entry(default_interval_secs: u64, global_timeout_secs: Option<u64>)
     // inventing one would be the bridge asserting something it cannot know.
     let version = model_version_from_env("JESSE_MODEL_LOCAL", None);
     RegistryModel {
+        family: Some("Local".to_string()),
+        effort: effort_from_env("JESSE_MODEL_LOCAL", "local", None),
         codex: CodexTuning::default(),
         id: "local".to_string(),
         label: derive_model_label("Local", version.as_deref(), None),
@@ -2995,6 +3206,10 @@ pub struct ActiveModel {
     /// the triple) and for the unpinned ambient default, which is what keeps that turn
     /// byte-for-byte the command it always was.
     pub login_model: Option<String>,
+    /// The effort THIS turn asked for, already validated against the model's declared scale —
+    /// or `None` for the model's default, which is what every turn that names none gets and
+    /// what keeps its argv byte-identical to a turn from before effort existed.
+    pub effort: Option<String>,
 }
 
 impl ActiveModel {
@@ -3013,6 +3228,7 @@ impl ActiveModel {
     /// no-switch caller pass so nothing about their command changes.
     pub fn ambient() -> Self {
         ActiveModel {
+            effort: None,
             id: DEFAULT_MODEL_ID.to_string(),
             kind: ModelKind::Ambient,
             env: None,
@@ -3049,6 +3265,7 @@ impl ActiveModel {
     /// rejects an unhealthy per-turn selection; the probe binary demands `configured`).
     pub fn from_registry(m: &RegistryModel) -> Self {
         ActiveModel {
+            effort: None,
             id: m.id.clone(),
             kind: m.kind,
             env: m.backend.clone(),
@@ -3074,6 +3291,8 @@ impl ActiveModel {
 /// The always-present ambient default entry.
 fn opus_entry() -> RegistryModel {
     RegistryModel {
+        family: Some("Claude".to_string()),
+        effort: Some(EffortScale::scale(&["high", "max"], "high")),
         codex: CodexTuning::default(),
         id: DEFAULT_MODEL_ID.to_string(),
         label: "Claude Opus".to_string(),
@@ -3141,6 +3360,7 @@ fn opus_env_entry() -> RegistryModel {
         // left to the CLI, exactly as before.
         subagent_model: login_model.clone(),
         login_model,
+        effort: effort_from_env("JESSE_MODEL_OPUS", "opus", opus_entry().effort),
         ..opus_entry()
     }
 }
@@ -3166,6 +3386,12 @@ fn fable_env_entry() -> RegistryModel {
     let login_model = env_string("JESSE_MODEL_FABLE_MODEL");
     let version = model_version_from_env("JESSE_MODEL_FABLE", None);
     RegistryModel {
+        family: Some("Claude".to_string()),
+        effort: effort_from_env(
+            "JESSE_MODEL_FABLE",
+            "fable",
+            Some(EffortScale::scale(&["high", "max"], "high")),
+        ),
         codex: CodexTuning::default(),
         id: "fable".to_string(),
         label: derive_model_label("Claude Fable", version.as_deref(), None),
@@ -3310,6 +3536,10 @@ pub struct ModelToml {
     pub vision: Option<Vec<VisionPartnerToml>>,
     /// Complementary mode toggle (default false). See [`RegistryModel::vision_complementary`].
     pub vision_complementary: Option<bool>,
+    /// The optional `effort = { kind, values, default }` sub-table: the per-turn effort scale
+    /// this model declares. Absent means none, and the app then renders no effort control.
+    /// A malformed one is refused at startup, naming the model — see [`parse_effort_toml`].
+    pub effort: Option<EffortToml>,
 }
 
 /// The optional `[models.quirks]` sub-table: three tri-state flags, each absent by default so
@@ -3611,6 +3841,22 @@ pub fn registry_model_from_toml(
             })
             .collect(),
         vision_complementary: t.vision_complementary.unwrap_or(false),
+        family: t
+            .family
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+        // Parsed permissively here — a malformed scale warns and is dropped, so a typo in an
+        // optional key never takes the model out of the registry — and REFUSED by the startup
+        // gate, which re-parses the declaration and names the model and the problem.
+        effort: t.effort.as_ref().and_then(|e| match parse_effort_toml(e) {
+            Ok(scale) => Some(scale),
+            Err(why) => {
+                eprintln!("jesse-bridge: WARNING model '{id}': {why}; no effort control offered.");
+                None
+            }
+        }),
     })
 }
 
@@ -4329,6 +4575,134 @@ mod tests {
                 e.id
             );
         }
+        for (k, v) in saved {
+            match v {
+                Some(val) => std::env::set_var(k, val),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+
+    /// AN EFFORT DECLARATION IS CHECKED FOR SHAPE before anything else: a scale needs values
+    /// and a default among them, a toggle is exactly `[off, on]`, nothing is declared twice,
+    /// and an unknown kind is named. Each failure says which of those it was.
+    #[test]
+    fn an_effort_declaration_is_refused_unless_it_is_well_formed() {
+        let decl = |kind: Option<&str>, values: &[&str], default: Option<&str>| EffortToml {
+            kind: kind.map(str::to_string),
+            values: Some(values.iter().map(|v| v.to_string()).collect()),
+            default: default.map(str::to_string),
+        };
+        let scale =
+            parse_effort_toml(&decl(None, &["low", "HIGH", "max"], Some("high"))).expect("a scale");
+        assert_eq!(scale.kind, EffortKind::Scale, "kind defaults to scale");
+        assert_eq!(
+            scale.values,
+            ["low", "high", "max"],
+            "values normalise to lower case"
+        );
+        let toggle = parse_effort_toml(&decl(Some("toggle"), &["low", "high"], Some("high")))
+            .expect("a toggle");
+        assert_eq!(toggle.kind, EffortKind::Toggle);
+        for (bad, why) in [
+            (decl(Some("dial"), &["low"], Some("low")), "kind"),
+            (decl(None, &[], Some("low")), "no values"),
+            (decl(None, &["low", "low"], Some("low")), "twice"),
+            (
+                decl(Some("toggle"), &["low", "high", "max"], Some("low")),
+                "exactly two",
+            ),
+            (decl(None, &["low", "high"], None), "default"),
+            (decl(None, &["low", "high"], Some("max")), "not one of"),
+        ] {
+            let err = parse_effort_toml(&bad).expect_err(why);
+            assert!(err.contains(why), "{why}: {err}");
+        }
+    }
+
+    /// THE BUILT-IN EFFORT SCALES ARE THE MEASURED ONES, a model where effort moved nothing
+    /// measurable declares none, every declared value is one the claude CLI acts on, and the
+    /// launch environment can re-declare any of them — including declaring none.
+    #[test]
+    fn built_in_effort_scales_are_the_measured_ones_and_env_overridable() {
+        let _g = ENV_LOCK.lock_ok();
+        let vars = [
+            "JESSE_MODEL_GLM_EFFORT",
+            "JESSE_MODEL_KIMI_EFFORT",
+            "JESSE_MODEL_QWEN_EFFORT",
+            "JESSE_MODEL_LOCAL_EFFORT",
+            "JESSE_MODEL_FABLE_EFFORT",
+            "JESSE_MODEL_OPUS_EFFORT",
+        ];
+        let saved: Vec<(&str, Option<String>)> =
+            vars.iter().map(|k| (*k, std::env::var(k).ok())).collect();
+        for k in vars {
+            std::env::remove_var(k);
+        }
+        let scale = |m: RegistryModel| m.effort.map(|s| (s.values, s.default));
+        let lhm = Some((
+            vec!["low".to_string(), "high".into(), "max".into()],
+            "high".to_string(),
+        ));
+        let hm = Some((vec!["high".to_string(), "max".into()], "high".to_string()));
+        assert_eq!(
+            scale(glm_env_entry(DEFAULT_HEALTH_INTERVAL_SECS, None)),
+            lhm
+        );
+        assert_eq!(
+            scale(qwen_env_entry(DEFAULT_HEALTH_INTERVAL_SECS, None)),
+            lhm
+        );
+        assert_eq!(scale(fable_env_entry()), hm);
+        assert_eq!(scale(opus_env_entry()), hm);
+        assert_eq!(
+            scale(opus_entry()),
+            hm,
+            "the env-free fixture carries it too"
+        );
+        assert_eq!(
+            scale(kimi_env_entry(DEFAULT_HEALTH_INTERVAL_SECS, None)),
+            None,
+            "no measurable effect on this surface: no control"
+        );
+        assert_eq!(
+            scale(local_env_entry(DEFAULT_HEALTH_INTERVAL_SECS, None)),
+            None
+        );
+        for m in [
+            glm_env_entry(DEFAULT_HEALTH_INTERVAL_SECS, None),
+            qwen_env_entry(DEFAULT_HEALTH_INTERVAL_SECS, None),
+            fable_env_entry(),
+            opus_entry(),
+        ] {
+            for v in &m.effort.expect("declared").values {
+                assert!(
+                    CLAUDE_CODE_EFFORT_VALUES.contains(&v.as_str()),
+                    "{}: '{v}' is not a value the CLI acts on",
+                    m.id
+                );
+            }
+        }
+
+        // Re-declared from the environment, including declaring none...
+        std::env::set_var("JESSE_MODEL_KIMI_EFFORT", "low, HIGH ,max");
+        std::env::set_var("JESSE_MODEL_GLM_EFFORT", "");
+        assert_eq!(
+            scale(kimi_env_entry(DEFAULT_HEALTH_INTERVAL_SECS, None)),
+            lhm
+        );
+        assert_eq!(
+            scale(glm_env_entry(DEFAULT_HEALTH_INTERVAL_SECS, None)),
+            None
+        );
+        // ...but never without the value an effort-less turn actually runs at.
+        std::env::set_var("JESSE_MODEL_QWEN_EFFORT", "low,max");
+        assert_eq!(
+            scale(qwen_env_entry(DEFAULT_HEALTH_INTERVAL_SECS, None)),
+            lhm,
+            "an override without 'high' keeps the built-in scale"
+        );
+
         for (k, v) in saved {
             match v {
                 Some(val) => std::env::set_var(k, val),
@@ -5152,6 +5526,8 @@ mod tests {
         // A text model paired to an unconfigured helper reports no vision; configuring the
         // helper flips it on.
         let helper_unarmed = RegistryModel {
+            family: None,
+            effort: None,
             login_model: None,
             version: None,
             aliases: Vec::new(),
@@ -5174,6 +5550,8 @@ mod tests {
             vision_complementary: false,
         };
         let text = RegistryModel {
+            family: None,
+            effort: None,
             login_model: None,
             version: None,
             aliases: Vec::new(),
@@ -5225,6 +5603,7 @@ mod tests {
         let _g = ENV_LOCK.lock_ok();
         std::env::set_var("JESSE_TEST_DECL_TOKEN2", "tok");
         let t = ModelToml {
+            effort: None,
             read_only: None,
             family: None,
             version: None,

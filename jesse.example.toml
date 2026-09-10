@@ -396,6 +396,34 @@ Answer the question I asked, not the one you wish I had asked.
 #                  An UNRECOGNISED value is still a startup ERROR, never a silent fallback to
 #                  read-write. When `read_only` is also set it wins, and `level` warns.
 #
+#   effort         { kind = "scale" | "toggle", values = [ ... ], default = "..." }. The
+#                  PER-TURN effort this model DECLARES — the exact values the picker's effort
+#                  control offers for it, weakest first, and the one a turn runs at when it
+#                  names none. Absent means NO effort control for this model at all; the app
+#                  never infers one. `kind = "toggle"` is thinking on/off over exactly two
+#                  values [off, on] and renders as a single switch; `scale` is a graded choice
+#                  and renders as one inline picker.
+#
+#                  DECLARE ONLY VALUES THAT DO SOMETHING. A value that does not change the
+#                  answer is a control that silently does nothing, which is the one thing the
+#                  picker is not allowed to offer. The built-ins' scales were set from live
+#                  turns, not vendor tables (see `effort_from_env` in bridge/src/config.rs):
+#                    glm, qwen ... low, high, max     opus, fable ... high, max
+#                    kimi ........ none — `low` and `max` did not differ measurably on
+#                                  Fireworks, whatever its vendor documents
+#                  Re-declare a built-in from the launch env as JESSE_MODEL_<ID>_EFFORT=low,high,max
+#                  (an EMPTY value removes its control). The default of a built-in is always
+#                  `high`, because that is what the claude CLI sends when a turn names none.
+#
+#                  The values are held at STARTUP to what the model's harness delivers:
+#                    claude-code  low | medium | high | xhigh | max  (its `--effort`; the CLI
+#                                 IGNORES anything else with a warning and sends its default,
+#                                 so e.g. "none" would be a picker option that does nothing)
+#                    codex        low | medium | high | xhigh | max  (model_reasoning_effort;
+#                                 a per-turn choice overrides `reasoning_effort` for that turn)
+#                    direct       no per-turn effort path — declaring one is a startup error
+#                  A turn naming a value its model does not declare is refused with a 400.
+#
 #   ---- `harness = "direct"` ONLY. Ignored by the two CLI harnesses, which hand their
 #        child a token through the environment and let the CLI choose its own transport. ----
 #

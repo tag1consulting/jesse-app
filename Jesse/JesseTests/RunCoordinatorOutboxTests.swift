@@ -42,7 +42,7 @@ final class RunCoordinatorOutboxTests: XCTestCase {
                   conversationId: String, voice: Bool,
                   instructions: String?, floorOverride: String?,
                   attachments: [JesseAttachment], requestId: UUID,
-                  model: String?) async throws -> JesseSendResult {
+                  model: String?, effort: String?) async throws -> JesseSendResult {
             sendCallCount += 1
             requestIds.append(requestId)
             conversationIds.append(conversationId)

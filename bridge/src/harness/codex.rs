@@ -580,11 +580,18 @@ pub fn codex_model_args(active: &ActiveModel) -> Vec<String> {
     // "use this model's default" — see [`ReasoningEffort`], which has no `none` for that
     // reason. The value is a closed set validated at STARTUP, because `--strict-config`
     // checks the key of a `-c` override and not its value (measured, 0.153.4).
-    if let Some(effort) = active.codex.reasoning_effort {
-        push(format!(
-            "model_reasoning_effort={}",
-            toml_string(effort.as_str())
-        ));
+    //
+    // A PER-TURN effort (the picker's choice, validated against the model's declared scale)
+    // wins over the model's static `reasoning_effort` for that one turn — the static key is the
+    // model's standing default, the per-turn value is someone asking for more or less now.
+    // Emitted ONCE either way: two `model_reasoning_effort` overrides would let the last win
+    // silently, which is the drift `codex_provider_args` is asked about for the slug.
+    let effort = active
+        .effort
+        .as_deref()
+        .or(active.codex.reasoning_effort.map(|e| e.as_str()));
+    if let Some(effort) = effort {
+        push(format!("model_reasoning_effort={}", toml_string(effort)));
     }
 
     // Where the child compacts. `model_auto_compact_token_limit`, WITH the prefix: the
@@ -2387,6 +2394,27 @@ mod tests {
     }
 
     // ---- The provider seam ---------------------------------------------------------
+
+    /// A PER-TURN effort overrides the model's static `reasoning_effort` for that turn, and the
+    /// override is emitted ONCE — two `model_reasoning_effort` keys would let the last one win
+    /// silently. With no per-turn effort the static value stands, as it always has.
+    #[test]
+    fn a_turn_effort_overrides_the_models_static_reasoning_effort_once() {
+        let mut m = ActiveModel::ambient();
+        m.harness = CODEX_ID.to_string();
+        m.codex.reasoning_effort = Some(ReasoningEffort::XHigh);
+        let flat = |a: &ActiveModel| codex_model_args(a).join(" ");
+        assert!(flat(&m).contains(r#"model_reasoning_effort="xhigh""#));
+
+        m.effort = Some("low".to_string());
+        let args = flat(&m);
+        assert!(args.contains(r#"model_reasoning_effort="low""#), "{args}");
+        assert_eq!(
+            args.matches("model_reasoning_effort").count(),
+            1,
+            "exactly one override: {args}"
+        );
+    }
 
     /// A model on its OWN OpenAI-style provider, as a deploy would declare it.
     fn openai_model(base_url: &str, model: &str, token: &str) -> ActiveModel {

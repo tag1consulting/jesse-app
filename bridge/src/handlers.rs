@@ -124,6 +124,12 @@ pub struct JesseRequest {
     // older app build or non-app caller that omits the field.
     #[serde(default)]
     model: Option<String>,
+    // Optional PER-TURN effort: one of the values the resolved model DECLARES in its
+    // `GET /jesse/models` row (`effort.values`). Validated after the model resolves — a model
+    // that declares no scale, or a value it does not declare, is a 400 rather than a silent
+    // no-op. Absent is the model's default and byte-for-byte today's turn.
+    #[serde(default)]
+    effort: Option<String>,
     // THE ZONE THIS DEVICE IS STANDING IN, IANA (`"Europe/London"`). Optional and
     // advisory: when present and resolvable it outranks the away profile for THIS request
     // only (see `effective_tz`), because the phone's own zone is a more specific claim than
@@ -178,6 +184,7 @@ impl JesseRequest {
     /// falls through to the globally active model, byte-for-byte the previous behaviour.
     pub fn scheduled(mode: &str, text: String, model: Option<String>) -> Self {
         JesseRequest {
+            effort: None,
             mode: mode.to_string(),
             text,
             model,
@@ -743,6 +750,9 @@ pub async fn start_turn(
         Some(id) => st.resolve_requested_model(id)?,
         None => st.resolve_active_model(),
     };
+    // The turn's effort, validated against what the model it resolved to DECLARES — before any
+    // work, for the same reason the model itself is.
+    let active = st.apply_turn_effort(active, req.effort.as_deref())?;
 
     let mode = req.mode.trim().to_lowercase();
     // Kill switch + gate: attempt the local diet-logging pipeline only when a diet
@@ -2446,6 +2456,16 @@ fn model_row(
         // The model's CEILING, as a string the clients render. `writes_allowed` stays
         // alongside it (it is `level == write`) so an older client keeps working unchanged.
         "level": capability_label(m.level),
+        // The family's display name, so a client can GROUP the picker without parsing a label.
+        // The id stands in when an entry declares none, which makes it a family of one.
+        "family": m.family.as_deref().unwrap_or(&m.id),
+        // Which harness runs this model, by id. Information for the picker to show beside the
+        // version, never a choice: a model is registered on exactly one harness.
+        "harness": m.harness,
+        // The effort scale this model DECLARES (`kind`, `values`, `default`), or null when effort
+        // does nothing measurable on it. The client renders an effort control from this and from
+        // nothing else — it never infers one.
+        "effort": m.effort,
         // Derived from this model's HARNESS, not from the model: a client cannot render a
         // spinner for a whole-answer harness if nothing tells it, and putting the flag on
         // the model keeps the harness invisible as an identity while exposing it as a

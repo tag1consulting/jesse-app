@@ -110,6 +110,8 @@ fn ambient_pick() -> RoutedPick {
 fn with_vaultqa_offload(mut cfg: Config) -> Config {
     let mut models = cfg.model_registry.models.clone();
     models.push(RegistryModel {
+        family: None,
+        effort: None,
         login_model: None,
         version: None,
         aliases: Vec::new(),
@@ -4877,6 +4879,8 @@ fn cfg_with_switch_registry(state_dir: &std::path::Path) -> Config {
     let registry = ModelRegistry {
         models: vec![
             RegistryModel {
+                family: None,
+                effort: None,
                 login_model: None,
                 version: None,
                 aliases: Vec::new(),
@@ -4904,6 +4908,8 @@ fn cfg_with_switch_registry(state_dir: &std::path::Path) -> Config {
                 vision_complementary: false,
             },
             RegistryModel {
+                family: None,
+                effort: None,
                 login_model: None,
                 version: None,
                 aliases: Vec::new(),
@@ -4935,6 +4941,8 @@ fn cfg_with_switch_registry(state_dir: &std::path::Path) -> Config {
                 vision_complementary: false,
             },
             RegistryModel {
+                family: None,
+                effort: None,
                 login_model: None,
                 version: None,
                 aliases: Vec::new(),
@@ -5345,6 +5353,9 @@ async fn the_models_endpoint_entry_shape_is_pinned() {
             "aliases",
             "available",
             "configured",
+            "effort",
+            "family",
+            "harness",
             "healthy",
             "id",
             "kind",
@@ -5470,6 +5481,84 @@ async fn drive_turn_to_done(st: &AppState, req_json: &str) -> Value {
         .unwrap()
         .to_string();
     wait_for_status(st, &job_id, "done").await
+}
+
+/// A TURN'S EFFORT IS VALIDATED AGAINST WHAT ITS MODEL DECLARES, before any work: a model with
+/// no scale, or a value the model does not declare, is a 400 rather than a silent no-op; a
+/// declared value is carried onto the turn, and the model's DEFAULT is carried as nothing so the
+/// turn is byte-identical to one that named no effort. The models row reports the scale, the
+/// family and the harness the picker renders from.
+#[tokio::test]
+async fn a_turn_effort_is_validated_against_the_models_declared_scale() {
+    let dir = std::env::temp_dir().join(format!("jesse-model-it-{}", random_hex()));
+    let mut cfg = cfg_with_switch_registry(&dir);
+    for m in cfg.model_registry.models.iter_mut() {
+        m.effort = (m.id == "glm-5.2").then(|| EffortScale::scale(&["low", "high", "max"], "high"));
+    }
+    let st = AppState::new(cfg);
+
+    for (body, want) in [
+        (
+            r#"{"mode":"ask","text":"hi","model":"opus","effort":"low"}"#,
+            "declares no effort scale",
+        ),
+        (
+            r#"{"mode":"ask","text":"hi","model":"glm-5.2","effort":"xhigh"}"#,
+            "low, high, max",
+        ),
+    ] {
+        let resp = app(st.clone())
+            .oneshot(jesse_request(Some("Bearer test-token"), body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{body}");
+        let text = body_string(resp).await;
+        assert!(text.contains(want), "{body}: {text}");
+    }
+
+    let glm = st.resolve_requested_model("glm-5.2").expect("available");
+    assert_eq!(
+        st.apply_turn_effort(glm.clone(), Some(" MAX "))
+            .unwrap()
+            .effort
+            .as_deref(),
+        Some("max")
+    );
+    assert_eq!(
+        st.apply_turn_effort(glm.clone(), Some("high"))
+            .unwrap()
+            .effort,
+        None,
+        "the declared default is carried as nothing"
+    );
+    assert_eq!(st.apply_turn_effort(glm, None).unwrap().effort, None);
+
+    let v = body_value(
+        app(st.clone())
+            .oneshot(models_request(Some("Bearer test-token")))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let rows = v["models"].as_array().unwrap();
+    let row = rows.iter().find(|m| m["id"] == "glm-5.2").unwrap();
+    assert_eq!(row["effort"]["kind"], "scale");
+    assert_eq!(
+        row["effort"]["values"],
+        serde_json::json!(["low", "high", "max"])
+    );
+    assert_eq!(row["effort"]["default"], "high");
+    assert_eq!(row["harness"], "claude-code");
+    assert_eq!(
+        row["family"], "glm-5.2",
+        "no declared family: the id stands in"
+    );
+    let opus = rows.iter().find(|m| m["id"] == "opus").unwrap();
+    assert!(
+        opus["effort"].is_null(),
+        "no scale is null, not an empty one"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
@@ -5724,6 +5813,8 @@ async fn preprocess_pairs_and_frames_a_faithful_view() {
     let base = start_mock_helper().await;
     // A registry with the mock helper (configured) and a text model paired to it.
     let helper = RegistryModel {
+        family: None,
+        effort: None,
         login_model: None,
         version: None,
         aliases: Vec::new(),
@@ -5746,6 +5837,8 @@ async fn preprocess_pairs_and_frames_a_faithful_view() {
         vision_complementary: false,
     };
     let text = RegistryModel {
+        family: None,
+        effort: None,
         login_model: None,
         version: None,
         aliases: Vec::new(),
@@ -5784,6 +5877,7 @@ async fn preprocess_pairs_and_frames_a_faithful_view() {
     );
 
     let active = ActiveModel {
+        effort: None,
         login_model: None,
         codex: Default::default(),
         id: "glm".into(),
@@ -5829,6 +5923,8 @@ async fn unpaired_model_reports_no_vision() {
     // A configured text model with NO partners reports vision disabled — the capability
     // rule: unpaired == no-vision, surfaced, never a silent half-state.
     let text = RegistryModel {
+        family: None,
+        effort: None,
         login_model: None,
         version: None,
         aliases: Vec::new(),
@@ -5933,6 +6029,8 @@ async fn the_vision_path_is_identical_on_both_harnesses() {
         role: VisionRole::Any,
     };
     let helper = RegistryModel {
+        family: None,
+        effort: None,
         login_model: None,
         version: None,
         aliases: Vec::new(),
@@ -5995,6 +6093,7 @@ async fn the_vision_path_is_identical_on_both_harnesses() {
     let _ = std::fs::remove_dir_all(&dir);
 
     let active_on = |harness: &str| ActiveModel {
+        effort: None,
         login_model: None,
         codex: Default::default(),
         id: "glm".into(),

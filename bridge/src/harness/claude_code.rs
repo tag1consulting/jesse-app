@@ -54,6 +54,16 @@ impl ClaudeCode {
         .stderr(Stdio::piped())
         .kill_on_drop(true); // killed if the timeout fires or the task is dropped
         apply_main_env(&mut cmd, req.active);
+        // THE TURN'S EFFORT, when it asked for one. Appended AFTER the containment argv and
+        // never part of `capability_args`, so it moves no recorded posture, and absent on a
+        // turn that named none — whose argv is then byte-identical to one from before effort
+        // existed. The value was validated against the model's declared scale, which the
+        // startup gate holds to the five values the CLI's `--effort` actually acts on: the CLI
+        // IGNORES anything else with a warning and sends its default, which would make this a
+        // control that silently does nothing.
+        if let Some(effort) = &req.active.effort {
+            cmd.arg("--effort").arg(effort);
+        }
         cmd
     }
 }
@@ -2411,6 +2421,7 @@ mod tests {
     /// DISTINCT from every role backend's so a leak is detectable.
     fn glm_active() -> ActiveModel {
         ActiveModel {
+            effort: None,
             login_model: None,
             codex: Default::default(),
             id: "glm-5.2".to_string(),
@@ -2437,6 +2448,8 @@ mod tests {
         let mut cfg = test_config();
         let mut models = cfg.model_registry.models.clone();
         models.push(RegistryModel {
+            family: None,
+            effort: None,
             login_model: None,
             version: None,
             aliases: Vec::new(),
@@ -2741,6 +2754,40 @@ mod tests {
                 None => std::env::remove_var(k),
             }
         }
+    }
+
+    /// THE TURN'S EFFORT reaches the child as `--effort <v>`, and is the WHOLE difference: the
+    /// rest of the argv is byte-identical to the same turn with no effort, and a turn with none
+    /// carries no `--effort` at all. That is what keeps the default turn unchanged and the flag
+    /// out of the recorded containment argv.
+    #[test]
+    fn a_turn_effort_reaches_the_child_as_the_effort_flag_and_is_otherwise_absent() {
+        let cfg = test_config();
+        let mut active = ActiveModel::ambient();
+        let build = |a: &ActiveModel| {
+            build_claude_command(
+                &cfg,
+                "PROMPT",
+                None,
+                a,
+                turn_capability(a),
+                main_mcp_config(&cfg, &ClaudeCode),
+            )
+        };
+        let plain = build(&active);
+        assert!(!cmd_has_flag(&plain, "--effort"), "no effort, no flag");
+
+        active.effort = Some("max".to_string());
+        let with = build(&active);
+        assert_eq!(cmd_arg_value(&with, "--effort").as_deref(), Some("max"));
+        let mut argv = cmd_argv(&with);
+        let at = argv.iter().position(|a| a == "--effort").expect("the flag");
+        argv.drain(at..at + 2);
+        assert_eq!(
+            argv,
+            cmd_argv(&plain),
+            "the effort flag is the only difference"
+        );
     }
 
     /// A ROUTED pick on the bridge's own login carries its slug and nothing else, and the

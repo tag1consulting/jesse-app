@@ -169,7 +169,7 @@ final class PushTests: XCTestCase {
                   conversationId: String, voice: Bool,
                   instructions: String?, floorOverride: String?,
                   attachments: [JesseAttachment], requestId: UUID,
-                  model: String?) async throws -> JesseSendResult {
+                  model: String?, effort: String?) async throws -> JesseSendResult {
             .running(jobId: "job-bg", conversationId: nil)
         }
         func result(jobId: String) async throws -> JesseResultState {
@@ -237,7 +237,7 @@ final class PushTests: XCTestCase {
                       conversationId: String, voice: Bool,
                       instructions: String?, floorOverride: String?,
                       attachments: [JesseAttachment], requestId: UUID,
-                      model: String?) async throws -> JesseSendResult {
+                      model: String?, effort: String?) async throws -> JesseSendResult {
                 .running(jobId: "job-done", conversationId: nil)
             }
             func result(jobId: String) async throws -> JesseResultState {
