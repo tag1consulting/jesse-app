@@ -9,7 +9,7 @@
   (That script refuses to install a rendering in which any placeholder survived, so this
   comment carries no example of one.)
 
-  The five service labels below are the launchd labels of the jobs the sentinel may restart.
+  The four service labels below are the launchd labels of the jobs the sentinel may restart.
   They are configuration, not defaults compiled into the binary: the compiled defaults sit in
   the documented `com.example.` namespace, and the sentinel warns at startup, by name, about
   any that are still placeholders.

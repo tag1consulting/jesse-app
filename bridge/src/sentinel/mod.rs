@@ -309,7 +309,7 @@ impl SentinelConfig {
     }
 
     /// Slots still carrying the documented placeholder label, so startup can say which
-    /// restart verbs are wired to nothing. Named rather than counted: "three of five" tells
+    /// restart verbs are wired to nothing. Named rather than counted: "three of four" tells
     /// an operator nothing they can act on.
     pub fn placeholder_labels(&self) -> Vec<(ServiceSlot, String)> {
         SERVICE_SLOTS

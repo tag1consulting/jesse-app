@@ -2953,7 +2953,7 @@ for the verb table and the watchdog rules.
   bearer check itself is the bridge's own constant-time `check_auth`, and the
   integration test asserts the refusal **in both directions** over a real socket.
 - **The verb table is closed.** `POST /sentinel/restart/{service}` takes one of
-  five fixed slugs — never a launchd label — and the labels those map to are
+  four fixed slugs — never a launchd label — and the labels those map to are
   deployment configuration. A caller cannot name a job the configuration did not
   name; anything else is a `404`. The two proxy verbs validate their `{id}` against
   an alphabet (`[A-Za-z0-9_-]`, 1–64) **and then** against the bridge's live

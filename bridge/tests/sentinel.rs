@@ -582,7 +582,7 @@ async fn status_degrades_a_hung_probe_to_unknown_and_still_answers() {
         body["sentinel"]["version"],
         json!(env!("CARGO_PKG_VERSION"))
     );
-    // The whole document lands in about one probe timeout, not five of them in series.
+    // The whole document lands in about one probe timeout, not four of them in series.
     assert!(
         took < Duration::from_secs(15),
         "status took {took:?} — a wedged probe must not hang the one request an operator has"
