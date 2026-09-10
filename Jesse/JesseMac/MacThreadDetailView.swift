@@ -312,16 +312,29 @@ private struct MacModelPickerMenu: View {
         }
     }
 
-    /// The resolved model's declared effort control: an inline picker, or a single switch.
+    /// The resolved model's declared effort control: one row per value, or a single switch.
+    ///
+    /// Rows rather than an inline `Picker`, matching the iPhone: an inline picker in a menu
+    /// replaces the enclosing `Section("Effort")` with its own, so the values render with no
+    /// header saying what they are. Proven on iOS by `ModelPickerMenuUITests`; applied here
+    /// because this menu is built from the same construct. **Not observed rendering on
+    /// macOS** — there is no macOS UI-test target, so the Mac side of this rests on the
+    /// shared construct and on `JesseMacTests` staying green, not on a screenshot.
     @ViewBuilder
     private func effortControl(_ control: ModelEffortControl, on model: ModelInfo) -> some View {
         switch control {
         case .picker(let values, let selected):
-            Picker("Effort", selection: Binding(get: { selected },
-                                                set: { selectEffort($0, on: model) })) {
-                ForEach(values, id: \.self) { Text($0).tag($0) }
+            ForEach(values, id: \.self) { value in
+                Button {
+                    selectEffort(value, on: model)
+                } label: {
+                    if value == selected {
+                        Label(value, systemImage: "checkmark")
+                    } else {
+                        Text(value)
+                    }
+                }
             }
-            .pickerStyle(.inline)
         case .toggle(let off, let on, let isOn):
             Toggle("Thinking", isOn: Binding(get: { isOn },
                                              set: { selectEffort($0 ? on : off, on: model) }))

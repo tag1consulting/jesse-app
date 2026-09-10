@@ -14,6 +14,62 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [App 1.0 (127)] - 2026-09-10
+
+**Two things the picker menu was supposed to show and did not, and the test layer that let
+them ship.** Both were found by opening the menu on a real device against a live bridge;
+both were invisible to the eleven `ModelMenuTests`, which were green throughout.
+
+### Fixed
+- **The resolved row now renders its harness and version.** App 1.0 (126) promised the
+  resolved model's row would carry `claude-code · 5.3` as secondary text. It never reached
+  the screen on iOS. `Label { Text(title); Text(subtitle) } icon: { … }` puts the second
+  `Text` inside the LABEL'S TITLE builder, and UIKit's menu-item conversion drops it there;
+  only the flat `Text` / `Text` / `Image` form, as siblings of the Button's own label, maps
+  to `UIAction.subtitle`. The Mac was never affected: it interpolates both into one string.
+- **The effort section has its header back.** `Section("Effort")` rendered no title, because
+  an inline `Picker` inside a menu supplies its OWN section and replaces the enclosing one.
+  On screen `high` and `max` sat under a bare divider, indistinguishable from model rows.
+  A graded scale now renders as one row per value with a checkmark on the one in force —
+  the same spelling the model rows above it use, and the same one tap to choose. Applied to
+  the Mac as well, which is built from the same construct; **not observed rendering there**,
+  as there is no macOS UI-test target.
+
+### The test layer, which is the actual point
+`ModelMenuTests` asserts `ModelMenuLayout`, the struct that DECIDES what a row says. In
+both defects the layout produced exactly the right value —
+`testTheResolvedModelCarriesTheCheckmarkAndTheHarnessDetail` asserts the subtitle is
+`claude-code · 5.3` and passes — and the view threw it away. A layout test cannot fail on a
+view that discards its input, so it was never cover for either.
+
+- **`ModelPickerMenuUITests` (new, JesseUITests)** asserts the PRESENTED menu. Written
+  first, and confirmed red on `63d7ee2` for both defects with the family-header test passing
+  beside them, so the failures were the defects and not a broken rig.
+- **The harness/version assertion is geometry, not text, and that is a real limitation.**
+  UIKit exposes a menu item's subtitle in neither the element's `label` nor its `value`, so
+  no string query can see it. What is observable is that the row grew a second line: the
+  resolved row must stand strictly taller than every other model row. Measured 42.0 against
+  42.0 before the fix; taller after.
+- **The test needs no bridge and no pairing.** `StubBridge` is a loopback socket in the test
+  runner serving one fixed `GET /jesse/models`; the simulator shares the host's network
+  stack. BSD sockets rather than `NWListener`, which goes through the iOS local-network
+  privacy gate and never reaches `.ready` in a test runner.
+- **`ConfigStore.load()` gains a DEBUG-only override**, `JESSE_UITEST_BRIDGE=host,port,token`.
+  A UI test cannot pair through Settings: CI builds with `CODE_SIGNING_ALLOWED=NO`, and an
+  unsigned app cannot write the Keychain (`SecItemAdd` returns `errSecMissingEntitlement`),
+  so Save reports "your token couldn't be saved" and the picker stays unloaded forever. The
+  override substitutes the credential store and nothing else — the real client, request,
+  decode, retry policy and layout all still run. Compiled out of Release, and a launch
+  environment can only be set by a debugger or an XCTest runner.
+- **`ModelPickerUITestContractTests` (new, JesseTests)** pins the two constants the UI-test
+  target has to hardcode (`jesse.lastUsedModelID`, and the override's parse), so a rename
+  cannot turn the menu tests into no-ops that still pass.
+
+### Known, not fixed
+A menu item's subtitle is invisible to VoiceOver as well as to XCUITest, so the harness and
+version are on screen but not announced. Left alone deliberately: the fix is an explicit
+`accessibilityLabel`, which would also make the assertion above testable at the wrong layer
+again. Worth doing on its own terms.
 ## [bridge 0.133.0] - 2026-09-10
 
 **Four findings from deploying 0.132.0, fixed: store files written through one shared temp
