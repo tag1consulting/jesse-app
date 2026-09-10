@@ -632,9 +632,9 @@ mod tests {
         assert_eq!(turn_capability(&ambient), Capability::Write);
         assert!(ambient.writes_allowed());
 
-        // 4. A model declared with no `level` is Read — it can answer, and cannot change
-        //    the vault.
-        assert_eq!(DEFAULT_MODEL_LEVEL, Capability::Read);
+        // 4. A model that says nothing about access is READ-WRITE — the operator's default
+        //    since `read_only` replaced `level`. Narrowing one is `read_only = true`.
+        assert_eq!(DEFAULT_MODEL_LEVEL, Capability::Write);
     }
 
     /// A MAIN TURN NEVER ROUTES AWAY FROM ITS SELECTED MODEL, even when that model is

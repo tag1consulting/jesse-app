@@ -138,6 +138,9 @@ Answer the question I asked, not the one you wish I had asked.
 # `write` the output is taken as-is, below it the hosted verdict is mandatory and
 # blocking. (This uses the level as a deliberate PROXY for extraction accuracy; they are
 # not the same property, but it is visible in config rather than implied by deployment.)
+# EVERY MODEL IS READ-WRITE UNLESS IT SAYS `read_only = true`, so by default an extraction
+# from any armed model is taken as-is. Mark a model `read_only = true` to have its
+# extractions verified.
 # `JESSE_DIET_PROBATION` was deleted along with the role backends.
 #
 # THIS NEVER GOVERNS A MAIN TURN. The bridge does not auto-switch a conversation off an
@@ -353,29 +356,45 @@ Answer the question I asked, not the one you wish I had asked.
 #                  `bridge/containment-direct.toml`. See SECURITY.md for what it can and
 #                  cannot reach compared with a claude-code turn.
 #
-#                  THE HARNESS BOUNDS THE LEVEL, and not every harness has every level.
-#                  A harness declares which levels it can EXPRESS, and a level it cannot
-#                  express is a startup error saying "cannot express" rather than "failed a
-#                  gate" — the two send an operator looking in different places. Codex has
-#                  no `basic`: its containment lever is an OS sandbox mode, not a tool
-#                  allowlist, and there is no config key that removes its shell, so its
-#                  weakest posture is byte-identical to `read`. `harness = "codex"` with
-#                  `level = "basic"` therefore refuses to start.
-#   level          the MOST this model may be granted: "basic" | "read" | "write".
-#                  Absent means "read" — the safe direction: a newly declared model can
-#                  be asked questions but cannot change anything.
-#                    basic  jobs needing no tools at all (titles, diet extraction)
-#                    read   may also read and search the vault
-#                    write  may also change the vault
-#                  The level is a CEILING, not a grant: the JOB sets the actual grant
-#                  beneath it. A `write` model serving a title runs at `basic`; a `read`
-#                  model backing a conversation gets the read-only posture.
-#                  It is validated at STARTUP against the committed containment record
-#                  (bridge/containment.toml): a level whose harness has no passing
-#                  battery row refuses to start, naming the highest level that passed.
-#                  There is NO per-model writes toggle — `default_writes` was removed and
-#                  a leftover key is a startup error. What a model may touch is config,
-#                  not something a phone can change.
+#                  THE HARNESS BOUNDS WHAT A MODEL MAY BE GRANTED, and every harness that can
+#                  run a model has both postures a model can be configured at (read-write and
+#                  read-only). The no-tools posture (`basic`) is a JOB posture — titles, diet
+#                  extraction — and is no longer something a model is configured at; that is
+#                  why `level = "basic"` on a codex model, which has no such posture, used to
+#                  refuse to start and now simply loads as read-only (see `level` below).
+#   read_only      true | false. Absent means FALSE: EVERY MODEL IS READ-WRITE BY DEFAULT.
+#                    false  may read, search and change the vault
+#                    true   may read and search the vault, and cannot change it
+#
+#                  READ THIS BEFORE ARMING A HOSTED MODEL: a third-party provider's model can
+#                  write the vault the moment its token is set, unless its entry says
+#                  `read_only = true`. That is a deliberate default, not an oversight — the
+#                  flag is how an operator narrows one model, not how they widen one.
+#
+#                  The env-triple built-ins (glm, kimi, qwen, local) take it as
+#                  JESSE_MODEL_<ID>_READ_ONLY=1.
+#
+#                  It is a CEILING, not a grant: the JOB sets the actual grant beneath it. A
+#                  read-write model serving a title runs with no tools at all; a read-only
+#                  model backing a conversation gets the read-only posture. It is validated at
+#                  STARTUP against the committed containment record for the model's harness: a
+#                  posture with no passing battery row refuses to start, naming the highest
+#                  that passed. There is NO per-model writes toggle on the phone —
+#                  `default_writes` was removed and a leftover key is a startup error.
+#
+#                  ONE MORE CONSEQUENCE OF THE DEFAULT: whether a diet extraction is VERIFIED
+#                  is decided by the extracting model being read-write (see `offload_order`
+#                  above). With read-write the default, a newly armed model that serves an
+#                  extraction is trusted as-is unless it is `read_only = true`.
+#   level          RETIRED. It still loads, mapped to its nearest new meaning with ONE startup
+#                  warning per mapped value:
+#                    "write"  → read-write (the default now; delete the key)
+#                    "read"   → read_only = true
+#                    "basic"  → read_only = true (no-tools is a job posture, not a model one;
+#                               read-only is the nearest that exists, and it never widens a
+#                               model that was deliberately kept narrow into writes)
+#                  An UNRECOGNISED value is still a startup ERROR, never a silent fallback to
+#                  read-write. When `read_only` is also set it wins, and `level` warns.
 #
 #   ---- `harness = "direct"` ONLY. Ignored by the two CLI harnesses, which hand their
 #        child a token through the environment and let the CLI choose its own transport. ----
@@ -435,7 +454,7 @@ Answer the question I asked, not the one you wish I had asked.
 #                  below that line — e.g. `auto_compact_token_limit = 272000`. It is a cost
 #                  control, not a containment control.
 #
-#                  WHAT `level` DOES NOT BOUND, so "read" is not read as "nothing can
+#                  WHAT `read_only` DOES NOT BOUND, so read-only is not read as "nothing can
 #                  happen": it bounds the TOOLS the model is granted. It does not bound the
 #                  DIRECTIVE CHANNEL — the bridge parses a directive off the final line of a
 #                  reply and acts on it itself, so a model at any level can still cause the
@@ -447,11 +466,10 @@ Answer the question I asked, not the one you wish I had asked.
 #                  `Directives` in `bridge/src/directives.rs`. Read it before assuming a
 #                  read-only model is inert.
 #
-#                  SUGGESTED ASSIGNMENT (guidance, not a compiled-in default):
-#                    Claude models .......... write
-#                    Codex models ........... write
-#                    Kimi 3, GLM ............ write
-#                    locally hosted models .. read
+#                  WHERE `read_only = true` IS STILL WORTH SETTING (guidance): a locally
+#                  hosted model you have not evaluated, and any model you want to be able to
+#                  ask about the vault without letting it change anything. Everything else
+#                  takes the read-write default.
 #   price          { in_per_m, cached_per_m, out_per_m } dollars per 1M tokens (default
 #                  0/0/0), feeding the per-turn cost badge.
 #   health         { path, interval_secs, timeout_secs } — probe endpoint + cadence
@@ -520,7 +538,7 @@ Answer the question I asked, not the one you wish I had asked.
 # base_url = "https://api.fireworks.ai/inference"
 # model = "accounts/fireworks/models/glm-5p3"
 # auth_token_env = "FIREWORKS_API_KEY"
-# level = "write"                          # GLM: trusted with the vault
+#                                          # no read_only: read-write, the default
 # harness = "claude-code"                  # the default; shown here for completeness
 # price = { in_per_m = 1.40, cached_per_m = 0.26, out_per_m = 4.40 }   # GLM 5.3's deck
 # health = { path = "/v1/messages", interval_secs = 60, timeout_secs = 15 }  # it thinks
@@ -539,7 +557,7 @@ Answer the question I asked, not the one you wish I had asked.
 # model = "gpt-5-codex"
 # subagent_model = "gpt-5-mini"            # cheaper model for spawned subagents
 # auth_token_env = "CODEX_GATEWAY_TOKEN"
-# level = "write"                          # Codex: trusted with the vault
+#                                          # no read_only: read-write, the default
 # price = { in_per_m = 1.25, cached_per_m = 0.13, out_per_m = 10.00 }
 # health = { interval_secs = 30, timeout_secs = 3 }
 
@@ -580,7 +598,7 @@ Answer the question I asked, not the one you wish I had asked.
 # model = "accounts/fireworks/models/kimi-k3"
 # auth_token_env = "JESSE_MODEL_KIMI_AUTH_TOKEN"
 # harness = "codex"                            # required: only codex speaks this surface
-# level = "read"                               # `write` also passes — see the block below
+# read_only = true                             # omit for read-write — see the block below
 # price = { in_per_m = 3.00, cached_per_m = 0.30, out_per_m = 15.00 }
 # health = { timeout_secs = 15 }               # K3 thinks; 3s would mark it unhealthy
 
@@ -589,7 +607,7 @@ Answer the question I asked, not the one you wish I had asked.
 # CLI directly off its own subscription login (`codex login`, whose credential the harness
 # copies into a fresh per-turn CODEX_HOME).
 #
-# WHAT `level = "write"` BUYS AND WHAT IT DOES NOT. It puts the child in Codex's
+# WHAT READ-WRITE BUYS ON THIS HARNESS AND WHAT IT DOES NOT. It puts the child in Codex's
 # `workspace-write` sandbox with `writable_roots` scoped to the turn's working directory and
 # nothing else, so writes outside the vault are refused BY THE OPERATING SYSTEM — including
 # writes into the per-turn CODEX_HOME and the bridge's own state directory, both of which sit
@@ -602,7 +620,7 @@ Answer the question I asked, not the one you wish I had asked.
 # oversight, and the remedy if it ever stops being acceptable is unix-user isolation, not a
 # config key.
 #
-# `level = "basic"` is refused at startup on this harness — see the `harness` field above.
+# The retired `level = "basic"` loads here as read-only — see the `harness` field above.
 #
 # WHICH MODEL IT ACTUALLY RUNS. The `model` slug below is passed to the child as
 # `-c model="<slug>"`, on this subscription posture as well as on a provider one. It did not
@@ -626,7 +644,8 @@ Answer the question I asked, not the one you wish I had asked.
 # model = "gpt-6-astra"                    # emitted as `-c model="gpt-6-astra"`; needs
 #                                          # codex-cli >= 0.153.1
 # auth_token_env = "JESSE_CODEX_TOKEN"     # the NAME of the env var, never the token
-# level = "write"                          # OS-sandboxed writes, scoped to the vault
+#                                          # read-write by default: OS-sandboxed writes,
+#                                          # scoped to the vault
 # reasoning_effort = "xhigh"               # optional; low|medium|high|xhigh|max. Omit for
 #                                          # the model's own default — there is no "none"
 # auto_compact_token_limit = 272000        # optional; caps the session under Astra's 272K
@@ -1172,7 +1191,7 @@ Answer the question I asked, not the one you wish I had asked.
 # model = "claude-sonnet-4-6"
 # auth_token_env = "ANTHROPIC_API_KEY"
 # harness = "direct"
-# level = "read"                               # the safe default; raise deliberately
+# read_only = true                             # narrowed on purpose; omit for read-write
 # price = { in_per_m = 3.00, cached_per_m = 0.30, out_per_m = 15.00 }
 #
 # OpenAI Chat Completions, on Fireworks' OpenAI-compatible root. NOTE THE `/v1`: it is the
@@ -1189,7 +1208,7 @@ Answer the question I asked, not the one you wish I had asked.
 # model = "accounts/fireworks/models/glm-5p2"
 # auth_token_env = "FIREWORKS_API_KEY"
 # harness = "direct"
-# level = "read"
+# read_only = true
 # thinking = "off"                             # the default; this host rejects the field
 # price = { in_per_m = 0.55, cached_per_m = 0.55, out_per_m = 2.19 }
 # [models.quirks]
@@ -1216,7 +1235,7 @@ Answer the question I asked, not the one you wish I had asked.
 # model = "gpt-5"
 # auth_token_env = "OPENAI_API_KEY"
 # harness = "direct"
-# level = "read"                               # the safe default; raise deliberately
+# read_only = true                             # narrowed on purpose; omit for read-write
 # thinking = "medium"                          # sent as reasoning.effort on this wire
 # price = { in_per_m = 1.25, cached_per_m = 0.13, out_per_m = 10.00 }
 # health = { timeout_secs = 15 }               # a reasoning model needs the longer probe

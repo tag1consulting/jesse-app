@@ -235,19 +235,26 @@ pub fn validate_model_config_with_env(
             let id = m.id.as_deref().unwrap_or("<unnamed>");
             errors.push(ConfigError::for_model(
                 id,
-                "`default_writes` has been removed; use `level` instead (\"basic\", \"read\" \
-                 or \"write\"). Levels live in the bridge config and are not settable from a \
-                 client, so the per-model writes toggle is gone with it.",
+                "`default_writes` has been removed. Every model is read-write unless its entry \
+                 says `read_only = true`; that flag lives in the bridge config and is not \
+                 settable from a client, so the per-model writes toggle is gone with it.",
             ));
         }
-        // A `level` that does not parse: refused rather than defaulted, because defaulting a
-        // typo to Read is a silent downgrade and defaulting it to Write is worse.
+        // A retired `level` whose value does not parse: refused rather than defaulted. The
+        // default is now READ-WRITE, so defaulting a typo would widen the model to vault writes
+        // on a word nobody meant — the worst direction a config error can fail in. The three
+        // old values still load (mapped, with a warning — see `resolve_model_access`).
         if let Some(raw) = m.level.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-            if parse_capability(raw).is_none() {
+            if parse_capability(&raw.to_ascii_lowercase()).is_none() {
                 let id = m.id.as_deref().unwrap_or("<unnamed>");
                 errors.push(ConfigError::for_model(
                     id,
-                    format!("unknown level '{raw}' (expected \"basic\", \"read\" or \"write\")"),
+                    format!(
+                        "unknown level '{raw}'. `level` is retired: every model is read-write \
+                         unless it says `read_only = true` (the old values \"write\", \"read\" \
+                         and \"basic\" still load). An unknown value is refused rather than \
+                         defaulted, because the default would make this model read-write."
+                    ),
                 ));
             }
         }
@@ -833,7 +840,7 @@ mod tests {
     }
 
     #[test]
-    fn a_leftover_default_writes_is_refused_and_names_level() {
+    fn a_leftover_default_writes_is_refused_and_names_read_only() {
         let decl = vec![ModelToml {
             id: Some("glm-5.2".to_string()),
             default_writes: Some(true),
@@ -844,7 +851,7 @@ mod tests {
             .first()
             .expect("a leftover default_writes must be refused");
         assert_eq!(e.model.as_deref(), Some("glm-5.2"));
-        assert!(e.message.contains("`level`"), "{e}");
+        assert!(e.message.contains("`read_only = true`"), "{e}");
         assert!(e.to_string().starts_with("model 'glm-5.2'"), "{e}");
     }
 
@@ -1190,6 +1197,34 @@ mod tests {
             highest_passing_level(&r, &Codex),
             Some(Capability::Write),
             "a failing row for a level the harness does not HAVE must not break the prefix"
+        );
+    }
+
+    /// `level = "basic"` on a CODEX model used to refuse to start — Codex has no no-tools
+    /// posture. `basic` is retired as a model posture and maps to read-only, so the same
+    /// DECLARATION now loads and starts at `read`. The refusal it used to reach is kept in the
+    /// test below, one layer down: a registry entry built at `Basic` on codex is still refused
+    /// in "cannot express" words, because the gate still asks the harness.
+    #[test]
+    fn a_retired_basic_level_on_codex_now_loads_as_read_only() {
+        let decl = ModelToml {
+            id: Some("codex-mini".into()),
+            kind: Some("hosted".into()),
+            base_url: Some("http://x".into()),
+            model: Some("m".into()),
+            harness: Some(CODEX_ID.into()),
+            level: Some("basic".into()),
+            ..ModelToml::default()
+        };
+        let m = registry_model_from_toml(&decl, None, None).expect("it loads");
+        assert_eq!(m.level, Capability::Read, "basic maps to read-only");
+        let cfg = cfg_with_codex_model("codex-mini", m.level);
+        let errors = validate(&cfg, std::slice::from_ref(&decl), CONTAINMENT_RECORDS);
+        assert!(
+            errors
+                .iter()
+                .all(|e| e.model.as_deref() != Some("codex-mini")),
+            "the declaration that used to refuse now starts: {errors:?}"
         );
     }
 
