@@ -65,8 +65,15 @@ reasoning budget and to stay within the override ceiling). A refused connection,
 or an auth failure is still recorded at once, and a success is never re-asked. A backend that
 is really hung is recorded unhealthy one confirmation later.
 
-**The Claude Code containment record is being re-recorded against claude 2.1.267** (the
-record lands in a follow-up commit on this branch).
+**The Claude Code containment record is re-recorded against claude 2.1.267.** All 64 probes
+across the four rows returned the verdicts recorded against 2.1.266 on 2026-09-09:
+`containment-probe` reported that nothing moved, and a probe-by-probe comparison of class,
+verdict, required level and status agreed. Only the header, the attempt counts and the scratch
+paths in the evidence changed. The two known-open baselines at `write` (`network_outbound`,
+`background_process`) are unchanged and, as before, carry no `[[accepted]]` entry. Several
+toolless-row probes waited out the 300 s probe timeout with no model reply before a retry
+answered; the battery discards a retry that proves less, so the verdicts stand. The CLI still
+auto-updates, so this record goes stale again at its next release unless the CLI is pinned.
 
 **Tests.** `atomicfile`: a private write that leaves no temp file, no temp file left by a
 failed rename, sixteen concurrent writers that never fail or tear the file, and a snapshot
