@@ -23,6 +23,7 @@ let package = Package(
     ],
     products: [
         .library(name: "JesseCore", targets: ["JesseCore"]),
+        .library(name: "JesseAsk", targets: ["JesseAsk"]),
         .library(name: "JesseNetworking", targets: ["JesseNetworking"]),
         .library(name: "JesseConversations", targets: ["JesseConversations"]),
         .library(name: "JesseSearch", targets: ["JesseSearch"]),
@@ -41,6 +42,37 @@ let package = Package(
         ),
         .testTarget(
             name: "JesseCoreTests",
+            dependencies: ["JesseCore"],
+            swiftSettings: [
+                .swiftLanguageMode(.v6),
+            ]
+        ),
+        // "Ask about this" — the SCREEN-AGNOSTIC half of the long-press / right-click
+        // gesture that opens the chat already knowing what was being looked at: the facts
+        // tree, the budget and its clamp, the scope, the time range, the reading's
+        // identity, the environment action, and the three view modifiers.
+        //
+        // It is a target of its own because two screens now have the gesture. It began
+        // inside JesseDietDisplay, where the Health tab was the only caller; extending it
+        // to the Ops screen forced the choice between copying the machinery into a second
+        // module and moving it somewhere both reach. Everything domain-specific stayed
+        // behind: the Health area enum, its serializers and its prompt are still in
+        // JesseDietDisplay, and JesseOps holds its own three.
+        //
+        // It depends on JesseCore for `AttachedContext` (an ask STAGES a snapshot against
+        // a conversation rather than firing a turn) and on nothing else. The frozen
+        // PROMPTS live in JesseCore rather than here, beside the other turn texts, for the
+        // reason written at the top of `HealthAskPrompt`: a reword is a behaviour change
+        // to the agent, so the layer that renders the numbers must not be the layer that
+        // can quietly reword the instruction wrapped around them.
+        //
+        // Isolation: default (nonisolated), matching the display targets rather than the
+        // app targets' MainActor default. The serializers that build a context are pure
+        // functions called from both MainActor views and off-main context builders; the
+        // views get MainActor from their `View` conformance, and `AskAction` marks its own
+        // closure `@MainActor` explicitly.
+        .target(
+            name: "JesseAsk",
             dependencies: ["JesseCore"],
             swiftSettings: [
                 .swiftLanguageMode(.v6),
@@ -152,14 +184,14 @@ let package = Package(
         // the isolated-deinit executor hop and aborts.
         .target(
             name: "JesseDietDisplay",
-            dependencies: ["JesseCore", "JesseNetworking"],
+            dependencies: ["JesseAsk", "JesseCore", "JesseNetworking"],
             swiftSettings: [
                 .swiftLanguageMode(.v6),
             ]
         ),
         .testTarget(
             name: "JesseDietDisplayTests",
-            dependencies: ["JesseDietDisplay", "JesseNetworking"],
+            dependencies: ["JesseDietDisplay", "JesseAsk", "JesseNetworking"],
             swiftSettings: [
                 .swiftLanguageMode(.v6),
             ]
@@ -227,14 +259,14 @@ let package = Package(
         // executor hop).
         .target(
             name: "JesseOps",
-            dependencies: ["JesseNetworking"],
+            dependencies: ["JesseAsk", "JesseCore", "JesseNetworking"],
             swiftSettings: [
                 .swiftLanguageMode(.v6),
             ]
         ),
         .testTarget(
             name: "JesseOpsTests",
-            dependencies: ["JesseOps", "JesseNetworking"],
+            dependencies: ["JesseOps", "JesseAsk", "JesseNetworking"],
             swiftSettings: [
                 .swiftLanguageMode(.v6),
             ]

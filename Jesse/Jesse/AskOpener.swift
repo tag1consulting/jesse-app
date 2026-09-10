@@ -1,32 +1,38 @@
 import Foundation
 import SwiftData
 import JesseCore
-import JesseDietDisplay
+import JesseAsk
 
-// How a Health-tab "Ask about this" becomes a conversation ON iOS.
+// How an "Ask about this" becomes a conversation ON iOS — for every screen that has the
+// gesture, the Health tab and the Ops screen alike.
 //
 // The split is the same one `TodayThreadOpener` draws, and for the same reason: WHAT the
 // turn says is a fact about the screen and lives in the shared package
-// (`HealthAskContext.promptText`, built from the frozen `HealthAskPrompt`); HOW it reaches
-// a conversation touches this app's coordinator and store, so it stays here.
+// (`AskContext.promptText`, built from that screen's own frozen prompt); HOW it reaches a
+// conversation touches this app's coordinator and store, so it stays here.
+//
+// NOTHING HERE KNOWS WHICH SCREEN IT CAME FROM, which is the point: an `AskContext` is a
+// title, an identity and an attachment, and staging one is the same work whether the
+// snapshot is a meal or a deploy card.
 //
 // An ask STAGES, it never fires. There is nothing for the agent to do until the user has
 // said what they want to know — firing on the long-press would make them wait out a full
 // turn before they could type a word, and would burn a turn on every idle poke at a card.
 // The snapshot waits as attached context and rides their first message.
 @MainActor
-enum HealthAskOpener {
+enum AskOpener {
 
     /// Open a conversation for `context` — resuming today's conversation about the very
     /// same reading if there is one, else staging a fresh thread.
     ///
-    /// RESUME is keyed on `HealthAskContext.scopeKey`, which is (area, scope, time range,
-    /// subject) with the range's own anchor date inside it. So a second press on the same
-    /// meal an hour later continues the conversation, and the same press tomorrow starts a
-    /// new one — because tomorrow it is a different reading.
+    /// RESUME is keyed on `AskContext.scopeKey`, which is (domain, area, scope, time
+    /// range, subject) with the range's own anchor date inside it. So a second press on the
+    /// same meal — or the same Ops card — an hour later continues the conversation, and the
+    /// same press tomorrow starts a new one, because tomorrow it is a different reading.
     ///
-    /// A resumed conversation is re-attached with a FRESH snapshot. The numbers may have
-    /// moved since the morning (a meal logged, a workout added), and the coordinator
+    /// A resumed conversation is re-attached with a FRESH snapshot. The reading may have
+    /// moved since it was started (a meal logged, a workout added, a deploy finished), and
+    /// the coordinator
     /// composes an attachment ahead of every send it is present for — so the next message
     /// carries the current screen rather than leaving the agent arguing from a stale one.
     ///
@@ -34,7 +40,7 @@ enum HealthAskOpener {
     /// inserted into the store until its first send (see `stage` below), so an ask that
     /// was opened and abandoned leaves nothing to come back to. That is the intent.
     @discardableResult
-    static func open(_ context: HealthAskContext, coordinator: RunCoordinator,
+    static func open(_ context: AskContext, coordinator: RunCoordinator,
                      modelContext: ModelContext, now: Date = Date()) -> JesseThread {
         if let existing = resumable(context, modelContext: modelContext, now: now) {
             coordinator.attach(context.attachment, to: existing.id)
@@ -49,7 +55,7 @@ enum HealthAskOpener {
     /// user did earlier today, so it follows their clock. The most recently updated match
     /// wins; archived conversations are excluded, because archiving one is how the user
     /// says they are done with it.
-    static func resumable(_ context: HealthAskContext, modelContext: ModelContext,
+    static func resumable(_ context: AskContext, modelContext: ModelContext,
                           now: Date = Date()) -> JesseThread? {
         let key = context.scopeKey
         let dayStart = Calendar.current.startOfDay(for: now)
@@ -77,7 +83,7 @@ enum HealthAskOpener {
     /// moment it opens, and the Chats list later reads "Lunch · Aug 22" instead of a wall
     /// of macros.
     @discardableResult
-    static func stage(_ context: HealthAskContext, coordinator: RunCoordinator) -> JesseThread {
+    static func stage(_ context: AskContext, coordinator: RunCoordinator) -> JesseThread {
         // ASK, not Tell: the turn's purpose is a conversation about a reading, and Ask
         // carries the floor that forbids task-work nobody requested — which is exactly the
         // protection wanted around a screen whose numbers a Tell might decide to "fix".

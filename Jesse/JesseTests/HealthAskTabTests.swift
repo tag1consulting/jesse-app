@@ -4,6 +4,7 @@ import SwiftData
 import JesseCore
 import JesseNetworking
 import JesseDietDisplay
+import JesseAsk
 
 /// The iOS half of the Health tab's "Ask about this": what a long-press actually opens,
 /// what the first send carries, and when a second ask RESUMES rather than forking.
@@ -52,7 +53,7 @@ final class HealthAskTabTests: XCTestCase {
         return try! DietSnapshot.decode(from: Data(json.utf8))
     }
 
-    private static func modelContext(_ model: HealthDashboardModel) -> HealthAskContext {
+    private static func modelContext(_ model: HealthDashboardModel) -> AskContext {
         // The page context is the one the shell's toolbar entry uses, and the only ask
         // context reachable without a view — which makes it the right one to drive these.
         model.pageAskContext!
@@ -78,7 +79,7 @@ final class HealthAskTabTests: XCTestCase {
         let ask = Self.modelContext(await Self.loadedModel())
         let before = try store.fetch(FetchDescriptor<JesseThread>()).count
 
-        let thread = HealthAskOpener.open(ask, coordinator: coordinator, modelContext: store)
+        let thread = AskOpener.open(ask, coordinator: coordinator, modelContext: store)
 
         XCTAssertEqual(thread.mode, JesseMode.ask.rawValue,
                        "an ask is an ASK — the floor that forbids unrequested task work")
@@ -95,7 +96,7 @@ final class HealthAskTabTests: XCTestCase {
     func testTheThreadIsNamedAfterTheScope() async throws {
         let store = try Self.makeContext()
         let ask = Self.modelContext(await Self.loadedModel())
-        let thread = HealthAskOpener.open(ask, coordinator: Self.coordinator(CapturingAskClient()),
+        let thread = AskOpener.open(ask, coordinator: Self.coordinator(CapturingAskClient()),
                                           modelContext: store)
         XCTAssertEqual(thread.title, ask.title)
         XCTAssertEqual(thread.askScopeTitle, ask.title)
@@ -108,7 +109,7 @@ final class HealthAskTabTests: XCTestCase {
         let store = try Self.makeContext()
         let coordinator = Self.coordinator(CapturingAskClient())
         let ask = Self.modelContext(await Self.loadedModel())
-        let thread = HealthAskOpener.open(ask, coordinator: coordinator, modelContext: store)
+        let thread = AskOpener.open(ask, coordinator: coordinator, modelContext: store)
 
         let attachment = coordinator.attachment(for: thread.id)
         XCTAssertEqual(attachment?.body, ask.promptText)
@@ -127,7 +128,7 @@ final class HealthAskTabTests: XCTestCase {
         let client = CapturingAskClient()
         let coordinator = Self.coordinator(client)
         let ask = Self.modelContext(await Self.loadedModel())
-        let thread = HealthAskOpener.open(ask, coordinator: coordinator, modelContext: store)
+        let thread = AskOpener.open(ask, coordinator: coordinator, modelContext: store)
 
         coordinator.send(thread: thread, text: "What's good and bad about today?",
                          voice: false, context: store)
@@ -147,7 +148,7 @@ final class HealthAskTabTests: XCTestCase {
         let store = try Self.makeContext()
         let coordinator = Self.coordinator(CapturingAskClient())
         let ask = Self.modelContext(await Self.loadedModel())
-        let thread = HealthAskOpener.open(ask, coordinator: coordinator, modelContext: store)
+        let thread = AskOpener.open(ask, coordinator: coordinator, modelContext: store)
 
         coordinator.send(thread: thread, text: "Why is lunch so caloric?",
                          voice: false, context: store)
@@ -167,7 +168,7 @@ final class HealthAskTabTests: XCTestCase {
         let client = CapturingAskClient()
         let coordinator = Self.coordinator(client)
         let ask = Self.modelContext(await Self.loadedModel())
-        let thread = HealthAskOpener.open(ask, coordinator: coordinator, modelContext: store)
+        let thread = AskOpener.open(ask, coordinator: coordinator, modelContext: store)
 
         coordinator.send(thread: thread, text: "", voice: false, context: store)
         await Self.settle()
@@ -203,14 +204,14 @@ final class HealthAskTabTests: XCTestCase {
         let coordinator = Self.coordinator(CapturingAskClient())
         let ask = Self.modelContext(await Self.loadedModel())
 
-        let first = HealthAskOpener.open(ask, coordinator: coordinator, modelContext: store)
+        let first = AskOpener.open(ask, coordinator: coordinator, modelContext: store)
         // Only a conversation that was actually HAD is resumable — the send is what puts
         // it in the store.
         coordinator.send(thread: first, text: "What's good about today?",
                          voice: false, context: store)
         await Self.settle()
 
-        let second = HealthAskOpener.open(ask, coordinator: coordinator, modelContext: store)
+        let second = AskOpener.open(ask, coordinator: coordinator, modelContext: store)
         XCTAssertEqual(second.id, first.id)
         XCTAssertEqual(try store.fetch(FetchDescriptor<JesseThread>()).count, 1)
     }
@@ -222,12 +223,12 @@ final class HealthAskTabTests: XCTestCase {
         let coordinator = Self.coordinator(CapturingAskClient())
         let ask = Self.modelContext(await Self.loadedModel())
 
-        let first = HealthAskOpener.open(ask, coordinator: coordinator, modelContext: store)
+        let first = AskOpener.open(ask, coordinator: coordinator, modelContext: store)
         coordinator.send(thread: first, text: "First question", voice: false, context: store)
         await Self.settle()
         XCTAssertNil(coordinator.attachment(for: first.id))
 
-        _ = HealthAskOpener.open(ask, coordinator: coordinator, modelContext: store)
+        _ = AskOpener.open(ask, coordinator: coordinator, modelContext: store)
         XCTAssertEqual(coordinator.attachment(for: first.id)?.body, ask.promptText)
     }
 
@@ -238,8 +239,8 @@ final class HealthAskTabTests: XCTestCase {
         let coordinator = Self.coordinator(CapturingAskClient())
         let ask = Self.modelContext(await Self.loadedModel())
 
-        let first = HealthAskOpener.open(ask, coordinator: coordinator, modelContext: store)
-        let second = HealthAskOpener.open(ask, coordinator: coordinator, modelContext: store)
+        let first = AskOpener.open(ask, coordinator: coordinator, modelContext: store)
+        let second = AskOpener.open(ask, coordinator: coordinator, modelContext: store)
         XCTAssertNotEqual(second.id, first.id)
     }
 
@@ -253,7 +254,7 @@ final class HealthAskTabTests: XCTestCase {
         let model = await Self.loadedModel()
 
         let dayRead = model.pageAskContext!
-        let first = HealthAskOpener.open(dayRead, coordinator: coordinator, modelContext: store)
+        let first = AskOpener.open(dayRead, coordinator: coordinator, modelContext: store)
         coordinator.send(thread: first, text: "About the day", voice: false, context: store)
         await Self.settle()
 
@@ -261,7 +262,7 @@ final class HealthAskTabTests: XCTestCase {
         let weekRead = model.pageAskContext!
         XCTAssertNotEqual(weekRead.scopeKey, dayRead.scopeKey,
                           "the window mode is part of what is being read")
-        XCTAssertNil(HealthAskOpener.resumable(weekRead, modelContext: store))
+        XCTAssertNil(AskOpener.resumable(weekRead, modelContext: store))
     }
 
     /// Yesterday's conversation about "today" is not today's. The scope key carries the
@@ -272,13 +273,13 @@ final class HealthAskTabTests: XCTestCase {
         let coordinator = Self.coordinator(CapturingAskClient())
         let ask = Self.modelContext(await Self.loadedModel())
 
-        let thread = HealthAskOpener.open(ask, coordinator: coordinator, modelContext: store)
+        let thread = AskOpener.open(ask, coordinator: coordinator, modelContext: store)
         coordinator.send(thread: thread, text: "Yesterday's question", voice: false, context: store)
         await Self.settle()
         // Backdate it: the conversation was had, but not today.
         thread.createdAt = Calendar.current.date(byAdding: .day, value: -1, to: Date())!
 
-        XCTAssertNil(HealthAskOpener.resumable(ask, modelContext: store))
+        XCTAssertNil(AskOpener.resumable(ask, modelContext: store))
     }
 
     /// An archived conversation is one the user is done with — never silently reopened.
@@ -287,12 +288,12 @@ final class HealthAskTabTests: XCTestCase {
         let coordinator = Self.coordinator(CapturingAskClient())
         let ask = Self.modelContext(await Self.loadedModel())
 
-        let thread = HealthAskOpener.open(ask, coordinator: coordinator, modelContext: store)
+        let thread = AskOpener.open(ask, coordinator: coordinator, modelContext: store)
         coordinator.send(thread: thread, text: "A question", voice: false, context: store)
         await Self.settle()
         thread.isArchived = true
 
-        XCTAssertNil(HealthAskOpener.resumable(ask, modelContext: store))
+        XCTAssertNil(AskOpener.resumable(ask, modelContext: store))
     }
 }
 

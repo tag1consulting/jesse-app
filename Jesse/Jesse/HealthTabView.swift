@@ -4,6 +4,7 @@ import JesseCore
 import JesseDietDisplay
 import JesseNetworking
 import JesseTodayDisplay
+import JesseAsk
 
 // The iOS Health tab: a thin shell around the SHARED dashboard (`HealthDashboardContent`
 // in JesseDietDisplay, rendered identically on the Mac). Everything platform-specific
@@ -171,7 +172,7 @@ struct HealthTabView: View {
         // does not reliably reach it. Attached here it covers the root and every
         // destination alike — Macros & calories, Food journal, Exercise, the charts, and
         // anything pushed later.
-        .environment(\.healthAsk, HealthAskAction { openAsk($0) })
+        .environment(\.jesseAsk, AskAction { openAsk($0) })
         // Load-on-appear lives in the shared `HealthDashboardContent`; the shell adds
         // only the iOS-specific after-turn and tab-activation refresh triggers.
         .onChange(of: coordinator.inFlight.count) { old, new in
@@ -219,8 +220,8 @@ struct HealthTabView: View {
 
     /// Open the chat about whatever was pressed: today's conversation about that exact
     /// reading if there is one, else a fresh one carrying the snapshot.
-    private func openAsk(_ context: HealthAskContext) {
-        let thread = HealthAskOpener.open(context, coordinator: coordinator,
+    private func openAsk(_ context: AskContext) {
+        let thread = AskOpener.open(context, coordinator: coordinator,
                                           modelContext: self.context)
         // Only a STAGED thread has an attachment worth dropping on dismissal; a resumed
         // one is already in the store and its re-attachment is spent by the next send.

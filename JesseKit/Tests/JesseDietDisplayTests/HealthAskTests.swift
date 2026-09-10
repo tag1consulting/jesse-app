@@ -1,6 +1,7 @@
 import XCTest
 @testable import JesseDietDisplay
 import JesseNetworking
+import JesseAsk
 
 // "Ask about this" — the context model, the serializers, and the budget.
 //
@@ -109,7 +110,7 @@ final class HealthAskTests: XCTestCase {
                             { "calories": 2200, "protein": 150, "fat": 65, "carbs": 220, "fiber": 30 }
                             """)
         let gauges = DietSemantics.gauges(for: snap.today, hour: 14)
-        let line = AskFacts.gaugeLine(gauges.protein)
+        let line = HealthFacts.gaugeLine(gauges.protein)
         XCTAssertTrue(line.hasPrefix("\(gauges.protein.label): "))
         XCTAssertTrue(line.contains(gauges.protein.remaining))
         XCTAssertTrue(line.contains("floor"), "protein is a floor, and the line says so")
@@ -123,7 +124,7 @@ final class HealthAskTests: XCTestCase {
         let gauge = DietSemantics.micronutrientGauge(.sodium, meals: snap.today.meals,
                                                      targets: snap.today.targets, hour: 14)
         XCTAssertTrue(gauge.partial, "fixture precondition: one item carries no sodium")
-        let facts = AskFacts.gauge(gauge).render()
+        let facts = HealthFacts.gauge(gauge).render()
         XCTAssertTrue(facts.contains("≥"), "a floor is marked, never rendered as a total")
         XCTAssertTrue(facts.contains("carries no measured value"))
         XCTAssertTrue(facts.contains("is a floor, not a total"))
@@ -160,7 +161,7 @@ final class HealthAskTests: XCTestCase {
             "{ \"item\": \"Food \(i)\", \"cal\": \(i * 10), \"p\": 1, \"f\": 1, \"c\": 1, \"fiber\": 0 }"
         }.joined(separator: ",")
         let big = snapshot(meals: "[{ \"name\": \"Buffet\", \"items\": [\(items)] }]")
-        let facts = AskFacts.meal(big.today.meals[0])
+        let facts = HealthFacts.meal(big.today.meals[0])
         let text = facts.render()
         XCTAssertTrue(text.contains("Food 20"), "the biggest contributor survives the cap")
         XCTAssertFalse(text.contains("Food 1 ("), "the smallest is dropped")
@@ -173,17 +174,17 @@ final class HealthAskTests: XCTestCase {
 
     /// A snapshot past the ceiling is cut at a line boundary and admits it.
     func testAnOversizedSnapshotIsClampedAndSaysSo() {
-        let long = Array(repeating: "x", count: HealthAskBudget.maxCharacters / 4)
+        let long = Array(repeating: "x", count: AskBudget.maxCharacters / 4)
             .map { $0 + String(repeating: "y", count: 20) }
             .joined(separator: "\n")
-        let clamped = HealthAskBudget.clamp(long)
+        let clamped = AskBudget.clamp(long)
         XCTAssertLessThan(clamped.count, long.count)
         XCTAssertTrue(clamped.hasSuffix("(snapshot truncated here to fit — ask for any part of it in full)"))
         XCTAssertFalse(clamped.dropLast(70).contains("\n\n"), "cut at a line, never mid-line")
     }
 
     func testAShortSnapshotIsUntouched() {
-        XCTAssertEqual(HealthAskBudget.clamp("one line"), "one line")
+        XCTAssertEqual(AskBudget.clamp("one line"), "one line")
     }
 
     // MARK: - Scope identity (what resume is decided on)
@@ -213,8 +214,8 @@ final class HealthAskTests: XCTestCase {
     /// A rolling window's key carries its anchor, so "the last 7 days" asked on two
     /// different days are two different readings and never share a conversation.
     func testARollingWindowIsAnchoredToItsDay() {
-        let a = HealthAskTimeRange.trailing(days: 7, through: "2026-08-22")
-        let b = HealthAskTimeRange.trailing(days: 7, through: "2026-08-23")
+        let a = AskTimeRange.trailing(days: 7, through: "2026-08-22")
+        let b = AskTimeRange.trailing(days: 7, through: "2026-08-23")
         XCTAssertNotEqual(a.key, b.key)
     }
 
@@ -253,7 +254,7 @@ final class HealthAskTests: XCTestCase {
     func testEveryScopeOffersTwoToFourStarters() {
         let snap = snapshot(meals: lunchJSON)
         let gauges = DietSemantics.gauges(for: snap.today, hour: 14)
-        let contexts: [HealthAskContext] = [
+        let contexts: [AskContext] = [
             HealthAsk.day(snapshot: snap, gauges: gauges, hour: 14, windowMode: .day, day: day),
             HealthAsk.meal(lunch(), day: day),
             HealthAsk.food(lunch().items[0], in: lunch(), day: day),

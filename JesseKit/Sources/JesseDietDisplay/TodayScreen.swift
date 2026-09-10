@@ -1,6 +1,7 @@
 import SwiftUI
 import JesseCore
 import JesseNetworking
+import JesseAsk
 
 // MARK: - Level 1: Today
 
@@ -587,7 +588,7 @@ struct TodayScreen: View {
     private func unavailableOr<Value, Destination: View>(
         section: Value?, label: String, errors: [String],
         icon: String, title: String, subtitle: String?,
-        ask: @escaping (Value) -> HealthAskContext,
+        ask: @escaping (Value) -> AskContext,
         @ViewBuilder destination: @escaping (Value) -> Destination
     ) -> some View {
         if let value = section {

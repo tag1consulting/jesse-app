@@ -1,9 +1,10 @@
 import Foundation
 import JesseNetworking
+import JesseAsk
 
 // The SCOPE factories: one per thing on the Health tab that can be asked about.
 //
-// Each is a thin composition over `AskFacts` — a title, a range, a subject noun, some
+// Each is a thin composition over `HealthFacts` — a title, a range, a subject noun, some
 // starters, and a facts tree assembled from the unit serializers. That is the whole
 // point of the split: an item names one unit block, a section names its items' blocks,
 // and a page names its sections'. Nothing here re-derives a number.
@@ -22,7 +23,7 @@ struct HealthAskDay: Equatable, Sendable {
     /// past reading can never be answered as if it were today's.
     let isToday: Bool
 
-    var range: HealthAskTimeRange { .day(iso, isToday: isToday) }
+    var range: AskTimeRange { .day(iso, isToday: isToday) }
     /// "Aug 22" — the title suffix.
     var short: String { DietSemantics.displayDate(iso) ?? iso }
     /// "today" / "Aug 22" — the possessive in a title ("today's macros").
@@ -100,12 +101,12 @@ enum HealthAsk {
     /// the tab's own toolbar entry. "What's good and what's bad about today" must be
     /// answerable from this alone, with nothing selected.
     static func day(snapshot: DietSnapshot, gauges: DietGauges, hour: Int,
-                    windowMode: NutrientWindowMode, day: HealthAskDay) -> HealthAskContext {
+                    windowMode: NutrientWindowMode, day: HealthAskDay) -> AskContext {
         let today = snapshot.today
         let isNeutral = HistoryUI.mode(fidelity: snapshot.fidelityKind) == .neutral
-        var children: [HealthAskFacts] = []
+        var children: [AskFacts] = []
 
-        var head = HealthAskFacts(heading: "The day", lines: [
+        var head = AskFacts(heading: "The day", lines: [
             "date \(today.date)\(day.isToday ? " (today, live)" : " (a past day)")",
         ])
         if let style = today.dayStyle { head.lines.append("day type: \(style)") }
@@ -121,16 +122,16 @@ enum HealthAsk {
         children.append(head)
 
         if !isNeutral {
-            children.append(HealthAskFacts(
+            children.append(AskFacts(
                 heading: "Summary",
-                lines: AskFacts.daySummary(DaySummary.make(gauges: gauges, hour: hour,
+                lines: HealthFacts.daySummary(DaySummary.make(gauges: gauges, hour: hour,
                                                            hasFood: !today.meals.isEmpty)).lines))
         }
 
-        children.append(HealthAskFacts(
+        children.append(AskFacts(
             heading: "Calories & macros",
-            lines: [AskFacts.gaugeLine(gauges.calories)]
-                + gauges.orderedMacros.map { AskFacts.gaugeLine($0.gauge) }
+            lines: [HealthFacts.gaugeLine(gauges.calories)]
+                + gauges.orderedMacros.map { HealthFacts.gaugeLine($0.gauge) }
                 + ["net: \(DietSemantics.fmt(gauges.net.intake)) eaten − "
                    + "\(DietSemantics.fmt(gauges.net.burned)) burned = "
                    + "\(DietSemantics.fmt(gauges.net.net))"]))
@@ -142,9 +143,9 @@ enum HealthAsk {
             let rows = NutrientWindows.gauges(series: series, targets: today.targets,
                                               windowDays: days)
             if !rows.isEmpty {
-                children.append(HealthAskFacts(
+                children.append(AskFacts(
                     heading: "Rolling \(days)-day read (what the screen is showing)",
-                    lines: rows.map { AskFacts.gaugeLine($0.gauge) },
+                    lines: rows.map { HealthFacts.gaugeLine($0.gauge) },
                     note: NutrientWindows.coverageFootnote))
             }
         }
@@ -154,84 +155,84 @@ enum HealthAsk {
             series: snapshot.isHistorical ? nil : snapshot.nutrientSeries)
             .filter { ($0.knownItemCount ?? 0) > 0 }
         if !micros.isEmpty {
-            children.append(HealthAskFacts(heading: "Micronutrients",
-                                           lines: micros.map(AskFacts.gaugeLine)))
+            children.append(AskFacts(heading: "Micronutrients",
+                                           lines: micros.map(HealthFacts.gaugeLine)))
         }
 
         if let card = HealthDisplay.weightCard(today: today, series: snapshot.weightSeries) {
-            children.append(HealthAskFacts(heading: "Weight", lines: AskFacts.weightCard(card).lines))
+            children.append(AskFacts(heading: "Weight", lines: HealthFacts.weightCard(card).lines))
         }
 
-        var foodLines = AskFacts.dayFoodTotals(today.meals)
+        var foodLines = HealthFacts.dayFoodTotals(today.meals)
         let meals = DietSemantics.sortedMeals(today.meals)
         foodLines.append("\(meals.count) \(meals.count == 1 ? "meal" : "meals") logged")
-        var food = HealthAskFacts(heading: "Food journal", lines: foodLines)
-        food.children = meals.map { AskFacts.meal($0, foodLimit: HealthAskBudget.maxNestedListItems) }
+        var food = AskFacts(heading: "Food journal", lines: foodLines)
+        food.children = meals.map { HealthFacts.meal($0, foodLimit: AskBudget.maxNestedListItems) }
         children.append(food)
 
         let sessions = DietSemantics.sortedExercise(today.exercise)
-        children.append(HealthAskFacts(
+        children.append(AskFacts(
             heading: "Exercise",
             lines: sessions.isEmpty
                 ? ["nothing logged"]
                 : ["\(sessions.count) \(sessions.count == 1 ? "session" : "sessions") · "
                    + "\(DietSemantics.fmt(DietSemantics.burnedCalories(today.exercise))) cal burned"],
-            children: sessions.map(AskFacts.workout)))
+            children: sessions.map(HealthFacts.workout)))
 
         if let coach = snapshot.coach {
-            children.append(HealthAskFacts(heading: "Coach's notes", lines: AskFacts.coach(coach).lines))
+            children.append(AskFacts(heading: "Coach's notes", lines: HealthFacts.coach(coach).lines))
         }
         if let progress = snapshot.progress {
             let targets = DietSemantics.displayTargets(
                 progress,
                 currentWeight: HealthDisplay.weightCard(today: today, series: snapshot.weightSeries)?.lbs,
                 today: today.date)
-            children.append(HealthAskFacts(heading: "Progress & pace",
-                                           lines: AskFacts.progress(progress, targets: targets).lines))
+            children.append(AskFacts(heading: "Progress & pace",
+                                           lines: HealthFacts.progress(progress, targets: targets).lines))
         }
         if !snapshot.errors.isEmpty {
-            children.append(HealthAskFacts(heading: "Sections that could not be read",
+            children.append(AskFacts(heading: "Sections that could not be read",
                                            lines: snapshot.errors))
         }
 
-        return HealthAskContext(
+        return AskContext(
             scope: .page, area: .day,
             timeRange: windowMode.days.map { .trailing(days: $0, through: today.date) } ?? day.range,
             title: "Health · \(day.short)", subject: "this whole day",
             subjectKey: "dashboard",
-            facts: HealthAskFacts(children: children),
+            facts: AskFacts(children: children),
             related: [today.date],
             suggestedQuestions: HealthAskStarters.dayPage)
     }
 
     /// The plain-language day summary card.
     static func daySummary(_ summary: DaySummary, gauges: DietGauges,
-                           day: HealthAskDay) -> HealthAskContext {
-        HealthAskContext(
+                           day: HealthAskDay) -> AskContext {
+        AskContext(
             scope: .section, area: .day, timeRange: day.range,
             title: "\(day.possessive.capitalizedAsk) summary", subject: "this summary",
             subjectKey: "summary",
-            facts: HealthAskFacts(children: [
-                AskFacts.daySummary(summary),
-                HealthAskFacts(heading: "The gauges it is derived from",
-                               lines: [AskFacts.gaugeLine(gauges.calories)]
-                                + gauges.orderedMacros.map { AskFacts.gaugeLine($0.gauge) }),
+            facts: AskFacts(children: [
+                HealthFacts.daySummary(summary),
+                AskFacts(heading: "The gauges it is derived from",
+                               lines: [HealthFacts.gaugeLine(gauges.calories)]
+                                + gauges.orderedMacros.map { HealthFacts.gaugeLine($0.gauge) }),
             ]),
             suggestedQuestions: HealthAskStarters.dayPage)
     }
 
     /// The day-type chip ("carb-load day").
     static func dayStyle(_ style: String?, isCarbLoad: Bool, gauges: DietGauges,
-                         day: HealthAskDay) -> HealthAskContext {
-        HealthAskContext(
+                         day: HealthAskDay) -> AskContext {
+        AskContext(
             scope: .item, area: .day, timeRange: day.range,
             title: "Day type · \(day.short)", subject: "this day type",
             subjectKey: "day-style",
-            facts: HealthAskFacts(lines: [
+            facts: AskFacts(lines: [
                 "day type: \(style ?? "not recorded")",
                 isCarbLoad ? "this is a carb-load day" : "this is an ordinary day",
-                "what it changes: \(AskFacts.gaugeLine(gauges.carbs))",
-                AskFacts.gaugeLine(gauges.fiber),
+                "what it changes: \(HealthFacts.gaugeLine(gauges.carbs))",
+                HealthFacts.gaugeLine(gauges.fiber),
             ]),
             suggestedQuestions: ["What does this day type change?",
                                  "How should I eat differently today?"])
@@ -243,11 +244,11 @@ enum HealthAsk {
     /// them, with the same judgements.
     static func macrosPage(today: DietToday, gauges: DietGauges, hour: Int,
                            judgeSeries: [NutrientDay]?, neutral: Bool,
-                           day: HealthAskDay) -> HealthAskContext {
-        var children: [HealthAskFacts] = [
-            HealthAskFacts(heading: "Calories & macros",
-                           lines: [AskFacts.gaugeLine(gauges.calories)]
-                            + gauges.orderedMacros.map { AskFacts.gaugeLine($0.gauge) }),
+                           day: HealthAskDay) -> AskContext {
+        var children: [AskFacts] = [
+            AskFacts(heading: "Calories & macros",
+                           lines: [HealthFacts.gaugeLine(gauges.calories)]
+                            + gauges.orderedMacros.map { HealthFacts.gaugeLine($0.gauge) }),
         ]
         if let bonus = gauges.carbsBonus {
             children[0].lines.append("\(bonus.label): \(DietSemantics.fmt(bonus.consumed))"
@@ -260,37 +261,37 @@ enum HealthAsk {
             return (g.knownItemCount ?? 0) > 0 ? g : nil
         }
         if !micros.isEmpty {
-            children.append(HealthAskFacts(heading: "Sub-entries under the macros above",
-                                           lines: micros.map(AskFacts.gaugeLine)))
+            children.append(AskFacts(heading: "Sub-entries under the macros above",
+                                           lines: micros.map(HealthFacts.gaugeLine)))
         }
         let minerals = NutrientOrder.minerals
             .map { DietSemantics.micronutrientGauge($0, meals: today.meals, targets: today.targets,
                                                     hour: hour, series: judgeSeries) }
             .filter { ($0.knownItemCount ?? 0) > 0 }
         if !minerals.isEmpty {
-            children.append(HealthAskFacts(heading: "Micronutrients",
-                                           lines: minerals.map(AskFacts.gaugeLine)))
+            children.append(AskFacts(heading: "Micronutrients",
+                                           lines: minerals.map(HealthFacts.gaugeLine)))
         }
         let windowRows = DietSemantics.rollingWindowGauges(for: today)
         if !windowRows.isEmpty {
-            children.append(HealthAskFacts(
+            children.append(AskFacts(
                 heading: "Over the last week (window totals, not day totals)",
-                lines: windowRows.map { AskFacts.gaugeLine($0.gauge) },
+                lines: windowRows.map { HealthFacts.gaugeLine($0.gauge) },
                 note: DietSemantics.rollingWindowFootnote))
         }
-        children.append(HealthAskFacts(
+        children.append(AskFacts(
             heading: "Net calories",
             lines: ["\(DietSemantics.fmt(gauges.net.intake)) eaten − "
                     + "\(DietSemantics.fmt(gauges.net.burned)) burned = "
                     + "\(DietSemantics.fmt(gauges.net.net)) net"]))
         if neutral {
-            children.append(HealthAskFacts(lines: [NeutralMode.noTargetsCaption]))
+            children.append(AskFacts(lines: [NeutralMode.noTargetsCaption]))
         }
-        return HealthAskContext(
+        return AskContext(
             scope: .page, area: .macros, timeRange: day.range,
             title: "Macros & calories · \(day.short)", subject: "\(day.possessive) macros",
             subjectKey: "macros",
-            facts: HealthAskFacts(children: children),
+            facts: AskFacts(children: children),
             related: [today.date],
             suggestedQuestions: HealthAskStarters.macros)
     }
@@ -299,10 +300,10 @@ enum HealthAsk {
     /// section scope, so long-pressing the row and opening the page agree.
     static func macrosSection(today: DietToday, gauges: DietGauges, hour: Int,
                               judgeSeries: [NutrientDay]?, neutral: Bool,
-                              day: HealthAskDay) -> HealthAskContext {
+                              day: HealthAskDay) -> AskContext {
         let page = macrosPage(today: today, gauges: gauges, hour: hour,
                               judgeSeries: judgeSeries, neutral: neutral, day: day)
-        return HealthAskContext(
+        return AskContext(
             scope: .section, area: .macros, timeRange: page.timeRange,
             title: page.title, subject: page.subject, subjectKey: "macros",
             facts: page.facts, related: page.related,
@@ -316,24 +317,24 @@ enum HealthAsk {
     /// which is what makes "why is this so caloric" answerable without a second turn.
     static func metric(_ gauge: MetricGauge, area: HealthAskArea, day: HealthAskDay,
                        breakdown: FoodBreakdown? = nil,
-                       starters: [String]? = nil) -> HealthAskContext {
-        var children = [AskFacts.gauge(gauge)]
+                       starters: [String]? = nil) -> AskContext {
+        var children = [HealthFacts.gauge(gauge)]
         if let breakdown {
-            let foods = AskFacts.contributors(breakdown, decimals: gauge.decimals, unit: gauge.unit)
+            let foods = HealthFacts.contributors(breakdown, decimals: gauge.decimals, unit: gauge.unit)
             if !foods.isEmpty { children.append(foods) }
         }
         // A rolling row's number spans days, so its range must say so rather than claim
         // the day it was tapped on.
         let range = gauge.rollingWindow.map {
-            HealthAskTimeRange.trailing(days: $0.days, through: $0.to ?? day.iso)
+            AskTimeRange.trailing(days: $0.days, through: $0.to ?? day.iso)
         } ?? gauge.windowRead.map {
-            HealthAskTimeRange.trailing(days: $0.windowDays, through: day.iso)
+            AskTimeRange.trailing(days: $0.windowDays, through: day.iso)
         } ?? day.range
-        return HealthAskContext(
+        return AskContext(
             scope: .item, area: area, timeRange: range,
             title: "\(gauge.label) · \(day.short)", subject: "this number",
             subjectKey: gauge.label,
-            facts: HealthAskFacts(children: children),
+            facts: AskFacts(children: children),
             suggestedQuestions: starters
                 ?? (gauge.label.lowercased().contains("calorie")
                     ? HealthAskStarters.calorieItem : HealthAskStarters.nutrientItem))
@@ -342,14 +343,14 @@ enum HealthAsk {
     /// The rolling 7/30-day read the window switcher puts on screen — the SECTION, whose
     /// rows are medians rather than today's numbers.
     static func rollingRead(_ rows: [(nutrient: TrendNutrient, gauge: MetricGauge)],
-                            windowDays: Int, day: HealthAskDay) -> HealthAskContext {
-        HealthAskContext(
+                            windowDays: Int, day: HealthAskDay) -> AskContext {
+        AskContext(
             scope: .section, area: .macros,
             timeRange: .trailing(days: windowDays, through: day.iso),
             title: "Rolling read · last \(windowDays) days",
             subject: "this \(windowDays)-day read", subjectKey: "rolling-\(windowDays)",
-            facts: HealthAskFacts(
-                lines: rows.map { AskFacts.gaugeLine($0.gauge) },
+            facts: AskFacts(
+                lines: rows.map { HealthFacts.gaugeLine($0.gauge) },
                 note: NutrientWindows.coverageFootnote),
             suggestedQuestions: ["What stands out over these days?",
                                  "Which of these is worth acting on?",
@@ -363,7 +364,7 @@ enum HealthAsk {
     /// this so caloric" and "is that a lot" are the same question asked from two ends, and
     /// a row torn out of its ranking can only answer the first.
     static func contribution(_ c: FoodContribution, in breakdown: FoodBreakdown,
-                             day: HealthAskDay) -> HealthAskContext {
+                             day: HealthAskDay) -> AskContext {
         let metric = breakdown.metric
         let amount = c.amount.map { " (\($0))" } ?? ""
         var lines = [
@@ -377,14 +378,14 @@ enum HealthAsk {
         if c.amount == nil {
             lines.append("no amount was logged for this row, so the estimate rests on the name alone")
         }
-        return HealthAskContext(
+        return AskContext(
             scope: .item, area: metric.isMicronutrient ? .macros : .calories,
             timeRange: day.range,
             title: "\(c.name) · \(metric.label)", subject: "this food",
             subjectKey: "contribution-\(metric.label)-\(c.name)",
-            facts: HealthAskFacts(
+            facts: AskFacts(
                 lines: lines,
-                children: [AskFacts.contributors(breakdown, decimals: metric.decimals,
+                children: [HealthFacts.contributors(breakdown, decimals: metric.decimals,
                                                  unit: metric.unit)]),
             suggestedQuestions: HealthAskStarters.food)
     }
@@ -392,15 +393,15 @@ enum HealthAsk {
     /// A food the log carries NO value for on this metric — the "Not estimated" group.
     /// Its question is a different one, so its starters are too.
     static func unmeasuredFood(_ u: UnknownFood, in breakdown: FoodBreakdown,
-                               day: HealthAskDay) -> HealthAskContext {
+                               day: HealthAskDay) -> AskContext {
         let metric = breakdown.metric
         let amount = u.amount.map { " (\($0))" } ?? ""
-        return HealthAskContext(
+        return AskContext(
             scope: .item, area: .macros, timeRange: day.range,
             title: "\(u.name) · \(metric.label) not estimated",
             subject: "this unmeasured food",
             subjectKey: "unmeasured-\(metric.label)-\(u.name)",
-            facts: HealthAskFacts(lines: [
+            facts: AskFacts(lines: [
                 "\(u.name)\(amount) carries NO measured \(metric.label.lowercased()) value",
                 "it is UNKNOWN, not zero — it is left out of the day's total rather than "
                     + "counted as nothing, which is why that total reads as a floor",
@@ -414,18 +415,18 @@ enum HealthAsk {
 
     /// The drill-down's "what fed this" block as a whole.
     static func drilldown(_ breakdown: FoodBreakdown, gauge: MetricGauge,
-                          day: HealthAskDay) -> HealthAskContext {
+                          day: HealthAskDay) -> AskContext {
         metric(gauge, area: breakdown.metric.isMicronutrient ? .macros : .calories,
                day: day, breakdown: breakdown)
     }
 
     /// The four macro rings, as one section.
-    static func macroRings(_ gauges: DietGauges, day: HealthAskDay) -> HealthAskContext {
-        HealthAskContext(
+    static func macroRings(_ gauges: DietGauges, day: HealthAskDay) -> AskContext {
+        AskContext(
             scope: .section, area: .macros, timeRange: day.range,
             title: "Macros · \(day.short)", subject: "\(day.possessive) macros",
             subjectKey: "macro-rings",
-            facts: HealthAskFacts(lines: gauges.orderedMacros.map { AskFacts.gaugeLine($0.gauge) }),
+            facts: AskFacts(lines: gauges.orderedMacros.map { HealthFacts.gaugeLine($0.gauge) }),
             suggestedQuestions: HealthAskStarters.macros)
     }
 
@@ -434,24 +435,24 @@ enum HealthAsk {
     /// section adds all compose from the same place.
     static func gaugeGroup(_ gauges: [MetricGauge], area: HealthAskArea, title: String,
                            subject: String, subjectKey: String, day: HealthAskDay,
-                           range: HealthAskTimeRange? = nil, note: String? = nil,
-                           starters: [String] = HealthAskStarters.nutrientItem) -> HealthAskContext {
-        HealthAskContext(
+                           range: AskTimeRange? = nil, note: String? = nil,
+                           starters: [String] = HealthAskStarters.nutrientItem) -> AskContext {
+        AskContext(
             scope: .section, area: area, timeRange: range ?? day.range,
             title: title, subject: subject, subjectKey: subjectKey,
-            facts: HealthAskFacts(lines: gauges.map(AskFacts.gaugeLine), note: note),
+            facts: AskFacts(lines: gauges.map(HealthFacts.gaugeLine), note: note),
             suggestedQuestions: starters)
     }
 
     /// The standalone minerals block on Macros & calories.
-    static func mineralsSection(_ gauges: [MetricGauge], day: HealthAskDay) -> HealthAskContext {
+    static func mineralsSection(_ gauges: [MetricGauge], day: HealthAskDay) -> AskContext {
         gaugeGroup(gauges, area: .macros, title: "Micronutrients · \(day.short)",
                    subject: "\(day.possessive) micronutrients", subjectKey: "minerals", day: day)
     }
 
     /// The "over the last week" block, whose numbers are WINDOW TOTALS rather than a
     /// day's — so its range says a week even though it was pressed on a day screen.
-    static func rollingWindowSection(_ gauges: [MetricGauge], day: HealthAskDay) -> HealthAskContext {
+    static func rollingWindowSection(_ gauges: [MetricGauge], day: HealthAskDay) -> AskContext {
         let days = gauges.compactMap { $0.rollingWindow?.days }.first ?? 7
         return gaugeGroup(gauges, area: .macros, title: "Last \(days) days",
                           subject: "this weekly total", subjectKey: "rolling-window",
@@ -460,12 +461,12 @@ enum HealthAsk {
     }
 
     /// The net-calorie bar.
-    static func netCalories(_ net: NetCalories, day: HealthAskDay) -> HealthAskContext {
-        HealthAskContext(
+    static func netCalories(_ net: NetCalories, day: HealthAskDay) -> AskContext {
+        AskContext(
             scope: .item, area: .calories, timeRange: day.range,
             title: "Net calories · \(day.short)", subject: "these net calories",
             subjectKey: "net-calories",
-            facts: HealthAskFacts(lines: [
+            facts: AskFacts(lines: [
                 "eaten \(DietSemantics.fmt(net.intake)) cal",
                 "burned in logged exercise \(DietSemantics.fmt(net.burned)) cal",
                 "net \(DietSemantics.fmt(net.net)) cal",
@@ -477,55 +478,55 @@ enum HealthAsk {
     // MARK: Food journal
 
     static func foodJournalPage(today: DietToday, proposed: DietProposed?,
-                                day: HealthAskDay) -> HealthAskContext {
+                                day: HealthAskDay) -> AskContext {
         let meals = DietSemantics.sortedMeals(today.meals)
-        var children = [HealthAskFacts(heading: "The day's food",
-                                       lines: AskFacts.dayFoodTotals(today.meals))]
-        children += meals.map { AskFacts.meal($0) }
+        var children = [AskFacts(heading: "The day's food",
+                                       lines: HealthFacts.dayFoodTotals(today.meals))]
+        children += meals.map { HealthFacts.meal($0) }
         if let proposed, !proposed.ideas.isEmpty {
-            var planned = HealthAskFacts(
+            var planned = AskFacts(
                 heading: "Planned (proposals — NOT eaten, not in any total above)",
-                children: proposed.ideas.map(AskFacts.idea))
+                children: proposed.ideas.map(HealthFacts.idea))
             if let source = proposed.source { planned.lines.append("source: \(source)") }
             if let gap = proposed.gapNote { planned.lines.append(gap) }
             children.append(planned)
         }
-        return HealthAskContext(
+        return AskContext(
             scope: .page, area: .foodJournal, timeRange: day.range,
             title: "Food journal · \(day.short)", subject: "\(day.possessive) food",
             subjectKey: "food-journal",
-            facts: HealthAskFacts(children: children),
+            facts: AskFacts(children: children),
             related: [today.date],
             suggestedQuestions: HealthAskStarters.foodJournal)
     }
 
-    static func foodJournalSection(today: DietToday, day: HealthAskDay) -> HealthAskContext {
+    static func foodJournalSection(today: DietToday, day: HealthAskDay) -> AskContext {
         let meals = DietSemantics.sortedMeals(today.meals)
-        return HealthAskContext(
+        return AskContext(
             scope: .section, area: .foodJournal, timeRange: day.range,
             title: "Food journal · \(day.short)", subject: "\(day.possessive) food",
             subjectKey: "food-journal",
-            facts: HealthAskFacts(
-                lines: AskFacts.dayFoodTotals(today.meals),
-                children: meals.map { AskFacts.meal($0, foodLimit: HealthAskBudget.maxNestedListItems) }),
+            facts: AskFacts(
+                lines: HealthFacts.dayFoodTotals(today.meals),
+                children: meals.map { HealthFacts.meal($0, foodLimit: AskBudget.maxNestedListItems) }),
             suggestedQuestions: HealthAskStarters.foodJournal)
     }
 
-    static func meal(_ meal: DietMeal, day: HealthAskDay) -> HealthAskContext {
-        HealthAskContext(
+    static func meal(_ meal: DietMeal, day: HealthAskDay) -> AskContext {
+        AskContext(
             scope: .item, area: .foodJournal, timeRange: day.range,
             title: "\(meal.name) · \(day.short)", subject: "this meal",
             subjectKey: meal.name,
-            facts: AskFacts.meal(meal),
+            facts: HealthFacts.meal(meal),
             suggestedQuestions: HealthAskStarters.meal)
     }
 
     /// ONE logged food, with the meal it sits in for context and every micronutrient the
     /// log actually measured for it — which is what "how confident is this estimate"
     /// needs, and what the row itself does not show.
-    static func food(_ item: DietItem, in meal: DietMeal, day: HealthAskDay) -> HealthAskContext {
-        var lines = [AskFacts.foodLine(item)]
-        let micros = AskFacts.foodMicros(item)
+    static func food(_ item: DietItem, in meal: DietMeal, day: HealthAskDay) -> AskContext {
+        var lines = [HealthFacts.foodLine(item)]
+        let micros = HealthFacts.foodMicros(item)
         if micros.isEmpty {
             lines.append("no micronutrients measured for this row — unknown, not zero")
         } else {
@@ -534,23 +535,23 @@ enum HealthAsk {
         if item.amount == nil {
             lines.append("no amount was logged, so the estimate rests on the name alone")
         }
-        return HealthAskContext(
+        return AskContext(
             scope: .item, area: .foodJournal, timeRange: day.range,
             title: "\(item.item) · \(meal.name)", subject: "this food",
             subjectKey: "\(meal.name)-\(item.item)",
-            facts: HealthAskFacts(
+            facts: AskFacts(
                 lines: lines,
-                children: [HealthAskFacts(heading: "The meal it is part of",
-                                          lines: AskFacts.meal(meal).lines)]),
+                children: [AskFacts(heading: "The meal it is part of",
+                                          lines: HealthFacts.meal(meal).lines)]),
             suggestedQuestions: HealthAskStarters.food)
     }
 
-    static func idea(_ idea: DietIdea, day: HealthAskDay) -> HealthAskContext {
-        HealthAskContext(
+    static func idea(_ idea: DietIdea, day: HealthAskDay) -> AskContext {
+        AskContext(
             scope: .item, area: .foodJournal, timeRange: day.range,
             title: "Planned: \(idea.name)", subject: "this planned meal",
             subjectKey: "planned-\(idea.name)",
-            facts: AskFacts.idea(idea),
+            facts: HealthFacts.idea(idea),
             suggestedQuestions: ["Is this a good idea for today?",
                                  "What would it do to my numbers?",
                                  "What would you change about it?"])
@@ -558,37 +559,37 @@ enum HealthAsk {
 
     // MARK: Exercise
 
-    static func exercisePage(_ exercise: [DietExercise], day: HealthAskDay) -> HealthAskContext {
+    static func exercisePage(_ exercise: [DietExercise], day: HealthAskDay) -> AskContext {
         let sessions = DietSemantics.sortedExercise(exercise)
-        return HealthAskContext(
+        return AskContext(
             scope: .page, area: .exercise, timeRange: day.range,
             title: "Exercise · \(day.short)", subject: "\(day.possessive) training",
             subjectKey: "exercise",
-            facts: HealthAskFacts(
+            facts: AskFacts(
                 lines: sessions.isEmpty
                     ? ["nothing logged"]
                     : ["\(sessions.count) \(sessions.count == 1 ? "session" : "sessions") · "
                        + "\(DietSemantics.fmt(DietSemantics.burnedCalories(exercise))) cal burned"],
-                children: sessions.map(AskFacts.workout)),
+                children: sessions.map(HealthFacts.workout)),
             suggestedQuestions: HealthAskStarters.exercise)
     }
 
-    static func exerciseSection(_ exercise: [DietExercise], day: HealthAskDay) -> HealthAskContext {
+    static func exerciseSection(_ exercise: [DietExercise], day: HealthAskDay) -> AskContext {
         let page = exercisePage(exercise, day: day)
-        return HealthAskContext(
+        return AskContext(
             scope: .section, area: .exercise, timeRange: page.timeRange, title: page.title,
             subject: page.subject, subjectKey: "exercise", facts: page.facts,
             suggestedQuestions: page.suggestedQuestions)
     }
 
     static func workout(_ e: DietExercise, day: HealthAskDay,
-                        alongside all: [DietExercise] = []) -> HealthAskContext {
-        var facts = AskFacts.workout(e)
+                        alongside all: [DietExercise] = []) -> AskContext {
+        var facts = HealthFacts.workout(e)
         if all.count > 1 {
             facts.lines.append("one of \(all.count) sessions logged that day · "
                 + "\(DietSemantics.fmt(DietSemantics.burnedCalories(all))) cal burned in total")
         }
-        return HealthAskContext(
+        return AskContext(
             scope: .item, area: .exercise, timeRange: day.range,
             title: "\(e.type.capitalized) · \(day.short)", subject: "this workout",
             subjectKey: "\(e.type)-\(e.time ?? "")",
@@ -598,12 +599,12 @@ enum HealthAsk {
 
     // MARK: Weight & progress
 
-    static func weightCard(_ card: HealthDisplay.WeightCard, day: HealthAskDay) -> HealthAskContext {
-        HealthAskContext(
+    static func weightCard(_ card: HealthDisplay.WeightCard, day: HealthAskDay) -> AskContext {
+        AskContext(
             scope: .item, area: .weight, timeRange: day.range,
             title: "Weight · \(day.short)", subject: "this weigh-in",
             subjectKey: "weight-card",
-            facts: AskFacts.weightCard(card),
+            facts: HealthFacts.weightCard(card),
             suggestedQuestions: HealthAskStarters.weight)
     }
 
@@ -612,42 +613,42 @@ enum HealthAsk {
     static func weightTrend(series: [WeightPoint], progress: DietProgress?,
                             rangeLabel: String, rangeDays: Int?,
                             selection: WeightPoint? = nil,
-                            scope: HealthAskScope = .page) -> HealthAskContext {
-        var children = [AskFacts.weightSeries(series)]
+                            scope: AskScope = .page) -> AskContext {
+        var children = [HealthFacts.weightSeries(series)]
         if let progress {
             let targets = DietSemantics.displayTargets(progress, currentWeight: series.last?.lbs,
                                                        today: series.last?.date)
-            children.append(HealthAskFacts(heading: "Goals",
-                                           lines: AskFacts.progress(progress, targets: targets).lines))
+            children.append(AskFacts(heading: "Goals",
+                                           lines: HealthFacts.progress(progress, targets: targets).lines))
         }
         if let selection {
-            children.append(HealthAskFacts(
+            children.append(AskFacts(
                 heading: "Currently selected on the chart",
                 lines: ["\(selection.date) — \(DietSemantics.fmt1(selection.lbs)) lb"
                         + (selection.bf.map { " · \(DietSemantics.fmt($0))% body fat" } ?? "")]))
         }
         let anchor = series.last?.date ?? ""
-        return HealthAskContext(
+        return AskContext(
             scope: scope, area: .weight,
             timeRange: rangeDays.map { .trailing(days: $0, through: anchor) }
                 ?? .all(through: anchor),
             title: "Weight & trend · \(rangeLabel)", subject: "this weight trend",
             subjectKey: "weight-trend",
-            facts: HealthAskFacts(children: children),
+            facts: AskFacts(children: children),
             suggestedQuestions: HealthAskStarters.weight)
     }
 
     static func progress(_ p: DietProgress, today: DietToday, series: [WeightPoint]?,
-                         scope: HealthAskScope, day: HealthAskDay) -> HealthAskContext {
+                         scope: AskScope, day: HealthAskDay) -> AskContext {
         let current = HealthDisplay.weightCard(today: today, series: series)?.lbs
         let targets = DietSemantics.displayTargets(p, currentWeight: current, today: today.date)
-        var facts = AskFacts.progress(p, targets: targets)
+        var facts = HealthFacts.progress(p, targets: targets)
         if let current { facts.lines.insert("current weight \(DietSemantics.fmt(current)) lb", at: 0) }
         if let bf = today.weight?.bf, let lbs = today.weight?.lbs {
             facts.lines.append("body composition today: \(DietSemantics.fmt(lbs * bf / 100)) lb fat, "
                 + "\(DietSemantics.fmt(lbs - lbs * bf / 100)) lb lean (\(DietSemantics.fmt(bf))% bf)")
         }
-        return HealthAskContext(
+        return AskContext(
             scope: scope, area: .progress, timeRange: day.range,
             title: "Progress & pace · \(day.short)", subject: "this progress",
             subjectKey: "progress",
@@ -655,61 +656,61 @@ enum HealthAsk {
             suggestedQuestions: HealthAskStarters.progress)
     }
 
-    static func coach(_ c: DietCoach, scope: HealthAskScope, day: HealthAskDay) -> HealthAskContext {
-        HealthAskContext(
+    static func coach(_ c: DietCoach, scope: AskScope, day: HealthAskDay) -> AskContext {
+        AskContext(
             scope: scope, area: .coach, timeRange: day.range,
             title: "Coach's notes · \(day.short)", subject: "these notes",
             subjectKey: "coach",
-            facts: AskFacts.coach(c),
+            facts: HealthFacts.coach(c),
             suggestedQuestions: HealthAskStarters.coach)
     }
 
     // MARK: Sources
 
     static func sourcesOverview(_ rankings: [NutrientSourceRanking], windowDays: Int,
-                                anchor: String, scope: HealthAskScope) -> HealthAskContext {
-        let (kept, note) = HealthAskBudget.cap(rankings, noun: "nutrients", totalsCoverAll: false)
-        return HealthAskContext(
+                                anchor: String, scope: AskScope) -> AskContext {
+        let (kept, note) = AskBudget.cap(rankings, noun: "nutrients", totalsCoverAll: false)
+        return AskContext(
             scope: scope, area: .sources,
             timeRange: .trailing(days: windowDays, through: anchor),
             title: "Sources · last \(windowDays) days", subject: "these sources",
             subjectKey: "sources-overview",
-            facts: HealthAskFacts(
+            facts: AskFacts(
                 lines: ["\(rankings.count) \(rankings.count == 1 ? "nutrient" : "nutrients") "
                         + "can be answered for over this range"],
-                children: kept.map(AskFacts.sourceRanking),
+                children: kept.map(HealthFacts.sourceRanking),
                 note: note),
             suggestedQuestions: HealthAskStarters.sources)
     }
 
     static func sourceRanking(_ r: NutrientSourceRanking, anchor: String,
-                              scope: HealthAskScope = .item) -> HealthAskContext {
-        HealthAskContext(
+                              scope: AskScope = .item) -> AskContext {
+        AskContext(
             scope: scope, area: .sources,
             timeRange: .trailing(days: r.windowDays, through: anchor),
             title: "\(r.nutrient.fullName) sources · last \(r.windowDays) days",
             subject: "these \(r.nutrient.fullName.lowercased()) sources",
             subjectKey: "sources-\(r.nutrient.rawValue)",
-            facts: AskFacts.sourceRanking(r),
+            facts: HealthFacts.sourceRanking(r),
             related: [r.nutrient.rawValue],
             suggestedQuestions: HealthAskStarters.sources)
     }
 
     /// ONE food inside a sources ranking.
     static func sourceEntry(_ e: NutrientSourceEntry, in r: NutrientSourceRanking,
-                            anchor: String) -> HealthAskContext {
-        HealthAskContext(
+                            anchor: String) -> AskContext {
+        AskContext(
             scope: .item, area: .sources,
             timeRange: .trailing(days: r.windowDays, through: anchor),
             title: "\(e.name) · \(r.nutrient.fullName)", subject: "this source",
             subjectKey: "source-\(r.nutrient.rawValue)-\(e.name)",
-            facts: HealthAskFacts(
+            facts: AskFacts(
                 lines: ["\(e.name) supplied \(NutrientTrends.fmt(e.value, r.nutrient)) "
                         + "\(r.nutrient.unit) of \(r.nutrient.fullName.lowercased()) over the "
                         + "last \(r.windowDays) days",
                         "\(NutrientSources.pct(e.share)) of the measured total, "
                         + "on \(e.days) \(e.days == 1 ? "day" : "days")"],
-                children: [AskFacts.sourceRanking(r)]),
+                children: [HealthFacts.sourceRanking(r)]),
             suggestedQuestions: HealthAskStarters.sources)
     }
 
@@ -717,15 +718,15 @@ enum HealthAsk {
 
     static func trend(_ t: NutrientTrend, rangeLabel: String, anchor: String,
                       selection: NutrientTrendPoint? = nil,
-                      scope: HealthAskScope = .page) -> HealthAskContext {
-        var facts = AskFacts.trend(t)
+                      scope: AskScope = .page) -> AskContext {
+        var facts = HealthFacts.trend(t)
         if let selection {
             facts.lines.append("currently selected on the chart: \(selection.date) — "
                 + "\(selection.isPartial ? "≥" : "")\(NutrientTrends.fmt(selection.value, t.nutrient)) "
                 + "\(t.unit)"
                 + (selection.dayTarget.map { " against that day's own \(NutrientTrends.fmt($0.value, t.nutrient)) \(t.unit)" } ?? " (that day recorded no target)"))
         }
-        return HealthAskContext(
+        return AskContext(
             scope: scope, area: .trends,
             timeRange: t.windowDays.map { .trailing(days: $0, through: anchor) }
                 ?? .all(through: anchor),
@@ -738,22 +739,22 @@ enum HealthAsk {
     // MARK: Consistency
 
     static func consistency(_ streaks: [NutrientStreak], anchor: String,
-                            scope: HealthAskScope) -> HealthAskContext {
-        let (kept, note) = HealthAskBudget.cap(streaks, noun: "nutrients", totalsCoverAll: false)
-        return HealthAskContext(
+                            scope: AskScope) -> AskContext {
+        let (kept, note) = AskBudget.cap(streaks, noun: "nutrients", totalsCoverAll: false)
+        return AskContext(
             scope: scope, area: .consistency, timeRange: .all(through: anchor),
             title: "Consistency", subject: "these streaks", subjectKey: "consistency",
-            facts: HealthAskFacts(children: kept.map(AskFacts.streak),
+            facts: AskFacts(children: kept.map(HealthFacts.streak),
                                   note: note ?? NutrientStreaks.gapRule),
             suggestedQuestions: HealthAskStarters.consistency)
     }
 
-    static func streak(_ s: NutrientStreak, anchor: String) -> HealthAskContext {
-        HealthAskContext(
+    static func streak(_ s: NutrientStreak, anchor: String) -> AskContext {
+        AskContext(
             scope: .item, area: .consistency, timeRange: .all(through: anchor),
             title: "\(s.nutrient.fullName) streak", subject: "this streak",
             subjectKey: "streak-\(s.nutrient.rawValue)",
-            facts: HealthAskFacts(children: [AskFacts.streak(s)], note: NutrientStreaks.gapRule),
+            facts: AskFacts(children: [HealthFacts.streak(s)], note: NutrientStreaks.gapRule),
             related: [s.nutrient.rawValue],
             suggestedQuestions: HealthAskStarters.consistency)
     }
@@ -761,37 +762,37 @@ enum HealthAsk {
     // MARK: Patterns
 
     static func patterns(_ report: DietCorrelationReport, anchor: String,
-                         scope: HealthAskScope) -> HealthAskContext {
-        var children = report.associations.map(AskFacts.association)
+                         scope: AskScope) -> AskContext {
+        var children = report.associations.map(HealthFacts.association)
         if !report.misses.isEmpty {
-            children.append(HealthAskFacts(
+            children.append(AskFacts(
                 heading: "Set aside, and why (never hidden)",
-                children: report.misses.map(AskFacts.patternMiss)))
+                children: report.misses.map(HealthFacts.patternMiss)))
         }
-        return HealthAskContext(
+        return AskContext(
             scope: scope, area: .patterns, timeRange: .all(through: anchor),
             title: "Patterns", subject: "these patterns", subjectKey: "patterns",
-            facts: HealthAskFacts(
+            facts: AskFacts(
                 lines: ["\(report.associations.count) association"
                         + "\(report.associations.count == 1 ? "" : "s") cleared the guardrails"],
                 children: children, note: DietCorrelations.caveat),
             suggestedQuestions: HealthAskStarters.patterns)
     }
 
-    static func association(_ a: DietAssociation, anchor: String) -> HealthAskContext {
-        HealthAskContext(
+    static func association(_ a: DietAssociation, anchor: String) -> AskContext {
+        AskContext(
             scope: .item, area: .patterns, timeRange: .all(through: anchor),
             title: a.title, subject: "this pattern", subjectKey: a.id,
-            facts: HealthAskFacts(children: [AskFacts.association(a)],
+            facts: AskFacts(children: [HealthFacts.association(a)],
                                   note: DietCorrelations.caveat),
             suggestedQuestions: HealthAskStarters.patterns)
     }
 
-    static func patternMiss(_ m: DietPairMiss, anchor: String) -> HealthAskContext {
-        HealthAskContext(
+    static func patternMiss(_ m: DietPairMiss, anchor: String) -> AskContext {
+        AskContext(
             scope: .item, area: .patterns, timeRange: .all(through: anchor),
             title: m.title, subject: "this set-aside pair", subjectKey: m.id,
-            facts: HealthAskFacts(children: [AskFacts.patternMiss(m)],
+            facts: AskFacts(children: [HealthFacts.patternMiss(m)],
                                   note: DietCorrelations.caveat),
             suggestedQuestions: ["Why isn't there enough data for this?",
                                  "What would I have to log to answer it?"])

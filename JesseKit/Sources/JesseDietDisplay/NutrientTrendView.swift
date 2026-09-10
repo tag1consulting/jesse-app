@@ -1,5 +1,6 @@
 import SwiftUI
 import Charts
+import JesseAsk
 
 // The per-nutrient trend detail — ONE nutrient, one tap deeper than its drill-down
 // sheet, drawn in the same Swift Charts language as `WeightTrendDetail`: a range
@@ -168,7 +169,7 @@ struct NutrientTrendDetail: View {
     /// The ask for this chart. The chart is asked about AS A WHOLE, with the current
     /// range and whatever point is being scrubbed carried in the context — no per-point
     /// menus, exactly as the brief requires.
-    private var ask: HealthAskContext {
+    private var ask: AskContext {
         HealthAsk.trend(trend, rangeLabel: rangeLabelText,
                         anchor: trend.points.last?.date ?? "",
                         selection: scrubbed.flatMap { p in

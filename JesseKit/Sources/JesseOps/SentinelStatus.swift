@@ -69,6 +69,19 @@ public struct Probe<Detail: Decodable & Sendable>: Decodable, Sendable {
 /// The four dots an Ops card can wear.
 public enum OpsHealth: Sendable, Equatable {
     case green, amber, red, grey
+
+    /// The dot's meaning in words. It is what the dot's accessibility label says AND what
+    /// an "Ask about this" snapshot carries, from this one definition: a snapshot that
+    /// described a colour, or named it differently from the label, would be a second
+    /// vocabulary for the same four states.
+    public var word: String {
+        switch self {
+        case .green: return "ok"
+        case .amber: return "warning"
+        case .red: return "failed"
+        case .grey: return "unknown"
+        }
+    }
 }
 
 // MARK: - The per-probe details
