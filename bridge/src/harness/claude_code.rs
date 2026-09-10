@@ -2529,6 +2529,104 @@ mod tests {
         }
     }
 
+    /// THE SLUG REACHES THE CHILD — the Anthropic half, pinned from the registry entry down.
+    ///
+    /// The failure mode this exists for is documented: a model's slug reached the health probe
+    /// and the picker label while the turn ran on the CLI's built-in default. The Codex half
+    /// was fixed in `codex_model_args`. On claude-code the slug arrives as `ANTHROPIC_MODEL`
+    /// through `apply_main_env`, and the test above proves that for a hand-built
+    /// `ActiveModel`. This one starts where an operator starts — the built-in entry, armed by
+    /// its token — so a break anywhere between the registry and the child's environment (the
+    /// entry, `ActiveModel::from_registry`, the harness's `build_turn`, `apply_main_env`)
+    /// fails here, for every Fireworks family at once.
+    #[test]
+    fn each_fireworks_entrys_slug_reaches_the_claude_code_child_as_anthropic_model() {
+        let _g = crate::testutil::ENV_LOCK.lock_ok();
+        let vars = [
+            "JESSE_CONFIG",
+            "JESSE_STATE_DIR",
+            "JESSE_MODEL_GLM_BASE_URL",
+            "JESSE_MODEL_GLM_AUTH_TOKEN",
+            "JESSE_MODEL_GLM_MODEL",
+            "JESSE_MODEL_KIMI_BASE_URL",
+            "JESSE_MODEL_KIMI_AUTH_TOKEN",
+            "JESSE_MODEL_KIMI_MODEL",
+            "JESSE_MODEL_QWEN_BASE_URL",
+            "JESSE_MODEL_QWEN_AUTH_TOKEN",
+            "JESSE_MODEL_QWEN_MODEL",
+        ];
+        let saved: Vec<(&str, Option<String>)> =
+            vars.iter().map(|k| (*k, std::env::var(k).ok())).collect();
+        for k in vars {
+            std::env::remove_var(k);
+        }
+        std::env::set_var("JESSE_CONFIG", "/nonexistent/jesse.local.toml");
+        for id in ["GLM", "KIMI", "QWEN"] {
+            std::env::set_var(format!("JESSE_MODEL_{id}_AUTH_TOKEN"), "fw-test");
+        }
+
+        let registry = ModelRegistry::from_env("");
+        let cfg = test_config();
+        let Runner::Spawned(harness) = cfg.harnesses.fallback_harness().runner() else {
+            panic!("claude-code is a spawned harness")
+        };
+        for (id, slug) in [
+            ("glm", "accounts/fireworks/models/glm-5p3"),
+            ("kimi", "accounts/fireworks/models/kimi-k3"),
+            ("qwen", "accounts/fireworks/models/qwen3p8-max"),
+        ] {
+            let entry = registry
+                .get(id)
+                .unwrap_or_else(|| panic!("{id} registered"));
+            assert_eq!(entry.harness, CLAUDE_CODE_ID, "{id} is a claude-code entry");
+            let active = ActiveModel::from_registry(entry);
+            let req = main_turn_request(
+                &cfg,
+                "PROMPT",
+                None,
+                &active,
+                turn_capability(&active),
+                main_mcp_config(&cfg, &ClaudeCode),
+                BUILDER_TURN_ID,
+            );
+            let cmd = harness
+                .build_turn(&cfg, &req)
+                .expect("claude never refuses");
+            let env = cmd_env_overrides(&cmd);
+            assert_eq!(
+                env.get("ANTHROPIC_MODEL").map(String::as_str),
+                Some(slug),
+                "{id}: the turn must run the slug the picker names, not the CLI's default"
+            );
+            assert_eq!(
+                env.get("CLAUDE_CODE_SUBAGENT_MODEL").map(String::as_str),
+                Some(slug),
+                "{id}: and so must the subagents it spawns"
+            );
+            assert_eq!(
+                env.get("ANTHROPIC_BASE_URL").map(String::as_str),
+                Some("https://api.fireworks.ai/inference"),
+                "{id}: on the Anthropic surface, no `/v1` suffix"
+            );
+            assert_eq!(
+                env.get("ANTHROPIC_AUTH_TOKEN").map(String::as_str),
+                Some("fw-test"),
+                "{id}: the token rides in the environment"
+            );
+            assert!(
+                !cmd_argv(&cmd).iter().any(|a| a == "fw-test"),
+                "{id}: and never on the command line, where `ps` would show it"
+            );
+        }
+
+        for (k, v) in saved {
+            match v {
+                Some(val) => std::env::set_var(k, val),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+
     #[test]
     fn readonly_main_turn_allowlist_has_no_write_or_send_tools() {
         // A non-ambient READ-ONLY model (writes off) yields the contained boundary: a

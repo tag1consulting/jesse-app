@@ -1761,10 +1761,10 @@ mod tests {
         // The key Job 3 added: a record must be able to say WHO probed it, because the
         // turn-behavior half of a row is model-dependent even though the sandbox is not.
         let mut named = sample_results();
-        named.model = Some("kimi-k3-codex".to_string());
+        named.model = Some("kimi-on-codex".to_string());
         let rendered = render_results(&named);
         assert!(
-            rendered.contains(r#"model = "kimi-k3-codex""#),
+            rendered.contains(r#"model = "kimi-on-codex""#),
             "{rendered}"
         );
         assert_eq!(parse_results(&rendered).expect("must parse"), named);

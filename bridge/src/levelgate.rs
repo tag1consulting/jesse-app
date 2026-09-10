@@ -1226,13 +1226,13 @@ mod tests {
     /// could not.
     #[test]
     fn a_model_on_a_wire_its_harness_does_not_drive_is_refused() {
-        let mut cfg = cfg_with_model("kimi-k3-codex", CLAUDE_CODE_ID, Capability::Read);
+        let mut cfg = cfg_with_model("kimi-on-codex", CLAUDE_CODE_ID, Capability::Read);
         cfg.harnesses = Arc::new(HarnessRegistry::new(vec![Box::new(Codex)]));
         if let Some(m) = cfg
             .model_registry
             .models
             .iter_mut()
-            .find(|m| m.id == "kimi-k3-codex")
+            .find(|m| m.id == "kimi-on-codex")
         {
             m.kind = ModelKind::OpenAi;
             m.wire = Wire::default_for_kind(ModelKind::OpenAi);
@@ -1240,7 +1240,7 @@ mod tests {
         let errors = validate(&cfg, &[], CONTAINMENT_RECORDS);
         let e = errors
             .iter()
-            .find(|e| e.model.as_deref() == Some("kimi-k3-codex"))
+            .find(|e| e.model.as_deref() == Some("kimi-on-codex"))
             .expect("a responses-wire model on claude-code must be refused");
         assert!(e.message.contains("is not a surface"), "{e}");
         assert!(e.message.contains("responses"), "{e}");
@@ -1255,12 +1255,12 @@ mod tests {
 
         // The same model on the harness that drives the wire starts cleanly — the gate
         // refuses a pairing, not a wire.
-        let mut ok = cfg_with_codex_model("kimi-k3-codex", Capability::Read);
+        let mut ok = cfg_with_codex_model("kimi-on-codex", Capability::Read);
         if let Some(m) = ok
             .model_registry
             .models
             .iter_mut()
-            .find(|m| m.id == "kimi-k3-codex")
+            .find(|m| m.id == "kimi-on-codex")
         {
             m.kind = ModelKind::OpenAi;
             m.wire = Wire::default_for_kind(ModelKind::OpenAi);

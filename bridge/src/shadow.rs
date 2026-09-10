@@ -39,12 +39,33 @@ pub const FW_GLM_IN_PER_M: f64 = 1.40;
 pub const FW_GLM_CACHED_PER_M: f64 = 0.14;
 pub const FW_GLM_OUT_PER_M: f64 = 4.40;
 
-/// Kimi K3 on Fireworks: $3.00 in / $0.30 cached / $15.00 out (model page, 2026-07-27).
-/// Serves as the DEFAULT deck for the `kimi-k3` registry entry, still overridable via
+/// Kimi K3 on Fireworks: $3.00 in / $0.30 cached / $15.00 out (model page, 2026-07-27;
+/// re-read on the pricing page and the model page 2026-09-10, unchanged).
+/// Serves as the DEFAULT deck for the `kimi` registry entry, still overridable via
 /// `JESSE_MODEL_KIMI_PRICE_{IN,CACHED,OUT}`.
 pub const FW_KIMI_K3_IN_PER_M: f64 = 3.00;
 pub const FW_KIMI_K3_CACHED_PER_M: f64 = 0.30;
 pub const FW_KIMI_K3_OUT_PER_M: f64 = 15.00;
+
+/// GLM 5.3 on Fireworks: $1.40 in / $0.26 cached / $4.40 out (pricing page and model page,
+/// 2026-09-10). The DEFAULT deck for the `glm` registry entry, overridable via
+/// `JESSE_MODEL_GLM_PRICE_{IN,CACHED,OUT}`.
+///
+/// **A separate deck from `FW_GLM_*` above, not a copy of it.** Input and output match 5.2's,
+/// but the cached rate nearly doubled (0.14 → 0.26), and a deck carried forward from 5.2 would
+/// under-report every cache read — which on a long conversation is most of the input. The 5.2
+/// deck stays where it is because the shadow audit prices the gateway's `fw-glm` alias, and
+/// that alias still names `glm-5p2`.
+pub const FW_GLM_5P3_IN_PER_M: f64 = 1.40;
+pub const FW_GLM_5P3_CACHED_PER_M: f64 = 0.26;
+pub const FW_GLM_5P3_OUT_PER_M: f64 = 4.40;
+
+/// Qwen 3.8 Max on Fireworks (`qwen3p8-max`): $2.00 in / $0.25 cached / $6.00 out (pricing
+/// page and model page, 2026-09-10). The DEFAULT deck for the `qwen` registry entry,
+/// overridable via `JESSE_MODEL_QWEN_PRICE_{IN,CACHED,OUT}`.
+pub const FW_QWEN3P8_MAX_IN_PER_M: f64 = 2.00;
+pub const FW_QWEN3P8_MAX_CACHED_PER_M: f64 = 0.25;
+pub const FW_QWEN3P8_MAX_OUT_PER_M: f64 = 6.00;
 
 /// Opus prices: $5 in / $25 out; cache reads about a tenth of input ($0.50).
 pub const OPUS_IN_PER_M: f64 = 5.00;
