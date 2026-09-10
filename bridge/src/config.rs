@@ -1773,6 +1773,24 @@ pub enum ModelKind {
     /// would fail every turn with a 404 from a model the picker showed as healthy.
     #[serde(rename = "openai")]
     OpenAi,
+    /// The bridge's OWN login — the same one [`ModelKind::Ambient`] inherits — told WHICH
+    /// model to run: `ANTHROPIC_MODEL` on the child, and no base URL and no token.
+    ///
+    /// **A variant rather than "`Ambient` plus a slug", and the reason is what `Ambient`
+    /// already means to everything that reads it.** `Ambient` is THE default: the entry
+    /// `upsert_model` protects, the one [`model_health`] calls healthy by construction, the
+    /// routing rule's final floor, and — on the wire — what the apps key `isDefault` on
+    /// (`kind == "ambient"`). A second ambient row would be a second "always available
+    /// default" to every one of those readers. This kind shares the login and none of that:
+    /// it is CONFIGURED only when it names a model, it is never the floor, and a client sees
+    /// it as an ordinary selectable row.
+    ///
+    /// What it deliberately does not need is the `(base_url, auth_token, model)` triple a
+    /// third-party backend needs, which is why its slug lives in
+    /// [`RegistryModel::login_model`] rather than in `backend`. It is not probed: the only
+    /// endpoint it has is the CLI's own login, and a model that login does not serve surfaces
+    /// as a failed turn rather than as an unhealthy row.
+    Subscription,
 }
 
 /// The API SURFACE a model's request/response is spoken on — the wire, as distinct from
@@ -1825,7 +1843,9 @@ impl Wire {
     pub fn default_for_kind(kind: ModelKind) -> Wire {
         match kind {
             ModelKind::OpenAi => Wire::Responses,
-            ModelKind::Ambient | ModelKind::Hosted | ModelKind::Local => Wire::Messages,
+            ModelKind::Ambient | ModelKind::Subscription | ModelKind::Hosted | ModelKind::Local => {
+                Wire::Messages
+            }
         }
     }
 
@@ -2221,6 +2241,20 @@ pub struct RegistryModel {
     /// concatenate their outputs under labeled sections (default off). Only meaningful
     /// with a doc+general pair; ignored for a lone `Any` helper.
     pub vision_complementary: bool,
+    /// The model the bridge's OWN login is told to run — `ANTHROPIC_MODEL` on the child with
+    /// no base URL and no token — or `None` to let that login run its own default.
+    ///
+    /// Only an entry with no `backend` reads this: a third-party backend's slug is the third
+    /// member of that triple and travels with it. So it is set on the ambient `opus` when an
+    /// operator pins it (`JESSE_MODEL_OPUS_MODEL`) and on a [`ModelKind::Subscription`] entry,
+    /// whose whole configuration it is, and is `None` everywhere else.
+    ///
+    /// It exists because the ambient path used to have NO way to name a model: the child got
+    /// `ANTHROPIC_MODEL` only as part of a full backend triple, so a turn on the subscription
+    /// login always ran the CLI's own default and nothing in config could say otherwise. The
+    /// codex harness closed the same gap for its subscription posture in `codex_model_args`;
+    /// this is the claude-code half.
+    pub login_model: Option<String>,
 }
 
 /// The set of models the conversation can be switched onto. Ordered as presented to the
@@ -2323,7 +2357,10 @@ impl ModelRegistry {
     /// `home` is the captured `Config.home`, used to locate the config file.
     pub fn from_env(home: &str) -> Self {
         // Source 1: the built-in ambient default, first (the app presents default-first).
-        let mut models: Vec<RegistryModel> = vec![opus_entry()];
+        // `opus_env_entry` rather than `opus_entry`: identical unless `JESSE_MODEL_OPUS_MODEL`
+        // pins a slug. Then the other model on the same login, right beside it.
+        let mut models: Vec<RegistryModel> = vec![opus_env_entry()];
+        upsert_model(&mut models, fable_env_entry());
 
         // The global default probe-interval override (`JESSE_HEALTH_INTERVAL_SECS`), resolved
         // ONCE here so a bad value warns a single time. An explicit per-model interval still
@@ -2582,6 +2619,8 @@ fn glm_env_entry(default_interval_secs: u64, global_timeout_secs: Option<u64>) -
         // `JESSE_MODEL_GLM_VISION_COMPLEMENTARY`. Unset → no vision (today's behavior).
         vision: parse_vision_partners(&env_string("JESSE_MODEL_GLM_VISION").unwrap_or_default()),
         vision_complementary: env_flag_true("JESSE_MODEL_GLM_VISION_COMPLEMENTARY"),
+        // A backend triple carries its own slug; nothing for the login to be told.
+        login_model: None,
     }
 }
 
@@ -2669,6 +2708,8 @@ fn kimi_env_entry(default_interval_secs: u64, global_timeout_secs: Option<u64>) 
         },
         vision: parse_vision_partners(&env_string("JESSE_MODEL_KIMI_VISION").unwrap_or_default()),
         vision_complementary: env_flag_true("JESSE_MODEL_KIMI_VISION_COMPLEMENTARY"),
+        // A backend triple carries its own slug; nothing for the login to be told.
+        login_model: None,
     }
 }
 
@@ -2746,6 +2787,8 @@ fn qwen_env_entry(default_interval_secs: u64, global_timeout_secs: Option<u64>) 
         },
         vision: parse_vision_partners(&env_string("JESSE_MODEL_QWEN_VISION").unwrap_or_default()),
         vision_complementary: env_flag_true("JESSE_MODEL_QWEN_VISION_COMPLEMENTARY"),
+        // A backend triple carries its own slug; nothing for the login to be told.
+        login_model: None,
     }
 }
 
@@ -2827,6 +2870,8 @@ fn local_env_entry(default_interval_secs: u64, global_timeout_secs: Option<u64>)
         },
         vision: parse_vision_partners(&env_string("JESSE_MODEL_LOCAL_VISION").unwrap_or_default()),
         vision_complementary: env_flag_true("JESSE_MODEL_LOCAL_VISION_COMPLEMENTARY"),
+        // A backend triple carries its own slug; nothing for the login to be told.
+        login_model: None,
     }
 }
 
@@ -2862,6 +2907,11 @@ pub struct ActiveModel {
     /// the hot path, so those turns handle attachments the old way (byte-for-byte).
     pub vision: Vec<VisionPartner>,
     pub vision_complementary: bool,
+    /// The slug the bridge's own login is told to run, copied from the entry's
+    /// [`RegistryModel::login_model`]. `None` whenever `env` is `Some` (the slug then rides in
+    /// the triple) and for the unpinned ambient default, which is what keeps that turn
+    /// byte-for-byte the command it always was.
+    pub login_model: Option<String>,
 }
 
 impl ActiveModel {
@@ -2897,6 +2947,9 @@ impl ActiveModel {
             // Ambient opus sees images natively (CLI Read tool); never uses the helper layer.
             vision: Vec::new(),
             vision_complementary: false,
+            // No pinned slug: the callers of this constructor (the title one-shot, the
+            // no-switch paths) have always run the CLI's own default, and still do.
+            login_model: None,
         }
     }
 
@@ -2924,6 +2977,7 @@ impl ActiveModel {
             price: m.price,
             vision: m.vision.clone(),
             vision_complementary: m.vision_complementary,
+            login_model: m.login_model.clone(),
         }
     }
 
@@ -2969,6 +3023,97 @@ fn opus_entry() -> RegistryModel {
         health: HealthConfig::default(),
         // Ambient opus already sees images through the CLI's native Read tool, so it is
         // never paired — vision helpers exist for the text backends that cannot.
+        vision: Vec::new(),
+        vision_complementary: false,
+        // Unpinned: the CLI runs its own default. See [`opus_env_entry`] for the pin.
+        login_model: None,
+    }
+}
+
+/// The ambient default as the RUNNING bridge builds it: [`opus_entry`], plus the one thing an
+/// operator may now say about it — which model the subscription login runs.
+///
+/// `JESSE_MODEL_OPUS_MODEL` pins a slug, delivered as `ANTHROPIC_MODEL` with no base URL and
+/// no token; `JESSE_MODEL_OPUS_VERSION` names its version for the label. UNSET — the
+/// out-of-box state — is byte-for-byte the entry it always was: nothing is set on the child and
+/// the CLI runs its own default. Nothing else about the ambient contract becomes configurable:
+/// no wire, no level, no base URL, and a `[[models]]` entry that tries to redefine `opus` is
+/// still refused.
+///
+/// **Why the default pins nothing, measured rather than assumed:** on 2026-09-10 the CLI's own
+/// default on the subscription login was `claude-opus-5[1m]`, the 1M-context variant. Pinning
+/// the bare `claude-opus-5` would have quietly narrowed the window. An operator who pins — which
+/// is worth doing alongside `fable`, so "Opus" in the picker stays Opus if the CLI's default
+/// ever moves — should pin `claude-opus-5[1m]`, which the login accepts.
+///
+/// [`opus_entry`] itself stays free of the environment, so [`ModelRegistry::opus_only`] — the
+/// test fixture and the no-config baseline — cannot be moved by a stray variable.
+fn opus_env_entry() -> RegistryModel {
+    let login_model = env_string("JESSE_MODEL_OPUS_MODEL");
+    let version = model_version_from_env("JESSE_MODEL_OPUS", None);
+    RegistryModel {
+        label: derive_model_label("Claude Opus", version.as_deref(), None),
+        version,
+        // The subagents follow the pin, as they follow every other switch; unpinned they are
+        // left to the CLI, exactly as before.
+        subagent_model: login_model.clone(),
+        login_model,
+        ..opus_entry()
+    }
+}
+
+/// The `fable` entry: Claude Fable on the bridge's OWN subscription login — no API key and no
+/// second billing relationship, which is the whole point of it.
+///
+/// **Verified on the login, not inferred from documentation.** On 2026-09-10 a real `-p` turn
+/// on the pinned CLI with `ANTHROPIC_MODEL=claude-fable-5-1` and every API-key variable
+/// removed reported `apiKeySource: "none"` and `model: "claude-fable-5-1"`, answered, and
+/// billed its usage to `claude-fable-5-1`. Asked for `claude-fable-5-1[1m]`, the login served
+/// plain `claude-fable-5-1`: there is no separate 1M variant to pin.
+///
+/// ARMED BY ONE VARIABLE, `JESSE_MODEL_FABLE_MODEL`, which is the slug itself — there is no
+/// token to set. Unset, the entry is present and unconfigured, which keeps a bridge with no
+/// model configuration exactly the opus-only registry it always was. Deliberately no
+/// compiled-in slug that arms itself: nothing probes a subscription entry (see
+/// [`ModelKind::Subscription`]), so a self-arming default would put a model in every picker on
+/// every deploy whether or not that deploy's login serves it.
+///
+/// `Write`, like `opus`: the same harness, the same containment record, the same login.
+fn fable_env_entry() -> RegistryModel {
+    let login_model = env_string("JESSE_MODEL_FABLE_MODEL");
+    let version = model_version_from_env("JESSE_MODEL_FABLE", None);
+    RegistryModel {
+        codex: CodexTuning::default(),
+        id: "fable".to_string(),
+        label: derive_model_label("Claude Fable", version.as_deref(), None),
+        version,
+        aliases: Vec::new(),
+        kind: ModelKind::Subscription,
+        wire: Wire::Messages,
+        // No triple: that is the point. The login supplies the endpoint and the credential.
+        backend: None,
+        subagent_model: login_model.clone(),
+        configured: login_model.is_some(),
+        login_model,
+        level: Capability::Write,
+        harness: CLAUDE_CODE_ID.to_string(),
+        auth_scheme: None,
+        quirks: DirectQuirks::default(),
+        thinking: None,
+        // Fable 5.1's metered deck, reported for the same reason Opus's is on the same login:
+        // what the turn would have cost, not what it did.
+        price: model_price_from_env(
+            "JESSE_MODEL_FABLE",
+            PriceDeck {
+                in_per_m: FABLE_5_1_IN_PER_M,
+                cached_per_m: FABLE_5_1_CACHED_PER_M,
+                cache_write_per_m: None,
+                out_per_m: FABLE_5_1_OUT_PER_M,
+            },
+        ),
+        // Unused: a subscription entry is never probed.
+        health: HealthConfig::default(),
+        // Fable sees images itself through the CLI's `Read` tool, like ambient Opus.
         vision: Vec::new(),
         vision_complementary: false,
     }
@@ -3254,6 +3399,7 @@ pub fn registry_model_from_toml(
         .filter(|s| !s.is_empty())
         .map(str::to_string);
     Some(RegistryModel {
+        login_model: None,
         id: id.to_string(),
         // An explicit `label` wins outright; otherwise family + version, so an entry that
         // declares both gets the same bump-tracking property the built-ins have.
@@ -3980,6 +4126,140 @@ mod tests {
             !r.is_configured("glm-5.2"),
             "an absent model is not configured"
         );
+        assert_eq!(opus.login_model, None, "and nothing is pinned on it");
+    }
+
+    /// `opus_only()` — the fixture and the no-config baseline — pins NOTHING, whatever the
+    /// environment says. That is what keeping the pin in `opus_env_entry` rather than in
+    /// `opus_entry` buys: a stray `JESSE_MODEL_OPUS_MODEL` in a test process cannot move the
+    /// registry every other test builds on.
+    #[test]
+    fn the_opus_only_registry_pins_nothing_whatever_the_environment_says() {
+        let _g = ENV_LOCK.lock_ok();
+        let saved = std::env::var("JESSE_MODEL_OPUS_MODEL").ok();
+        std::env::set_var("JESSE_MODEL_OPUS_MODEL", "claude-opus-5[1m]");
+        assert_eq!(ModelRegistry::opus_only().default_model().login_model, None);
+        match saved {
+            Some(v) => std::env::set_var("JESSE_MODEL_OPUS_MODEL", v),
+            None => std::env::remove_var("JESSE_MODEL_OPUS_MODEL"),
+        }
+    }
+
+    /// OPUS IS PINNED ONLY WHEN ASKED, and asking moves nothing else. Unset is the entry it
+    /// always was — no slug, no subagent model, the same label — which is the byte-for-byte
+    /// property the no-config bridge depends on. Set, it names a slug and a version and stays
+    /// the ambient default in every other respect.
+    #[test]
+    fn opus_pins_a_login_model_only_when_asked() {
+        let _g = ENV_LOCK.lock_ok();
+        let vars = ["JESSE_MODEL_OPUS_MODEL", "JESSE_MODEL_OPUS_VERSION"];
+        let saved: Vec<(&str, Option<String>)> =
+            vars.iter().map(|k| (*k, std::env::var(k).ok())).collect();
+        for k in vars {
+            std::env::remove_var(k);
+        }
+
+        let unpinned = opus_env_entry();
+        assert_eq!(unpinned.login_model, None);
+        assert_eq!(unpinned.subagent_model, None);
+        assert_eq!(
+            unpinned.label,
+            opus_entry().label,
+            "\"Claude Opus\", unchanged"
+        );
+        assert!(unpinned.backend.is_none());
+        assert!(matches!(unpinned.kind, ModelKind::Ambient));
+
+        // The [1m] form, because that is what the CLI's own default was when this was
+        // measured: pinning the bare slug would narrow the window.
+        std::env::set_var("JESSE_MODEL_OPUS_MODEL", "claude-opus-5[1m]");
+        std::env::set_var("JESSE_MODEL_OPUS_VERSION", "5");
+        let pinned = opus_env_entry();
+        assert_eq!(pinned.login_model.as_deref(), Some("claude-opus-5[1m]"));
+        assert_eq!(
+            pinned.subagent_model.as_deref(),
+            Some("claude-opus-5[1m]"),
+            "the subagents follow the pin"
+        );
+        assert_eq!(pinned.label, "Claude Opus 5");
+        // Nothing else about the ambient contract moved.
+        assert!(matches!(pinned.kind, ModelKind::Ambient));
+        assert!(pinned.backend.is_none(), "no base url and no token");
+        assert!(pinned.configured && pinned.level == Capability::Write);
+
+        for (k, v) in saved {
+            match v {
+                Some(val) => std::env::set_var(k, val),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+
+    /// FABLE IS ARMED BY ITS SLUG ALONE, on the subscription login. Unset it is registered and
+    /// unconfigured — listed, disabled, "not configured" — and set it is a selectable entry
+    /// with no backend triple at all: nothing metered, nothing that needs a key.
+    #[test]
+    fn fable_is_armed_by_its_slug_alone_on_the_subscription_login() {
+        let _g = ENV_LOCK.lock_ok();
+        let vars = [
+            "JESSE_MODEL_FABLE_MODEL",
+            "JESSE_MODEL_FABLE_VERSION",
+            "JESSE_MODEL_FABLE_PRICE_IN",
+            "JESSE_MODEL_FABLE_PRICE_CACHED",
+            "JESSE_MODEL_FABLE_PRICE_OUT",
+        ];
+        let saved: Vec<(&str, Option<String>)> =
+            vars.iter().map(|k| (*k, std::env::var(k).ok())).collect();
+        for k in vars {
+            std::env::remove_var(k);
+        }
+
+        let unarmed = fable_env_entry();
+        assert_eq!(unarmed.id, "fable");
+        assert!(matches!(unarmed.kind, ModelKind::Subscription));
+        assert!(
+            !unarmed.configured,
+            "no slug: registered but not configured"
+        );
+        assert_eq!(unarmed.login_model, None);
+
+        std::env::set_var("JESSE_MODEL_FABLE_MODEL", "claude-fable-5-1");
+        std::env::set_var("JESSE_MODEL_FABLE_VERSION", "5.1");
+        let armed = fable_env_entry();
+        assert!(
+            armed.configured,
+            "the slug is the whole of its configuration"
+        );
+        assert_eq!(armed.login_model.as_deref(), Some("claude-fable-5-1"));
+        assert_eq!(armed.subagent_model.as_deref(), Some("claude-fable-5-1"));
+        assert!(
+            armed.backend.is_none(),
+            "no base url and no token: the login is the credential"
+        );
+        assert_eq!(armed.harness, CLAUDE_CODE_ID);
+        assert_eq!(armed.wire, Wire::Messages);
+        assert_eq!(
+            armed.level,
+            Capability::Write,
+            "the same posture as opus: same harness, same record, same login"
+        );
+        assert_eq!(armed.label, "Claude Fable 5.1");
+        assert_eq!(
+            (
+                armed.price.in_per_m,
+                armed.price.cached_per_m,
+                armed.price.out_per_m
+            ),
+            (10.0, 0.25, 50.0),
+            "Fable 5.1's deck — its cache reads are 0.025x input, not a tenth"
+        );
+
+        for (k, v) in saved {
+            match v {
+                Some(val) => std::env::set_var(k, val),
+                None => std::env::remove_var(k),
+            }
+        }
     }
 
     #[test]
@@ -4550,7 +4830,10 @@ mod tests {
     }
 
     /// The `JESSE_MODEL_*` env-triple vars, cleared so a test's registry is deterministic.
-    const MODEL_ENV_VARS: [&str; 12] = [
+    const MODEL_ENV_VARS: [&str; 14] = [
+        // The two subscription-login slugs: one arms `fable`, the other pins `opus`.
+        "JESSE_MODEL_FABLE_MODEL",
+        "JESSE_MODEL_OPUS_MODEL",
         "JESSE_MODEL_GLM_BASE_URL",
         "JESSE_MODEL_GLM_AUTH_TOKEN",
         "JESSE_MODEL_GLM_MODEL",
@@ -4681,6 +4964,7 @@ mod tests {
         // A text model paired to an unconfigured helper reports no vision; configuring the
         // helper flips it on.
         let helper_unarmed = RegistryModel {
+            login_model: None,
             version: None,
             aliases: Vec::new(),
             codex: Default::default(),
@@ -4702,6 +4986,7 @@ mod tests {
             vision_complementary: false,
         };
         let text = RegistryModel {
+            login_model: None,
             version: None,
             aliases: Vec::new(),
             codex: Default::default(),
@@ -5181,6 +5466,10 @@ mod tests {
             "kimi-k3-codex",
             "kimi-codex",
             "qwen",
+            // Registered on the subscription login, and — with no slug set — not armed. This is
+            // the property the whole stage keeps: no model configuration means opus alone is
+            // selectable.
+            "fable",
             "local",
         ] {
             let m = r
@@ -5194,7 +5483,7 @@ mod tests {
         // One entry per family: the retired `kimi-codex` is an alias above, not a row here.
         assert_eq!(
             r.models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
-            ["opus", "glm", "kimi", "qwen", "local"],
+            ["opus", "fable", "glm", "kimi", "qwen", "local"],
             "no declarative entries appear with no config"
         );
 

@@ -308,11 +308,25 @@ impl ModelHealth {
 /// construction (never probed). A configured non-ambient model is healthy iff its last
 /// probe passed (before the first probe it carries the optimistic seed). An unconfigured
 /// model (no token/triple — e.g. `local` with no `JESSE_MODEL_LOCAL_*`) is never healthy.
+///
+/// A [`ModelKind::Subscription`] entry is the ambient case with one difference: it is
+/// healthy exactly when it is CONFIGURED (it names a model), because it shares the ambient
+/// login and has no endpoint of its own to probe. So an unarmed `fable` renders disabled as
+/// "not configured", and an armed one is selectable; a model the login does not serve would
+/// surface as a failed turn, which is the honest place for it — there is no cheaper probe of
+/// a CLI login than a turn.
 pub fn model_health(m: &RegistryModel, health: &HealthStore) -> ModelHealth {
     if matches!(m.kind, ModelKind::Ambient) {
         return ModelHealth {
             configured: true,
             healthy: true,
+            status: None,
+        };
+    }
+    if matches!(m.kind, ModelKind::Subscription) {
+        return ModelHealth {
+            configured: m.configured,
+            healthy: m.configured,
             status: None,
         };
     }
@@ -787,11 +801,46 @@ mod tests {
         assert!(probe_targets(&registry).is_empty(), "opus is never probed");
     }
 
+    /// A SUBSCRIPTION entry shares the ambient login, so it is healthy exactly when it names a
+    /// model, and it is never probed either way — the login has no endpoint of its own. The
+    /// unarmed case is the one that matters: it must render "not configured", not quietly
+    /// inherit the ambient default's "always available".
+    #[test]
+    fn a_subscription_entry_is_available_exactly_when_it_names_a_model() {
+        let opus = ModelRegistry::opus_only().default_model().clone();
+        let mut fable = opus.clone();
+        fable.id = "fable".into();
+        fable.kind = ModelKind::Subscription;
+        fable.configured = false;
+        fable.login_model = None;
+
+        let registry = ModelRegistry {
+            models: vec![opus.clone(), fable.clone()],
+        };
+        let store = HealthStore::seeded(&registry);
+        let h = model_health(registry.get("fable").unwrap(), &store);
+        assert!(!h.configured && !h.healthy && !h.available());
+
+        fable.configured = true;
+        fable.login_model = Some("claude-fable-5-1".into());
+        let registry = ModelRegistry {
+            models: vec![opus, fable],
+        };
+        let store = HealthStore::seeded(&registry);
+        let h = model_health(registry.get("fable").unwrap(), &store);
+        assert!(h.configured && h.healthy && h.available());
+        assert!(
+            probe_targets(&registry).is_empty(),
+            "a login has no endpoint to probe"
+        );
+    }
+
     #[test]
     fn seeded_store_makes_a_configured_model_optimistically_available() {
         // A configured non-ambient model is selectable from startup (seeded healthy) and is
         // demoted only by an observed failure.
         let glm = RegistryModel {
+            login_model: None,
             version: None,
             aliases: Vec::new(),
             codex: Default::default(),
@@ -841,6 +890,7 @@ mod tests {
         // unconfigured path itself, so it must not go green merely because some shipped
         // model happens to be unarmed today.
         let unarmed = RegistryModel {
+            login_model: None,
             version: None,
             aliases: Vec::new(),
             codex: Default::default(),

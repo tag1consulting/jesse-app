@@ -337,6 +337,7 @@ mod tests {
     fn with_offload_model(mut cfg: Config, id: &str) -> Config {
         let mut models = cfg.model_registry.models.clone();
         models.push(RegistryModel {
+            login_model: None,
             version: None,
             aliases: Vec::new(),
             codex: Default::default(),

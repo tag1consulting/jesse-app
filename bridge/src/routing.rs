@@ -106,6 +106,11 @@ pub struct RoutedPick {
     /// non-ambient model (an unconfigured entry never wins the walk); `None` only for the
     /// ambient entry, which applies nothing.
     pub backend: Option<(String, String, String)>,
+    /// The slug the bridge's own login is told to run, when the pick is an entry on that
+    /// login which names one — a [`ModelKind::Subscription`] entry, or `opus` pinned by
+    /// `JESSE_MODEL_OPUS_MODEL`. `None` otherwise, including the unpinned ambient floor, which
+    /// then applies nothing exactly as it always has. See [`RegistryModel::login_model`].
+    pub login_model: Option<String>,
 }
 
 impl RoutedPick {
@@ -219,6 +224,7 @@ pub fn route_job(
             harness: m.harness.clone(),
             level: m.level,
             backend: m.backend.clone(),
+            login_model: m.login_model.clone(),
         };
         pick.log(job);
         return pick;
@@ -237,6 +243,7 @@ pub fn route_job(
                 harness: active.harness.clone(),
                 level: active.level,
                 backend: active.env.clone(),
+                login_model: active.login_model.clone(),
             };
             pick.log(job);
             return pick;
@@ -244,12 +251,15 @@ pub fn route_job(
     }
     // Ambient: applies no backend env, so the child inherits the bridge's process env —
     // exactly what every role call site did before this rule existed when its override was
-    // unset.
+    // unset. The one thing it may carry is `opus`'s own pin, read off the registry's default
+    // entry so the floor runs the model the picker calls Opus; unpinned that is `None` and
+    // the floor is byte-for-byte what it was.
     let pick = RoutedPick {
         id: DEFAULT_MODEL_ID.to_string(),
         harness: CLAUDE_CODE_ID.to_string(),
         level: Capability::Write,
         backend: None,
+        login_model: cfg.model_registry.default_model().login_model.clone(),
     };
     pick.log(job);
     pick
@@ -263,6 +273,7 @@ mod tests {
     /// A configured, healthy registry entry at `level`.
     fn model(id: &str, level: Capability) -> RegistryModel {
         RegistryModel {
+            login_model: None,
             version: None,
             aliases: Vec::new(),
             codex: Default::default(),
@@ -315,6 +326,36 @@ mod tests {
         );
         cfg.harnesses = Arc::new(HarnessRegistry::new(vec![Box::new(Codex)]));
         cfg
+    }
+
+    /// A pick on the bridge's own login carries its slug, and the ambient floor carries
+    /// `opus`'s pin — so a routed job lands on the model the picker names — while an unpinned
+    /// floor still applies nothing at all.
+    #[test]
+    fn a_login_model_rides_on_the_routed_pick() {
+        let cfg = cfg_with(vec![], &[]);
+        let health = all_healthy(&cfg);
+
+        // The conversation rung: a Fable conversation serving a job it clears.
+        let mut fable = ActiveModel::ambient();
+        fable.id = "fable".to_string();
+        fable.kind = ModelKind::Subscription;
+        fable.login_model = Some("claude-fable-5-1".to_string());
+        let pick = route_job(&cfg, &health, RoutedJob::Title, Some(&fable), None);
+        assert_eq!(pick.id, "fable");
+        assert_eq!(pick.login_model.as_deref(), Some("claude-fable-5-1"));
+        assert!(pick.backend.is_none(), "and nothing metered");
+
+        // The floor, unpinned (the fixture's opus): nothing.
+        let floor = route_job(&cfg, &health, RoutedJob::Title, None, None);
+        assert_eq!(floor.id, DEFAULT_MODEL_ID);
+        assert_eq!(floor.login_model, None);
+
+        // The floor, pinned: opus's own slug, read off the registry's default entry.
+        let mut pinned = cfg_with(vec![], &[]);
+        pinned.model_registry.models[0].login_model = Some("claude-opus-5[1m]".to_string());
+        let floor = route_job(&pinned, &all_healthy(&pinned), RoutedJob::Title, None, None);
+        assert_eq!(floor.login_model.as_deref(), Some("claude-opus-5[1m]"));
     }
 
     /// THE BUG THIS CHECK EXISTS FOR, stated as a test rather than as a comment.

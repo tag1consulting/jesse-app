@@ -788,6 +788,7 @@ mod tests {
         let mut cfg = test_config();
         let mut models = cfg.model_registry.models.clone();
         models.push(RegistryModel {
+            login_model: None,
             version: None,
             aliases: Vec::new(),
             codex: Default::default(),

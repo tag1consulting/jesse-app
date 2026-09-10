@@ -97,6 +97,7 @@ async fn wait_for_status_within(
 /// resolves to when `offload_order` is empty.
 fn ambient_pick() -> RoutedPick {
     RoutedPick {
+        login_model: None,
         id: DEFAULT_MODEL_ID.to_string(),
         harness: CLAUDE_CODE_ID.to_string(),
         level: Capability::Write,
@@ -109,6 +110,7 @@ fn ambient_pick() -> RoutedPick {
 fn with_vaultqa_offload(mut cfg: Config) -> Config {
     let mut models = cfg.model_registry.models.clone();
     models.push(RegistryModel {
+        login_model: None,
         version: None,
         aliases: Vec::new(),
         codex: Default::default(),
@@ -4875,6 +4877,7 @@ fn cfg_with_switch_registry(state_dir: &std::path::Path) -> Config {
     let registry = ModelRegistry {
         models: vec![
             RegistryModel {
+                login_model: None,
                 version: None,
                 aliases: Vec::new(),
                 codex: Default::default(),
@@ -4901,6 +4904,7 @@ fn cfg_with_switch_registry(state_dir: &std::path::Path) -> Config {
                 vision_complementary: false,
             },
             RegistryModel {
+                login_model: None,
                 version: None,
                 aliases: Vec::new(),
                 codex: Default::default(),
@@ -4931,6 +4935,7 @@ fn cfg_with_switch_registry(state_dir: &std::path::Path) -> Config {
                 vision_complementary: false,
             },
             RegistryModel {
+                login_model: None,
                 version: None,
                 aliases: Vec::new(),
                 codex: Default::default(),
@@ -5098,6 +5103,81 @@ async fn set_model_accepts_a_healthy_configured_model() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(st.models.active(), "glm-5.2");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A SUBSCRIPTION entry on the model endpoints: listed with kind `subscription` — NOT
+/// `ambient`, which the apps read as the always-available default — selectable when it names a
+/// model, refused as not configured when it does not, and resolved to a turn that carries the
+/// slug and no backend triple.
+#[tokio::test]
+async fn a_subscription_entry_is_listed_and_selectable_only_when_it_names_a_model() {
+    let dir = std::env::temp_dir().join(format!("jesse-model-it-{}", random_hex()));
+    let mut cfg = cfg_with_switch_registry(&dir);
+    let mut fable = cfg.model_registry.models[0].clone(); // the ambient opus row
+    fable.id = "fable".into();
+    fable.label = "Claude Fable 5.1".into();
+    fable.version = Some("5.1".into());
+    fable.kind = ModelKind::Subscription;
+    fable.configured = true;
+    fable.login_model = Some("claude-fable-5-1".into());
+    fable.subagent_model = fable.login_model.clone();
+    let mut unarmed = fable.clone();
+    unarmed.id = "fable-unarmed".into();
+    unarmed.configured = false;
+    unarmed.login_model = None;
+    unarmed.subagent_model = None;
+    cfg.model_registry.models.push(fable);
+    cfg.model_registry.models.push(unarmed);
+    let st = AppState::new(cfg);
+
+    let v = body_value(
+        app(st.clone())
+            .oneshot(models_request(Some("Bearer test-token")))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let models = v["models"].as_array().unwrap();
+    let row = models.iter().find(|m| m["id"] == "fable").unwrap();
+    assert_eq!(
+        row["kind"], "subscription",
+        "not `ambient`: the apps key the always-available default on that"
+    );
+    assert_eq!(row["configured"], true);
+    assert_eq!(row["available"], true);
+    assert_eq!(row["version"], "5.1");
+    let off = models.iter().find(|m| m["id"] == "fable-unarmed").unwrap();
+    assert_eq!(off["configured"], false, "no slug: listed, disabled");
+    assert_eq!(off["available"], false);
+    // Exactly one row is the ambient default.
+    assert_eq!(
+        models.iter().filter(|m| m["kind"] == "ambient").count(),
+        1,
+        "{models:?}"
+    );
+
+    let resp = app(st.clone())
+        .oneshot(set_model_request(
+            Some("Bearer test-token"),
+            r#"{"id":"fable"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(st.models.active(), "fable");
+    let active = st.resolve_active_model();
+    assert_eq!(active.login_model.as_deref(), Some("claude-fable-5-1"));
+    assert!(active.env.is_none(), "no base url and no token");
+
+    let resp = app(st.clone())
+        .oneshot(set_model_request(
+            Some("Bearer test-token"),
+            r#"{"id":"fable-unarmed"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -5644,6 +5724,7 @@ async fn preprocess_pairs_and_frames_a_faithful_view() {
     let base = start_mock_helper().await;
     // A registry with the mock helper (configured) and a text model paired to it.
     let helper = RegistryModel {
+        login_model: None,
         version: None,
         aliases: Vec::new(),
         codex: Default::default(),
@@ -5665,6 +5746,7 @@ async fn preprocess_pairs_and_frames_a_faithful_view() {
         vision_complementary: false,
     };
     let text = RegistryModel {
+        login_model: None,
         version: None,
         aliases: Vec::new(),
         codex: Default::default(),
@@ -5702,6 +5784,7 @@ async fn preprocess_pairs_and_frames_a_faithful_view() {
     );
 
     let active = ActiveModel {
+        login_model: None,
         codex: Default::default(),
         id: "glm".into(),
         kind: ModelKind::Hosted,
@@ -5746,6 +5829,7 @@ async fn unpaired_model_reports_no_vision() {
     // A configured text model with NO partners reports vision disabled — the capability
     // rule: unpaired == no-vision, surfaced, never a silent half-state.
     let text = RegistryModel {
+        login_model: None,
         version: None,
         aliases: Vec::new(),
         codex: Default::default(),
@@ -5849,6 +5933,7 @@ async fn the_vision_path_is_identical_on_both_harnesses() {
         role: VisionRole::Any,
     };
     let helper = RegistryModel {
+        login_model: None,
         version: None,
         aliases: Vec::new(),
         codex: Default::default(),
@@ -5910,6 +5995,7 @@ async fn the_vision_path_is_identical_on_both_harnesses() {
     let _ = std::fs::remove_dir_all(&dir);
 
     let active_on = |harness: &str| ActiveModel {
+        login_model: None,
         codex: Default::default(),
         id: "glm".into(),
         kind: ModelKind::Hosted,

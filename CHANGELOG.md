@@ -14,6 +14,85 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [bridge 0.129.0] - 2026-09-10
+
+**Opus and Fable are both selectable on the subscription login — no API key, no second
+billing relationship.** The claude-code harness set `ANTHROPIC_MODEL` only as part of a full
+third-party backend triple, and `apply_main_env` was a no-op for the ambient default. So a turn
+on the subscription login ran the CLI's own default model and nothing in config could say
+otherwise. The codex harness closed the same gap for its subscription posture in
+`codex_model_args`; this is the claude-code half.
+
+**Verified on the login, not inferred from documentation.** All on 2026-09-10, on the pinned
+CLI (2.1.267), with every API-key variable removed:
+
+- `ANTHROPIC_MODEL=claude-fable-5-1`: `apiKeySource: "none"`, init model `claude-fable-5-1`,
+  a successful turn, and usage billed to `claude-fable-5-1`. The subscription serves Fable.
+- The bridge's exact child environment (`ANTHROPIC_MODEL` and `CLAUDE_CODE_SUBAGENT_MODEL` both
+  `claude-fable-5-1`, no base URL, no token) on a turn that spawned a subagent: the subagent's
+  `Read` ran on `claude-fable-5-1` too.
+- With no slug at all, the CLI's default is **`claude-opus-5[1m]`** — the 1M-context variant.
+  That decided the next point.
+
+**`opus` pins nothing by default.** Pinning the bare `claude-opus-5` would quietly narrow the
+window from the CLI's own default. `JESSE_MODEL_OPUS_MODEL` pins a slug (the login accepts
+`claude-opus-5[1m]`) and `JESSE_MODEL_OPUS_VERSION` labels it. Unset, `opus` is byte-for-byte
+the entry it was and its child carries none of the four variables. `ModelRegistry::opus_only()`
+reads no environment at all, so the fixture cannot be moved by a stray variable.
+
+**`fable` is a new built-in entry, armed by its slug alone.** Set
+`JESSE_MODEL_FABLE_MODEL=claude-fable-5-1` (and `JESSE_MODEL_FABLE_VERSION=5.1` for the label
+"Claude Fable 5.1"). Unset, it is listed and disabled as "not configured". A bridge with no
+model configuration is still the opus-only-selectable registry it always was, and that test
+still passes. Deliberately no self-arming compiled-in slug: nothing probes a subscription entry,
+so a default that armed itself would put Fable in every picker on every deploy whether or not
+that deploy's login serves it.
+
+**A new `ModelKind::Subscription` (`"subscription"` on the wire), not `ambient` plus a slug.**
+`ambient` means THE default to everything that reads it: `upsert_model` protects it,
+`model_health` calls it healthy by construction, routing uses it as the floor, and both apps key
+`isDefault` on `kind == "ambient"`. A second ambient row would have been a second
+always-available default in the app. A subscription entry shares the login and none of that: it
+is healthy exactly when it is configured, it is never probed (the login has no endpoint of its
+own), and a client sees an ordinary row. No app change is needed.
+
+**`fable` is `write`, like `opus`** — the same harness, the same containment record and the same
+login. Its deck is Fable 5.1's published one, 10.00 / **0.25** / 50.00: cache reads on 5.1 are
+0.025x input, not the usual tenth, so a deck derived by the usual rule would over-report every
+cache read four-fold. On the subscription the badge reports what the turn would have cost on the
+metered API, as it always has for `opus`.
+
+**Routed jobs carry the slug too.** A routed pick names the login's slug when its model has one,
+and the ambient floor carries `opus`'s pin, so a title or diet job lands on the model the picker
+names. Unpinned, the floor applies nothing, as before.
+
+**Containment: nothing moves.** No record, acceptance, tool grant or MCP set changes.
+`ANTHROPIC_MODEL` is not part of `capability_args`, and both entries run the posture `opus`
+already ran.
+
+### Added
+- `ModelKind::Subscription`; `RegistryModel::login_model`, `ActiveModel::login_model`,
+  `RoutedPick::login_model`.
+- The `fable` built-in (`JESSE_MODEL_FABLE_MODEL`, `_VERSION`, `_PRICE_*`) and the `opus` pin
+  (`JESSE_MODEL_OPUS_MODEL`, `_VERSION`).
+- `FABLE_5_1_*` price constants.
+- Tests:
+  - `a_subscription_entrys_slug_reaches_the_child_with_no_base_url_or_token` (registry down to
+    the built `Command`)
+  - `a_routed_pick_on_the_login_carries_only_its_slug`
+  - `fable_is_armed_by_its_slug_alone_on_the_subscription_login`
+  - `opus_pins_a_login_model_only_when_asked`
+  - `the_opus_only_registry_pins_nothing_whatever_the_environment_says`
+  - `a_subscription_entry_is_available_exactly_when_it_names_a_model`
+  - `a_login_model_rides_on_the_routed_pick`
+  - the endpoint test `a_subscription_entry_is_listed_and_selectable_only_when_it_names_a_model`
+  - The no-config test now lists `fable` as registered and unconfigured.
+
+### Changed
+- `apply_main_env` and `apply_routed_env` deliver a login slug as `ANTHROPIC_MODEL` (plus the
+  subagent model on a main turn) with no base URL and no token.
+- `jesse.example.toml` documents both entries and the pin.
+
 ## [bridge 0.128.0] - 2026-09-10
 
 **Each model is registered ONCE, on ONE harness, and the built-in Fireworks families are now

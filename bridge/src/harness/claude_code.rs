@@ -1451,11 +1451,23 @@ pub fn build_vaultqa_child_command(cfg: &Config, prompt: &str) -> Command {
 /// property. Unlike `apply_title_env` / `apply_diet_env` / `apply_vaultqa_env` (which
 /// carry a per-ROLE backend), this carries the CONVERSATION's chosen model; the two
 /// never mix (a main turn never calls the role appliers, and vice versa).
+///
+/// **The subscription half.** An entry with no triple may still name a model for the bridge's
+/// OWN login — `fable`, or `opus` pinned by `JESSE_MODEL_OPUS_MODEL` — and this delivers it as
+/// `ANTHROPIC_MODEL` (plus the subagent model) with NO base URL and NO token, so the turn stays
+/// on the login's credential and nothing metered is involved. Before this, that path had no
+/// way to name a model at all: a subscription turn ran the CLI's default whatever the picker
+/// said. The unpinned ambient default names none and remains a no-op.
 pub fn apply_main_env(cmd: &mut Command, active: &ActiveModel) {
     if let Some((base_url, auth_token, model)) = &active.env {
         cmd.env("ANTHROPIC_BASE_URL", base_url)
             .env("ANTHROPIC_AUTH_TOKEN", auth_token)
             .env("ANTHROPIC_MODEL", model);
+        if let Some(subagent) = &active.subagent_model {
+            cmd.env("CLAUDE_CODE_SUBAGENT_MODEL", subagent);
+        }
+    } else if let Some(model) = &active.login_model {
+        cmd.env("ANTHROPIC_MODEL", model);
         if let Some(subagent) = &active.subagent_model {
             cmd.env("CLAUDE_CODE_SUBAGENT_MODEL", subagent);
         }
@@ -1478,6 +1490,9 @@ pub fn apply_routed_env(cmd: &mut Command, pick: &RoutedPick) {
         cmd.env("ANTHROPIC_BASE_URL", base_url)
             .env("ANTHROPIC_AUTH_TOKEN", auth_token)
             .env("ANTHROPIC_MODEL", model);
+    } else if let Some(model) = &pick.login_model {
+        // A pick on the bridge's own login that names a model: the slug and nothing else.
+        cmd.env("ANTHROPIC_MODEL", model);
     }
 }
 
@@ -1931,6 +1946,7 @@ mod tests {
     /// A routed pick pointing at a local backend — the shape `apply_routed_env` layers.
     fn routed_pick(id: &str) -> RoutedPick {
         RoutedPick {
+            login_model: None,
             id: id.to_string(),
             harness: CLAUDE_CODE_ID.to_string(),
             level: Capability::Basic,
@@ -1980,6 +1996,7 @@ mod tests {
         apply_routed_env(
             &mut ambient,
             &RoutedPick {
+                login_model: None,
                 id: DEFAULT_MODEL_ID.to_string(),
                 harness: CLAUDE_CODE_ID.to_string(),
                 level: Capability::Write,
@@ -2394,6 +2411,7 @@ mod tests {
     /// DISTINCT from every role backend's so a leak is detectable.
     fn glm_active() -> ActiveModel {
         ActiveModel {
+            login_model: None,
             codex: Default::default(),
             id: "glm-5.2".to_string(),
             kind: ModelKind::Hosted,
@@ -2419,6 +2437,7 @@ mod tests {
         let mut cfg = test_config();
         let mut models = cfg.model_registry.models.clone();
         models.push(RegistryModel {
+            login_model: None,
             version: None,
             aliases: Vec::new(),
             codex: Default::default(),
@@ -2625,6 +2644,132 @@ mod tests {
                 None => std::env::remove_var(k),
             }
         }
+    }
+
+    /// THE SUBSCRIPTION HALF. An entry on the bridge's own login that names a model reaches
+    /// the child as `ANTHROPIC_MODEL` (and the subagent model) with NO base URL and NO token,
+    /// so the turn stays on the login's credential and no metered key is involved. The
+    /// unpinned `opus` beside it still sets nothing at all, and a pinned one sets the slug and
+    /// nothing else. Built from the registry down, like the Fireworks test above.
+    #[test]
+    fn a_subscription_entrys_slug_reaches_the_child_with_no_base_url_or_token() {
+        let _g = crate::testutil::ENV_LOCK.lock_ok();
+        let vars = [
+            "JESSE_CONFIG",
+            "JESSE_STATE_DIR",
+            "JESSE_MODEL_FABLE_MODEL",
+            "JESSE_MODEL_OPUS_MODEL",
+        ];
+        let saved: Vec<(&str, Option<String>)> =
+            vars.iter().map(|k| (*k, std::env::var(k).ok())).collect();
+        for k in vars {
+            std::env::remove_var(k);
+        }
+        std::env::set_var("JESSE_CONFIG", "/nonexistent/jesse.local.toml");
+        std::env::set_var("JESSE_MODEL_FABLE_MODEL", "claude-fable-5-1");
+
+        let cfg = test_config();
+        let Runner::Spawned(harness) = cfg.harnesses.fallback_harness().runner() else {
+            panic!("claude-code is a spawned harness")
+        };
+        let env_of = |active: &ActiveModel| {
+            let req = main_turn_request(
+                &cfg,
+                "PROMPT",
+                None,
+                active,
+                turn_capability(active),
+                main_mcp_config(&cfg, &ClaudeCode),
+                BUILDER_TURN_ID,
+            );
+            cmd_env_overrides(
+                &harness
+                    .build_turn(&cfg, &req)
+                    .expect("claude never refuses"),
+            )
+        };
+        const METERED: [&str; 3] = [
+            "ANTHROPIC_BASE_URL",
+            "ANTHROPIC_AUTH_TOKEN",
+            "ANTHROPIC_API_KEY",
+        ];
+
+        let registry = ModelRegistry::from_env("");
+        let fable = ActiveModel::from_registry(registry.get("fable").expect("registered"));
+        let env = env_of(&fable);
+        assert_eq!(
+            env.get("ANTHROPIC_MODEL").map(String::as_str),
+            Some("claude-fable-5-1"),
+            "the turn runs the model the picker names, not the CLI's default"
+        );
+        assert_eq!(
+            env.get("CLAUDE_CODE_SUBAGENT_MODEL").map(String::as_str),
+            Some("claude-fable-5-1")
+        );
+        for k in METERED {
+            assert!(
+                !env.contains_key(k),
+                "a subscription turn must not carry {k}"
+            );
+        }
+
+        // The unpinned default beside it: byte-for-byte nothing.
+        let opus = ActiveModel::from_registry(registry.default_model());
+        let env = env_of(&opus);
+        for k in METERED
+            .iter()
+            .chain(["ANTHROPIC_MODEL", "CLAUDE_CODE_SUBAGENT_MODEL"].iter())
+        {
+            assert!(!env.contains_key(*k), "unpinned opus must not carry {k}");
+        }
+
+        // Pinned: the slug and nothing metered.
+        std::env::set_var("JESSE_MODEL_OPUS_MODEL", "claude-opus-5[1m]");
+        let pinned = ModelRegistry::from_env("");
+        let env = env_of(&ActiveModel::from_registry(pinned.default_model()));
+        assert_eq!(
+            env.get("ANTHROPIC_MODEL").map(String::as_str),
+            Some("claude-opus-5[1m]")
+        );
+        for k in METERED {
+            assert!(!env.contains_key(k), "a pinned opus must not carry {k}");
+        }
+
+        for (k, v) in saved {
+            match v {
+                Some(val) => std::env::set_var(k, val),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+
+    /// A ROUTED pick on the bridge's own login carries its slug and nothing else, and the
+    /// unpinned floor still applies nothing — so a routed job never picks up a metered
+    /// variable by way of a subscription model.
+    #[test]
+    fn a_routed_pick_on_the_login_carries_only_its_slug() {
+        let mut pick = routed_pick("fable");
+        pick.backend = None;
+        pick.login_model = Some("claude-fable-5-1".to_string());
+        let mut cmd = Command::new("true");
+        apply_routed_env(&mut cmd, &pick);
+        let env = cmd_env_overrides(&cmd);
+        assert_eq!(
+            env.get("ANTHROPIC_MODEL").map(String::as_str),
+            Some("claude-fable-5-1")
+        );
+        assert!(!env.contains_key("ANTHROPIC_BASE_URL"));
+        assert!(!env.contains_key("ANTHROPIC_AUTH_TOKEN"));
+
+        let mut floor = routed_pick("opus");
+        floor.backend = None;
+        floor.login_model = None;
+        let mut cmd = Command::new("true");
+        apply_routed_env(&mut cmd, &floor);
+        assert!(
+            cmd_env_overrides(&cmd).is_empty(),
+            "the unpinned floor applies nothing"
+        );
     }
 
     #[test]
