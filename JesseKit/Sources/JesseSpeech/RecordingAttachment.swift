@@ -100,6 +100,16 @@ public final class RecordingAttachment {
         return false
     }
 
+    /// Whether a recording is in hand at all — the language picker is up, or the engine is
+    /// reading it. Wider than `isBusy`, which is only the transcription itself.
+    ///
+    /// The composer's durable draft records this: a run that is in flight when the composer
+    /// goes away does NOT survive, and cannot, because the working copy is deleted on every
+    /// exit path (and swept at the next launch for a run the system killed). So the draft
+    /// notes the name and the restored composer says the recording is gone, rather than
+    /// handing back text that has quietly lost its transcript.
+    public var isInFlight: Bool { stage != .idle }
+
     private let transcriber: any AudioFileTranscribing
     private let probe: any AudioFileProbing
     private let workingCopy: RecordingWorkingCopy

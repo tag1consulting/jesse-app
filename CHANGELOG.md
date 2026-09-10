@@ -14,6 +14,106 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [App 1.0 (129)] - 2026-09-10
+
+**An unfinished message stays in the conversation it was typed in — across switching
+conversations, across leaving the app, and across a relaunch — until it is sent or
+deliberately erased.**
+
+### Fixed — the composer's text was temporary view state, and nothing else
+
+- **Root cause: there was no durable half.** The iOS composer held its text in
+  `ThreadDetailView`'s `@State private var input` (and its staged files in
+  `@State private var attachments`); the Mac held it in `MacThreadDetailView`'s
+  `@State private var draft`. `JesseThread` had no draft field of any kind. Neither reported
+  symptom was a race — both are what the platform is contracted to do with view state.
+  Switching conversations DESTROYS the view (the iPhone pops the detail off the stack; the
+  iPad's and the Mac's detail columns carry `.id(thread.id)`), and leaving the app long
+  enough ends the process. One storage gap, two symptoms.
+- **The fix: the draft lives on the conversation.** `JesseThread` gains `draftText`,
+  `draftUpdatedAt`, `draftPendingRecording`, `draftContextLabel` and a cascading
+  `draftAttachments` relationship to the new `DraftAttachment` entity (`.externalStorage`,
+  modeled on `OutboxAttachment`). Keyed on `id`, the SwiftData identity, deliberately NOT on
+  `conversationId`: a draft is a fact about a composer on THIS device, and `conversationId`
+  is the cross-device sync key. Putting it on the thread row is what makes "deleting a
+  conversation deletes its draft" a schema guarantee rather than a cleanup pass. `nil` means
+  no draft was recorded; `""` means the user deliberately emptied the composer, which is
+  persisted — otherwise clearing a draft and relaunching would bring it back.
+- **One shared implementation, both platforms.** `ComposerDraft` (JesseCore) is the only
+  place a draft is read, written or spent, so the phone and the Mac cannot grow two ideas of
+  what a draft is. The view state stays — a text view has to bind to something — but it is
+  now a MIRROR: restored on appearance, written through on every edit.
+- **Saved as the user edits, not on the way out.** Every keystroke, paste, dictation update
+  and landed transcript reaches the model synchronously through the composer's own binding;
+  only the sqlite write is coalesced, by `ComposerDraftAutosave`, 250 ms after the last
+  edit. The pending window is closed explicitly on `onDisappear`, on any scene phase but
+  `.active`, and at send. **The durability boundary the tests demonstrate:** an edit plus a
+  flush is on disk with no further lifecycle event, a burst of fifty keystrokes is one
+  transaction, and a UI test kills the app straight after typing (no back navigation, no tab
+  switch) and finds the draft after relaunch.
+- **Ownership transfers atomically at send.** `RunCoordinator.send` now returns whether the
+  message was DURABLY STAGED, and releases the draft INSIDE the same save that writes the
+  optimistic user turn and its `OutboxItem` — so the message is never in neither place and
+  never in both. The composer clears only on `true`. A refused send (empty, or a turn already
+  running) never reaches the release; a staging save that throws puts the draft back whole,
+  files and markers included. Once staged, the outbox owns delivery: a network failure flips
+  the item to `.failed` for its own Retry and never resurrects a second sendable copy.
+  Previously `send()` cleared `input` and `attachments` BEFORE calling the coordinator, which
+  could refuse the send or fail its save.
+- **A failed staging save also puts the SCREEN CONTEXT back**, on both platforms. The
+  attachment is spent early on purpose (so a send refused mid-turn leaves it for the send that
+  does go through), and leaving it spent after a save failure would mean the preserved draft,
+  sent again, went WITHOUT the reading the conversation was opened about — the same message
+  quietly turning into a different one. Found while auditing the new preserve-the-draft path
+  against the attached-context case.
+- **The Mac's send is split into `stage` and `deliver`.** `MacCoordinator.stageAndSend` does
+  the guards, the insert, the draft release and a REAL save synchronously, then delivers in a
+  detached task; `send(text:…) async` is unchanged for every other call site and keeps its
+  awaitable shape. The staging save was a swallowed `try?`, so a store failure there used to
+  clear the composer and transmit a turn that might never persist — it now surfaces
+  "Couldn't save your message" and keeps the text. `MacCoordinator` gains the injectable
+  `save:` seam the phone has had since the outbox landed.
+- **Both empty-thread reapers now spare a drafted conversation.**
+  `ThreadListView.pruneEmpty` and `MacRootView.pruneEmptyThreads` delete turn-less,
+  never-sent threads on appear; without an exemption they would have destroyed both the
+  draft and the conversation it belonged to. A deliberately emptied draft does not count, so
+  an abandoned `+`-then-back is still reaped. A never-sent conversation that is not yet in the
+  store (a staged Health ask, a Today discussion) is inserted by its first keystroke, so its
+  draft survives a relaunch; an empty draft still leaves no row behind.
+- **What a restored draft LOST is named, never silently dropped.** Two things that were part
+  of the pending message cannot come back with it, and the composer says so in one caption:
+  - **An in-flight transcription.** `RecordingAttachment` deletes the working copy on every
+    exit path, and a run whose model died with the view has its transcript dropped and its
+    working copy swept at the next launch — so restoring a REFERENCE to that audio would be
+    restoring a file that is gone. The draft records the recording's name while a run is in
+    flight, and a composer restored with that marker set reports the recording by name and
+    says the transcript is not coming. The deletion guarantee is untouched.
+  - **Attached screen context.** The Today tab's Discuss and the Health tab's "Ask about
+    this" hold their context in memory on the coordinator, which dies with the process. A
+    draft recorded against one and restored without it says the reading is no longer
+    attached, so restored text cannot silently become a different message.
+- **Drafts are local and unsynced.** No wire type carries one, and hydration, the session
+  and flag reconcilers, a title mint, a model or effort switch and an incoming reply all
+  leave them alone — asserted by driving those exact writes and re-reading the draft. There
+  is no expiry and no purge while the conversation exists.
+- **Migration.** Four additive optionals with nil defaults plus one new entity and one new
+  empty to-many relationship: `JesseSchemaV5` lightweight-migrates with no migration code,
+  the same shape as `Turn.attachments` → `TurnAttachment`. A store written at V4 opens with
+  its rows intact and the draft columns defaulted.
+- **Tests.** `ComposerDraftTests` (JesseCore, 27 cases) writes through a REAL disk-backed
+  store and reopens it: exact multiline Unicode text, deliberate emptying persisted as `""`,
+  two conversations keeping their own drafts, a write against one thread leaving the other
+  untouched (the asynchronous-picker case), staged file bytes in order, the release/restore
+  handoff, the one-shot notices, the autosave contract, the V4 → V5 migration, and the
+  unsynced assertion. `ComposerDraftHandoffTests` (iOS) drives a real `RunCoordinator`:
+  one-save handoff, refused sends, a forced save failure, retry without duplication, and
+  newer text surviving an older send's completion. `MacComposerDraftTests` mirrors it plus a
+  reopen on that platform. `ComposerDraftUITests` types into the real `UITextView`,
+  navigates A → B → A, backgrounds, terminates immediately after an edit, and relaunches —
+  the only layer at which the original bug was visible at all. `ComposerInput` gains an
+  accessibility identifier so that test can find the composer among the transcript's
+  per-reply text views.
+
 ## [bridge 0.134.0] - 2026-09-10
 
 **The miniserve diet dashboard is retired, so the sentinel stops supervising it; and the local

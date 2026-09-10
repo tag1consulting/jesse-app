@@ -29,6 +29,22 @@ struct MacThreadDetailView: View {
     @State private var recording = RecordingAttachment()
     @State private var showAudioImporter = false
 
+    // ── The DURABLE half of the composer ────────────────────────────────────────────
+    //
+    // `draft` above is view state, and this view carries `.id(thread.id)` in the split
+    // view's detail column — so selecting another conversation destroys it, and quitting
+    // takes it regardless. `draft` is now a MIRROR of `thread`'s persisted draft, through
+    // the same shared `ComposerDraft` the phone uses.
+    @State private var drafts = ComposerDraftAutosave()
+    /// Guards the restore so it happens once per composer; a second one would overwrite
+    /// live typing with a stale value.
+    @State private var didRestoreDraft = false
+    /// What a restored draft lost, if anything (a recording mid-transcription, or the
+    /// screen context the conversation was opened about). Nil almost always.
+    @State private var draftNotice: String?
+
+    @Environment(\.scenePhase) private var scenePhase
+
     private var running: Bool { coordinator.isRunning(thread.id) }
 
     var body: some View {
@@ -39,10 +55,51 @@ struct MacThreadDetailView: View {
         }
         .navigationTitle(displayTitle(for: thread))
         .navigationSubtitle(subtitle)
-        .onAppear { mode = thread.modeValue }
+        .onAppear {
+            mode = thread.modeValue
+            restoreDraft()
+        }
+        // Close the pending-write window wherever this composer stops being reachable.
+        .onDisappear { drafts.flush() }
+        .onChange(of: scenePhase) { _, phase in
+            if phase != .active { drafts.flush() }
+        }
         .task(id: thread.id) {
             await coordinator.hydrate(thread: thread, context: context)
         }
+    }
+
+    // MARK: - The durable draft
+
+    /// Put the composer back the way the user left it, before any edit can be recorded.
+    private func restoreDraft() {
+        guard !didRestoreDraft else { return }
+        didRestoreDraft = true
+        let saved = ComposerDraft.snapshot(of: thread)
+        draft = saved.text
+        draftNotice = ComposerDraftNotice.message(
+            for: saved,
+            contextStillAttached: coordinator.attachedContext(for: thread.id) != nil)
+        if saved.pendingRecording != nil || saved.contextLabel != nil {
+            ComposerDraft.clearNotices(on: thread)
+            drafts.arm { persistDraft() }
+        }
+    }
+
+    /// Record the composer's text against THIS thread. The model write is immediate; the
+    /// save trails the last keystroke.
+    private func recordDraft() {
+        guard didRestoreDraft else { return }
+        let changed = ComposerDraft.write(
+            text: draft,
+            pendingRecording: recording.isInFlight ? recording.sourceName : nil,
+            contextLabel: coordinator.attachment(for: thread.id)?.contextLabel,
+            to: thread, in: context)
+        if changed { drafts.arm { persistDraft() } }
+    }
+
+    private func persistDraft() {
+        try? context.save()
     }
 
     /// The window subtitle. This used to read "Not yet started" off `sessionId == nil`, which
@@ -101,6 +158,27 @@ struct MacThreadDetailView: View {
 
     private var composer: some View {
         VStack(spacing: 8) {
+            // What a restored draft LOST, named. Not an error line: the text is right
+            // there, and something that was part of the pending message simply is not
+            // coming back with it. On a Section footer this would ellipsise (see the
+            // Health tab's caveats), so it is a row of its own.
+            if let draftNotice {
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    Image(systemName: "exclamationmark.circle")
+                    Text(draftNotice)
+                    Spacer(minLength: 0)
+                    Button {
+                        self.draftNotice = nil
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Dismiss")
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
             if let error = coordinator.lastError ?? recording.errorMessage {
                 Text(error).font(.caption).foregroundStyle(.red)
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -199,6 +277,13 @@ struct MacThreadDetailView: View {
             guard value != nil, let done = recording.takeCompleted() else { return }
             draft = done.messageBody(typed: draft)
         }
+        // Every path into the composer ends up here: `draft` is written by the text view's
+        // delegate on every keystroke, paste and dictation update, and by the transcript
+        // landing above.
+        .onChange(of: draft) { _, _ in recordDraft() }
+        // A recording in flight is part of the pending message; the draft records its name
+        // so a composer restored without it can say so.
+        .onChange(of: recording.stage) { _, _ in recordDraft() }
     }
 
     /// A picked recording. Transcribed on this Mac, never uploaded, and the working copy
@@ -223,11 +308,25 @@ struct MacThreadDetailView: View {
                 || coordinator.attachedContext(for: thread.id) != nil)
     }
 
+    /// THE COMPOSER IS CLEARED ONLY ON A DURABLE STAGE. `stageAndSend` persists the user
+    /// turn synchronously — in the same save that releases this thread's draft — and returns
+    /// whether that succeeded. A refused send and a staging save that threw both return
+    /// false, leave the draft in place, and leave the text on screen.
     private func send() {
         guard canSend else { return }
-        let text = draft
+        guard coordinator.stageAndSend(text: draft, mode: mode, thread: thread,
+                                       context: context) else {
+            // The draft is still the truth, and `stageAndSend` may just have put it back
+            // after a failed save. Get it to disk now rather than wait on a debounce.
+            drafts.disarm()
+            persistDraft()
+            return
+        }
+        // Staged. The staging save persisted the release, so an armed draft write is both
+        // stale and unnecessary.
+        drafts.disarm()
         draft = ""
-        Task { await coordinator.send(text: text, mode: mode, thread: thread, context: context) }
+        draftNotice = nil
     }
 }
 

@@ -190,6 +190,78 @@ public final class JesseThread {
     // about what it was about. Doubles as the thread's list title for an ask.
     public var askScopeTitle: String?
 
+    // ── The composer's UNSENT DRAFT, per conversation and per device ─────────────
+    //
+    // What the user has typed here and not yet sent. Before this it lived only in the
+    // detail view's `@State`, which meant two guaranteed losses: navigating away destroys
+    // the view (both shells put `.id(thread.id)` on the detail column, and the iPhone pops
+    // the whole thing), and process termination takes it regardless. Neither is a race —
+    // they are what the platform is contracted to do with view state — so the only fix is
+    // a durable home, which is this.
+    //
+    // Keyed on `id`, the SwiftData IDENTITY, deliberately NOT on `conversationId`: a draft
+    // is a fact about a composer on THIS device, and `conversationId` is the cross-device
+    // sync key. Storing it on the thread row is what makes "deleting a conversation deletes
+    // its draft" a property of the schema rather than a cleanup someone has to remember.
+    //
+    // LOCAL AND UNSYNCED. Nothing writes these fields but the composer: they ride no
+    // request, appear in no wire type, and neither hydration, the session reconciler, the
+    // flag reconciler, a title mint nor a model switch touches them. A half-typed message
+    // is not something to publish to another device mid-sentence.
+    //
+    // nil means "no draft was ever recorded"; the EMPTY STRING means "the user deliberately
+    // emptied the composer", which is a state worth persisting — otherwise clearing a draft
+    // and relaunching would bring it back. Additive optional with a nil default → SwiftData
+    // lightweight-migrates existing stores with no migration code, exactly as
+    // `selectedModelID` and `registeredAt` do.
+    public var draftText: String?
+    // When the draft was last recorded. Diagnostic, and the tie-breaker if a later feature
+    // ever needs to reason about draft age. Never an expiry: a draft lives as long as its
+    // conversation does.
+    public var draftUpdatedAt: Date?
+    // The display name of a recording whose TRANSCRIPTION WAS STILL RUNNING when this draft
+    // was last recorded, else nil.
+    //
+    // It exists because a transcription cannot be restored and its audio cannot be kept.
+    // `RecordingAttachment` deletes the working copy on every exit path, and a run whose
+    // model was destroyed with the view has its transcript dropped (the task holds the
+    // model weakly) and its working copy swept at the next launch. So on restore this can
+    // only mean "that run never finished here" — and the composer SAYS SO, by name, rather
+    // than silently handing back a draft that has quietly lost a recording. Cleared as soon
+    // as it is reported, and cleared normally whenever a run settles.
+    public var draftPendingRecording: String?
+    // The `AttachedContext.contextLabel` of the screen context attached to this composer
+    // when the draft was recorded, else nil.
+    //
+    // Attached context (the Today tab's Discuss, the Health tab's "Ask about this") lives in
+    // memory on the coordinator and dies with the process, while this draft does not. Without
+    // this field a relaunched draft would send as a bare message on a conversation whose whole
+    // point was the reading it was opened about — the restored text silently becoming a
+    // different message. Recorded so the composer can say the item is no longer attached.
+    public var draftContextLabel: String?
+
+    /// Files staged in the composer and not yet sent. iOS only in practice (the Mac composer
+    /// has no attachment pipeline), cascade-deleted with the thread and with the draft.
+    @Relationship(deleteRule: .cascade, inverse: \DraftAttachment.thread)
+    public var draftAttachments: [DraftAttachment] = []
+
+    /// Whether this conversation is holding an unsent composer draft worth keeping alive.
+    ///
+    /// Read by both shells' empty-thread reapers: a never-sent conversation with a draft is
+    /// not an abandoned `+`-then-back, it is a message in progress, and reaping it would be
+    /// the very loss this draft exists to prevent. A deliberately EMPTIED draft (`""`) is
+    /// not worth keeping a turn-less thread alive for, so it reads false and the reaper may
+    /// take the thread as it always did.
+    public var hasComposerDraft: Bool {
+        !(draftText ?? "").isEmpty || !draftAttachments.isEmpty
+    }
+
+    /// Draft files in a stable order (the relationship itself is unordered), matching how
+    /// `OutboxItem.orderedAttachments` orders its own.
+    public var orderedDraftAttachments: [DraftAttachment] {
+        draftAttachments.sorted { $0.createdAt < $1.createdAt }
+    }
+
     @Relationship(deleteRule: .cascade, inverse: \Turn.thread)
     public var turns: [Turn] = []
 
@@ -669,6 +741,39 @@ public final class OutboxAttachment {
     // The owning item; nil only transiently before insert. `OutboxItem.attachments`
     // is the cascade side.
     public var item: OutboxItem?
+
+    public init(filename: String, mime: String, data: Data, createdAt: Date = Date()) {
+        self.id = UUID()
+        self.filename = filename
+        self.mime = mime
+        self.data = data
+        self.createdAt = createdAt
+    }
+}
+
+/// One file staged in a composer and not yet sent — the durable half of the composer's
+/// attachment chips.
+///
+/// Modeled on `OutboxAttachment` and for the same reason: `.externalStorage` so a 10 MB
+/// photo does not bloat the thread's sqlite row, and cascade-deleted from its owner so no
+/// separate cleanup can be forgotten. It differs from `OutboxAttachment` in WHO owns it:
+/// an outbox attachment belongs to a message that is already on its way, this one belongs
+/// to a message that has not been sent, and the send is precisely the moment ownership
+/// moves from here to there (in one save — see `ComposerDraft.release`).
+///
+/// A new entity with every property defaulted and one new to-many relationship with an
+/// empty default → SwiftData lightweight-migrates existing stores with no migration code,
+/// exactly as `TurnAttachment` and the outbox entities did.
+@Model
+public final class DraftAttachment {
+    public var id: UUID = UUID()
+    public var filename: String = ""
+    public var mime: String = ""
+    @Attribute(.externalStorage) public var data: Data = Data()
+    public var createdAt: Date = Date()
+    // The owning conversation; nil only transiently before insert. `JesseThread
+    // .draftAttachments` is the cascade side.
+    public var thread: JesseThread?
 
     public init(filename: String, mime: String, data: Data, createdAt: Date = Date()) {
         self.id = UUID()

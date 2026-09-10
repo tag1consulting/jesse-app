@@ -171,14 +171,19 @@ struct MacRootView: View {
         }
     }
 
-    /// Delete never-used empty threads: no turns, never sent (no session), and not the one
-    /// currently running. Deliberately narrow, so it can never take a thread whose turn is in
-    /// flight or one that holds any history.
+    /// Delete never-used empty threads: no turns, never sent (no session), no unsent draft,
+    /// and not the one currently running. Deliberately narrow, so it can never take a thread
+    /// whose turn is in flight or one that holds any history.
+    ///
+    /// The draft clause is the phone's too: a turn-less conversation holding a typed message
+    /// is a message in progress, and reaping it here would destroy both the draft and the
+    /// conversation it belongs to. A deliberately emptied draft does not count.
     private func pruneEmptyThreads() {
         var pruned = 0
         for t in threads where t.turns.isEmpty
             && (t.sessionId ?? "").isEmpty
             && t.registeredAt == nil
+            && !t.hasComposerDraft
             && !(coordinator.isRunning && coordinator.activeThreadID == t.id) {
             if selection == t.id { selection = nil }
             if let cid = t.conversationId, !cid.isEmpty { MacCursorStore.clear(cid) }
