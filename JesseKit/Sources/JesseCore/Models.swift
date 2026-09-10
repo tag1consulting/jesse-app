@@ -95,6 +95,12 @@ public final class JesseThread {
     // default → SwiftData lightweight-migrates existing stores with no migration code
     // (matching `aiTitle`/`origin`/`lastDeliveredJobId`).
     public var selectedModelID: String?
+    // The EFFORT this conversation's turns run at, on `selectedModelID` — one of the values
+    // that model declares, or nil for its default. It belongs to the model it was chosen on:
+    // picking a different model clears it, and it is only ever sent alongside the thread's own
+    // model (see `ModelMenuAction`). New optional property with a nil default → SwiftData
+    // lightweight-migrates existing stores with no migration code, like `selectedModelID`.
+    public var selectedEffort: String?
     // Whether this thread is starred. New property with a default, so SwiftData
     // lightweight-migrates existing stores with no migration code.
     //

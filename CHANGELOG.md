@@ -14,6 +14,121 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [bridge 0.131.0] - 2026-09-10
+
+**Every model DECLARES its effort scale, a turn can ask for one of its values, and the value
+reaches the child on both CLI harnesses.** The picker's effort control (App 1.0 (126)) renders
+from this declaration and from nothing else, so the bridge is the one place that decides what
+an effort control offers and whether one exists at all.
+
+**The built-in scales are MEASURED, not copied from vendor tables.** Each was set from live
+turns on 2026-09-10 — the same hard reasoning prompt at each level, two samples per level, on
+the surface the model actually runs on — and a value is in a scale only when it moved the
+output measurably against its neighbours:
+
+| model | `low` | `high` (default) | `max` | declared |
+|-|-|-|-|-|
+| GLM 5.3 | 1,176 / 2,824 | 6,234 / 5,976 | 16,000 (cap) / 10,531 | `low`, `high`, `max` |
+| Qwen 3.8 Max | 4,197 / 6,286 | 8,365 / 8,953 | 9,580 / 11,803 | `low`, `high`, `max` |
+| Opus 5 | 976 / 1,164 | 682 / 1,774 | 4,974 / 4,095 | `high`, `max` |
+| Fable 5.1 | 973 / 3,470 | 3,949 / 2,087 | 5,635 / 5,547 | `high`, `max` |
+| Kimi K3 | 6,039 / 3,035 | — | 3,575 / 10,694 | none |
+
+(Output tokens.) Three findings worth reading on their own:
+
+- **Kimi K3 declares no scale, against its vendor's documentation.** Kimi documents `low` /
+  `high` / `max`; on Fireworks' Anthropic surface `low` against `max` overlapped completely on
+  two prompts. An effort control on it would be one that does nothing, so there is none.
+- **Opus 5 and Fable 5.1 declare `high` and `max`, not Anthropic's five levels.** On two prompts
+  `low` was indistinguishable from the default, and `max` produced two to four times the output.
+  Both are re-declarable from the launch environment (below) if a workload shows otherwise.
+- **GLM's `medium` measured with its `high`** (5,462 / 3,646), so it is left out.
+
+**What the claude CLI does with an unknown effort, measured on the wire:** `--effort` accepts
+exactly `low`, `medium`, `high`, `xhigh`, `max`, and IGNORES anything else — `--effort none`
+prints a warning and sends `high`. There is no way to turn thinking off through this flag. So
+the startup gate refuses a claude-code model that declares any other value, naming it: otherwise
+it would be a picker option that silently does nothing. With no flag the CLI sends `high`, which
+is why every claude-code built-in's default is `high`.
+
+**Fireworks honours `output_config.effort` and validates it** — an unknown value is a 400 listing
+`low`, `medium`, `high`, `xhigh`, `max`, `none` and `adaptive` — and the claude CLI puts the
+`--effort` value into `output_config.effort` on the main request for a Fireworks slug as it does
+for an Anthropic one (captured locally, nothing sent to a provider).
+
+### Added
+- `EffortScale` (`kind` scale | toggle, `values`, `default`) on `RegistryModel`, and in every
+  `GET /jesse/models` row as `effort` (null when none). Rows also gain `family` (the id when an
+  entry declares none), which the picker groups by, and `harness`, which it shows as information.
+- `[[models]] effort = { kind, values, default }`, and `JESSE_MODEL_<ID>_EFFORT=low,high,max` to
+  re-declare a built-in's scale from the launch environment (empty removes it; an override that
+  leaves out `high`, the value an effort-less turn runs at, is refused and the built-in stands).
+- `POST /jesse` `effort`: validated against the resolved model's declared scale before any work.
+  A model with no scale, or a value it does not declare, is a 400 naming what it does accept —
+  refused rather than ignored. The declared default is carried as nothing, so that turn's argv is
+  byte-identical to one that named no effort.
+- claude-code: the turn's effort as `--effort <v>`, appended after the containment argv and never
+  part of `capability_args`. codex: as `model_reasoning_effort`, overriding the model's static
+  `reasoning_effort` for that turn, emitted once.
+- Startup gate: a malformed `effort` declaration is refused naming the model; a value the model's
+  harness cannot deliver is refused naming the value and the harness's set; `direct` has no
+  per-turn effort path and refuses any scale.
+- Tests: `an_effort_declaration_is_refused_unless_it_is_well_formed`,
+  `built_in_effort_scales_are_the_measured_ones_and_env_overridable`,
+  `an_effort_the_harness_cannot_deliver_is_refused`,
+  `a_turn_effort_reaches_the_child_as_the_effort_flag_and_is_otherwise_absent`,
+  `a_turn_effort_overrides_the_models_static_reasoning_effort_once`, and the endpoint test
+  `a_turn_effort_is_validated_against_the_models_declared_scale`. The models-row shape test gains
+  the three keys.
+
+**Containment: nothing moves.** `--effort` is outside `capability_args`, so no recorded argv
+changes, and no record, acceptance, tool grant or MCP set is touched.
+
+## [App 1.0 (126)] - 2026-09-10
+
+**The model picker groups models by family and has an effort control — and switching between
+two models is still two taps.** Same one toolbar menu, per conversation, on the iPhone and the
+Mac, both drawn from one shared layout in JesseKit (`ModelMenuLayout`) so they cannot drift.
+
+- **Families are sections, not submenus.** A header costs no tap; a submenu would cost one. A
+  family with one model gets no header and is a plain row. Opus and Fable share the `Claude`
+  header; GLM, Kimi and Qwen are single rows.
+- **Harness is never a row.** The resolved model's row carries the checkmark and, as secondary
+  text, the harness and backend version it runs on (`claude-code · 5.3`).
+- **Effort is one inline control in a trailing section, for the resolved model only**, and only
+  when the bridge DECLARES a scale for it — a picker for a graded scale, a single switch for
+  thinking on/off, nothing at all otherwise (Kimi, a local model). Never inferred on this side.
+- **The button label stays the model name**, and gains the effort only when it is not the
+  model's default (`GLM 5.3 · low`).
+- **Unchanged and kept:** an unavailable model still renders, disabled, with its reason; the
+  resolved model carries the checkmark; before the list loads the button still shows the next
+  turn's model rather than going blank.
+
+**Tap count, before and after:** switching between two models of the same family was two taps
+(open the menu, pick the model) and is still two — sections add no navigation. Choosing an effort
+is two taps too (open, pick the value).
+
+**An effort belongs to the model it was chosen on.** Picking another model clears it; picking an
+effort pins that model to the conversation; a turn sends an effort only alongside the
+conversation's own model; and once the list loads, a stored effort the model no longer declares
+is dropped, so a provider change cannot leave a thread sending a value the bridge would refuse.
+`JesseThread.selectedEffort` is a new optional property (lightweight migration).
+
+**`effort` is a parameter of the one `send`, with no forwarding default,** on both the shared
+`BridgeClientProtocol` and the iOS `JesseClientProtocol` (and its `sendFulfilling` retry path) —
+the codebase's own rule that a forwarding default is how a call site quietly drops a field. Every
+test fake takes the new parameter.
+
+### Tests (JesseKit, `ModelMenuTests`)
+`testAFamilyOfOneRendersNoSectionHeader`, `testAModelWithNoDeclaredEffortScaleRendersNoEffortSection`,
+`testAScaleRendersOnePickerWithTheEffortInForceSelected`, `testAnOnOffScaleRendersAToggleAndNotAPicker`,
+`testAnUnhealthyModelStillRendersDisabledWithItsReason`,
+`testTheResolvedModelCarriesTheCheckmarkAndTheHarnessDetail`,
+`testTheMenuRendersTruthfullyBeforeTheModelListLoads`,
+`testPickingAnotherModelClearsTheEffortAndPickingAnEffortPinsItsModel`,
+`testAnEffortIsSentOnlyWithTheThreadsOwnModelAndOnlyWhileDeclared`,
+`testThePerTurnEffortFieldEncodesWhenSetAndOmitsWhenBlank`, `testTheEffortScaleDecodesFromTheBridgeRow`.
+
 ## [bridge 0.130.0] - 2026-09-10
 
 **Every model is READ-WRITE by default, and read-only is an optional per-model flag.** This

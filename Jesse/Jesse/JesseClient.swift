@@ -152,7 +152,7 @@ protocol JesseClientProtocol: FlagSyncing, Sendable {
     func send(mode: JesseMode, text: String, sessionId: String?, conversationId: String,
               voice: Bool, instructions: String?, floorOverride: String?,
               attachments: [JesseAttachment], requestId: UUID,
-              model: String?) async throws -> JesseSendResult
+              model: String?, effort: String?) async throws -> JesseSendResult
     /// List conversations (`GET /jesse/conversations`, ETag-conditioned) so the app can
     /// adopt, update and delete-local against the bridge's own thread records. Defaulted to
     /// `.notModified` so a fake need not model the list.
@@ -171,7 +171,7 @@ protocol JesseClientProtocol: FlagSyncing, Sendable {
     func sendFulfilling(_ request: DeviceContextRequest, mode: JesseMode, text: String,
                         sessionId: String?, conversationId: String, voice: Bool,
                         instructions: String?, floorOverride: String?,
-                        model: String?) async throws -> JesseSendResult
+                        model: String?, effort: String?) async throws -> JesseSendResult
     func result(jobId: String) async throws -> JesseResultState
     /// Fetch ONE returned file's bytes (`GET /jesse/artifact/{id}`). The reply carries
     /// only metadata, so this is the one call content moves on. Throws an
@@ -212,11 +212,11 @@ extension JesseClientProtocol {
     func sendFulfilling(_ request: DeviceContextRequest, mode: JesseMode, text: String,
                         sessionId: String?, conversationId: String, voice: Bool,
                         instructions: String?, floorOverride: String?,
-                        model: String?) async throws -> JesseSendResult {
+                        model: String?, effort: String?) async throws -> JesseSendResult {
         try await send(mode: mode, text: text, sessionId: sessionId,
                        conversationId: conversationId, voice: voice,
                        instructions: instructions, floorOverride: floorOverride,
-                       attachments: [], requestId: UUID(), model: model)
+                       attachments: [], requestId: UUID(), model: model, effort: effort)
     }
     // Default "no version" so existing conformers (the test fakes) need not implement
     // the health probe.
@@ -349,7 +349,7 @@ struct JesseClient: JesseClientProtocol {
               floorOverride: String?,
               attachments: [JesseAttachment],
               requestId: UUID,
-              model: String?) async throws -> JesseSendResult {
+              model: String?, effort: String?) async throws -> JesseSendResult {
         // Classify-then-attach, in the request-building path so EVERY turn — typed, Siri,
         // and the watch relay — inherits it. The block is attached ONLY when the master
         // toggle is on AND the message classifies as health-related. Best-effort
@@ -381,7 +381,7 @@ struct JesseClient: JesseClientProtocol {
                                        locationContext: await locationBlock,
                                        mealCorrectionsAck: mealCorrectionsAck(),
                                        requestId: requestId,
-                                       model: model)
+                                       model: model, effort: effort)
         return try await bridge.sendPrepared(request)
     }
 
@@ -449,7 +449,7 @@ struct JesseClient: JesseClientProtocol {
     func sendFulfilling(_ requested: DeviceContextRequest, mode: JesseMode, text: String,
                         sessionId: String?, conversationId: String, voice: Bool,
                         instructions: String?, floorOverride: String?,
-                        model: String?) async throws -> JesseSendResult {
+                        model: String?, effort: String?) async throws -> JesseSendResult {
         // A retry answering a directive: bypass the classifier, fulfil the request from
         // the channel's provider (honoring that channel's consents), and re-send the
         // SAME text on the SAME thread with the data + the flags. When it can't be
@@ -486,7 +486,7 @@ struct JesseClient: JesseClientProtocol {
             locationContextUnavailableReason: channel == .location
                 ? outgoing.unavailableReason : nil,
             mealCorrectionsAck: mealCorrectionsAck(),
-            model: model)
+            model: model, effort: effort)
         return try await bridge.sendPrepared(request)
     }
 
@@ -587,7 +587,8 @@ struct JesseClient: JesseClientProtocol {
                             locationContextUnavailableReason: String? = nil,
                             mealCorrectionsAck: Int? = nil,
                             requestId: UUID? = nil,
-                            model: String? = nil) -> JesseRequest {
+                            model: String? = nil,
+                            effort: String? = nil) -> JesseRequest {
         JesseBridgeClient.makeRequest(
             mode: mode, text: text, sessionId: sessionId,
             conversationId: conversationId, voice: voice,
@@ -608,7 +609,7 @@ struct JesseClient: JesseClientProtocol {
             // Encode the outbox idempotency key as its string form; nil drops the field.
             requestId: requestId?.uuidString,
             // The per-turn model selection; nil/blank drops the field (bridge uses default).
-            model: model)
+            model: model, effort: effort)
     }
 
     // MARK: - Pure encode/decode forwards (the wire-contract test surface)

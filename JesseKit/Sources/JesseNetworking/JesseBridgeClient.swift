@@ -25,11 +25,14 @@ public protocol BridgeClientProtocol: FlagSyncing, Sendable {
     /// thread identity) are BOTH required rather than defaulted: a caller that omitted the
     /// request id disabled the bridge's own dedup for exactly the traffic that needs it, and
     /// a caller that omitted the conversation id made the bridge mint one the client would
-    /// then not recognize. There is deliberately no overload that lets either be dropped.
+    /// then not recognize. There is deliberately no overload that lets either be dropped —
+    /// and for the same reason `effort` (the per-turn effort, nil for the model's default) is a
+    /// parameter of this one send rather than a second, defaulted requirement: a forwarding
+    /// default is how a call site quietly drops a field.
     func send(mode: JesseMode, text: String, sessionId: String?, conversationId: String,
               voice: Bool, instructions: String?, floorOverride: String?,
               attachments: [JesseRequest.Attachment], requestId: String,
-              model: String?) async throws -> JesseSendResult
+              model: String?, effort: String?) async throws -> JesseSendResult
     func result(jobId: String) async throws -> JesseResultState
     /// Fetch ONE returned file's bytes. The reply carries only metadata, so this is the
     /// one call content moves on. A `404` is an `ArtifactFetchError.expired` or
@@ -51,6 +54,7 @@ public protocol BridgeClientProtocol: FlagSyncing, Sendable {
 }
 
 public extension BridgeClientProtocol {
+
     /// Default "never stored here": a conformer that does not model the artifact channel
     /// behaves exactly like a bridge that has no such id, so an existing fake keeps
     /// compiling and renders the same empty state a bridge without the channel would.
@@ -243,12 +247,13 @@ public struct JesseBridgeClient: BridgeClientProtocol {
     public func send(mode: JesseMode, text: String, sessionId: String?, conversationId: String,
                      voice: Bool, instructions: String?, floorOverride: String?,
                      attachments: [JesseRequest.Attachment],
-                     requestId: String, model: String?) async throws -> JesseSendResult {
+                     requestId: String, model: String?,
+                     effort: String?) async throws -> JesseSendResult {
         let request = Self.makeRequest(mode: mode, text: text, sessionId: sessionId,
                                        conversationId: conversationId,
                                        voice: voice, instructions: instructions,
                                        floorOverride: floorOverride, attachments: attachments,
-                                       requestId: requestId, model: model)
+                                       requestId: requestId, model: model, effort: effort)
         return try await sendPrepared(request)
     }
 
@@ -740,7 +745,8 @@ public struct JesseBridgeClient: BridgeClientProtocol {
                                    locationContextUnavailableReason: String? = nil,
                                    mealCorrectionsAck: Int? = nil,
                                    requestId: String? = nil,
-                                   model: String? = nil) -> JesseRequest {
+                                   model: String? = nil,
+                                   effort: String? = nil) -> JesseRequest {
         func nonBlank(_ s: String?) -> String? {
             guard let s, !s.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
             return s
@@ -780,7 +786,10 @@ public struct JesseBridgeClient: BridgeClientProtocol {
             requestId: requestId,
             // The per-turn model selection; blank collapses to nil so the field drops out
             // (the bridge then uses its stored default, today's behavior).
-            model: nonBlank(model))
+            model: nonBlank(model),
+            // The per-turn effort, only ever one the model declares; blank collapses to nil and
+            // the model's default runs.
+            effort: nonBlank(effort))
     }
 
     /// Encode a wire body. Optional fields omit when nil. `sortedKeys` makes the byte

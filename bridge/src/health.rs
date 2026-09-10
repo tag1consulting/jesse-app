@@ -840,6 +840,8 @@ mod tests {
         // A configured non-ambient model is selectable from startup (seeded healthy) and is
         // demoted only by an observed failure.
         let glm = RegistryModel {
+            family: None,
+            effort: None,
             login_model: None,
             version: None,
             aliases: Vec::new(),
@@ -890,6 +892,8 @@ mod tests {
         // unconfigured path itself, so it must not go green merely because some shipped
         // model happens to be unarmed today.
         let unarmed = RegistryModel {
+            family: None,
+            effort: None,
             login_model: None,
             version: None,
             aliases: Vec::new(),

@@ -196,7 +196,7 @@ final class MacOfflineRecoveryTests: XCTestCase {
         nonisolated func send(mode: JesseMode, text: String, sessionId: String?,
                               conversationId: String, voice: Bool, instructions: String?,
                               floorOverride: String?, attachments: [JesseRequest.Attachment],
-                              requestId: String, model: String?) async throws -> JesseSendResult {
+                              requestId: String, model: String?, effort: String?) async throws -> JesseSendResult {
             throw JesseError.notConfigured
         }
         nonisolated func result(jobId: String) async throws -> JesseResultState { .cancelled }

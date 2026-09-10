@@ -82,6 +82,152 @@ public enum ModelSelectionResolver {
     }
 }
 
+// MARK: - The picker's layout: one menu, families as sections, effort inline
+
+/// The one effort control the picker shows, for the RESOLVED model only — derived from that
+/// model's own declaration and nothing else.
+public enum ModelEffortControl: Equatable, Sendable {
+    /// A graded scale: one inline picker over `values`, with `selected` checked.
+    case picker(values: [String], selected: String)
+    /// Thinking on/off: a single switch. `isOn` is whether the ON value is the one in force.
+    case toggle(off: String, on: String, isOn: Bool)
+}
+
+/// One row of the picker.
+public struct ModelMenuRow: Equatable, Sendable, Identifiable {
+    public let id: String
+    /// The label, plus the disabled reason (`— unreachable`) when the model cannot be picked.
+    public let title: String
+    public let isEnabled: Bool
+    /// The resolved model: the one the next turn runs on. It carries the checkmark.
+    public let isSelected: Bool
+    /// Harness and version, on the SELECTED row only — information, never a control.
+    public let subtitle: String?
+}
+
+/// One family's rows. `header` is nil for a family of one: a level with a single child is not
+/// a level, so a lone model renders as a plain row beside the others.
+public struct ModelMenuSection: Equatable, Sendable, Identifiable {
+    public let id: String
+    public let header: String?
+    public let rows: [ModelMenuRow]
+}
+
+/// EVERYTHING BOTH PICKERS RENDER, computed here so the iPhone and the Mac cannot drift.
+///
+/// One menu, and the whole of it fits in one menu: families are SECTIONS (a header costs no
+/// tap), harness is secondary text on the selected row (never a row), and effort is one inline
+/// control in a trailing section — present only when the resolved model declares a scale.
+/// Switching between two models is therefore two taps, open and pick, exactly as before.
+///
+/// `state == nil` is the list not having loaded (a slow bridge, a failed fetch, an older bridge
+/// with no `/jesse/models`): no sections and no effort, and a button label that is still the
+/// truth about the next turn — the resolved id — rather than blank.
+public struct ModelMenuLayout: Equatable, Sendable {
+    public let sections: [ModelMenuSection]
+    public let effort: ModelEffortControl?
+    public let buttonLabel: String
+
+    public init(state: ModelSwitchState?, threadModelID: String?, deviceDefaultID: String?,
+                threadEffort: String?) {
+        let resolved = state?.resolvedModel(threadModelID: threadModelID,
+                                            deviceDefaultID: deviceDefaultID)
+        var order: [String] = []
+        var byFamily: [String: [ModelInfo]] = [:]
+        for model in state?.offered ?? [] {
+            if byFamily[model.family] == nil { order.append(model.family) }
+            byFamily[model.family, default: []].append(model)
+        }
+        sections = order.map { family in
+            let models = byFamily[family] ?? []
+            return ModelMenuSection(
+                id: family,
+                header: models.count > 1 ? family : nil,
+                rows: models.map { model in
+                    let selected = model.id == resolved?.id
+                    return ModelMenuRow(id: model.id,
+                                        title: selected ? model.label : model.menuRowLabel,
+                                        isEnabled: model.available,
+                                        isSelected: selected,
+                                        subtitle: selected ? model.detailLine : nil)
+                })
+        }
+        effort = resolved.flatMap { $0.effortControl(threadEffort: threadEffort) }
+        let base = ModelSelectionResolver.resolvedLabel(state: state,
+                                                        threadModelID: threadModelID,
+                                                        deviceDefaultID: deviceDefaultID)
+        if let resolved, let chosen = resolved.sendableEffort(threadEffort) {
+            buttonLabel = "\(base) · \(chosen)"
+        } else {
+            buttonLabel = base
+        }
+    }
+}
+
+public extension ModelInfo {
+    /// Harness and version, for the selected row's subtitle: `claude-code · 5.3`. nil when the
+    /// bridge reported neither.
+    var detailLine: String? {
+        let parts = [harness, version].compactMap { $0 }.filter { !$0.isEmpty }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
+    }
+
+    /// The effort a turn on THIS model should send for a stored choice: the choice when this
+    /// model declares it and it is not the default, else nil — send nothing, the default runs.
+    /// A choice this model does not declare (made on another model, or before the provider
+    /// changed) is never sent, because the bridge would refuse it.
+    func sendableEffort(_ stored: String?) -> String? {
+        guard let scale = effort, let stored, scale.values.contains(stored),
+              stored != scale.defaultValue else { return nil }
+        return stored
+    }
+
+    /// The effort control for this model, or nil when it declares no scale.
+    func effortControl(threadEffort: String?) -> ModelEffortControl? {
+        guard let scale = effort, !scale.values.isEmpty else { return nil }
+        let inForce = sendableEffort(threadEffort) ?? scale.defaultValue
+        if scale.isToggle {
+            return .toggle(off: scale.values[0], on: scale.values[1],
+                           isOn: inForce == scale.values[1])
+        }
+        return .picker(values: scale.values, selected: inForce)
+    }
+}
+
+/// What a pick does to a thread's stored selection, stated once for both apps.
+public enum ModelMenuAction {
+    /// Picking a MODEL: it becomes the thread's model, and a stored effort survives only when
+    /// the model did not change — an effort belongs to the model it was chosen on.
+    public static func pick(_ model: ModelInfo, currentModelID: String?,
+                            currentEffort: String?) -> (modelID: String, effort: String?) {
+        (model.id, model.id == currentModelID ? currentEffort : nil)
+    }
+
+    /// Picking an EFFORT on the resolved model: it pins that model to the thread (an effort is
+    /// only ever sent with the model it was chosen for), and the default is stored as nil so a
+    /// default turn stays byte-identical.
+    public static func pickEffort(_ value: String,
+                                  on model: ModelInfo) -> (modelID: String, effort: String?) {
+        (model.id, model.sendableEffort(value))
+    }
+
+    /// The effort a turn SENDS: only with the thread's OWN model. A thread riding the device
+    /// default has no model of its own, and so no effort to send.
+    public static func effortToSend(threadModelID: String?, threadEffort: String?) -> String? {
+        guard threadModelID != nil else { return nil }
+        return threadEffort
+    }
+
+    /// A stored effort to KEEP once the list has loaded: nil when the resolved model no longer
+    /// declares it, so a provider change cannot leave a thread sending a value the bridge would
+    /// refuse.
+    public static func sanitizedEffort(state: ModelSwitchState, threadModelID: String?,
+                                       deviceDefaultID: String?, threadEffort: String?) -> String? {
+        state.resolvedModel(threadModelID: threadModelID, deviceDefaultID: deviceDefaultID)?
+            .sendableEffort(threadEffort)
+    }
+}
+
 private extension String {
     /// The trimmed value, or `nil` when blank — so a stored empty/whitespace id reads as "unset".
     var trimmedNonEmpty: String? {

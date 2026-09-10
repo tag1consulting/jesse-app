@@ -349,6 +349,10 @@ final class MacCoordinator {
         // device's default (`LastUsedModelStore`). Local to this Mac and this thread — it never
         // mutates the bridge's global default, so the phone is unaffected. nil → bridge default.
         let model = thread.selectedModelID ?? LastUsedModelStore.id
+        // The thread's EFFORT, sent only alongside its own model (`ModelMenuAction`), so a thread
+        // riding this Mac's default model never carries an effort chosen on another one.
+        let effort = ModelMenuAction.effortToSend(threadModelID: thread.selectedModelID,
+                                                  threadEffort: thread.selectedEffort)
         // The thread identity, sent on every turn. The Mac has no outbox to reuse a request id
         // from, so it keeps generating one per attempt; identity is carried by the conversation.
         let conversationId = thread.conversationId ?? JesseThread.mintConversationId()
@@ -358,7 +362,8 @@ final class MacCoordinator {
                 mode: mode, text: trimmed, sessionId: thread.sessionId,
                 conversationId: conversationId,
                 voice: false, instructions: nil, floorOverride: nil,
-                attachments: [], requestId: UUID().uuidString, model: model)
+                attachments: [], requestId: UUID().uuidString, model: model,
+                effort: effort)
             // Adopt the AUTHORITATIVE id the bridge registered and stamp the first ACK, which
             // is what the detail view's delivery caption reads.
             adoptRegistration(thread: thread, conversationId: result.conversationId)

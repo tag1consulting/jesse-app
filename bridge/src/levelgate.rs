@@ -298,6 +298,14 @@ pub fn validate_model_config_with_env(
                 ));
             }
         }
+        // A malformed `effort` scale: refused here, where the declaration still exists, because
+        // the registry build dropped it with only a warning.
+        if let Some(e) = &m.effort {
+            if let Err(why) = parse_effort_toml(e) {
+                let id = m.id.as_deref().unwrap_or("<unnamed>");
+                errors.push(ConfigError::for_model(id, why));
+            }
+        }
     }
 
     // 4. The records themselves, FIRST among the checks that depend on them: absent or
@@ -356,6 +364,37 @@ pub fn validate_model_config_with_env(
             ));
             continue; // the level checks below would be meaningless against no harness
         };
+
+        // 2a. An effort scale the harness cannot DELIVER. A value outside what the harness acts on
+        //     is not an error the child reports — the claude CLI ignores an unknown `--effort`
+        //     with a warning and sends its default — so it would be a picker option that does
+        //     nothing. Refused here, naming the value and what the harness takes.
+        if let Some(scale) = &m.effort {
+            match harness_effort_values(&m.harness) {
+                None => errors.push(ConfigError::for_model(
+                    &m.id,
+                    format!(
+                        "declares an effort scale, but harness '{}' has no per-turn effort path; \
+                         delete `effort`.",
+                        m.harness
+                    ),
+                )),
+                Some(allowed) => {
+                    if let Some(bad) = scale.values.iter().find(|v| !allowed.contains(&v.as_str()))
+                    {
+                        errors.push(ConfigError::for_model(
+                            &m.id,
+                            format!(
+                                "effort value '{bad}' is not one harness '{}' can deliver ({}); \
+                                 it would be ignored and the default sent.",
+                                m.harness,
+                                allowed.join(", ")
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
 
         // 2b. A model whose WIRE the harness does not drive. The `wire` key names the API
         //     surface a turn is spoken on — `responses` means the base_url answers
@@ -795,6 +834,8 @@ mod tests {
         let mut cfg = test_config();
         let mut models = cfg.model_registry.models.clone();
         models.push(RegistryModel {
+            family: None,
+            effort: None,
             login_model: None,
             version: None,
             aliases: Vec::new(),
@@ -1197,6 +1238,78 @@ mod tests {
             highest_passing_level(&r, &Codex),
             Some(Capability::Write),
             "a failing row for a level the harness does not HAVE must not break the prefix"
+        );
+    }
+
+    /// AN EFFORT VALUE THE HARNESS CANNOT DELIVER IS REFUSED AT STARTUP. It is not an error
+    /// anything downstream would report: the claude CLI IGNORES an unknown `--effort` with a
+    /// warning and sends its default, so the value would be a picker option that silently does
+    /// nothing. The values the harness does act on start cleanly, and a MALFORMED declaration
+    /// is refused where it is still visible, naming the model.
+    #[test]
+    fn an_effort_the_harness_cannot_deliver_is_refused() {
+        let with_effort = |mut cfg: Config, id: &str, values: &[&str], default: &str| {
+            let m = cfg
+                .model_registry
+                .models
+                .iter_mut()
+                .find(|m| m.id == id)
+                .expect("the model");
+            m.effort = Some(EffortScale::scale(values, default));
+            cfg
+        };
+        // claude-code: `none` is not a value its CLI's `--effort` acts on.
+        let cfg = with_effort(
+            cfg_with_model("fw", CLAUDE_CODE_ID, Capability::Read),
+            "fw",
+            &["none", "high"],
+            "high",
+        );
+        let e = validate(&cfg, &[], &claude_only(claude_record()))
+            .into_iter()
+            .find(|e| e.model.as_deref() == Some("fw"))
+            .expect("a value the CLI ignores must be refused");
+        assert!(e.message.contains("'none'"), "{e}");
+        assert!(
+            e.message.contains("low, medium, high, xhigh, max"),
+            "the error lists what the harness does take: {e}"
+        );
+        // ...and values it does act on start cleanly.
+        let cfg = with_effort(
+            cfg_with_model("fw", CLAUDE_CODE_ID, Capability::Read),
+            "fw",
+            &["low", "high", "max"],
+            "high",
+        );
+        assert!(validate(&cfg, &[], &claude_only(claude_record())).is_empty());
+        // codex: its reasoning-effort set, which has `xhigh`.
+        let cfg = with_effort(
+            cfg_with_codex_model("cx", Capability::Read),
+            "cx",
+            &["low", "xhigh"],
+            "low",
+        );
+        assert!(validate(&cfg, &[], CONTAINMENT_RECORDS)
+            .iter()
+            .all(|e| e.model.as_deref() != Some("cx")));
+        // direct has no per-turn effort path at all.
+        assert_eq!(harness_effort_values(DIRECT_ID), None);
+        // A malformed declaration is refused, naming the model and what was wrong.
+        let decl = vec![ModelToml {
+            id: Some("fw".into()),
+            effort: Some(EffortToml {
+                kind: Some("toggle".into()),
+                values: Some(vec!["low".into()]),
+                default: Some("low".into()),
+            }),
+            ..ModelToml::default()
+        }];
+        let errors = validate(&test_config(), &decl, &claude_only(claude_record()));
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.model.as_deref() == Some("fw") && e.message.contains("exactly two")),
+            "{errors:?}"
         );
     }
 

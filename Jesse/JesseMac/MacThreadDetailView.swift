@@ -251,18 +251,20 @@ private struct MacModelPickerMenu: View {
     var body: some View {
         Group {
             if let modelState = store.state {
+                // The same one menu the iPhone renders, from the same `ModelMenuLayout`.
                 Menu {
-                    ForEach(modelState.offered) { model in
-                        Button {
-                            select(model)
-                        } label: {
-                            if model.id == selectedID {
-                                Label(model.label, systemImage: "checkmark")
-                            } else {
-                                Text(model.menuRowLabel)
-                            }
+                    ForEach(layout.sections) { section in
+                        if let header = section.header {
+                            Section(header) { rows(section, in: modelState) }
+                        } else {
+                            rows(section, in: modelState)
                         }
-                        .disabled(!model.available)
+                    }
+                    if let control = layout.effort,
+                       let resolved = modelState.resolvedModel(
+                        threadModelID: thread.selectedModelID,
+                        deviceDefaultID: LastUsedModelStore.id) {
+                        Section("Effort") { effortControl(control, on: resolved) }
                     }
                 } label: {
                     buttonLabel
@@ -282,18 +284,48 @@ private struct MacModelPickerMenu: View {
         .task { await loadWithRetry() }
     }
 
-    private var buttonLabel: some View { Label(currentLabel, systemImage: "cpu") }
+    private var buttonLabel: some View { Label(layout.buttonLabel, systemImage: "cpu") }
 
-    /// The resolved model's id (for the checkmark), meaningful only once the list has loaded.
-    private var selectedID: String? {
-        store.state?.resolvedModel(threadModelID: thread.selectedModelID,
-                                   deviceDefaultID: LastUsedModelStore.id)?.id
+    /// Everything the menu renders — shared with the iPhone's picker.
+    private var layout: ModelMenuLayout {
+        ModelMenuLayout(state: store.state, threadModelID: thread.selectedModelID,
+                        deviceDefaultID: LastUsedModelStore.id, threadEffort: thread.selectedEffort)
     }
-    /// The button label, resolvable even before the list loads (falls back to the resolved id).
-    private var currentLabel: String {
-        ModelSelectionResolver.resolvedLabel(state: store.state,
-                                             threadModelID: thread.selectedModelID,
-                                             deviceDefaultID: LastUsedModelStore.id)
+
+    /// One family's rows: the checkmark and the harness/version detail on the resolved model, a
+    /// disabled row with its reason for one that cannot be picked right now.
+    @ViewBuilder
+    private func rows(_ section: ModelMenuSection, in state: ModelSwitchState) -> some View {
+        ForEach(section.rows) { row in
+            Button {
+                if let model = state.offered.first(where: { $0.id == row.id }) { select(model) }
+            } label: {
+                if row.isSelected, let subtitle = row.subtitle {
+                    Label("\(row.title) — \(subtitle)", systemImage: "checkmark")
+                } else if row.isSelected {
+                    Label(row.title, systemImage: "checkmark")
+                } else {
+                    Text(row.title)
+                }
+            }
+            .disabled(!row.isEnabled)
+        }
+    }
+
+    /// The resolved model's declared effort control: an inline picker, or a single switch.
+    @ViewBuilder
+    private func effortControl(_ control: ModelEffortControl, on model: ModelInfo) -> some View {
+        switch control {
+        case .picker(let values, let selected):
+            Picker("Effort", selection: Binding(get: { selected },
+                                                set: { selectEffort($0, on: model) })) {
+                ForEach(values, id: \.self) { Text($0).tag($0) }
+            }
+            .pickerStyle(.inline)
+        case .toggle(let off, let on, let isOn):
+            Toggle("Thinking", isOn: Binding(get: { isOn },
+                                             set: { selectEffort($0 ? on : off, on: model) }))
+        }
     }
 
     /// Populate the shared list with ONE bounded, backed-off burst (`loadModelList`, the same
@@ -309,14 +341,37 @@ private struct MacModelPickerMenu: View {
                 return store.state
             },
             sleep: { try? await Task.sleep(for: .seconds($0)) })
+        // Drop a stored effort the resolved model no longer declares, exactly as the iPhone does.
+        if let state = store.state {
+            let kept = ModelMenuAction.sanitizedEffort(
+                state: state, threadModelID: thread.selectedModelID,
+                deviceDefaultID: LastUsedModelStore.id, threadEffort: thread.selectedEffort)
+            if kept != thread.selectedEffort {
+                thread.selectedEffort = kept
+                try? context.save()
+            }
+        }
     }
 
     /// Pick a model for THIS conversation: store it on the thread and make it this Mac's
-    /// default for the next new conversation. No bridge write — the phone is unaffected.
+    /// default for the next new conversation. No bridge write — the phone is unaffected. A
+    /// different model clears the thread's effort.
     private func select(_ model: ModelInfo) {
         guard model.available, model.id != thread.selectedModelID else { return }
-        thread.selectedModelID = model.id
+        let next = ModelMenuAction.pick(model, currentModelID: thread.selectedModelID,
+                                        currentEffort: thread.selectedEffort)
+        thread.selectedModelID = next.modelID
+        thread.selectedEffort = next.effort
         LastUsedModelStore.id = model.id
+        try? context.save()
+    }
+
+    /// Pick an effort for the resolved model; it pins that model to the thread.
+    private func selectEffort(_ value: String, on model: ModelInfo) {
+        let next = ModelMenuAction.pickEffort(value, on: model)
+        thread.selectedModelID = next.modelID
+        thread.selectedEffort = next.effort
+        LastUsedModelStore.id = next.modelID
         try? context.save()
     }
 }

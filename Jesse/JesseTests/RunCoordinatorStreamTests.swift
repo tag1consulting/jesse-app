@@ -30,7 +30,7 @@ final class RunCoordinatorStreamTests: XCTestCase {
                   conversationId: String, voice: Bool,
                   instructions: String?, floorOverride: String?,
                   attachments: [JesseAttachment], requestId: UUID,
-                  model: String?) async throws -> JesseSendResult {
+                  model: String?, effort: String?) async throws -> JesseSendResult {
             // Always outrun the grace window so the coordinator streams.
             .running(jobId: "job-stream", conversationId: nil)
         }

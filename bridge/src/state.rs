@@ -323,6 +323,52 @@ impl AppState {
         }
     }
 
+    /// Apply a PER-TURN effort (the request's optional `effort` field) to the model that will
+    /// run the turn, validated against the scale that model DECLARES.
+    ///
+    /// REFUSED RATHER THAN IGNORED — a `400` naming the model and what it does accept. An
+    /// ignored effort could only ever be a control that silently does nothing, which is exactly
+    /// what the declaration exists to prevent; a stale client that sends one learns so at once.
+    /// Absent or blank is the model's default and changes nothing. Asking for the declared
+    /// DEFAULT is accepted and carried as `None`, so that turn's argv is byte-identical to one
+    /// that named no effort at all.
+    pub fn apply_turn_effort(
+        &self,
+        mut active: ActiveModel,
+        effort: Option<&str>,
+    ) -> Result<ActiveModel, ApiError> {
+        let Some(raw) = effort.map(str::trim).filter(|s| !s.is_empty()) else {
+            return Ok(active);
+        };
+        let value = raw.to_ascii_lowercase();
+        let scale = self
+            .cfg
+            .model_registry
+            .get(&active.id)
+            .and_then(|m| m.effort.as_ref());
+        match scale {
+            None => Err((
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "model '{}' declares no effort scale, so effort '{raw}' would do nothing",
+                    active.id
+                ),
+            )),
+            Some(s) if !s.accepts(&value) => Err((
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "model '{}' has no effort '{raw}' (it declares {})",
+                    active.id,
+                    s.values.join(", ")
+                ),
+            )),
+            Some(s) => {
+                active.effort = (value != s.default).then_some(value);
+                Ok(active)
+            }
+        }
+    }
+
     /// Build the `ActiveModel` for a resolved registry entry: its `ANTHROPIC_*` env, subagent
     /// model, price deck, harness and LEVEL. Shared by the stored-default resolution and the
     /// per-turn selection so both produce a byte-identical `ActiveModel` for a given model.
@@ -362,6 +408,8 @@ mod tests {
         let registry = ModelRegistry {
             models: vec![
                 RegistryModel {
+                    family: None,
+                    effort: None,
                     login_model: None,
                     version: None,
                     aliases: Vec::new(),
@@ -384,6 +432,8 @@ mod tests {
                     vision_complementary: false,
                 },
                 RegistryModel {
+                    family: None,
+                    effort: None,
                     login_model: None,
                     version: None,
                     aliases: Vec::new(),

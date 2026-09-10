@@ -273,6 +273,8 @@ mod tests {
     /// A configured, healthy registry entry at `level`.
     fn model(id: &str, level: Capability) -> RegistryModel {
         RegistryModel {
+            family: None,
+            effort: None,
             login_model: None,
             version: None,
             aliases: Vec::new(),

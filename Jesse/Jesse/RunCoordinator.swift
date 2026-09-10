@@ -240,6 +240,8 @@ final class RunCoordinator {
         // The PER-TURN model the original turn ran on, so the fulfillment retry answers on
         // the SAME model. nil → the bridge's stored default.
         var model: String? = nil
+        // ...and the PER-TURN effort it ran at, so the retry answers at the same effort.
+        var effort: String? = nil
     }
 
     /// The PER-TURN model a thread should send on: its own stored selection, else this
@@ -247,6 +249,14 @@ final class RunCoordinator {
     /// default (opus). Resolved fresh at send time so a Retry/resume picks up any change.
     private func modelID(for thread: JesseThread) -> String? {
         thread.selectedModelID ?? LastUsedModelStore.id
+    }
+
+    /// The PER-TURN effort a thread should send: its stored choice, and only alongside its OWN
+    /// model — a thread riding the device default has no model of its own, so no effort
+    /// (`ModelMenuAction.effortToSend`). nil → the model's default runs.
+    private func effortValue(for thread: JesseThread) -> String? {
+        ModelMenuAction.effortToSend(threadModelID: thread.selectedModelID,
+                                     threadEffort: thread.selectedEffort)
     }
 
     // AI-title generation bookkeeping (see `ensureTitle`). Not observed by views —
@@ -710,6 +720,7 @@ final class RunCoordinator {
         // Resolve the PER-TURN model on the main actor before detaching — the thread's own
         // selection, else this device's default. Sent on this turn only; never the global.
         let model = modelID(for: thread)
+        let effort = effortValue(for: thread)
         // Reconstitute the outgoing attachments from the persisted ORIGINAL bytes.
         let attachments = item.orderedAttachments.map {
             JesseAttachment(filename: $0.filename, mime: $0.mime, data: $0.data)
@@ -734,7 +745,8 @@ final class RunCoordinator {
                                                    floorOverride: floorOverride,
                                                    attachments: attachments,
                                                    requestId: requestId,
-                                                   model: model)
+                                                   model: model,
+                                                   effort: effort)
                 switch result {
                 case .reply(let reply, _, let remoteConversationId):
                     // ACK (legacy inline 200 — effectively dead against the fixed
@@ -770,7 +782,8 @@ final class RunCoordinator {
                                        retry: TurnRetry(mode: mode, text: text,
                                                           instructions: instructions,
                                                           floorOverride: floorOverride,
-                                                          model: model))
+                                                          model: model,
+                                                          effort: effort))
                 }
             } catch is CancellationError {
                 // Pre-ACK cancel: today this silently cleared, losing the message.
@@ -1858,7 +1871,7 @@ final class RunCoordinator {
                 needs, mode: retry.mode, text: retry.text, sessionId: sessionId,
                 conversationId: conversationId, voice: voice,
                 instructions: retry.instructions, floorOverride: retry.floorOverride,
-                model: retry.model)
+                model: retry.model, effort: retry.effort)
             switch result {
             case .reply(let reply, _, _):
                 finish(threadID: threadID, thread: thread, reply: Self.appCapped(reply),
@@ -2457,6 +2470,7 @@ extension RunCoordinator {
         // A relayed watch turn runs on the destination thread's model (its own selection,
         // else this device's default) exactly like a typed turn.
         let model = modelID(for: thread)
+        let effort = effortValue(for: thread)
 
         let outcome: TurnOutcome
         do {
@@ -2464,7 +2478,8 @@ extension RunCoordinator {
                                                conversationId: conversationId,
                                                voice: voice, instructions: instructions,
                                                floorOverride: floorOverride, attachments: [],
-                                               requestId: requestId, model: model)
+                                               requestId: requestId, model: model,
+                                               effort: effort)
             switch result {
             case .reply(let reply, _, let remoteConversationId):
                 // An older bridge that answered inline. Deliver it directly.
