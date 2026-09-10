@@ -1,5 +1,6 @@
 import SwiftUI
 import SwiftData
+import JesseAsk
 import JesseCore
 import JesseOps
 import JesseSpeech
@@ -335,6 +336,20 @@ struct SettingsView: View {
     // gear-button open leaves it false.
     var autoPresentScanner = false
     @Environment(\.dismiss) private var dismiss
+
+    // The two the OPS ASK needs. Settings is where this app pushes the Ops screens
+    // from, so it is where the "Ask about this" action is injected and where the
+    // conversation an ask opens is presented. Both come from the environment the
+    // presenting `ContentView` already has: a sheet inherits it.
+    @Environment(RunCoordinator.self) private var coordinator
+    @Environment(\.modelContext) private var modelContext
+
+    /// The conversation an ask opened, presented over the Ops screen.
+    @State private var askThread: JesseThread?
+    /// That thread's id while it is still STAGED — un-inserted, with an attachment that
+    /// has not been spent. Nil once a send has consumed it, so dismissing after a send
+    /// drops nothing.
+    @State private var stagedAskID: UUID?
 
     @State private var host = ""
     @State private var port = ""
@@ -704,6 +719,40 @@ struct SettingsView: View {
                 scannerSheet
             }
         }
+        // ON THE STACK, not on the Form inside it: the Ops screens are PUSHED by
+        // `NavigationLink`s, and a pushed view is presented by the stack rather than
+        // rendered as a child of its root, so an environment value attached to the root
+        // does not reliably reach it. Attached here it covers Bridge ops, the Schedule
+        // sub-page it leads to, and Away mode alike. Same placement as the Health tab's.
+        .environment(\.jesseAsk, AskAction { openAsk($0) })
+        .sheet(item: $askThread, onDismiss: dropUnsentAsk) { thread in
+            // `hidesTabBar: false`: a sheet already covers the tab bar, and asking the
+            // detail view to hide it would leave it hidden after dismissal.
+            NavigationStack { ThreadDetailView(thread: thread, hidesTabBar: false) }
+        }
+    }
+
+    // MARK: - Ask about this
+
+    /// Open the chat about whatever was pressed on an Ops screen: today's conversation
+    /// about that exact reading if there is one, else a fresh one carrying the snapshot.
+    ///
+    /// The same two lines the Health tab uses, through the same `AskOpener` — the opener
+    /// knows nothing about which screen a context came from, which is why there is one.
+    private func openAsk(_ context: AskContext) {
+        let thread = AskOpener.open(context, coordinator: coordinator,
+                                    modelContext: modelContext)
+        // Only a STAGED thread has an attachment worth dropping on dismissal; a resumed
+        // one is already in the store and its re-attachment is spent by the next send.
+        stagedAskID = thread.modelContext == nil ? thread.id : nil
+        askThread = thread
+    }
+
+    /// Dismissing an ask without sending drops its context with it — a no-op once the
+    /// first send has consumed it.
+    private func dropUnsentAsk() {
+        if let id = stagedAskID { coordinator.clearAttachedContext(for: id) }
+        stagedAskID = nil
     }
 
     // MARK: - Ops

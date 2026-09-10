@@ -1,4 +1,5 @@
 import SwiftUI
+import JesseAsk
 import JesseNetworking
 
 // Away mode: where the owner declares that they are somewhere else, in which zone, until when.
@@ -24,6 +25,9 @@ public struct AwayModeView: View {
         _model = State(initialValue: AwayModel(configuration: configuration))
     }
 
+    /// When the reading on screen was taken — see `OpsAskReading`.
+    private var reading: OpsAskReading { OpsAskReading() }
+
     public var body: some View {
         Form {
             currentSection
@@ -32,6 +36,13 @@ public struct AwayModeView: View {
         }
         .formStyle(.grouped)
         .navigationTitle("Away mode")
+        // PAGE LEVEL ONLY on this screen. What is worth asking about here is the profile in
+        // force — which zone dates are being derived in, and whether a stored period is
+        // still live — and that is one reading, not a card per row. The editor below is a
+        // form: a per-row ask on a date picker or a text field would be a menu over a
+        // control, and the ask is read-only anyway.
+        .askPageToolbar(OpsAsk.awayPage(model.profile, loadError: model.loadError,
+                                        reading: reading))
         .task {
             await model.refresh()
             seedFromProfile()

@@ -1,5 +1,6 @@
 import SwiftUI
 import JesseNetworking
+import JesseAsk
 
 // The Patterns screen: what moved together across weight, training and intake. Reached from
 // a nav row on the Health tab, in the same drill-down style as Consistency and Sources.

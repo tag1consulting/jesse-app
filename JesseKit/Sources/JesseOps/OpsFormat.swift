@@ -81,6 +81,31 @@ public enum OpsFormat {
         return f.string(from: date)
     }
 
+    /// `running · pid 15818 · 7 runs`, or the reason there is no such line.
+    ///
+    /// Here rather than on the view that draws it because the Services card AND the ask
+    /// snapshot both print this line, and two builders for it would be two answers to
+    /// "what state is the bridge job in". It is also why it is a plain function: a `static`
+    /// on a `View` is MainActor-isolated, and the serializers are not.
+    public static func serviceState(_ row: ServiceRow) -> String {
+        var parts: [String] = [row.state ?? "unknown"]
+        if let pid = row.pid { parts.append("pid \(pid)") }
+        // `(never exited)` is not zero — the sentinel sends null for it, and printing "exit 0"
+        // would tell an operator a KeepAlive job had exited cleanly when it never exited.
+        if let code = row.lastExitCode { parts.append("last exit \(code)") }
+        if let runs = row.runs { parts.append("\(runs) runs") }
+        return parts.joined(separator: " · ")
+    }
+
+    /// "off until Sun 7 Sep, 09:00", or "off, no deadline" — and lapsed overrides say so,
+    /// because "it was disabled until Sunday and Sunday has passed" is a thing someone asks.
+    public static func overrideLine(_ ov: ScheduleRow.EnableOverride) -> String {
+        let state = ov.enabled ? "on" : "off"
+        let lapsed = (ov.active == false) ? " (lapsed)" : ""
+        guard let until = ov.untilMs else { return "\(state), no deadline\(lapsed)" }
+        return "\(state) until \(dayAndTime(date(fromMs: until), in: .current))\(lapsed)"
+    }
+
     /// The colour a schedule outcome wears. `fired` is the only green one: `fired-no-output`
     /// ran and produced nothing, which is a different alarm, and a `skipped` is neither a
     /// success nor a failure.

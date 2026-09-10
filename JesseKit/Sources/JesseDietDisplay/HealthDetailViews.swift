@@ -1,5 +1,6 @@
 import SwiftUI
 import JesseNetworking
+import JesseAsk
 
 // The Level-2 detail screens (except the weight chart, which is its own file). Each
 // renders purely from `DietSnapshot` + `DietSemantics`/`Explainers`; no business
@@ -599,7 +600,7 @@ struct ProgressPaceDetail: View {
     /// This page's one ask context — the whole progress picture. Every section on the
     /// page offers the same one: pace, goals and body composition are one reading, and
     /// splitting them would hand the agent a third of the story.
-    private var ask: HealthAskContext {
+    private var ask: AskContext {
         HealthAsk.progress(progress, today: today, series: series, scope: .page, day: day)
     }
 
@@ -783,7 +784,7 @@ struct CoachDetail: View {
 
     /// One reading, so one context: the notes, what's ahead and the quote are the coach's
     /// single message about the day, and an ask on any of them carries all of it.
-    private var ask: HealthAskContext {
+    private var ask: AskContext {
         HealthAsk.coach(coach, scope: .page, day: day)
     }
 

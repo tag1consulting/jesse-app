@@ -1,6 +1,7 @@
 import SwiftUI
 import JesseNetworking
 import Charts
+import JesseAsk
 
 // The weight-and-trend detail: a Swift Charts line of daily weigh-ins plus a 7-day
 // moving average, target rule marks, a range picker, drag-to-scrub, and a BF%
@@ -91,7 +92,7 @@ struct WeightTrendDetail: View {
     /// The ask for this chart: the range currently shown, plus whatever point is under
     /// the user's finger. The gesture applies to the chart AS A WHOLE — there are no
     /// per-point menus, and the selection rides along instead.
-    private var ask: HealthAskContext {
+    private var ask: AskContext {
         HealthAsk.weightTrend(series: filteredWeightPoints(), progress: progress,
                               rangeLabel: rangeLabelText, rangeDays: range.days,
                               selection: scrubbedRow)

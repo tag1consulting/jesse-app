@@ -1,4 +1,5 @@
 import SwiftUI
+import JesseAsk
 import JesseNetworking
 
 // The Ops screen: the sentinel's status document as cards, the eight verbs as buttons, the
@@ -12,6 +13,23 @@ import JesseNetworking
 // One view, both platforms. It deliberately carries no `NavigationStack` of its own: iOS
 // pushes it from Settings and macOS presents it in a stack of its own, and a view that brought
 // its own stack would nest one inside the other on iOS.
+//
+// "ASK ABOUT THIS" runs through every card here, and it draws NOTHING at rest: `.askable`
+// attaches a native `contextMenu` and no icon, badge or chip, so at rest this screen renders
+// pixel for pixel as it did before the feature existed. Three rules govern where it goes:
+//
+//   * A CARD'S ASK SITS ON ITS ROWS, wrapped in a `Group` so one modifier covers all of them
+//     — a `Group`'s modifiers apply to each of its children inside a `List`, so a long press
+//     anywhere on the card offers the card. Repeating rows (a service, a ledger line, a
+//     release) carry their own item-level ask instead, which is the narrower press winning.
+//   * A VIEW THAT ALREADY HAD A LONG PRESS keeps it. The deploy log tail is
+//     `.textSelection(.enabled)`, and a `contextMenu` takes that gesture over, so it uses
+//     the `copyText:` spelling and the menu carries a Copy of its own.
+//   * NOTHING STACKS ON AN EXISTING CONTEXT MENU. SwiftUI does not merge two of those; the
+//     second wins and the first silently disappears. No view on this screen has one.
+//
+// Taps, the confirmation dialogs, the ledger's disclosure group and the Schedule navigation
+// link are all untouched: a `contextMenu` composes with them rather than replacing them.
 
 public struct OpsView: View {
     @State private var model: OpsModel
@@ -22,6 +40,24 @@ public struct OpsView: View {
 
     public init(configuration: OpsConfiguration) {
         _model = State(initialValue: OpsModel(configuration: configuration))
+    }
+
+    /// WHEN the reading on screen was taken. Rebuilt on each body evaluation, which is what
+    /// makes an ask made now say "taken at 14:32" rather than quoting the moment the screen
+    /// was opened. Its identity is only the device day, so a second press an hour later still
+    /// resumes the same conversation — see `OpsAskReading`.
+    private var reading: OpsAskReading { OpsAskReading() }
+
+    /// The page-level ask: every card on screen at once, which is the scope the two
+    /// questions this feature exists for are actually asked at ("is anything wrong here",
+    /// "what would a deploy bring in").
+    private var pageAsk: AskContext {
+        OpsAsk.page(status: model.status, deploy: model.deploy,
+                    refreshError: model.refreshError,
+                    isSentinelPaired: model.isSentinelPaired,
+                    verbs: OpsAction.allActions(labels: labelsBySlug),
+                    lastVerb: model.lastVerb, isRunningVerb: model.isRunningVerb,
+                    reading: reading)
     }
 
     public var body: some View {
@@ -50,6 +86,7 @@ public struct OpsView: View {
             if model.isSentinelPaired { deployCard }
         }
         .navigationTitle("Bridge ops")
+        .askPageToolbar(pageAsk)
         .refreshable { await model.refresh() }
         .task { await model.refresh() }
         // Re-armed whenever a new deploy appears, so pressing Deploy starts the poll without
@@ -88,25 +125,32 @@ public struct OpsView: View {
 
     private var bridgeCard: some View {
         Section("Bridge") {
-            OpsProbeHeader(title: "Reachability", probe: model.status?.bridge)
-            if let d = model.status?.bridge.detail {
-                LabeledContent("Version", value: d.health?.version ?? "unknown")
-                LabeledContent("Latency", value: d.latencyMs.map { "\($0) ms" } ?? "unknown")
-                LabeledContent("Profile", value: d.health?.profile ?? "home")
-                if let tz = d.health?.tz { LabeledContent("Zone", value: tz) }
-                // Only the COUNT: the drift array is a diagnostic the bridge's own log carries
-                // in full, and a status card that printed it would be unreadable on a phone.
-                LabeledContent("Drift entries", value: String(d.health?.drift?.count ?? 0))
+            // The `Group` is what makes ONE `.askable` cover the whole card: its modifiers
+            // apply to each child row inside a `List`, so a long press on any line of the
+            // card offers the card. Same shape on the five cards below.
+            Group {
+                OpsProbeHeader(title: "Reachability", probe: model.status?.bridge)
+                if let d = model.status?.bridge.detail {
+                    LabeledContent("Version", value: d.health?.version ?? "unknown")
+                    LabeledContent("Latency", value: d.latencyMs.map { "\($0) ms" } ?? "unknown")
+                    LabeledContent("Profile", value: d.health?.profile ?? "home")
+                    if let tz = d.health?.tz { LabeledContent("Zone", value: tz) }
+                    // Only the COUNT: the drift array is a diagnostic the bridge's own log carries
+                    // in full, and a status card that printed it would be unreadable on a phone.
+                    LabeledContent("Drift entries", value: String(d.health?.drift?.count ?? 0))
+                }
             }
+            .askable(OpsAsk.bridgeCard(model.status, reading: reading))
         }
     }
 
     private var servicesCard: some View {
         Section("Services") {
             OpsProbeHeader(title: "launchd", probe: model.status?.services)
+                .askable(OpsAsk.servicesCard(model.status, reading: reading))
             ForEach(model.status?.serviceRows ?? []) { row in
                 LabeledContent {
-                    Text(Self.serviceStateLine(row))
+                    Text(OpsFormat.serviceState(row))
                         .font(.callout)
                         .foregroundStyle(.secondary)
                 } label: {
@@ -120,6 +164,10 @@ public struct OpsView: View {
                         }
                     }
                 }
+                // A row is its own subject — "what does the lock reaper do", "is this state
+                // normal for it" — so the narrower press wins here and the card's own ask
+                // stays on the probe header above.
+                .askable(OpsAsk.serviceRow(row, reading: reading))
             }
         }
     }
@@ -172,6 +220,10 @@ public struct OpsView: View {
     static let expandedReleases = 3
 
     /// One release: its title, then its claims, one `Text` each so they wrap independently.
+    ///
+    /// The ask goes on HERE rather than at the three call sites, so the blocks folded away
+    /// inside the disclosure group are askable too — and so a press on any of them opens a
+    /// chat that also knows whether that release is the one running.
     @ViewBuilder
     private func releaseBlock(_ r: DeployStatusDocument.Release, label: String?) -> some View {
         VStack(alignment: .leading, spacing: 3) {
@@ -189,110 +241,115 @@ public struct OpsView: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-    }
-
-    /// `running · pid 15818 · 7 runs`, or the reason there is no such line.
-    static func serviceStateLine(_ row: ServiceRow) -> String {
-        var parts: [String] = [row.state ?? "unknown"]
-        if let pid = row.pid { parts.append("pid \(pid)") }
-        // `(never exited)` is not zero — the sentinel sends null for it, and printing "exit 0"
-        // would tell an operator a KeepAlive job had exited cleanly when it never exited.
-        if let code = row.lastExitCode { parts.append("last exit \(code)") }
-        if let runs = row.runs { parts.append("\(runs) runs") }
-        return parts.joined(separator: " · ")
+        .askable(OpsAsk.release(r, label: label, in: model.deploy, reading: reading))
     }
 
     private var tailscaleCard: some View {
         Section("Tailscale") {
-            OpsProbeHeader(title: "Tailnet", probe: model.status?.tailscale)
-            if let d = model.status?.tailscale.detail {
-                LabeledContent("Online", value: (d.online ?? false) ? "yes" : "no")
-                if let name = d.dnsName { LabeledContent("Name", value: name) }
-                if let ips = d.ips, !ips.isEmpty {
-                    LabeledContent("Addresses", value: ips.joined(separator: ", "))
+            Group {
+                OpsProbeHeader(title: "Tailnet", probe: model.status?.tailscale)
+                if let d = model.status?.tailscale.detail {
+                    LabeledContent("Online", value: (d.online ?? false) ? "yes" : "no")
+                    if let name = d.dnsName { LabeledContent("Name", value: name) }
+                    if let ips = d.ips, !ips.isEmpty {
+                        LabeledContent("Addresses", value: ips.joined(separator: ", "))
+                    }
                 }
             }
+            .askable(OpsAsk.tailscaleCard(model.status, reading: reading))
         }
     }
 
     private var diskCard: some View {
         Section("Disk") {
-            OpsProbeHeader(title: "Free space", probe: model.status?.disk)
-            if let d = model.status?.disk.detail {
-                ForEach(d.volumes ?? []) { v in
-                    LabeledContent(v.path,
-                                   value: "\(OpsFormat.bytes(v.freeBytes)) free of \(OpsFormat.bytes(v.totalBytes))")
-                }
-                LabeledContent("Artifacts",
-                               value: "\(OpsFormat.bytes(d.artifactsBytes)) in \(d.artifactsFiles ?? 0) files")
-                if d.artifactsComplete == false {
-                    // A partial walk must say so rather than under-report the store as small.
-                    Text("The artifact walk hit its entry ceiling, so that size is a floor, not a total.")
-                        .font(.caption).foregroundStyle(.secondary)
+            Group {
+                OpsProbeHeader(title: "Free space", probe: model.status?.disk)
+                if let d = model.status?.disk.detail {
+                    ForEach(d.volumes ?? []) { v in
+                        LabeledContent(v.path,
+                                       value: "\(OpsFormat.bytes(v.freeBytes)) free of \(OpsFormat.bytes(v.totalBytes))")
+                    }
+                    LabeledContent("Artifacts",
+                                   value: "\(OpsFormat.bytes(d.artifactsBytes)) in \(d.artifactsFiles ?? 0) files")
+                    if d.artifactsComplete == false {
+                        // A partial walk must say so rather than under-report the store as small.
+                        Text("The artifact walk hit its entry ceiling, so that size is a floor, not a total.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
                 }
             }
+            .askable(OpsAsk.diskCard(model.status, reading: reading))
         }
     }
 
     private var gitCard: some View {
         Section("Git") {
-            OpsProbeHeader(title: "Vault", probe: model.status?.git)
-            if let d = model.status?.git.detail {
-                LabeledContent("Branch", value: d.branch ?? "unknown")
-                LabeledContent("Ahead / behind",
-                               value: "\(d.ahead.map(String.init) ?? "?") / \(d.behind.map(String.init) ?? "?")")
-                LabeledContent("Working tree", value: (d.dirty ?? false) ? "dirty" : "clean")
-                LabeledContent("Index lock",
-                               value: d.indexLockAgeSecs.map { "\($0)s old" } ?? "none")
-                if let c = d.conflicts, !c.isEmpty {
-                    LabeledContent("Conflicts", value: c.joined(separator: ", "))
-                        .foregroundStyle(.red)
-                }
-                if let line = d.lastAutocommitLine?.line {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("Last autocommit").font(.caption).foregroundStyle(.secondary)
-                        Text(line).font(.callout)
-                        if d.lastAutocommitLine?.published == false {
-                            Text("not published").font(.caption).foregroundStyle(.orange)
+            Group {
+                OpsProbeHeader(title: "Vault", probe: model.status?.git)
+                if let d = model.status?.git.detail {
+                    LabeledContent("Branch", value: d.branch ?? "unknown")
+                    LabeledContent("Ahead / behind",
+                                   value: "\(d.ahead.map(String.init) ?? "?") / \(d.behind.map(String.init) ?? "?")")
+                    LabeledContent("Working tree", value: (d.dirty ?? false) ? "dirty" : "clean")
+                    LabeledContent("Index lock",
+                                   value: d.indexLockAgeSecs.map { "\($0)s old" } ?? "none")
+                    if let c = d.conflicts, !c.isEmpty {
+                        LabeledContent("Conflicts", value: c.joined(separator: ", "))
+                            .foregroundStyle(.red)
+                    }
+                    if let line = d.lastAutocommitLine?.line {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Last autocommit").font(.caption).foregroundStyle(.secondary)
+                            Text(line).font(.callout)
+                            if d.lastAutocommitLine?.published == false {
+                                Text("not published").font(.caption).foregroundStyle(.orange)
+                            }
                         }
                     }
                 }
             }
+            .askable(OpsAsk.gitCard(model.status, reading: reading))
         }
     }
 
     private var qmdCard: some View {
         Section("QMD") {
-            OpsProbeHeader(title: "Index", probe: model.status?.qmd)
-            if let d = model.status?.qmd.detail {
-                if let node = d.nodeVersion { LabeledContent("Node", value: node) }
-                if let line = d.firstStderrLine, !line.isEmpty {
-                    Text(line).font(.callout).foregroundStyle(.secondary)
+            Group {
+                OpsProbeHeader(title: "Index", probe: model.status?.qmd)
+                if let d = model.status?.qmd.detail {
+                    if let node = d.nodeVersion { LabeledContent("Node", value: node) }
+                    if let line = d.firstStderrLine, !line.isEmpty {
+                        Text(line).font(.callout).foregroundStyle(.secondary)
+                    }
                 }
             }
+            .askable(OpsAsk.qmdCard(model.status, reading: reading))
         }
     }
 
     private var watchdogCard: some View {
         Section("Watchdog") {
-            let w = model.status?.sentinel?.watchdog
-            LabeledContent("Last tick",
-                           value: OpsFormat.relative(fromMs: w?.lastTickMs) ?? "never")
-            LabeledContent("Kickstarts (last hour)", value: String(w?.kickstartsLastHour ?? 0))
-            if let gaveUp = w?.gaveUpMs {
-                // The single most important line on the page when it is set: the difference
-                // between "the bridge is down" and "the bridge is down AND nothing is trying to
-                // fix it any more".
-                Label("Gave up \(OpsFormat.relative(fromMs: gaveUp) ?? "") — nothing is trying to restart the bridge any more",
-                      systemImage: "exclamationmark.triangle.fill")
-                    .font(.callout).foregroundStyle(.red)
+            Group {
+                let w = model.status?.sentinel?.watchdog
+                LabeledContent("Last tick",
+                               value: OpsFormat.relative(fromMs: w?.lastTickMs) ?? "never")
+                LabeledContent("Kickstarts (last hour)", value: String(w?.kickstartsLastHour ?? 0))
+                if let gaveUp = w?.gaveUpMs {
+                    // The single most important line on the page when it is set: the difference
+                    // between "the bridge is down" and "the bridge is down AND nothing is trying to
+                    // fix it any more".
+                    Label("Gave up \(OpsFormat.relative(fromMs: gaveUp) ?? "") — nothing is trying to restart the bridge any more",
+                          systemImage: "exclamationmark.triangle.fill")
+                        .font(.callout).foregroundStyle(.red)
+                }
+                if let e = w?.lastError, !e.isEmpty {
+                    Text(e).font(.callout).foregroundStyle(.secondary)
+                }
+                if let s = model.status?.sentinel {
+                    LabeledContent("Sentinel", value: s.version ?? "unknown")
+                }
             }
-            if let e = w?.lastError, !e.isEmpty {
-                Text(e).font(.callout).foregroundStyle(.secondary)
-            }
-            if let s = model.status?.sentinel {
-                LabeledContent("Sentinel", value: s.version ?? "unknown")
-            }
+            .askable(OpsAsk.watchdogCard(model.status, reading: reading))
         }
     }
 
@@ -300,23 +357,33 @@ public struct OpsView: View {
 
     private var actionsSection: some View {
         Section {
-            ForEach(OpsAction.allActions(labels: labelsBySlug), id: \.id) { action in
-                Button(action.buttonTitle) { pending = action }
-                    .disabled(model.isRunningVerb)
-            }
-            if model.isRunningVerb {
-                HStack { ProgressView(); Text("Running…").foregroundStyle(.secondary) }
-            }
-            if let outcome = model.lastVerb {
-                Label {
-                    Text("\(outcome.verb): \(outcome.detail)")
-                } icon: {
-                    Image(systemName: outcome.succeeded
-                          ? "checkmark.circle.fill" : "exclamationmark.circle.fill")
+            Group {
+                ForEach(OpsAction.allActions(labels: labelsBySlug), id: \.id) { action in
+                    Button(action.buttonTitle) { pending = action }
+                        .disabled(model.isRunningVerb)
                 }
-                .font(.callout)
-                .foregroundStyle(outcome.succeeded ? Color.secondary : Color.red)
+                if model.isRunningVerb {
+                    HStack { ProgressView(); Text("Running…").foregroundStyle(.secondary) }
+                }
+                if let outcome = model.lastVerb {
+                    Label {
+                        Text("\(outcome.verb): \(outcome.detail)")
+                    } icon: {
+                        Image(systemName: outcome.succeeded
+                              ? "checkmark.circle.fill" : "exclamationmark.circle.fill")
+                    }
+                    .font(.callout)
+                    .foregroundStyle(outcome.succeeded ? Color.secondary : Color.red)
+                }
             }
+            // ONE ask for the whole section rather than one per verb. A press asks about the
+            // verbs on offer and the last outcome, which is the question ("what does reloading
+            // the environment actually do") — and a `contextMenu` composes with the tap, so
+            // every button still opens its confirmation dialog on a plain tap.
+            .askable(OpsAsk.actionsSection(verbs: OpsAction.allActions(labels: labelsBySlug),
+                                           last: model.lastVerb,
+                                           isRunning: model.isRunningVerb,
+                                           reading: reading))
         } header: {
             Text("Actions")
         } footer: {
@@ -346,13 +413,22 @@ public struct OpsView: View {
 
     private var ledgerSection: some View {
         Section {
-            DisclosureGroup("Ledger", isExpanded: $showLedger) {
+            // A `label:` closure rather than `DisclosureGroup("Ledger")`, so the label itself
+            // can carry the section's ask. The two spellings render identically, and the
+            // disclosure still expands on a plain tap.
+            DisclosureGroup(isExpanded: $showLedger) {
                 let rows = model.status?.ledgerRows ?? []
                 if rows.isEmpty {
                     Text("The scheduler has not written a ledger line yet.")
                         .font(.callout).foregroundStyle(.secondary)
                 }
-                ForEach(rows) { row in LedgerRowView(row: row) }
+                ForEach(rows) { row in
+                    LedgerRowView(row: row, reading: reading)
+                }
+            } label: {
+                Text("Ledger")
+                    .askable(OpsAsk.ledgerSection(model.status?.ledgerRows ?? [],
+                                                  reading: reading))
             }
         }
     }
@@ -375,22 +451,28 @@ public struct OpsView: View {
     private var deployCard: some View {
         Section {
             if let doc = model.deploy {
-                LabeledContent("Running",
-                               value: "\(doc.running.version ?? "unknown") · \(OpsFormat.shortSha(doc.running.sha))")
-                LabeledContent {
-                    HStack(spacing: 6) {
-                        HealthDot(doc.originMain.ciHealth)
-                        Text("\(doc.originMain.version ?? "unknown") · \(OpsFormat.shortSha(doc.originMain.sha))")
+                Group {
+                    LabeledContent("Running",
+                                   value: "\(doc.running.version ?? "unknown") · \(OpsFormat.shortSha(doc.running.sha))")
+                    LabeledContent {
+                        HStack(spacing: 6) {
+                            HealthDot(doc.originMain.ciHealth)
+                            Text("\(doc.originMain.version ?? "unknown") · \(OpsFormat.shortSha(doc.originMain.sha))")
+                        }
+                    } label: {
+                        Text("origin/main")
                     }
-                } label: {
-                    Text("origin/main")
+                    if let detail = doc.originMain.ciDetail {
+                        Text(detail).font(.caption).foregroundStyle(.secondary)
+                    }
+                    if doc.originMain.isStale, let why = doc.originMain.staleReason {
+                        Text("This view is stale: \(why)").font(.caption).foregroundStyle(.orange)
+                    }
                 }
-                if let detail = doc.originMain.ciDetail {
-                    Text(detail).font(.caption).foregroundStyle(.secondary)
-                }
-                if doc.originMain.isStale, let why = doc.originMain.staleReason {
-                    Text("This view is stale: \(why)").font(.caption).foregroundStyle(.orange)
-                }
+                // The card's own ask, on the two version rows and the lines about them: this
+                // is the press behind "what is running, and what is on origin/main". The
+                // release blocks and the progress view below carry their own.
+                .askable(OpsAsk.deployCard(model.deploy, reading: reading))
 
                 if let releases = doc.releases { releaseNotes(releases) }
 
@@ -401,13 +483,20 @@ public struct OpsView: View {
                 }
                 .disabled(!availability.isReady || model.isRunningVerb)
                 if let why = availability.reason {
+                    // The refusal line IS the answer to "why can I not deploy", so it carries
+                    // the card. The button itself is left untouched, so nothing can come
+                    // between a press and its confirmation dialog.
                     Text(why).font(.caption).foregroundStyle(.secondary)
+                        .askable(OpsAsk.deployCard(model.deploy, reading: reading))
                 }
 
-                if let record = doc.deploy { DeployProgressView(record: record) }
+                if let record = doc.deploy {
+                    DeployProgressView(record: record, reading: reading)
+                }
             } else {
                 Text("The sentinel has not answered the deploy card yet.")
                     .font(.callout).foregroundStyle(.secondary)
+                    .askable(OpsAsk.deployCard(model.deploy, reading: reading))
             }
         } header: {
             Text("Deploy")
@@ -524,7 +613,8 @@ struct HealthDot: View {
         Circle()
             .fill(color)
             .frame(width: 10, height: 10)
-            .accessibilityLabel(name)
+            // The one vocabulary for the four states, shared with the ask snapshots.
+            .accessibilityLabel(health.word)
     }
 
     private var color: Color {
@@ -533,15 +623,6 @@ struct HealthDot: View {
         case .amber: return .orange
         case .red: return .red
         case .grey: return .gray
-        }
-    }
-
-    private var name: String {
-        switch health {
-        case .green: return "ok"
-        case .amber: return "warning"
-        case .red: return "failed"
-        case .grey: return "unknown"
         }
     }
 }
@@ -570,12 +651,14 @@ struct OpsProbeHeader<Detail: Decodable & Sendable>: View {
 /// One ledger line: when, which job, what happened, and why.
 struct LedgerRowView: View {
     let row: LedgerRow
+    let reading: OpsAskReading
 
     var body: some View {
         if let raw = row.raw {
             // A line the ledger could not parse is SHOWN, not dropped: a ledger emitting
             // garbage is a thing to see.
             Text(raw).font(.caption.monospaced()).foregroundStyle(.orange)
+                .askable(OpsAsk.ledgerRow(row, reading: reading))
         } else {
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 8) {
@@ -594,6 +677,7 @@ struct LedgerRowView: View {
                     Text(reason).font(.caption).foregroundStyle(.secondary)
                 }
             }
+            .askable(OpsAsk.ledgerRow(row, reading: reading))
         }
     }
 }
@@ -601,8 +685,39 @@ struct LedgerRowView: View {
 /// The in-flight (or just-finished) deploy: its phase, its log tail, and its verdict.
 struct DeployProgressView: View {
     let record: DeployStatusDocument.DeployRecord
+    let reading: OpsAskReading
 
+    /// What the log tail's Copy item puts on the pasteboard — the whole tail as shown, or
+    /// nil when there is no tail and so no menu item.
+    ///
+    /// A named property rather than an expression inline in the body, so the ONE thing a
+    /// later edit could silently lose (see the note at the call site) is a value a test can
+    /// read. `AskableTests` pins it.
+    var logTailCopy: String? {
+        record.logTail.isEmpty ? nil : record.logTail.joined(separator: "\n")
+    }
+
+    /// ONE menu for the whole row, and it is one deliberately.
+    ///
+    /// The phase line and the log tail sit in a single `List` row, and a row presents ONE
+    /// context menu: two `.askable`s inside it — one on the phase lines, one on the tail —
+    /// left whichever won without a Copy item, which is exactly the affordance rule one
+    /// exists to protect. So the row is askable once, and it is the `copyText:` spelling
+    /// whenever there is a tail.
+    ///
+    /// COPY IS PRESERVED HERE ON PURPOSE. This is the one view on the Ops screen with
+    /// `.textSelection(.enabled)`, and attaching a `contextMenu` takes the system's
+    /// press-and-hold selection — and its Copy callout — over. Do not drop the `copyText:`
+    /// in a later edit, and do not add a second `.askable` anywhere in this row.
     var body: some View {
+        if let copy = logTailCopy {
+            rows.askable(OpsAsk.deployProgress(record, reading: reading), copyText: copy)
+        } else {
+            rows.askable(OpsAsk.deployProgress(record, reading: reading))
+        }
+    }
+
+    private var rows: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 8) {
                 HealthDot(record.resultHealth)
@@ -612,9 +727,9 @@ struct DeployProgressView: View {
             if let reason = record.reason, !reason.isEmpty {
                 Text(reason).font(.callout).foregroundStyle(.secondary)
             }
-            if !record.logTail.isEmpty {
+            if let copy = logTailCopy {
                 ScrollView {
-                    Text(record.logTail.joined(separator: "\n"))
+                    Text(copy)
                         .font(.caption.monospaced())
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .textSelection(.enabled)

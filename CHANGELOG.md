@@ -14,6 +14,92 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [App 1.0 (130)] - 2026-09-10
+
+**"Ask about this" now works on the Ops screens.** A long press on iOS, or a right click on
+macOS, on any Ops card, service row, ledger line or release block opens the app's chat
+already carrying a snapshot of exactly what was on screen; each page also carries one
+toolbar entry covering everything on it at once. The two questions it exists to answer are
+"what would a deploy bring in" and "what version of X is running".
+
+### Added — the Ops half
+
+- **One implementation, not two.** Everything the feature has that is not about diet moved
+  out of `JesseDietDisplay` into a new `JesseAsk` target: the facts tree, the budget and its
+  clamp, the scope, the reading's identity, the environment action and the three view
+  modifiers. `JesseDietDisplay` and `JesseOps` both depend on it, and everything
+  screen-specific stayed behind — the Health area enum, its serializers and its prompt on
+  one side, and Ops's own three on the other. `AskContext` gained an `AskDomain`, which is
+  the screen's key namespace plus its frozen prompt; `health` and `ops` are the two, and a
+  Health `scopeKey` still reads exactly as it did. No shim layer of typealiases was left
+  behind: `HealthAskContext` is `AskContext`, `HealthAskOpener` is `AskOpener`, and every
+  call site was renamed.
+- **Every card, and every repeating row inside one.** Bridge, Services (and each service),
+  Tailscale, Disk, Git, QMD, Watchdog, Actions, the Ledger (and each line, parsed or raw),
+  Deploy (and each release block, and a deploy in progress), plus the Schedule sub-page,
+  each chain and each job, and Away mode at page level. A card's ask sits on its rows,
+  wrapped in a `Group` so one modifier covers all of them and a press anywhere on the card
+  offers the card.
+- **The release snapshot shows MORE than the screen, on purpose.** The Deploy card folds all
+  but the newest three undeployed releases behind a disclosure group so the button stays
+  reachable; the snapshot carries every one of them, because the question is what a deploy
+  would bring in. It also states BOTH losses: what the app capped, and how many releases the
+  sentinel dropped out of the document before the app ever saw it. Silent truncation reads
+  as completeness.
+- **Staleness travels with the reading.** A cached view of `origin/main` says so inside the
+  snapshot, with its reason and the note that the version, sha, CI verdict and release list
+  below it may all be out of date — not merely in the card's title, which the snapshot does
+  not carry. A failed refresh says the cards below it may be from an earlier read.
+- **A frozen Ops prompt, a peer of the Health one rather than a variant.** `OpsAskPrompt`
+  sits beside `HealthAskPrompt` in JesseCore. It fences the reading and says every word
+  between the fences is data — which matters more here than on the Health tab, because an
+  Ops reading quotes commit titles, changelog lines, launchd errors and deploy log output,
+  none of it written by the owner. Its negative half names every verb the screen offers:
+  restart, reload the environment, unlock git, prune, deploy, build, push, commit, edit,
+  fire or enable a job, and run a routine. A general "do not act" is the kind an agent talks
+  itself around; a named one is not, and `OpsAskPromptTests` pins each clause. It does allow
+  answering from what it knows about the repository, and requires saying so out loud.
+- **Identity is the device day.** An Ops reading changes minute to minute, so its label says
+  what time it was taken and its key is the device's calendar day: two presses on the same
+  card this afternoon resume one conversation, a press tomorrow starts another, and a
+  resumed conversation is re-attached with a fresh snapshot before its next send. The Ops
+  namespace can never collide with a Health one.
+- **Both shells, no second presentation path.** iOS injects the action on the Settings
+  navigation stack that pushes the Ops screens and presents the conversation as a sheet over
+  them; macOS gets `MacOpsWindowShell`, which gives both Ops windows the stack, the
+  injection and the sheet — and `JesseMacApp` now hands those two `Window` scenes the
+  coordinator and the model container, which a `Window` inherits from no `WindowGroup`. An
+  ask still STAGES and never fires a turn, and one opened and dismissed without sending
+  drops its attachment.
+
+### Changed
+
+- **`OpsFormat` gained the two pure line builders the cards and the snapshots share** —
+  `serviceState` (`running · pid 15818 · 7 runs`) and `overrideLine` — moved off `OpsView`
+  and `ScheduleRowView`. Two builders for one line is two answers to "what state is the
+  bridge job in", and a `static` on a `View` is MainActor-isolated where the serializers are
+  not. `OpsHealth` gained `word`, which is now the single source for the dot's
+  accessibility label and for the snapshots.
+- **The deploy log tail keeps its Copy.** It is the one view on the Ops screen with
+  `.textSelection(.enabled)`, and attaching a `contextMenu` takes the system's
+  press-and-hold selection over, so it uses the `copyText:` spelling and the menu carries a
+  Copy of the whole tail beside the ask. **A `List` ROW presents one context menu, not one
+  per subview** — found in the simulator, not in a test: the deploy progress view first had
+  two `.askable`s inside one row (the phase lines, and the tail), and the one that won was
+  the one without the Copy, which is precisely the affordance the rule exists to protect.
+  The row is now askable exactly once, in the `copyText:` spelling whenever there is a tail.
+  A repository-wide audit of `textSelection` found the other sites are the chat's own reply
+  renderers and the Health tab's drill-down rows, all outside this change and untouched.
+  Nothing on these screens had an existing `contextMenu`, so nothing was stacked over one.
+
+### Unchanged
+
+- **Nothing is drawn at rest.** No icon on a card, no badge, no chip, no overlay, no hover
+  affordance. The only glyph the feature has is the page toolbar entry, and at rest the Ops
+  screens render pixel for pixel as they did. Every tap, swipe, disclosure group and
+  navigation link still behaves as before: a `contextMenu` composes with them rather than
+  replacing them.
+
 ## [App 1.0 (129)] - 2026-09-10
 
 **An unfinished message stays in the conversation it was typed in — across switching

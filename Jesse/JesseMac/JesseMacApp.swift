@@ -87,17 +87,27 @@ struct JesseMacApp: App {
         // The two operations screens, as windows. They are shared with iOS
         // (`JesseOps.OpsView` / `JesseOps.AwayModeView`); the Mac contributes the window,
         // the stack, and the two configs — no second implementation of anything.
+        //
+        // The COORDINATOR and the MODEL CONTAINER are handed to each of these scenes
+        // explicitly, because a `Window` scene inherits neither from the `WindowGroup`
+        // above: "Ask about this" on an Ops card stages a real conversation in the store
+        // and hands it to the coordinator, so both windows need both. `MacOpsWindowShell`
+        // is where the stack, the ask injection and the ask's sheet live.
         Window("Bridge Ops", id: MacOpsWindow.ops) {
-            NavigationStack { OpsView(configuration: configStore.opsConfiguration) }
+            MacOpsWindowShell { OpsView(configuration: configStore.opsConfiguration) }
                 .frame(minWidth: 520, minHeight: 640)
+                .environment(coordinator)
         }
         .defaultSize(width: 620, height: 760)
+        .modelContainer(store.container)
 
         Window("Away Mode", id: MacOpsWindow.away) {
-            NavigationStack { AwayModeView(configuration: configStore.opsConfiguration) }
+            MacOpsWindowShell { AwayModeView(configuration: configStore.opsConfiguration) }
                 .frame(minWidth: 460, minHeight: 480)
+                .environment(coordinator)
         }
         .defaultSize(width: 520, height: 560)
+        .modelContainer(store.container)
     }
 
     /// The reply notification's title. The shared resolution, with this surface's own

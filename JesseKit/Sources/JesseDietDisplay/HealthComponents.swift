@@ -1,5 +1,6 @@
 import SwiftUI
 import JesseNetworking
+import JesseAsk
 
 // Shared building blocks for the Health tab. Every view here is a pure function of
 // its inputs — the numbers and statuses are computed upstream by `DietSemantics` /

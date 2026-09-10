@@ -3,6 +3,7 @@ import SwiftData
 import JesseCore
 import JesseNetworking
 import JesseDietDisplay
+import JesseAsk
 
 // The Mac's Health tab: the SAME diet/health dashboard the iPhone shows, rendered from
 // the shared `HealthDashboardContent` (JesseDietDisplay) with a Mac-only chrome. It is
@@ -112,7 +113,7 @@ struct MacHealthView: View {
                     }
                 }
                 .sheet(item: $askThread, onDismiss: dropUnsentAsk) { thread in
-                    MacHealthAskSheet(thread: thread) { askThread = nil }
+                    MacAskSheet(thread: thread) { askThread = nil }
                 }
                 // A tap could kick off the long morning routine, so confirm first.
                 .confirmationDialog("Start new day", isPresented: $confirmNewDay) {
@@ -126,7 +127,7 @@ struct MacHealthView: View {
         // presented by the stack rather than rendered as a child of the root, so an
         // environment value attached to the root does not reliably reach the sub-pages.
         // Same placement as the phone.
-        .environment(\.healthAsk, HealthAskAction { openAsk($0) })
+        .environment(\.jesseAsk, AskAction { openAsk($0) })
         // A Mac that slept never leaves `.active`, so the scene phase alone would never
         // re-probe after a lid-open — see `MacWake`.
         .onReconnect {
@@ -153,8 +154,8 @@ struct MacHealthView: View {
 
     /// Open the chat about whatever was right-clicked: today's conversation about that
     /// exact reading if there is one, else a fresh one carrying the snapshot.
-    private func openAsk(_ ask: HealthAskContext) {
-        let thread = MacHealthAskOpener.open(ask, coordinator: coordinator,
+    private func openAsk(_ ask: AskContext) {
+        let thread = MacAskOpener.open(ask, coordinator: coordinator,
                                              modelContext: context)
         // Only a STAGED thread has an attachment worth dropping on dismissal.
         stagedAskID = thread.modelContext == nil ? thread.id : nil
@@ -178,25 +179,5 @@ struct MacHealthView: View {
         context.insert(thread)
         try? context.save()
         Task { await coordinator.send(text: HealthNewDay.prompt, mode: .tell, thread: thread, context: context) }
-    }
-}
-
-
-/// The conversation an ask opens, in a sheet sized like the Today tab's — one window
-/// shape for "a conversation opened from a tab", not two.
-private struct MacHealthAskSheet: View {
-    let thread: JesseThread
-    let onDone: () -> Void
-
-    var body: some View {
-        NavigationStack {
-            MacThreadDetailView(thread: thread)
-                .toolbar {
-                    ToolbarItem(placement: .confirmationAction) {
-                        Button("Done", action: onDone)
-                    }
-                }
-        }
-        .frame(minWidth: 640, idealWidth: 760, minHeight: 520, idealHeight: 620)
     }
 }

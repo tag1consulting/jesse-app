@@ -1,17 +1,17 @@
 import Foundation
 import SwiftData
 import JesseCore
-import JesseDietDisplay
+import JesseAsk
 
-// How a Health-tab "Ask about this" becomes a conversation ON THE MAC — the peer of the
-// phone's `HealthAskOpener`, and the same split it draws.
+// How an "Ask about this" becomes a conversation ON THE MAC — the peer of the phone's
+// `AskOpener`, and the same split it draws, for every screen that has the gesture.
 //
-// WHAT the turn says is shared: `HealthAskContext.promptText`, built in JesseDietDisplay
-// from the frozen `HealthAskPrompt`. WHAT COUNTS AS THE SAME READING is shared too:
+// WHAT the turn says is shared: `AskContext.promptText`, built by the screen's own module
+// from that screen's own frozen prompt. WHAT COUNTS AS THE SAME READING is shared too:
 // `scopeKey`. Only the dispatch — this platform's coordinator and store — lives here, so
 // the two shells cannot grow two ideas of what an ask is scoped to or when it resumes.
 @MainActor
-enum MacHealthAskOpener {
+enum MacAskOpener {
 
     /// Open a conversation for `context`, resuming today's conversation about the very
     /// same reading if there is one.
@@ -20,7 +20,7 @@ enum MacHealthAskOpener {
     /// moved since it was started, and the coordinator composes an attachment ahead of
     /// every send it is present for, so the next message carries the current screen.
     @discardableResult
-    static func open(_ context: HealthAskContext, coordinator: MacCoordinator,
+    static func open(_ context: AskContext, coordinator: MacCoordinator,
                      modelContext: ModelContext, now: Date = Date()) -> JesseThread {
         if let existing = resumable(context, modelContext: modelContext, now: now) {
             coordinator.attach(context.attachment, to: existing.id)
@@ -31,7 +31,7 @@ enum MacHealthAskOpener {
 
     /// Today's conversation about this exact reading, if one was started and sent. Only
     /// sent conversations exist to be found — a staged thread is not in the store.
-    static func resumable(_ context: HealthAskContext, modelContext: ModelContext,
+    static func resumable(_ context: AskContext, modelContext: ModelContext,
                           now: Date = Date()) -> JesseThread? {
         let key = context.scopeKey
         let dayStart = Calendar.current.startOfDay(for: now)
@@ -52,7 +52,7 @@ enum MacHealthAskOpener {
     /// could delete this one out from under the open sheet. `MacCoordinator.send` inserts
     /// on the first send.
     @discardableResult
-    static func stage(_ context: HealthAskContext, coordinator: MacCoordinator) -> JesseThread {
+    static func stage(_ context: AskContext, coordinator: MacCoordinator) -> JesseThread {
         // ASK, not Tell: the turn's purpose is a conversation about a reading, and Ask
         // carries the floor that forbids task-work nobody requested.
         let thread = JesseThread(mode: .ask)

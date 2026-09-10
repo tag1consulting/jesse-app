@@ -332,7 +332,7 @@ final class ComposerDraftHandoffTests: XCTestCase {
         let fake = DraftFakeClient([.hold])
         let coordinator = makeCoordinator(fake)
 
-        let staged = JesseThread(mode: .ask)   // as HealthAskOpener / TodayTurn stage one
+        let staged = JesseThread(mode: .ask)   // as AskOpener / TodayTurn stage one
         XCTAssertNil(staged.modelContext)
         ComposerDraft.write(text: "about this reading", to: staged, in: context)
         try context.save()

@@ -2,6 +2,7 @@ import Foundation
 import Observation
 import JesseCore
 import JesseNetworking
+import JesseAsk
 
 // The Health tab's view model. Owns the currently-viewed snapshot, the fetch state,
 // day-history paging, and an in-memory per-date cache. Invariants:
@@ -297,7 +298,7 @@ public final class HealthDashboardModel {
     /// Every derivation below mirrors `TodayScreen`'s own, line for line — the engine
     /// hour, the past-day judging rule, and the window clamp — so the page-level ask and
     /// the screen it describes cannot come from two different readings of the same day.
-    public var pageAskContext: HealthAskContext? {
+    public var pageAskContext: AskContext? {
         guard let snapshot else { return nil }
         let clockHour = Calendar.current.component(.hour, from: now())
         let hour = HistoryRender.engineHour(isHistorical: snapshot.isHistorical,

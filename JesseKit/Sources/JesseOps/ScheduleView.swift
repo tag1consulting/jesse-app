@@ -1,4 +1,5 @@
 import SwiftUI
+import JesseAsk
 import JesseNetworking
 
 // The schedule, as a screen: one section per chain, the head first and its links indented
@@ -8,6 +9,10 @@ import JesseNetworking
 // (with a deadline, so it comes back by itself) and running one now. Everything else on the
 // row is there to answer "why did that not happen" without opening a terminal — the outcome,
 // the reason, the streak, and the output the job was contracted to produce.
+//
+// "Ask about this" reaches the page (its own toolbar entry, beside Reload config), each
+// chain (its section header) and each row. Nothing is drawn at rest, and the row's toggle
+// and its Fire now button keep their plain taps: a `contextMenu` composes with them.
 
 public struct ScheduleView: View {
     @State private var model: ScheduleModel
@@ -18,6 +23,10 @@ public struct ScheduleView: View {
     public init(configuration: OpsConfiguration) {
         _model = State(initialValue: ScheduleModel(configuration: configuration))
     }
+
+    /// When the reading on screen was taken — see `OpsAskReading` for why its identity is
+    /// only the device day.
+    private var reading: OpsAskReading { OpsAskReading() }
 
     public var body: some View {
         List {
@@ -30,6 +39,7 @@ public struct ScheduleView: View {
                     ForEach(chain.members) { member in
                         ScheduleRowView(member: member,
                                         bridgeTz: model.bridgeTz,
+                                        reading: reading,
                                         message: model.rowMessages[member.row.id],
                                         isBusy: model.busyJob == member.row.id,
                                         onToggle: { on in
@@ -45,11 +55,18 @@ public struct ScheduleView: View {
                     }
                 } header: {
                     Text(chain.members.count > 1 ? "\(chain.id) chain" : chain.id)
+                        .askable(OpsAsk.scheduleChain(chain, bridgeTz: model.bridgeTz,
+                                                      reading: reading))
                 }
             }
             if !model.invalid.isEmpty { invalidSection }
         }
         .navigationTitle("Schedule")
+        // A SECOND `.primaryAction` beside Reload config, never `.secondaryAction`: that
+        // placement collapses into an overflow ellipsis on iOS, and one declared inside a
+        // conditional gets an empty menu UIKit then refuses to present.
+        .askPageToolbar(OpsAsk.schedulePage(model.document, route: model.route,
+                                            loadError: model.loadError, reading: reading))
         .refreshable { await model.refresh() }
         .task { await model.refresh() }
         .toolbar {
@@ -136,6 +153,7 @@ public struct ScheduleView: View {
 struct ScheduleRowView: View {
     let member: ScheduleChain.Member
     let bridgeTz: String?
+    let reading: OpsAskReading
     let message: String?
     let isBusy: Bool
     let onToggle: (Bool) -> Void
@@ -185,7 +203,7 @@ struct ScheduleRowView: View {
                 detailLine("Promoted", "took the clock slot of \(from)")
             }
             if let ov = row.override {
-                detailLine("Override", Self.overrideLine(ov))
+                detailLine("Override", OpsFormat.overrideLine(ov))
             }
             if let retry = row.retryDueMs {
                 detailLine("Retry due", OpsFormat.inBothZones(retry, bridgeTz: bridgeTz))
@@ -210,15 +228,9 @@ struct ScheduleRowView: View {
             }
         }
         .padding(.leading, CGFloat(member.depth) * 16)
-    }
-
-    /// "off until Sun 7 Sep, 09:00", or "off, no deadline" — and lapsed overrides say so,
-    /// because "it was disabled until Sunday and Sunday has passed" is a thing someone asks.
-    static func overrideLine(_ ov: ScheduleRow.EnableOverride) -> String {
-        let state = ov.enabled ? "on" : "off"
-        let lapsed = (ov.active == false) ? " (lapsed)" : ""
-        guard let until = ov.untilMs else { return "\(state), no deadline\(lapsed)" }
-        return "\(state) until \(OpsFormat.dayAndTime(OpsFormat.date(fromMs: until), in: .current))\(lapsed)"
+        // The whole row, so a press anywhere on it asks about the job. The toggle and the
+        // Fire now button keep their taps — a `contextMenu` does not replace them.
+        .askable(OpsAsk.scheduleRow(member, bridgeTz: bridgeTz, reading: reading))
     }
 
     @ViewBuilder

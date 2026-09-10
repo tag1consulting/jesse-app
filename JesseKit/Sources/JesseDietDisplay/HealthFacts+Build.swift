@@ -1,5 +1,6 @@
 import Foundation
 import JesseNetworking
+import JesseAsk
 
 // The UNIT serializers: one function per thing the Health tab draws, each turning it
 // into the lines a chat needs to answer questions about it.
@@ -7,7 +8,7 @@ import JesseNetworking
 // This is the layer that makes "don't hand-write three serializers per area" true. There
 // is exactly one serializer per UNIT (a meal, a food, a workout, a gauge, a trend, a
 // source ranking, a streak, an association), and the scope factories in
-// `HealthAskContext+Areas.swift` compose them: a section is its units' blocks, a page is
+// `AskContext+Areas.swift` compose them: a section is its units' blocks, a page is
 // its sections'. Adding a unit is one function here; widening a scope is one line there.
 //
 // Everything is a pure function of values the view already holds. Nothing here fetches,
@@ -21,7 +22,7 @@ import JesseNetworking
 // exactly as the screen renders them. A snapshot that quietly flattened those would let
 // the agent state as fact something the app is careful never to claim.
 
-enum AskFacts {
+enum HealthFacts {
 
     // MARK: - Numbers, shared
 
@@ -76,7 +77,7 @@ enum AskFacts {
     /// The full block for a metric row asked about on its own: the line above, plus every
     /// qualification the row itself carries (partiality, the window a colour came from,
     /// a flag, a note, a blow-out).
-    static func gauge(_ g: MetricGauge) -> HealthAskFacts {
+    static func gauge(_ g: MetricGauge) -> AskFacts {
         var lines = [gaugeLine(g)]
         if g.partial {
             lines.append("\(g.unknownItemCount) logged "
@@ -110,17 +111,17 @@ enum AskFacts {
             }
             lines.append(line)
         }
-        return HealthAskFacts(lines: lines)
+        return AskFacts(lines: lines)
     }
 
     /// The foods behind a metric, already ranked by the same builder the drill-down sheet
     /// uses — so "why is this so caloric" is answerable from the snapshot alone.
     static func contributors(_ breakdown: FoodBreakdown, decimals: Int, unit: String,
-                             limit: Int = HealthAskBudget.maxListItems) -> HealthAskFacts {
+                             limit: Int = AskBudget.maxListItems) -> AskFacts {
         guard !breakdown.contributions.isEmpty || !breakdown.unknownFoods.isEmpty else {
-            return HealthAskFacts()
+            return AskFacts()
         }
-        let (kept, note) = HealthAskBudget.cap(breakdown.contributions, limit: limit,
+        let (kept, note) = AskBudget.cap(breakdown.contributions, limit: limit,
                                                noun: "contributing foods")
         var lines = kept.map { c -> String in
             let amount = c.amount.map { " (\($0))" } ?? ""
@@ -128,14 +129,14 @@ enum AskFacts {
                 + "\(unitSuffix(unit)) · \(NutrientSources.pct(c.share)) of the total"
         }
         if !breakdown.unknownFoods.isEmpty {
-            let (unknown, unknownNote) = HealthAskBudget.cap(
-                breakdown.unknownFoods, limit: HealthAskBudget.maxNestedListItems,
+            let (unknown, unknownNote) = AskBudget.cap(
+                breakdown.unknownFoods, limit: AskBudget.maxNestedListItems,
                 noun: "unmeasured foods", totalsCoverAll: false)
             lines.append("not estimated (unknown, never counted as zero): "
                 + unknown.map(\.name).joined(separator: ", ")
                 + (unknownNote.map { " — \($0)" } ?? ""))
         }
-        var block = HealthAskFacts(heading: "Where it came from", lines: lines, note: note)
+        var block = AskFacts(heading: "Where it came from", lines: lines, note: note)
         if let recon = breakdown.reconciliationNote {
             block.lines.append("reconciliation: \(recon)")
         }
@@ -176,13 +177,13 @@ enum AskFacts {
     /// `foodLimit` is how the page-level union stays inside budget — a meal asked about on
     /// its own lists everything, the same meal inside a whole-day snapshot lists its
     /// biggest few and says how many it left out.
-    static func meal(_ m: DietMeal, foodLimit: Int = HealthAskBudget.maxListItems) -> HealthAskFacts {
+    static func meal(_ m: DietMeal, foodLimit: Int = AskBudget.maxListItems) -> AskFacts {
         let subtotal = DietSemantics.subtotal(of: m)
         let time = m.time.map { " · \($0)" } ?? ""
         // Ordered by calories so a cap keeps the rows that explain the subtotal.
         let ordered = m.items.sorted { ($0.cal ?? 0) > ($1.cal ?? 0) }
-        let (kept, note) = HealthAskBudget.cap(ordered, limit: foodLimit, noun: "foods")
-        return HealthAskFacts(
+        let (kept, note) = AskBudget.cap(ordered, limit: foodLimit, noun: "foods")
+        return AskFacts(
             heading: "\(m.name)\(time)",
             lines: ["\(DietSemantics.fmt(subtotal.cal)) cal · \(MacroLine.format(subtotal))"]
                 + kept.map(foodLine),
@@ -205,19 +206,19 @@ enum AskFacts {
 
     /// A planned (not logged) meal idea. Kept visibly distinct, because the screen keeps
     /// it visibly distinct and a proposal counted as eaten is the worst kind of error.
-    static func idea(_ idea: DietIdea) -> HealthAskFacts {
+    static func idea(_ idea: DietIdea) -> AskFacts {
         let total = DietSemantics.total(of: idea.items)
         let time = idea.time.map { " · \($0)" } ?? ""
         var lines = ["PLANNED, not logged — ~\(DietSemantics.fmt(total.cal)) cal · \(MacroLine.format(total))"]
         lines += idea.items.map(foodLine)
         if let notes = idea.notes { lines.append("note: \(notes)") }
-        return HealthAskFacts(heading: "\(idea.name)\(time)", lines: lines)
+        return AskFacts(heading: "\(idea.name)\(time)", lines: lines)
     }
 
     // MARK: - Exercise
 
     /// One logged session, with every field the card shows and none it doesn't.
-    static func workout(_ e: DietExercise) -> HealthAskFacts {
+    static func workout(_ e: DietExercise) -> AskFacts {
         var parts: [String] = []
         if let d = e.duration { parts.append("duration \(d)") }
         if let dist = e.distance {
@@ -229,12 +230,12 @@ enum AskFacts {
         var lines = [parts.isEmpty ? "no metrics recorded" : parts.joined(separator: " · ")]
         if let d = e.desc { lines.append(d) }
         let time = e.time.map { " · \($0)" } ?? ""
-        return HealthAskFacts(heading: "\(e.type.capitalized)\(time)", lines: lines)
+        return AskFacts(heading: "\(e.type.capitalized)\(time)", lines: lines)
     }
 
     // MARK: - Weight, progress, coach
 
-    static func weightCard(_ c: HealthDisplay.WeightCard) -> HealthAskFacts {
+    static func weightCard(_ c: HealthDisplay.WeightCard) -> AskFacts {
         var lines = ["\(DietSemantics.fmt(c.lbs)) lb"
             + (c.kg.map { " (\(DietSemantics.fmt($0)) kg)" } ?? "")]
         if let d = c.deltaLbs {
@@ -247,15 +248,15 @@ enum AskFacts {
             lines.append("no weigh-in today — this is the last one, from \(last). "
                 + "Body fat and lean mass are deliberately not carried forward")
         }
-        return HealthAskFacts(lines: lines)
+        return AskFacts(lines: lines)
     }
 
     /// The weight series, summarized rather than dumped: the ends, the extremes, the
     /// 7-day average, and the recent tail. Ninety raw points would be most of the budget
     /// and answer nothing the summary doesn't.
-    static func weightSeries(_ series: [WeightPoint], tail: Int = 14) -> HealthAskFacts {
+    static func weightSeries(_ series: [WeightPoint], tail: Int = 14) -> AskFacts {
         guard let first = series.first, let last = series.last else {
-            return HealthAskFacts(lines: ["no weigh-ins in this range"])
+            return AskFacts(lines: ["no weigh-ins in this range"])
         }
         var lines = [
             "\(series.count) weigh-ins from \(first.date) to \(last.date)",
@@ -276,12 +277,12 @@ enum AskFacts {
         lines.append("most recent \(recent.count): "
             + recent.map { "\($0.date) \(DietSemantics.fmt1($0.lbs))" }.joined(separator: ", "))
         let hidden = series.count - recent.count
-        return HealthAskFacts(
+        return AskFacts(
             heading: "Weigh-ins", lines: lines,
             note: hidden > 0 ? "\(hidden) earlier weigh-ins summarized above rather than listed" : nil)
     }
 
-    static func progress(_ p: DietProgress, targets: [DietTarget]) -> HealthAskFacts {
+    static func progress(_ p: DietProgress, targets: [DietTarget]) -> AskFacts {
         var lines: [String] = []
         if let start = p.startWeight { lines.append("start weight \(DietSemantics.fmt(start)) lb") }
         for t in targets {
@@ -306,10 +307,10 @@ enum AskFacts {
         }
         if let zone = p.paceZone { lines.append("pace zone \(zone)") }
         if let traj = p.trajectory { lines.append("trajectory: \(traj)") }
-        return HealthAskFacts(lines: lines)
+        return AskFacts(lines: lines)
     }
 
-    static func coach(_ c: DietCoach) -> HealthAskFacts {
+    static func coach(_ c: DietCoach) -> AskFacts {
         var lines: [String] = []
         if let title = c.title { lines.append(CoachHTML.plainText(title)) }
         lines += c.notes.map { "note: \(CoachHTML.plainText($0))" }
@@ -318,11 +319,11 @@ enum AskFacts {
             lines.append("quote: “\(CoachHTML.plainText(q.text))”"
                 + (q.author.map { " — \(CoachHTML.plainText($0))" } ?? ""))
         }
-        return HealthAskFacts(lines: lines)
+        return AskFacts(lines: lines)
     }
 
-    static func daySummary(_ s: DaySummary) -> HealthAskFacts {
-        HealthAskFacts(lines: [s.headline, "what would help next: \(s.nextAction)",
+    static func daySummary(_ s: DaySummary) -> AskFacts {
+        AskFacts(lines: [s.headline, "what would help next: \(s.nextAction)",
                                "overall reading: \(toneWord(s.tone))"])
     }
 
@@ -331,7 +332,7 @@ enum AskFacts {
     /// One nutrient's trend over the visible range. The verdict sentence is the ENGINE's
     /// (`NutrientTrends.verdict`), so the snapshot repeats the screen's own words rather
     /// than paraphrasing a chart, and the day-by-day tail rides underneath it.
-    static func trend(_ t: NutrientTrend, tail: Int = 14) -> HealthAskFacts {
+    static func trend(_ t: NutrientTrend, tail: Int = 14) -> AskFacts {
         var lines = [NutrientTrends.verdict(t)]
         lines.append("direction over the range: \(t.direction.label)")
         if t.daysTargetUnknown > 0 {
@@ -350,7 +351,7 @@ enum AskFacts {
                 }.joined(separator: ", "))
         }
         let hidden = t.points.count - recent.count
-        return HealthAskFacts(
+        return AskFacts(
             heading: "\(t.nutrient.fullName) trend (\(t.unit))", lines: lines,
             note: hidden > 0
                 ? "\(hidden) earlier known days are in every statistic above but not listed"
@@ -359,9 +360,9 @@ enum AskFacts {
 
     /// One nutrient's ranked food sources over a range, with the coverage sentence the
     /// screen prints beneath it.
-    static func sourceRanking(_ r: NutrientSourceRanking) -> HealthAskFacts {
+    static func sourceRanking(_ r: NutrientSourceRanking) -> AskFacts {
         guard !r.isEmpty else {
-            return HealthAskFacts(
+            return AskFacts(
                 heading: r.nutrient.fullName,
                 lines: ["nothing logged in this range carries a measured value, "
                         + "so there is nothing to rank"])
@@ -374,13 +375,13 @@ enum AskFacts {
                 + " · on \(e.days) \(e.days == 1 ? "day" : "days")"
         }
         lines.append(NutrientSources.coverageLine(r))
-        return HealthAskFacts(heading: "\(r.nutrient.fullName) sources", lines: lines,
+        return AskFacts(heading: "\(r.nutrient.fullName) sources", lines: lines,
                               note: NutrientSources.unknownRule)
     }
 
     /// One nutrient's consistency row, in the screen's own wording.
-    static func streak(_ s: NutrientStreak) -> HealthAskFacts {
-        HealthAskFacts(
+    static func streak(_ s: NutrientStreak) -> AskFacts {
+        AskFacts(
             heading: s.nutrient.fullName,
             lines: ["current run \(s.current) \(s.current == 1 ? "day" : "days")"
                         + " · best run \(s.longest)",
@@ -389,15 +390,15 @@ enum AskFacts {
     }
 
     /// One association, in the engine's fixed, non-causal wording.
-    static func association(_ a: DietAssociation) -> HealthAskFacts {
-        HealthAskFacts(
+    static func association(_ a: DietAssociation) -> AskFacts {
+        AskFacts(
             heading: a.title,
             lines: ["Spearman \(a.coefficientText) over \(a.pairs) day-pairs (\(a.strengthWord))",
                     a.sentence])
     }
 
     /// One pair the guardrails set aside, named rather than hidden.
-    static func patternMiss(_ m: DietPairMiss) -> HealthAskFacts {
-        HealthAskFacts(heading: m.title, lines: [m.reasonText])
+    static func patternMiss(_ m: DietPairMiss) -> AskFacts {
+        AskFacts(heading: m.title, lines: [m.reasonText])
     }
 }
