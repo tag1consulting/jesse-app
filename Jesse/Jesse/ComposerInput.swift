@@ -15,6 +15,10 @@ import UniformTypeIdentifiers
 // collapses to one line, growth to `maxLines` then internal scrolling, a
 // placeholder, Dynamic Type, and a rounded border.
 struct ComposerInput: UIViewRepresentable {
+    /// The composer field's UI-test handle. Shared with `ComposerDraftUITests`; a literal
+    /// in two places is how a renamed identifier turns a real regression into a green run.
+    static let accessibilityIdentifier = "composer.input"
+
     @Binding var text: String
     @Binding var isFocused: Bool
     var placeholder: String
@@ -33,6 +37,11 @@ struct ComposerInput: UIViewRepresentable {
         view.backgroundColor = .clear
         view.textContainerInset = UIEdgeInsets(top: 8, left: 8, bottom: 8, right: 8)
         view.isScrollEnabled = true
+        // Named so a UI test can find THIS field rather than guessing among the
+        // `UITextView`s the transcript now renders (one per reply, since App 1.0 (125)).
+        // Draft persistence is only provable by typing into the real composer, navigating,
+        // and relaunching — which needs an unambiguous handle on it.
+        view.accessibilityIdentifier = ComposerInput.accessibilityIdentifier
 
         view.layer.cornerRadius = 8
         view.layer.borderWidth = 1

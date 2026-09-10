@@ -265,13 +265,21 @@ final class MacCoordinator {
     /// the session reconciler's resurrection guard. Injectable so a test uses a scratch suite.
     private let sessionDeletionStore: PendingSessionDeletionStore
 
+    /// The store write, as one seam. Production is `try $0.save()`; a test injects a throw
+    /// to drive the staging failure the composer's draft handoff has to survive — the phone
+    /// has had this seam since the outbox landed, and the Mac's staging used to swallow its
+    /// save with `try?`, which is why a failed stage there was invisible.
+    private let save: @MainActor (ModelContext) throws -> Void
+
     init(configStore: MacConfigStore,
          makeClient: @escaping @MainActor (JesseConfig) -> any BridgeClientProtocol
             = { JesseBridgeClient(config: $0) },
-         sessionDeletionStore: PendingSessionDeletionStore = PendingSessionDeletionStore()) {
+         sessionDeletionStore: PendingSessionDeletionStore = PendingSessionDeletionStore(),
+         save: @escaping @MainActor (ModelContext) throws -> Void = { try $0.save() }) {
         self.configStore = configStore
         self.makeClient = makeClient
         self.sessionDeletionStore = sessionDeletionStore
+        self.save = save
     }
 
     private var client: any BridgeClientProtocol { makeClient(configStore.config) }
@@ -300,14 +308,45 @@ final class MacCoordinator {
     /// with a context attached a real turn ("just look at it") instead of a silently
     /// dropped one.
     func send(text: String, mode: JesseMode, thread: JesseThread, context: ModelContext) async {
+        guard let composed = stage(text: text, thread: thread, context: context) else { return }
+        await deliver(composed, mode: mode, thread: thread, context: context)
+    }
+
+    /// The COMPOSER's send: stages synchronously, then delivers in a detached task.
+    ///
+    /// It exists so the draft handoff happens in the same main-actor turn as the click or
+    /// the Return key. `send` above is awaitable, which means its staging is a hop away from
+    /// its caller, and a composer that cleared its text around an `await` is the shape of
+    /// bug this whole change is about. Returns whether the message was DURABLY STAGED, which
+    /// is the only condition on which the composer may clear itself.
+    @discardableResult
+    func stageAndSend(text: String, mode: JesseMode, thread: JesseThread,
+                      context: ModelContext) -> Bool {
+        guard let composed = stage(text: text, thread: thread, context: context) else {
+            return false
+        }
+        Task { await deliver(composed, mode: mode, thread: thread, context: context) }
+        return true
+    }
+
+    /// Persist the optimistic user turn (and spend the attachment and the draft) for a send,
+    /// returning the COMPOSED text to transmit, or nil if the send was refused or could not
+    /// be saved.
+    ///
+    /// Synchronous by design: everything that decides whether this message now exists —
+    /// the guards, the run gate, the insert, the draft release, the save — happens before
+    /// this function returns, so no caller can observe a half-staged send and no keystroke
+    /// can land inside the handoff.
+    private func stage(text: String, thread: JesseThread, context: ModelContext) -> String? {
         let attached = attachedContexts[thread.id]
         let typed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         let trimmed = attached.map { TodayThreadContext.firstMessage(context: $0.body, typed: text) }
             ?? typed
         // The guards run on the COMPOSED text and before the attachment is spent, so a
         // send refused because a turn is already running leaves the context attached for
-        // the send that does go through.
-        guard !trimmed.isEmpty, !isRunning, configStore.isConfigured else { return }
+        // the send that does go through — and leaves the composer's draft untouched, since
+        // nothing below has run.
+        guard !trimmed.isEmpty, !isRunning, configStore.isConfigured else { return nil }
         attachedContexts[thread.id] = nil
 
         // A staged thread is not in the store until its first send (the Chats list reaps
@@ -328,7 +367,27 @@ final class MacCoordinator {
         userTurn.thread = thread
         context.insert(userTurn)
         thread.updatedAt = Date()
-        try? context.save()
+        // ── The composer's DRAFT is spent in the SAME save as the turn that replaces it.
+        // The Mac has no outbox, so the persisted user turn IS the durable record of this
+        // message, and the transaction that writes it is the transaction that stops the
+        // draft being one. `release` hands back what it took so a throw can undo it.
+        let releasedDraft = ComposerDraft.release(from: thread, in: context)
+        // Real error handling, not the `try?` this used to be. A staging save that fails is
+        // the case where the user's message exists nowhere on disk, and swallowing it meant
+        // going on to send a turn whose transcript might never persist — and, now, clearing
+        // a composer whose text was the only remaining copy.
+        do {
+            try save(context)
+        } catch {
+            ComposerDraft.restore(releasedDraft, to: thread, in: context)
+            // The screen context goes back too. It was spent above on the assumption that
+            // this send was going to happen; leaving it spent would mean the preserved
+            // draft, sent again, went WITHOUT the reading the conversation was opened
+            // about — the same message turning into a different one.
+            attachedContexts[thread.id] = attached
+            lastError = "Couldn't save your message — try sending it again."
+            return nil
+        }
 
         activeThreadID = thread.id
         isRunning = true
@@ -336,6 +395,13 @@ final class MacCoordinator {
         streamingText = ""
         activity = ""
         lastError = nil
+        return trimmed
+    }
+
+    /// The network half of a send: the POST, then the stream or the poll. `trimmed` is the
+    /// composed text `stage` already persisted as the user turn.
+    private func deliver(_ trimmed: String, mode: JesseMode, thread: JesseThread,
+                         context: ModelContext) async {
         defer {
             isRunning = false
             accepted = false

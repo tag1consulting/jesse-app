@@ -597,9 +597,19 @@ final class RunCoordinator {
     /// until the first has landed: a log that arrives out of order is a log that reads as
     /// a different day's. Nothing else uses it, and nothing else should — the transcript
     /// and the outbox row are how a person learns a message went.
+    ///
+    /// RETURNS whether the message was DURABLY STAGED — true once the optimistic user turn
+    /// and its `OutboxItem` are on disk, false for a send that was refused (empty, or a turn
+    /// already running) and false for one whose staging save threw. That return is what the
+    /// composer's draft handoff is built on: it clears the composer only on true, so a
+    /// refused or unsaved send leaves the text exactly where the user left it. The draft
+    /// itself is dropped INSIDE the staging save (see `ComposerDraft.release`), so the
+    /// message is never in neither place and never in both; a save that throws puts the
+    /// draft straight back.
+    @discardableResult
     func send(thread: JesseThread, text: String, voice: Bool, context: ModelContext,
               attachments: [JesseAttachment] = [],
-              onAck: (@MainActor (Bool) -> Void)? = nil) {
+              onAck: (@MainActor (Bool) -> Void)? = nil) -> Bool {
         let threadID = thread.id
         let attached = attachedContexts[threadID]
         let typed = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -610,7 +620,9 @@ final class RunCoordinator {
         // for the send that does go through.
         guard !trimmed.isEmpty, !isRunning(thread.id) else {
             onAck?(false)
-            return
+            // Refused before anything was spent: the attachment stays attached (above) and
+            // the composer's draft stays untouched, because nothing here has released it.
+            return false
         }
         attachedContexts[threadID] = nil
         errors[threadID] = nil
@@ -667,6 +679,14 @@ final class RunCoordinator {
                 OutboxAttachment(filename: att.filename, mime: att.mime, data: att.data))
         }
         context.insert(item)
+        // ── The composer's DRAFT is spent in the SAME save. This is the ownership
+        // transfer, and it is atomic on purpose: the transaction that makes the outbox the
+        // owner of this message is the transaction that stops the draft being one. There is
+        // no instant in which a kill would leave the message in neither place (the old
+        // "clear the composer, then call the coordinator" order), and none in which it is
+        // in both (a draft the user would find waiting after their message had already
+        // gone). `release` hands back what it took so a throw below can undo it.
+        let releasedDraft = ComposerDraft.release(from: thread, in: context)
         // Real error handling, not `try?`. If this throws the user message is shown
         // but neither it nor the outbox record is persisted, and proceeding would
         // attach the reply to a thread that may never persist. Surface a recoverable
@@ -675,9 +695,18 @@ final class RunCoordinator {
             try save(context)
         } catch {
             Log.run.error("optimistic user-turn + outbox save failed for thread \(threadID): \(error.localizedDescription) — aborting the turn")
+            // Nothing was persisted, so the draft was never really spent. Put it back
+            // before surfacing the failure: the composer keeps its text (it clears only on
+            // a `true` return) and the model now agrees with it again.
+            ComposerDraft.restore(releasedDraft, to: thread, in: context)
+            // And put the SCREEN CONTEXT back with it. It was spent above on the
+            // assumption that this send was going to happen; leaving it spent would mean
+            // the preserved draft, sent again, went WITHOUT the reading the conversation
+            // was opened about — the same message turning into a different one.
+            attachedContexts[threadID] = attached
             errors[threadID] = "Couldn't save your message — try sending it again."
             onAck?(false)
-            return
+            return false
         }
         // Persist storage-optimized thumbnail previews of any attachments onto the
         // user turn (for history). The full-resolution bytes live in the OutboxItem
@@ -690,6 +719,10 @@ final class RunCoordinator {
         // existing InFlight/consume/Re-check machinery owns the turn unchanged; a
         // throw before that ACK flips the item to `.failed` for the per-message Retry.
         transmit(item: item, thread: thread, context: context, onAck: onAck)
+        // Durably staged. From here the outbox owns delivery — a network failure flips the
+        // item to `.failed` for its own Retry and never comes back to the composer, so a
+        // retry can never produce a second sendable copy of this message.
+        return true
     }
 
     /// The bridge round-trip for one staged (or retried) `OutboxItem`, keyed by its

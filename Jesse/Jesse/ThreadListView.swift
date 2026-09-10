@@ -555,10 +555,18 @@ struct ThreadListView: View {
     /// doesn't accumulate empties from `+`-then-back. Scoped to purely-local threads
     /// (no `sessionId`): an adopted stub (started on the Mac) carries a `sessionId` but
     /// has no turns until it hydrates on open, so it must be preserved, not pruned.
+    ///
+    /// An UNSENT DRAFT also preserves a thread. A turn-less conversation someone has typed
+    /// a message into is not an abandoned `+`-then-back, and reaping it would be exactly
+    /// the loss the durable draft exists to prevent — the user would come back to find both
+    /// the message and the conversation gone. A draft the user deliberately EMPTIED does
+    /// not count (`hasComposerDraft` is false for `""`), so an emptied composer leaves the
+    /// thread as reapable as it ever was.
     private func pruneEmpty() {
         var changed = false
         for thread in threads
-        where thread.turns.isEmpty && thread.sessionId == nil && !coordinator.isRunning(thread.id) {
+        where thread.turns.isEmpty && thread.sessionId == nil && !thread.hasComposerDraft
+                && !coordinator.isRunning(thread.id) {
             context.delete(thread)
             changed = true
         }
