@@ -348,11 +348,10 @@ public struct SentinelStatusDocument: Decodable, Sendable {
         try JSONDecoder().decode(SentinelStatusDocument.self, from: data)
     }
 
-    /// The five service slots in the order the sentinel declares them, so the card reads the
+    /// The four service slots in the order the sentinel declares them, so the card reads the
     /// same every refresh. Anything the sentinel adds later lands after them, sorted, rather
     /// than being dropped.
-    public static let serviceOrder = ["bridge", "autocommit", "lock-reaper", "qmd-update",
-                                      "miniserve"]
+    public static let serviceOrder = ["bridge", "autocommit", "lock-reaper", "qmd-update"]
 
     public var serviceRows: [ServiceRow] {
         guard let rows = services.detail else { return [] }

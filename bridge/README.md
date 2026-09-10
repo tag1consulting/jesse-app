@@ -2213,7 +2213,7 @@ shows `null` rather than a guess, and the first successful deploy fills it in.
 | Route | What it does |
 | --- | --- |
 | `GET /sentinel/status` | The whole picture, in one document. See below. |
-| `POST /sentinel/restart/{bridge\|autocommit\|lock-reaper\|qmd-update\|miniserve}` | `launchctl kickstart -k gui/<uid>/<label>`. For `bridge`, then polls `/health` for 60 s and answers `{restarted, healthy, version}`. |
+| `POST /sentinel/restart/{bridge\|autocommit\|lock-reaper\|qmd-update}` | `launchctl kickstart -k gui/<uid>/<label>`. For `bridge`, then polls `/health` for 60 s and answers `{restarted, healthy, version}`. |
 | `POST /sentinel/bridge/reload-env` | `bootout` + `bootstrap` from the bridge's plist, then the same health poll. **The only way a plist environment change takes effect** — `kickstart -k` re-execs with the old environment. |
 | `POST /sentinel/git/unlock` | Removes `~/jesse/.git/index.lock` **only** if it is older than 180 s *and* `pgrep -u <uid> -x git` finds nothing, then kicks the autocommit. Otherwise `409` naming which condition failed. |
 | `POST /sentinel/artifacts/prune` | Deletes artifact directories older than 7 days; answers with the bytes freed. |
@@ -2222,10 +2222,10 @@ shows `null` rather than a guess, and the first successful deploy fills it in.
 | `GET /sentinel/deploy/status` | The deploy card: the last deploy, what is running, and what `origin/main` is. See below. |
 | `POST /sentinel/deploy` | Build a merged commit, swap the three binaries, restart, roll back on any failure. `202 {deploy_id}`; progress on the status route. See below. |
 
-The `{service}` segment is one of **five fixed slugs**, never a launchd label:
+The `{service}` segment is one of **four fixed slugs**, never a launchd label:
 the labels are deployment configuration (`JESSE_SENTINEL_LABEL_*`), so there is
 no way for a caller to name a job the configuration did not name. Anything else
-is a `404` that lists the five.
+is a `404` that lists the four.
 
 Every mutating verb passes three gates in order — the bearer token
 (constant-time, the bridge's own `check_auth`), a **10-per-minute** rate limit,
@@ -2481,7 +2481,7 @@ carrying a token that pairs nothing is worse than one carrying neither.
 | `JESSE_SENTINEL_BRIDGE_STATE_DIR` | `~/.jesse-bridge` | Where `artifacts/` and `device.json` live. |
 | `JESSE_SENTINEL_LEDGER` | `<vault repo>/vault/Inbox/scheduled-jobs-ledger.jsonl` | |
 | `JESSE_SENTINEL_AUTOCOMMIT_LOG` | read from the autocommit job's plist | |
-| `JESSE_SENTINEL_LABEL_{BRIDGE,AUTOCOMMIT,LOCK_REAPER,QMD_UPDATE,MINISERVE}` | `com.example.*` placeholders (except `com.qmd.update`) | The launchd labels the restart verbs address. **Any still on a placeholder is named, loudly, at startup** — a label in someone's reverse-DNS namespace is personal infrastructure and cannot be a compiled-in default (`scripts/ci-guards.sh` §5). |
+| `JESSE_SENTINEL_LABEL_{BRIDGE,AUTOCOMMIT,LOCK_REAPER,QMD_UPDATE}` | `com.example.*` placeholders (except `com.qmd.update`) | The launchd labels the restart verbs address. **Any still on a placeholder is named, loudly, at startup** — a label in someone's reverse-DNS namespace is personal infrastructure and cannot be a compiled-in default (`scripts/ci-guards.sh` §5). |
 | `JESSE_SENTINEL_DEPLOY_CLONE` | `~/deploy/jesse-app` | The clone the deploy verb builds in. **Never a checkout someone works in** — every deploy leaves it on a detached head. Created by the installer. |
 | `JESSE_SENTINEL_BIN_DIR` | `~/.local/bin` | Where the three symlinks and `jesse-bridge.d/` live. |
 | `JESSE_SENTINEL_GITHUB_TOKEN` | — | A **fine-grained, read-only** token (Actions: read, Contents: read). Absent → `POST /sentinel/deploy` refuses, because a deploy that cannot verify CI is not one this service performs. |

@@ -2933,7 +2933,7 @@ for the verb table and the watchdog rules.
   record; no MCP server was added or changed. The sentinel is a separate binary on
   a separate port that no child process is told about and no allowlist grants. The
   agent cannot call it, and the containment posture is byte-for-byte what it was.
-- **What it can do.** Restart the five launchd jobs this deployment names,
+- **What it can do.** Restart the four launchd jobs this deployment names,
   `bootout`/`bootstrap` the bridge from its plist, delete a provably-stale
   `.git/index.lock`, delete artifact directories older than seven days, forward
   two of the bridge's own scheduler control verbs, and **replace the bridge

@@ -34,7 +34,7 @@ pub use watchdog::*;
 // turn; it listens on its own port, with its own token, and the two tokens are disjoint on
 // purpose (see `refuse_shared_token`).
 //
-// What it can do: read state (`GET /sentinel/status`), restart the five launchd jobs this
+// What it can do: read state (`GET /sentinel/status`), restart the four launchd jobs this
 // deployment runs, reload the bridge's plist environment, clear a stale git index lock,
 // prune the artifact store, and proxy the scheduler's two control verbs. What it cannot do:
 // read the vault, run a model, or accept a command that is not in the table.
@@ -71,7 +71,7 @@ pub const WATCHDOG_TICK: Duration = Duration::from_secs(60);
 /// cannot kickstart the bridge in a circle.
 pub const VERB_RATE_PER_MIN: u32 = 10;
 
-/// The five launchd jobs this deployment runs, as the sentinel's own vocabulary. The URL
+/// The four launchd jobs this deployment runs, as the sentinel's own vocabulary. The URL
 /// says `bridge`, not a reverse-DNS label: the label is deployment configuration (see
 /// [`SentinelConfig::labels`]), the SLOT is what the verb table is written in terms of.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
@@ -80,16 +80,14 @@ pub enum ServiceSlot {
     Autocommit,
     LockReaper,
     QmdUpdate,
-    Miniserve,
 }
 
 /// Every slot, in the order `GET /sentinel/status` reports them.
-pub const SERVICE_SLOTS: [ServiceSlot; 5] = [
+pub const SERVICE_SLOTS: [ServiceSlot; 4] = [
     ServiceSlot::Bridge,
     ServiceSlot::Autocommit,
     ServiceSlot::LockReaper,
     ServiceSlot::QmdUpdate,
-    ServiceSlot::Miniserve,
 ];
 
 impl ServiceSlot {
@@ -100,7 +98,6 @@ impl ServiceSlot {
             ServiceSlot::Autocommit => "autocommit",
             ServiceSlot::LockReaper => "lock-reaper",
             ServiceSlot::QmdUpdate => "qmd-update",
-            ServiceSlot::Miniserve => "miniserve",
         }
     }
 
@@ -117,13 +114,12 @@ impl ServiceSlot {
             ServiceSlot::Autocommit => "JESSE_SENTINEL_LABEL_AUTOCOMMIT",
             ServiceSlot::LockReaper => "JESSE_SENTINEL_LABEL_LOCK_REAPER",
             ServiceSlot::QmdUpdate => "JESSE_SENTINEL_LABEL_QMD_UPDATE",
-            ServiceSlot::Miniserve => "JESSE_SENTINEL_LABEL_MINISERVE",
         }
     }
 
     /// The label used when the deployment names none.
     ///
-    /// FOUR OF THE FIVE ARE PLACEHOLDERS ON PURPOSE. A launchd label in someone's own
+    /// THREE OF THE FOUR ARE PLACEHOLDERS ON PURPOSE. A launchd label in someone's own
     /// reverse-DNS namespace is personal infrastructure, and `scripts/ci-guards.sh` refuses
     /// it in a tracked file — correctly, because a default that happened to match one
     /// machine would silently do nothing on every other one. So the defaults sit in the
@@ -136,7 +132,6 @@ impl ServiceSlot {
             ServiceSlot::Autocommit => "com.example.jesse-autocommit",
             ServiceSlot::LockReaper => "com.example.jesse-lock-reaper",
             ServiceSlot::QmdUpdate => "com.qmd.update",
-            ServiceSlot::Miniserve => "com.example.miniserve-diet-dashboard",
         }
     }
 }
@@ -756,11 +751,32 @@ mod tests {
         for slot in SERVICE_SLOTS {
             assert_eq!(ServiceSlot::from_slug(slot.slug()), Some(slot));
         }
-        // The verb table is CLOSED: a path segment that is not one of the five names
+        // The verb table is CLOSED: a path segment that is not one of the four names
         // nothing, so no caller can address a launchd label the config did not name.
         assert_eq!(ServiceSlot::from_slug("com.example.jesse-bridge"), None);
         assert_eq!(ServiceSlot::from_slug(""), None);
         assert_eq!(ServiceSlot::from_slug("Bridge"), None);
+    }
+
+    /// The miniserve diet dashboard was retired, not silenced: the Health tab renders from
+    /// `GET /jesse/diet` and the HTML it served is gone. Its slot must not come back, or the
+    /// services probe reports "not loaded" for a job that no longer exists.
+    #[test]
+    fn the_retired_dashboard_server_is_not_supervised() {
+        let slugs: Vec<&str> = SERVICE_SLOTS.iter().map(|s| s.slug()).collect();
+        assert_eq!(
+            slugs,
+            vec!["bridge", "autocommit", "lock-reaper", "qmd-update"]
+        );
+        assert_eq!(ServiceSlot::from_slug("miniserve"), None);
+        for slot in SERVICE_SLOTS {
+            assert!(
+                !slot.default_label().contains("miniserve"),
+                "{} still defaults to the retired label",
+                slot.slug()
+            );
+            assert!(!slot.label_env().contains("MINISERVE"), "{}", slot.slug());
+        }
     }
 
     #[test]
@@ -852,7 +868,7 @@ mod tests {
             .collect();
         // The configured one drops out; qmd-update's default is the tool's real label and
         // was never a placeholder.
-        assert_eq!(names, vec!["autocommit", "lock-reaper", "miniserve"]);
+        assert_eq!(names, vec!["autocommit", "lock-reaper"]);
         assert_eq!(
             cfg.target(ServiceSlot::Bridge),
             "gui/501/com.tag1.jesse-bridge"

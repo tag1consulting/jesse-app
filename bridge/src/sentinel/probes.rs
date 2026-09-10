@@ -174,10 +174,10 @@ pub fn parse_launchctl_print(text: &str) -> ServiceInfo {
     info
 }
 
-/// One `launchctl print` per configured label, sequentially — five 5 ms calls, and running
+/// One `launchctl print` per configured label, sequentially — four 5 ms calls, and running
 /// them concurrently would only add task overhead. A label that is not loaded exits
-/// non-zero, which is reported as a `not-loaded` state rather than an error: a miniserve
-/// that was never installed is a fact about the deployment, not a fault in the sentinel.
+/// non-zero, which is reported as a `not-loaded` state rather than an error: a job that
+/// was never installed is a fact about the deployment, not a fault in the sentinel.
 pub async fn probe_services(sen: &Sentinel) -> Probe {
     let mut out = serde_json::Map::new();
     let mut any_failed = false;
@@ -191,7 +191,7 @@ pub async fn probe_services(sen: &Sentinel) -> Probe {
         )
         .await;
         // A launchctl we could not run, or that hung, makes the WHOLE probe `unknown`
-        // rather than painting five services as "not loaded" on no evidence.
+        // rather than painting four services as "not loaded" on no evidence.
         if res.unrunnable() {
             return Probe::unknown(format!("launchctl print {target}: {}", res.summary()));
         }
