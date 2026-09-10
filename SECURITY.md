@@ -547,12 +547,21 @@ Residual risks, none of which the sandbox closes:
 
 #### Codex does not get this
 
-`Harness::main_mcp_config` is per harness, and Claude Code's main turn is the only one that
-gained the `build` server. Codex stays on the fourteen-server set (`MESSAGES_MCP_CONFIG`).
-Giving it a build tool would move Codex's row labels, orphan the two operator `[[accepted]]`
-blocks in `containment-codex.toml` that are keyed by those labels, and require a live Codex
-battery that this change does not run — and Codex is not armed at `write` on this deployment
-in any case. The asymmetry is deliberate and is recorded rather than introduced quietly.
+`Harness::main_mcp_config` is per harness. Claude Code's main turn carries three servers
+Codex's does not — `build` (this one), `places` and `inbound` — and they are named in ONE
+place, `CODEX_WITHHELD_MCP_SERVERS`; a test fails the build if the two harnesses differ by
+anything else. Every other server's entry is spelled once and shared by both.
+
+Giving Codex any of the three would move Codex's row labels and orphan BOTH operator
+`[[accepted]]` blocks in `containment-codex.toml`, which are keyed by those labels — including
+the signed `write` acceptance the `codex-write` model on this deployment runs on. A re-record
+carries acceptances across by label, so it would leave every known-open unsigned: green in CI,
+and no longer vouched for. Closing the gap is the owner re-signing against a fresh live battery,
+not a code change. The asymmetry is deliberate and recorded rather than introduced quietly.
+
+Separately, and not closable by any server list: Codex's sandbox scopes writes only, so a Codex
+child can read whatever the bridge's unix user can read. The remedy is the same dedicated unix
+user named above.
 
 #### Deployment
 
