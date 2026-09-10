@@ -2422,6 +2422,16 @@ fn model_row(
     json!({
         "id": m.id,
         "label": m.label,
+        // The backend version this entry points at, beside the label that was derived from
+        // it. Reported separately because a client that wants to show the resolved version
+        // as secondary text should not have to parse it back out of a display string.
+        // `null` for a family with no version to declare (the ambient default, a local
+        // endpoint whose operator did not say).
+        "version": m.version,
+        // The ids that used to name this entry. A client never needs to SEND one — the
+        // bridge resolves them — but a settings screen that shows a stale selection can say
+        // what it resolved to.
+        "aliases": m.aliases,
         "kind": m.kind,
         // The API SURFACE this model's turn is spoken on, beside the hosting arrangement
         // `kind` names. Reported because the two were one key until now and a client (or an
@@ -2542,7 +2552,11 @@ pub async fn jesse_set_model(
         Some(m) => {
             let h = model_health(m, &st.health);
             if h.available() {
-                let active = st.models.set_active(id);
+                // The CANONICAL id, never the string the client sent: a client that named
+                // an alias (an old versioned id it persisted before the family rename) gets
+                // the new id written back, so the alias is a one-time resolution rather
+                // than a name that lives on in state forever.
+                let active = st.models.set_active(&m.id);
                 Ok(Json(json!({ "active": active })))
             } else if !h.configured {
                 Err((

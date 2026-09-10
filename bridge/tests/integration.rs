@@ -109,6 +109,8 @@ fn ambient_pick() -> RoutedPick {
 fn with_vaultqa_offload(mut cfg: Config) -> Config {
     let mut models = cfg.model_registry.models.clone();
     models.push(RegistryModel {
+        version: None,
+        aliases: Vec::new(),
         codex: Default::default(),
         id: "local-vaultqa".to_string(),
         label: "Local vault QA".to_string(),
@@ -4873,6 +4875,8 @@ fn cfg_with_switch_registry(state_dir: &std::path::Path) -> Config {
     let registry = ModelRegistry {
         models: vec![
             RegistryModel {
+                version: None,
+                aliases: Vec::new(),
                 codex: Default::default(),
                 id: "opus".into(),
                 label: "Claude Opus".into(),
@@ -4897,6 +4901,8 @@ fn cfg_with_switch_registry(state_dir: &std::path::Path) -> Config {
                 vision_complementary: false,
             },
             RegistryModel {
+                version: None,
+                aliases: Vec::new(),
                 codex: Default::default(),
                 id: "glm-5.2".into(),
                 label: "GLM 5.2".into(),
@@ -4925,6 +4931,8 @@ fn cfg_with_switch_registry(state_dir: &std::path::Path) -> Config {
                 vision_complementary: false,
             },
             RegistryModel {
+                version: None,
+                aliases: Vec::new(),
                 codex: Default::default(),
                 id: "test-unarmed".into(),
                 label: "Unarmed Test Model".into(),
@@ -5158,6 +5166,78 @@ async fn set_model_unavailable_is_409_and_does_not_switch() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A DEVICE THAT PERSISTED AN OLD VERSIONED ID KEEPS WORKING, end to end and through the
+/// endpoints rather than through the registry alone.
+///
+/// Two halves, and the second is the one a unit test cannot see: selecting by an alias
+/// writes the CANONICAL id back to `model.json`, so the alias is a one-time resolution
+/// rather than a name that lives on in state forever.
+#[tokio::test]
+async fn an_alias_selects_the_family_entry_and_persists_the_canonical_id() {
+    let dir = std::env::temp_dir().join(format!("jesse-model-alias-{}", random_hex()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut cfg = cfg_with_switch_registry(&dir);
+    // The fixture's hosted entry, renamed to its family the way the built-ins now are.
+    let glm = cfg
+        .model_registry
+        .models
+        .iter_mut()
+        .find(|m| m.id == "glm-5.2")
+        .unwrap();
+    glm.id = "glm".into();
+    glm.version = Some("5.2".into());
+    glm.label = "GLM 5.2".into();
+    glm.aliases = vec!["glm-5.2".into()];
+    let st = AppState::new(cfg);
+
+    // A client that still knows only the old id.
+    let resp = app(st.clone())
+        .oneshot(set_model_request(
+            Some("Bearer test-token"),
+            r#"{"id":"glm-5.2"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        body_value(resp).await["active"],
+        "glm",
+        "the response names the canonical id, not the alias the client sent"
+    );
+    assert_eq!(
+        st.models.active(),
+        "glm",
+        "the alias is resolved once and the canonical id is what persists"
+    );
+
+    // The row carries the version and the alias, so a client can render both.
+    let resp = app(st.clone())
+        .oneshot(models_request(Some("Bearer test-token")))
+        .await
+        .unwrap();
+    let v = body_value(resp).await;
+    let row = v["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"] == "glm")
+        .unwrap()
+        .clone();
+    assert_eq!(row["version"], "5.2");
+    assert_eq!(row["label"], "GLM 5.2");
+    assert_eq!(row["aliases"], serde_json::json!(["glm-5.2"]));
+    // The ambient default declares no version rather than inventing one.
+    let opus = v["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"] == "opus")
+        .unwrap();
+    assert!(opus["version"].is_null());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// THE MODELS-ENDPOINT SHAPE, pinned. A silently changed shape is a client that renders the
 /// wrong thing, so the whole key set is asserted rather than each new field alone. It has
 /// gained `level` and `streams_text`, and in D12 `search_degraded` — the flag that says this
@@ -5182,6 +5262,7 @@ async fn the_models_endpoint_entry_shape_is_pinned() {
     assert_eq!(
         keys,
         vec![
+            "aliases",
             "available",
             "configured",
             "healthy",
@@ -5193,6 +5274,7 @@ async fn the_models_endpoint_entry_shape_is_pinned() {
             "level",
             "search_degraded",
             "streams_text",
+            "version",
             "vision",
             "wire",
             "writes_allowed",
@@ -5562,6 +5644,8 @@ async fn preprocess_pairs_and_frames_a_faithful_view() {
     let base = start_mock_helper().await;
     // A registry with the mock helper (configured) and a text model paired to it.
     let helper = RegistryModel {
+        version: None,
+        aliases: Vec::new(),
         codex: Default::default(),
         id: "mock".into(),
         label: "Mock VL".into(),
@@ -5581,6 +5665,8 @@ async fn preprocess_pairs_and_frames_a_faithful_view() {
         vision_complementary: false,
     };
     let text = RegistryModel {
+        version: None,
+        aliases: Vec::new(),
         codex: Default::default(),
         id: "glm".into(),
         label: "GLM".into(),
@@ -5660,6 +5746,8 @@ async fn unpaired_model_reports_no_vision() {
     // A configured text model with NO partners reports vision disabled — the capability
     // rule: unpaired == no-vision, surfaced, never a silent half-state.
     let text = RegistryModel {
+        version: None,
+        aliases: Vec::new(),
         codex: Default::default(),
         id: "glm".into(),
         label: "GLM".into(),
@@ -5761,6 +5849,8 @@ async fn the_vision_path_is_identical_on_both_harnesses() {
         role: VisionRole::Any,
     };
     let helper = RegistryModel {
+        version: None,
+        aliases: Vec::new(),
         codex: Default::default(),
         id: "mock".into(),
         label: "Mock VL".into(),

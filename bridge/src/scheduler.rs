@@ -2129,13 +2129,9 @@ impl Scheduler {
                 }
             }
         };
-        let model_ids: Vec<String> = st
-            .cfg
-            .model_registry
-            .models
-            .iter()
-            .map(|m| m.id.clone())
-            .collect();
+        // Aliases included — see `Config::from_env`, which validates the boot-time copy of
+        // this same file against the same list.
+        let model_ids: Vec<String> = st.cfg.model_registry.known_ids();
         let vault = PathBuf::from(&st.cfg.vault);
         let next = validate_schedule_with(
             &raw,

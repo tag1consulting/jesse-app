@@ -1877,6 +1877,58 @@ pub fn model_wire_from_env(prefix: &str, id: &str, kind: ModelKind) -> Wire {
     }
 }
 
+/// The declared backend VERSION for an env-triple model: `<prefix>_VERSION` when set to a
+/// non-blank value, else the built-in default (which may itself be `None`).
+///
+/// One variable per model, exactly like `<prefix>_MODEL` and `<prefix>_BASE_URL`, and that
+/// symmetry is the whole point: pointing a family at a new backend version is
+/// `<prefix>_MODEL` for the slug and `<prefix>_VERSION` for what the picker says about it,
+/// both in the launch environment, neither in Rust. A blank value is read as "no version to
+/// show" rather than as an empty version string, so `JESSE_MODEL_GLM_VERSION=` renders
+/// `GLM` rather than `GLM ` with a trailing space.
+pub fn model_version_from_env(prefix: &str, default: Option<&str>) -> Option<String> {
+    match std::env::var(format!("{prefix}_VERSION")) {
+        Ok(raw) => {
+            let v = raw.trim();
+            if v.is_empty() {
+                None
+            } else {
+                Some(v.to_string())
+            }
+        }
+        Err(_) => default.map(str::to_string),
+    }
+}
+
+/// The label an entry shows in the picker: family, then version, then an optional
+/// parenthetical note.
+///
+/// **DERIVED RATHER THAN DECLARED, so it cannot go stale.** A label written out by hand
+/// (`"GLM 5.2"`) is a second place the version is spelled, and the second place is the one
+/// that stops being true — an operator who repoints the slug at 5.3 gets a picker still
+/// claiming 5.2 and no way to fix it short of a release. Deriving it means the version is
+/// spelled ONCE, in [`RegistryModel::version`], which is itself env-overridable.
+///
+/// The `note` is for a distinction that is not a version: two entries for the same family on
+/// two different API surfaces need something in the label to tell them apart, and it must not
+/// displace the version — hence a trailing parenthetical rather than an explicit label
+/// override, which would re-introduce exactly the staleness this exists to remove.
+///
+/// An explicit `label` in config still wins over this entirely; that is the operator saying
+/// they want a fixed string and accepting that it will not track a bump.
+pub fn derive_model_label(family: &str, version: Option<&str>, note: Option<&str>) -> String {
+    let mut out = family.trim().to_string();
+    if let Some(v) = version.map(str::trim).filter(|v| !v.is_empty()) {
+        out.push(' ');
+        out.push_str(v);
+    }
+    if let Some(n) = note.map(str::trim).filter(|n| !n.is_empty()) {
+        out.push(' ');
+        out.push_str(n);
+    }
+    out
+}
+
 /// How a `direct` model's token is presented on the wire.
 ///
 /// The two schemes that exist in practice. `None` on a model means the agent layer picks by
@@ -2047,11 +2099,44 @@ pub struct DirectQuirks {
 /// named env var, and is never serialized to a client or to `model.json`).
 #[derive(Debug, Clone)]
 pub struct RegistryModel {
-    /// The stable id the store + endpoints key on (`opus`, `glm-5.2`, `kimi-k3`, `local`,
-    /// or any declarative id).
+    /// The stable id the store + endpoints key on — a **FAMILY** id, carrying no version
+    /// (`opus`, `glm`, `kimi`, `local`, or any declarative id).
+    ///
+    /// **VERSION-FREE ON PURPOSE.** The id is what the switch persists and what every
+    /// endpoint keys on, so a version inside it makes a backend bump either a lie (the
+    /// picker still says 5.2 while the slug points at 5.3) or a code change plus a release.
+    /// The version moved to [`RegistryModel::version`], which is env-overridable exactly
+    /// like the slug — see [`model_version_from_env`].
+    ///
+    /// The old versioned ids did not disappear: each family keeps them in
+    /// [`RegistryModel::aliases`], so a selection persisted as `glm-5.2` still resolves.
     pub id: String,
+    /// The backend version this entry currently points at (`5.2`, `K3`), or `None` for a
+    /// family that has no version to show (`opus`, `local`).
+    ///
+    /// **DECLARED, NOT DISCOVERED.** Nothing on the wire reports a version, so this is the
+    /// operator's statement about which backend the slug names. It exists so a bump is one
+    /// configuration change: `JESSE_MODEL_GLM_MODEL` moves the slug,
+    /// `JESSE_MODEL_GLM_VERSION` moves the version, and the label follows the second
+    /// automatically because it is derived from it (see [`derive_model_label`]).
+    pub version: Option<String>,
     /// The human label shown in the app's switcher.
+    ///
+    /// DERIVED from family + version unless the entry declared one explicitly. The
+    /// derivation is what makes the acceptance property hold: repointing a family at a new
+    /// backend version changes the slug, the version string and the picker label together,
+    /// from configuration alone.
     pub label: String,
+    /// Ids that used to name this entry and must keep resolving — the old versioned ids.
+    ///
+    /// A persisted selection is a bare string in `model.json`; renaming an entry therefore
+    /// ORPHANS it, and the degrade path in `State::resolve_active_model` would silently drop
+    /// the operator back onto the ambient default. An alias makes the rename invisible: the
+    /// registry resolves the old id to this entry, and the endpoints persist the CANONICAL
+    /// id back so the alias is needed exactly once per device.
+    ///
+    /// An exact id always beats an alias — see [`ModelRegistry::get`].
+    pub aliases: Vec<String>,
     pub kind: ModelKind,
     /// The API surface this model's turn is spoken on — see [`Wire`].
     ///
@@ -2157,9 +2242,47 @@ pub const DEFAULT_MODEL_ID: &str = "opus";
 pub const DEFAULT_MODEL_LEVEL: Capability = Capability::Read;
 
 impl ModelRegistry {
-    /// Look up an entry by id.
+    /// Look up an entry by its canonical id, then — only if nothing matched — by ALIAS.
+    ///
+    /// **TWO PASSES, NOT ONE, AND THE ORDER IS LOAD-BEARING.** A single pass that accepted
+    /// either would let an alias on one entry shadow another entry's real id, which is a
+    /// silent mis-route: the operator selects `kimi`, and a stale alias somewhere sends the
+    /// turn to a different backend. An exact id always wins, so an alias can only ever
+    /// resolve a name nothing else claims.
+    ///
+    /// This is what makes the versionless-id rename invisible to a device that persisted
+    /// `glm-5.2` before the rename: every caller in the bridge — the selection resolve, the
+    /// per-turn `model` field, `POST /jesse/model`, the routing walk, the schedule's `model`
+    /// key — reaches the registry through here.
     pub fn get(&self, id: &str) -> Option<&RegistryModel> {
-        self.models.iter().find(|m| m.id == id)
+        self.models.iter().find(|m| m.id == id).or_else(|| {
+            self.models
+                .iter()
+                .find(|m| m.aliases.iter().any(|a| a == id))
+        })
+    }
+
+    /// Every name the registry answers to — canonical ids first, then aliases.
+    ///
+    /// What a validator that checks "does this name a model?" must ask, rather than the id
+    /// list: a `[[schedule]]` job whose `model` key was written before the family rename
+    /// names an alias, and rejecting it would fail the whole schedule file at boot over a
+    /// name the registry resolves perfectly well.
+    pub fn known_ids(&self) -> Vec<String> {
+        let mut out: Vec<String> = self.models.iter().map(|m| m.id.clone()).collect();
+        for m in &self.models {
+            out.extend(m.aliases.iter().cloned());
+        }
+        out
+    }
+
+    /// The CANONICAL id for a name that may be an alias, or `None` when nothing claims it.
+    ///
+    /// The endpoints persist THIS rather than what the client sent, so an alias is needed
+    /// exactly once per device: the first selection carrying the old id writes the new one
+    /// back, and the alias is thereafter dead weight rather than a load-bearing indirection.
+    pub fn canonical_id(&self, id: &str) -> Option<&str> {
+        self.get(id).map(|m| m.id.as_str())
     }
 
     /// The default (ambient) entry — always present, so this never panics in practice;
@@ -2244,6 +2367,10 @@ impl ModelRegistry {
             }
         }
 
+        // An alias that can never fire is a silent no-op, and a persisted selection is
+        // exactly what it was supposed to rescue. Log once per dead alias.
+        validate_model_aliases(&models);
+
         // A paired vision helper that doesn't resolve is a config error worth shouting
         // about — never a silent no-op. Log once per broken pairing at startup.
         validate_vision_pairings(&models);
@@ -2266,6 +2393,41 @@ impl ModelRegistry {
         m.vision
             .iter()
             .any(|p| self.vision_partner(&p.id).is_some())
+    }
+}
+
+/// Warn once for every alias that can never resolve to the entry that declares it — either
+/// because a real entry already claims the name (an exact id always wins, see
+/// [`ModelRegistry::get`]) or because two entries claim the same alias (the earlier one
+/// wins, and the later entry's alias is dead).
+///
+/// A WARNING RATHER THAN AN ERROR, unlike the level and wire checks in `validate_model_config`:
+/// an alias grants nothing and gates nothing, so a dead one costs an operator a resolution
+/// they expected, never a posture they did not intend. What it must not be is SILENT — the
+/// whole reason an alias exists is that somebody's persisted selection depends on it.
+fn validate_model_aliases(models: &[RegistryModel]) {
+    let ids: std::collections::HashSet<&str> = models.iter().map(|m| m.id.as_str()).collect();
+    let mut claimed: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+    for m in models {
+        for a in &m.aliases {
+            if ids.contains(a.as_str()) {
+                eprintln!(
+                    "jesse-bridge: WARNING model '{}' declares alias '{a}', which is already \
+                     the canonical id of another entry — an exact id always wins, so this \
+                     alias resolves nothing. Remove it or rename the alias.",
+                    m.id
+                );
+                continue;
+            }
+            if let Some(first) = claimed.insert(a.as_str(), m.id.as_str()) {
+                eprintln!(
+                    "jesse-bridge: WARNING models '{first}' and '{}' both declare alias \
+                     '{a}'; '{first}' wins (registry order) and '{}''s alias is INERT. A \
+                     selection persisted as '{a}' will resolve to '{first}'.",
+                    m.id, m.id
+                );
+            }
+        }
     }
 }
 
@@ -2298,12 +2460,24 @@ fn validate_vision_pairings(models: &[RegistryModel]) {
     }
 }
 
-/// Insert `m` into the list, REPLACING any existing entry with the same id IN PLACE (stable
-/// order, default-first preserved) or appending it when new. The ambient `opus` default is
-/// protected: an entry that tries to take its id is refused with a warning, so `opus` stays
-/// byte-for-byte the built-in. This is what makes the three-source merge "later overrides
-/// earlier by id" while keeping the always-present ambient default untouchable.
-fn upsert_model(models: &mut Vec<RegistryModel>, m: RegistryModel) {
+/// Insert `m` into the list, REPLACING any existing entry that answers to `m`'s id IN PLACE
+/// (stable order, default-first preserved) or appending it when new. The ambient `opus`
+/// default is protected: an entry that tries to take its id is refused with a warning, so
+/// `opus` stays byte-for-byte the built-in. This is what makes the three-source merge "later
+/// overrides earlier by id" while keeping the always-present ambient default untouchable.
+///
+/// **"ANSWERS TO" MEANS BY ALIAS TOO, and that is what keeps an existing config working.**
+/// `jesse.example.toml` documents overriding a built-in by declaring a `[[models]]` entry
+/// with the same id, and the ids the built-ins had were the versioned ones. Matching on the
+/// canonical id alone would have turned every such deploy's OVERRIDE into a SECOND entry
+/// beside the built-in it meant to replace — two GLMs in the picker, one of them the
+/// defaults the operator was overriding.
+///
+/// The replacement then answers to every name its predecessor answered to (the union of both
+/// alias sets, plus the replaced entry's own id when it differs), so no persisted selection
+/// is orphaned by an override either. An entry cannot alias its own id; that would be a
+/// self-loop the lookup never reaches.
+fn upsert_model(models: &mut Vec<RegistryModel>, mut m: RegistryModel) {
     if m.id == DEFAULT_MODEL_ID || matches!(m.kind, ModelKind::Ambient) {
         eprintln!(
             "jesse-bridge: WARNING model '{}' would redefine the built-in ambient default \
@@ -2312,31 +2486,53 @@ fn upsert_model(models: &mut Vec<RegistryModel>, m: RegistryModel) {
         );
         return;
     }
-    if let Some(existing) = models.iter_mut().find(|e| e.id == m.id) {
-        *existing = m;
+    let at = models
+        .iter()
+        .position(|e| e.id == m.id)
+        .or_else(|| models.iter().position(|e| e.aliases.contains(&m.id)));
+    if let Some(at) = at {
+        let existing = &models[at];
+        let mut inherited: Vec<String> = existing.aliases.clone();
+        if existing.id != m.id {
+            inherited.push(existing.id.clone());
+        }
+        for a in inherited {
+            if a != m.id && !m.aliases.contains(&a) {
+                m.aliases.push(a);
+            }
+        }
+        models[at] = m;
     } else {
         models.push(m);
     }
 }
 
-/// The `glm-5.2` env-triple entry (hosted on Fireworks' Anthropic surface). base + model
+/// The `glm` env-triple entry (hosted on Fireworks' Anthropic surface). base + model
 /// DEFAULT; only the token must be supplied, so an operator arms GLM with a single secret
 /// env var.
+///
+/// **THE ID IS THE FAMILY, NOT THE VERSION**, and `glm-5.2` is kept as an alias so a
+/// selection persisted before the rename still resolves. The version it displays comes from
+/// `JESSE_MODEL_GLM_VERSION`, beside the slug's own `JESSE_MODEL_GLM_MODEL`, so a bump is
+/// two launch-environment lines and no release.
 fn glm_env_entry(default_interval_secs: u64, global_timeout_secs: Option<u64>) -> RegistryModel {
     let backend = resolve_model_backend(
-        "glm-5.2",
+        "glm",
         env_string("JESSE_MODEL_GLM_BASE_URL"),
         env_string("JESSE_MODEL_GLM_AUTH_TOKEN"),
         env_string("JESSE_MODEL_GLM_MODEL"),
         Some("https://api.fireworks.ai/inference"),
         Some("accounts/fireworks/models/glm-5p2"),
     );
+    let version = model_version_from_env("JESSE_MODEL_GLM", Some("5.2"));
     RegistryModel {
         codex: CodexTuning::default(),
-        id: "glm-5.2".to_string(),
-        label: "GLM 5.2".to_string(),
+        id: "glm".to_string(),
+        label: derive_model_label("GLM", version.as_deref(), None),
+        version,
+        aliases: vec!["glm-5.2".to_string()],
         kind: ModelKind::Hosted,
-        wire: model_wire_from_env("JESSE_MODEL_GLM", "glm-5.2", ModelKind::Hosted),
+        wire: model_wire_from_env("JESSE_MODEL_GLM", "glm", ModelKind::Hosted),
         subagent_model: backend.as_ref().map(|(_, _, m)| m.clone()),
         configured: backend.is_some(),
         backend,
@@ -2384,22 +2580,26 @@ fn glm_env_entry(default_interval_secs: u64, global_timeout_secs: Option<u64>) -
 /// operator who wants a helper anyway.
 fn kimi_env_entry(default_interval_secs: u64, global_timeout_secs: Option<u64>) -> RegistryModel {
     let backend = resolve_model_backend(
-        "kimi-k3",
+        "kimi",
         env_string("JESSE_MODEL_KIMI_BASE_URL"),
         env_string("JESSE_MODEL_KIMI_AUTH_TOKEN"),
         env_string("JESSE_MODEL_KIMI_MODEL"),
         Some("https://api.fireworks.ai/inference"),
         Some("accounts/fireworks/models/kimi-k3"),
     );
+    let version = model_version_from_env("JESSE_MODEL_KIMI", Some("K3"));
     RegistryModel {
         codex: CodexTuning::default(),
-        id: "kimi-k3".to_string(),
-        // The SURFACE is in the label because there are now two Kimi entries and they are
-        // not interchangeable — see [`kimi_codex_env_entry`]. The id is untouched: it is
-        // what the switch persists and what every stored selection already names.
-        label: "Kimi K3 (Anthropic)".to_string(),
+        id: "kimi".to_string(),
+        // The SURFACE is in the label because there are two Kimi entries and they are not
+        // interchangeable — see [`kimi_codex_env_entry`]. It rides as the derivation's NOTE
+        // rather than as an explicit label, so the version half still tracks
+        // `JESSE_MODEL_KIMI_VERSION`.
+        label: derive_model_label("Kimi", version.as_deref(), Some("(Anthropic)")),
+        version,
+        aliases: vec!["kimi-k3".to_string()],
         kind: ModelKind::Hosted,
-        wire: model_wire_from_env("JESSE_MODEL_KIMI", "kimi-k3", ModelKind::Hosted),
+        wire: model_wire_from_env("JESSE_MODEL_KIMI", "kimi", ModelKind::Hosted),
         subagent_model: backend.as_ref().map(|(_, _, m)| m.clone()),
         configured: backend.is_some(),
         backend,
@@ -2464,7 +2664,7 @@ fn kimi_codex_env_entry(
     global_timeout_secs: Option<u64>,
 ) -> RegistryModel {
     let backend = resolve_model_backend(
-        "kimi-k3-codex",
+        "kimi-codex",
         env_string("JESSE_MODEL_KIMI_CODEX_BASE_URL"),
         env_string("JESSE_MODEL_KIMI_CODEX_AUTH_TOKEN")
             .or_else(|| env_string("JESSE_MODEL_KIMI_AUTH_TOKEN")),
@@ -2472,12 +2672,21 @@ fn kimi_codex_env_entry(
         Some("https://api.fireworks.ai/inference/v1"),
         Some("accounts/fireworks/models/kimi-k3"),
     );
+    // Defaults to the sibling's version for the same reason it defaults to the sibling's
+    // token: it is the same weights on the same provider, so a bump that moves one moves
+    // both. `JESSE_MODEL_KIMI_CODEX_VERSION` splits them for a deploy that needs it.
+    let version = model_version_from_env(
+        "JESSE_MODEL_KIMI_CODEX",
+        model_version_from_env("JESSE_MODEL_KIMI", Some("K3")).as_deref(),
+    );
     RegistryModel {
         codex: CodexTuning::default(),
-        id: "kimi-k3-codex".to_string(),
-        label: "Kimi K3 (Codex)".to_string(),
+        id: "kimi-codex".to_string(),
+        label: derive_model_label("Kimi", version.as_deref(), Some("(Codex)")),
+        version,
+        aliases: vec!["kimi-k3-codex".to_string()],
         kind: ModelKind::OpenAi,
-        wire: model_wire_from_env("JESSE_MODEL_KIMI_CODEX", "kimi-k3-codex", ModelKind::OpenAi),
+        wire: model_wire_from_env("JESSE_MODEL_KIMI_CODEX", "kimi-codex", ModelKind::OpenAi),
         // NO `CLAUDE_CODE_SUBAGENT_MODEL` analogue on this harness: the codex child is not
         // handed a subagent model, and claiming one here would describe a switch that does
         // not exist.
@@ -2533,10 +2742,16 @@ fn local_env_entry(default_interval_secs: u64, global_timeout_secs: Option<u64>)
         None,
         None,
     );
+    // No built-in default: a local endpoint's version is whatever the operator loaded, and
+    // inventing one would be the bridge asserting something it cannot know.
+    let version = model_version_from_env("JESSE_MODEL_LOCAL", None);
     RegistryModel {
         codex: CodexTuning::default(),
         id: "local".to_string(),
-        label: "Local".to_string(),
+        label: derive_model_label("Local", version.as_deref(), None),
+        version,
+        // Already versionless; there is no old id to keep resolving.
+        aliases: Vec::new(),
         kind: ModelKind::Local,
         wire: model_wire_from_env("JESSE_MODEL_LOCAL", "local", ModelKind::Local),
         subagent_model: backend.as_ref().map(|(_, _, m)| m.clone()),
@@ -2674,6 +2889,10 @@ fn opus_entry() -> RegistryModel {
         codex: CodexTuning::default(),
         id: DEFAULT_MODEL_ID.to_string(),
         label: "Claude Opus".to_string(),
+        // The ambient default runs whatever the subscription login serves, so there is no
+        // version this build can honestly declare — and no old id to alias.
+        version: None,
+        aliases: Vec::new(),
         kind: ModelKind::Ambient,
         // The ambient default speaks Anthropic Messages and is not configurable — no
         // `JESSE_MODEL_OPUS_*` prefix exists to read a wire from, deliberately.
@@ -2738,6 +2957,19 @@ pub struct HealthToml {
 pub struct ModelToml {
     pub id: Option<String>,
     pub label: Option<String>,
+    /// The DISPLAY name of this entry's family (`GLM`, `Qwen`), used to derive the label
+    /// together with `version`. Absent means the `id` itself.
+    pub family: Option<String>,
+    /// The backend version this entry points at, shown in the picker beside the family.
+    /// Absent means the label is the family alone.
+    ///
+    /// Declared rather than discovered — see [`RegistryModel::version`]. Set it in the same
+    /// edit that moves `model`, and the label follows both.
+    pub version: Option<String>,
+    /// Ids that used to name this entry and must keep resolving to it. See
+    /// [`RegistryModel::aliases`]; an alias that collides with a real id is inert (the real
+    /// id wins) and warns at startup.
+    pub aliases: Option<Vec<String>>,
     /// `hosted` | `local` (`ambient` is reserved for the built-in opus and refused).
     pub kind: Option<String>,
     /// `messages` | `chat` | `responses`. Absent means [`Wire::default_for_kind`], so an
@@ -2964,15 +3196,40 @@ pub fn registry_model_from_toml(
             interval_secs: resolve_health_interval(None, global_interval),
             timeout_secs: resolve_health_timeout(None, global_timeout, DEFAULT_HEALTH_TIMEOUT_SECS),
         });
+    let version = t
+        .version
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
     Some(RegistryModel {
         id: id.to_string(),
+        // An explicit `label` wins outright; otherwise family + version, so an entry that
+        // declares both gets the same bump-tracking property the built-ins have.
         label: t
             .label
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .unwrap_or(id)
-            .to_string(),
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                let family = t
+                    .family
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(id);
+                derive_model_label(family, version.as_deref(), None)
+            }),
+        version,
+        aliases: t
+            .aliases
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .map(|a| a.trim().to_string())
+            .filter(|a| !a.is_empty())
+            .collect(),
         kind,
         wire,
         backend,
@@ -3130,10 +3387,14 @@ impl Config {
         // the literal for the same reason the model ids are: the schedule is validated
         // inside the literal and borrows it.
         let profile_table = load_profile_table(&home);
-        // The ids the `[[schedule]]` `model` key is validated against. Collected before the
+        // The names the `[[schedule]]` `model` key is validated against. Collected before the
         // literal for the same reason the registry itself is: the schedule is built inside
         // it and cannot borrow a field of the struct being built.
-        let model_ids: Vec<String> = model_registry.models.iter().map(|m| m.id.clone()).collect();
+        //
+        // ALIASES INCLUDED, deliberately: a schedule written against an old versioned id
+        // names something the registry resolves, so rejecting it here would fail the whole
+        // schedule file at boot over a name that works everywhere else.
+        let model_ids: Vec<String> = model_registry.known_ids();
         Config {
             token: env_string("JESSE_TOKEN").unwrap_or_default(),
             // Capture HOME once — session-path lookups read `cfg.home`, not the env.
@@ -4327,6 +4588,9 @@ mod tests {
         let _g = ENV_LOCK.lock_ok();
         std::env::set_var("JESSE_TEST_VIS_TOKEN", "tok");
         let t = ModelToml {
+            family: None,
+            version: None,
+            aliases: None,
             harness: None,
             auth_scheme: None,
             quirks: None,
@@ -4368,6 +4632,8 @@ mod tests {
         // A text model paired to an unconfigured helper reports no vision; configuring the
         // helper flips it on.
         let helper_unarmed = RegistryModel {
+            version: None,
+            aliases: Vec::new(),
             codex: Default::default(),
             id: "vl".into(),
             label: "VL".into(),
@@ -4387,6 +4653,8 @@ mod tests {
             vision_complementary: false,
         };
         let text = RegistryModel {
+            version: None,
+            aliases: Vec::new(),
             codex: Default::default(),
             id: "glm".into(),
             label: "GLM".into(),
@@ -4435,6 +4703,9 @@ mod tests {
         let _g = ENV_LOCK.lock_ok();
         std::env::set_var("JESSE_TEST_DECL_TOKEN2", "tok");
         let t = ModelToml {
+            family: None,
+            version: None,
+            aliases: None,
             reasoning_effort: None,
             auto_compact_token_limit: None,
             harness: None,
@@ -4603,14 +4874,14 @@ mod tests {
             opus_entry(),
             glm_env_entry(DEFAULT_HEALTH_INTERVAL_SECS, None),
         ]; // glm unconfigured (no env)
-        let mut decl_glm = model_toml("glm-5.2", "hosted", None);
+        let mut decl_glm = model_toml("glm", "hosted", None);
         decl_glm.label = Some("Declared GLM".into());
         upsert_model(
             &mut models,
             registry_model_from_toml(&decl_glm, None, None).unwrap(),
         );
         assert_eq!(models.len(), 2, "same id replaces in place, not appends");
-        assert_eq!(models[1].id, "glm-5.2");
+        assert_eq!(models[1].id, "glm");
         assert_eq!(models[1].label, "Declared GLM", "later source wins by id");
 
         upsert_model(
@@ -4627,6 +4898,180 @@ mod tests {
         assert!(
             matches!(models[0].kind, ModelKind::Ambient),
             "opus stays ambient"
+        );
+    }
+
+    /// THE MIGRATION PROPERTY, from the direction that actually breaks: a device that
+    /// persisted the OLD versioned id before the family rename.
+    ///
+    /// `model.json` holds a bare string, so a rename orphans it and
+    /// `State::resolve_active_model` degrades silently to the ambient default — the operator
+    /// finds themselves back on opus with nothing said. This starts from exactly that
+    /// persisted string and asserts it still resolves to the family entry.
+    #[test]
+    fn a_selection_persisted_under_an_old_versioned_id_still_resolves() {
+        let _g = ENV_LOCK.lock_ok();
+        for var in [
+            "JESSE_MODEL_GLM_AUTH_TOKEN",
+            "JESSE_MODEL_KIMI_AUTH_TOKEN",
+            "JESSE_MODEL_GLM_VERSION",
+            "JESSE_MODEL_KIMI_VERSION",
+        ] {
+            std::env::remove_var(var);
+        }
+        let registry = ModelRegistry::from_env("/nonexistent-home");
+
+        // What a pre-rename device wrote into `model.json`, verbatim.
+        for (persisted, family) in [
+            ("glm-5.2", "glm"),
+            ("kimi-k3", "kimi"),
+            ("kimi-k3-codex", "kimi-codex"),
+        ] {
+            let resolved = registry
+                .get(persisted)
+                .unwrap_or_else(|| panic!("persisted id '{persisted}' resolves to nothing"));
+            assert_eq!(
+                resolved.id, family,
+                "'{persisted}' must resolve to the family entry"
+            );
+            assert_eq!(registry.canonical_id(persisted), Some(family));
+        }
+
+        // ...and the new ids resolve to themselves, which is what the endpoints persist back.
+        for family in ["glm", "kimi", "kimi-codex", "local", "opus"] {
+            assert_eq!(registry.canonical_id(family), Some(family));
+        }
+    }
+
+    /// An exact id BEATS an alias, so a stale alias can never shadow a real entry and
+    /// silently send a turn to another backend.
+    #[test]
+    fn an_exact_id_wins_over_another_entrys_alias() {
+        let mut a = glm_env_entry(DEFAULT_HEALTH_INTERVAL_SECS, None);
+        a.id = "shadow".to_string();
+        a.aliases = vec!["kimi".to_string()];
+        let b = kimi_env_entry(DEFAULT_HEALTH_INTERVAL_SECS, None);
+        // Alias-holder FIRST, so an order-dependent single-pass lookup would pick it.
+        let registry = ModelRegistry { models: vec![a, b] };
+        assert_eq!(registry.get("kimi").map(|m| m.id.as_str()), Some("kimi"));
+    }
+
+    /// THE ACCEPTANCE, exercised end to end: repointing a family at a new backend version
+    /// moves the slug, the version string and the picker label TOGETHER, from configuration
+    /// alone — no code change, no release.
+    #[test]
+    fn repointing_a_family_moves_slug_version_and_label_together() {
+        let _g = ENV_LOCK.lock_ok();
+        std::env::set_var("JESSE_MODEL_GLM_AUTH_TOKEN", "tok");
+        std::env::remove_var("JESSE_MODEL_GLM_MODEL");
+        std::env::remove_var("JESSE_MODEL_GLM_VERSION");
+
+        let before = glm_env_entry(DEFAULT_HEALTH_INTERVAL_SECS, None);
+        assert_eq!(before.label, "GLM 5.2");
+        assert_eq!(before.version.as_deref(), Some("5.2"));
+        assert_eq!(
+            before.backend.as_ref().map(|(_, _, m)| m.as_str()),
+            Some("accounts/fireworks/models/glm-5p2")
+        );
+
+        // The one configuration change a version bump costs.
+        std::env::set_var("JESSE_MODEL_GLM_MODEL", "accounts/fireworks/models/glm-5p3");
+        std::env::set_var("JESSE_MODEL_GLM_VERSION", "5.3");
+        let after = glm_env_entry(DEFAULT_HEALTH_INTERVAL_SECS, None);
+
+        assert_eq!(after.id, "glm", "the id does not move with the version");
+        assert_eq!(after.label, "GLM 5.3");
+        assert_eq!(after.version.as_deref(), Some("5.3"));
+        assert_eq!(
+            after.backend.as_ref().map(|(_, _, m)| m.as_str()),
+            Some("accounts/fireworks/models/glm-5p3")
+        );
+        // The old id keeps resolving across the bump — an alias is about the ID, not the
+        // version it was named after.
+        assert!(after.aliases.iter().any(|a| a == "glm-5.2"));
+
+        std::env::remove_var("JESSE_MODEL_GLM_AUTH_TOKEN");
+        std::env::remove_var("JESSE_MODEL_GLM_MODEL");
+        std::env::remove_var("JESSE_MODEL_GLM_VERSION");
+    }
+
+    /// A blank `_VERSION` means "no version to show", not an empty version — so the label is
+    /// the family alone and carries no trailing space.
+    #[test]
+    fn a_blank_version_override_renders_the_family_alone() {
+        let _g = ENV_LOCK.lock_ok();
+        std::env::set_var("JESSE_MODEL_GLM_VERSION", "   ");
+        let m = glm_env_entry(DEFAULT_HEALTH_INTERVAL_SECS, None);
+        assert_eq!(m.version, None);
+        assert_eq!(m.label, "GLM");
+        std::env::remove_var("JESSE_MODEL_GLM_VERSION");
+    }
+
+    /// The label derivation, including the parenthetical note that tells two entries of one
+    /// family apart WITHOUT displacing the version.
+    #[test]
+    fn a_label_is_family_then_version_then_note() {
+        assert_eq!(derive_model_label("GLM", Some("5.3"), None), "GLM 5.3");
+        assert_eq!(derive_model_label("Local", None, None), "Local");
+        assert_eq!(
+            derive_model_label("Kimi", Some("K3"), Some("(Codex)")),
+            "Kimi K3 (Codex)"
+        );
+        assert_eq!(derive_model_label("Qwen", Some("  "), None), "Qwen");
+    }
+
+    /// A declarative entry gets the same derivation, and an explicit `label` still wins
+    /// outright (the operator asking for a fixed string).
+    #[test]
+    fn a_declarative_entry_derives_its_label_from_family_and_version() {
+        let mut t = model_toml("qwen", "hosted", None);
+        t.family = Some("Qwen".into());
+        t.version = Some("3.5".into());
+        t.aliases = Some(vec!["qwen-3".into(), "  ".into()]);
+        let m = registry_model_from_toml(&t, None, None).unwrap();
+        assert_eq!(m.label, "Qwen 3.5");
+        assert_eq!(m.version.as_deref(), Some("3.5"));
+        assert_eq!(m.aliases, vec!["qwen-3".to_string()], "blanks are dropped");
+
+        // No `family`: the id stands in for it.
+        let mut bare = model_toml("qwen", "hosted", None);
+        bare.version = Some("3.5".into());
+        assert_eq!(
+            registry_model_from_toml(&bare, None, None).unwrap().label,
+            "qwen 3.5"
+        );
+
+        // An explicit label wins.
+        t.label = Some("Whatever I Say".into());
+        assert_eq!(
+            registry_model_from_toml(&t, None, None).unwrap().label,
+            "Whatever I Say"
+        );
+    }
+
+    /// A `[[models]]` entry written against an OLD versioned id still OVERRIDES the built-in
+    /// it names, rather than appearing beside it as a second entry — and the replacement
+    /// inherits every name its predecessor answered to.
+    #[test]
+    fn a_declarative_entry_naming_an_old_id_overrides_the_family_entry() {
+        let mut models = vec![
+            opus_entry(),
+            glm_env_entry(DEFAULT_HEALTH_INTERVAL_SECS, None),
+        ];
+        let mut decl = model_toml("glm-5.2", "hosted", None);
+        decl.label = Some("My GLM".into());
+        upsert_model(
+            &mut models,
+            registry_model_from_toml(&decl, None, None).unwrap(),
+        );
+        assert_eq!(models.len(), 2, "an override, not a second GLM");
+        assert_eq!(models[1].id, "glm-5.2", "the operator's id stands");
+        assert_eq!(models[1].label, "My GLM");
+        let registry = ModelRegistry { models };
+        assert_eq!(
+            registry.canonical_id("glm"),
+            Some("glm-5.2"),
+            "the replaced entry's own id keeps resolving"
         );
     }
 

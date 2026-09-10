@@ -149,7 +149,7 @@ Answer the question I asked, not the one you wish I had asked.
 # Absent or empty (the default) → every such job goes to the ambient default, which is
 # byte-for-byte the behavior before this key existed.
 #
-# offload_order = ["local", "glm-5.2"]
+# offload_order = ["local", "glm"]
 
 # =============================================================================
 # [[models]] — the global model switch's registry (declarative, operator-configurable)
@@ -163,15 +163,32 @@ Answer the question I asked, not the one you wish I had asked.
 #   2. the legacy `JESSE_MODEL_GLM_* / _KIMI_* / _LOCAL_*` env triples (still supported).
 #   3. these `[[models]]` entries.
 #
-# `glm-5.2`, `kimi-k3` and `kimi-k3-codex` DEFAULT their base_url + slug to the live
+# AN ENTRY ID NAMES A FAMILY AND CARRIES NO VERSION — `glm`, `kimi`, `kimi-codex`,
+# `local`. The version lives in its own `version` key (env: `JESSE_MODEL_<ID>_VERSION`) and
+# the picker label is DERIVED from family + version, so repointing a family at a new
+# backend is two launch-environment lines and no release:
+#
+#     JESSE_MODEL_GLM_MODEL=accounts/fireworks/models/glm-5p3
+#     JESSE_MODEL_GLM_VERSION=5.3          # picker now reads "GLM 5.3"
+#
+# A version inside the ID could not do that: the id is what the switch PERSISTS, so
+# changing it orphans a stored selection, and leaving it stale makes the picker lie.
+#
+# THE OLD VERSIONED IDS STILL RESOLVE, as aliases: `glm-5.2` → `glm`, `kimi-k3` → `kimi`,
+# `kimi-k3-codex` → `kimi-codex`. Nothing has to be edited on upgrade — a device that
+# persisted `glm-5.2` selects `glm`, and the bridge writes the canonical id back the first
+# time. An exact id always beats an alias, and a `[[models]]` entry naming an old id still
+# OVERRIDES the built-in it names rather than appearing beside it.
+#
+# `glm`, `kimi` and `kimi-codex` DEFAULT their base_url + slug to the live
 # Fireworks values, so each is armed by exporting ONE var — `JESSE_MODEL_GLM_AUTH_TOKEN` /
 # `JESSE_MODEL_KIMI_AUTH_TOKEN`. `local` has no defaults: all three vars are required.
 #
 # KIMI K3 IS REGISTERED TWICE, ON PURPOSE, and the two are not one model in two costumes:
-#   * `kimi-k3`        — the ANTHROPIC surface (`/v1/messages`) on a claude-code child,
+#   * `kimi`           — the ANTHROPIC surface (`/v1/messages`) on a claude-code child,
 #                        contained by the tool allowlist + strict MCP recorded in
 #                        bridge/containment.toml.
-#   * `kimi-k3-codex`  — the OPENAI surface (`/v1/responses`) on a real `codex exec` child,
+#   * `kimi-codex`     — the OPENAI surface (`/v1/responses`) on a real `codex exec` child,
 #                        contained by the OS sandbox recorded in
 #                        bridge/containment-codex.toml, reaching the vault via the shell.
 # K3 is natively an OpenAI-style model, so the Codex entry is the RECOMMENDED path for it;
@@ -184,8 +201,23 @@ Answer the question I asked, not the one you wish I had asked.
 # that is CONFIGURED (its token env var is set) AND HEALTHY (its last probe passed).
 #
 # Fields (id, kind, base_url, model are REQUIRED; the rest are optional):
-#   id             stable key the switch persists (e.g. "fireworks", "codex")
-#   label          shown in the app switcher (defaults to id)
+#   id             stable key the switch persists — A FAMILY NAME, NO VERSION IN IT
+#                  (e.g. "glm", "qwen", "codex"). See the note above: a version here makes
+#                  a backend bump either a lie or a code change.
+#   family         the family's DISPLAY name, used with `version` to derive the label
+#                  (e.g. "GLM" for id "glm"). Defaults to the id.
+#   version        the backend version this entry points at (e.g. "5.3"). Shown in the
+#                  picker beside the family and reported by GET /jesse/models. Declared,
+#                  not discovered — nothing on the wire reports a version — so set it in
+#                  the same edit that moves `model`.
+#   label          shown in the app switcher. Absent, it is DERIVED as "<family> <version>"
+#                  and therefore tracks a version bump on its own. Setting it explicitly
+#                  wins outright, and means the label no longer follows `version`.
+#   aliases        ids that used to name this entry and must keep resolving to it (e.g.
+#                  aliases = ["glm-5.2"]). A persisted selection is a bare string, so a
+#                  rename without an alias silently drops that device back onto the ambient
+#                  default. An alias that collides with a real id is inert and warns at
+#                  startup; the exact id always wins.
 #   kind           WHERE THE BACKEND LIVES ("ambient" is reserved for the built-in opus):
 #                    hosted  an endpoint hosted by a provider
 #                    local   an endpoint on this machine
@@ -402,7 +434,7 @@ Answer the question I asked, not the one you wish I had asked.
 #   full [[models]] block. Seconds, floored at 5; a zero/unparseable value is ignored with
 #   a startup warning. Priority per model, highest first: an explicit per-model
 #   health.interval_secs (below) > JESSE_HEALTH_INTERVAL_SECS > the built-in 60s default.
-#   Applies to the env-triple models (glm-5.2, kimi-k3, local) and any [[models]] entry
+#   Applies to the env-triple models (glm, kimi, local) and any [[models]] entry
 #   that omits its own interval_secs. Does NOT change the per-probe timeout or path.
 #
 # THREE WAYS TO REACH AN OPENAI-SHAPED MODEL, and they are not interchangeable:
@@ -480,7 +512,7 @@ Answer the question I asked, not the one you wish I had asked.
 #   * it serves the Responses API at <base_url>/responses, and
 #   * it serves /chat/completions for the health probe (or set health.path explicitly).
 #
-# `kimi-k3-codex` IS NOW A BUILT-IN ENTRY and needs no block here at all: exporting
+# `kimi-codex` IS NOW A BUILT-IN ENTRY and needs no block here at all: exporting
 # `JESSE_MODEL_KIMI_AUTH_TOKEN` arms it exactly as it arms its Anthropic-surface sibling.
 # The block below is what that built-in is EQUIVALENT TO — write it out only to override a
 # field (a different slug, its own key, `level = "write"`, a different deck).
@@ -491,8 +523,11 @@ Answer the question I asked, not the one you wish I had asked.
 # permanently unreachable.
 #
 # [[models]]
-# id = "kimi-k3-codex"
-# label = "Kimi K3 (Codex)"
+# id = "kimi-codex"
+# family = "Kimi"
+# version = "K3"
+# aliases = ["kimi-k3-codex"]         # what this entry used to be called
+#                                     # label is derived: "Kimi K3"
 # kind = "openai"                              # hosting: a provider endpoint
 # # wire = "responses"                         # implied by kind = "openai"; spell it out
 #                                              # only to say something the kind does not,
@@ -572,7 +607,7 @@ Answer the question I asked, not the one you wish I had asked.
 # backend. That is a real egress of user uploads (consistent with running a hosted text
 # model there). Keep uploads local by pairing a local-only helper alias instead.
 #
-# DO NOT PAIR A NATIVELY-MULTIMODAL MODEL. `kimi-k3` reads images itself, so leaving it
+# DO NOT PAIR A NATIVELY-MULTIMODAL MODEL. `kimi` (K3) reads images itself, so leaving it
 # UNPAIRED is what gives it vision: attachments take the CLI Read-tool path and the child
 # hands the model the actual image. Pairing it would transcribe the image to text first
 # and hide the pixels from a model that can see them — worse answers AND a second billed
@@ -602,8 +637,10 @@ Answer the question I asked, not the one you wish I had asked.
 # 2) Pair a text model with them (role: "doc" | "general" | "any"). Declarative:
 #
 # [[models]]
-# id = "glm-5.2"
-# label = "GLM 5.2"
+# id = "glm"
+# family = "GLM"
+# version = "5.2"                     # label is derived: "GLM 5.2"
+# aliases = ["glm-5.2"]               # what this entry used to be called
 # kind = "hosted"
 # base_url = "https://api.fireworks.ai/inference"
 # model = "accounts/fireworks/models/glm-5p2"
@@ -613,7 +650,7 @@ Answer the question I asked, not the one you wish I had asked.
 #
 #   Or pair the env-triple models without a [[models]] block:
 #     JESSE_MODEL_GLM_VISION="paddleocr-vl:doc,qwen3-vl:general"
-#     JESSE_MODEL_GLM_VISION_COMPLEMENTARY=off      # (glm-5.2 / kimi-k3 / local supported)
+#     JESSE_MODEL_GLM_VISION_COMPLEMENTARY=off      # (glm / kimi / local supported)
 #   A single "any" helper handles every attachment type:  JESSE_MODEL_GLM_VISION="qwen3-vl:any"
 #
 # 3) Global vision knobs (env, no rebuild):
@@ -761,7 +798,8 @@ Answer the question I asked, not the one you wish I had asked.
 #                  chain. A turn that talked to the model and wrote nothing is
 #                  not a job that did its work.
 #   model          OPTIONAL registry id (anything GET /jesse/models lists), e.g.
-#                  "glm-5.2". Validated AT LOAD — a typo disables that entry by
+#                  "glm" — an old alias like "glm-5.2" resolves too. Validated AT
+#                  LOAD, so a typo disables that entry by
 #                  name instead of failing one turn a night later. It backs only
 #                  this job's turns and never touches the global active model.
 #                  Unset uses whatever is globally active.

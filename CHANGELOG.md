@@ -14,6 +14,55 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [bridge 0.127.0] - 2026-09-10
+
+**A model's id names its FAMILY and carries no version, so bumping a backend is
+configuration rather than a release.** The registry's ids were `glm-5.2`, `kimi-k3`,
+`kimi-k3-codex`. An id is the string the switch PERSISTS and every endpoint keys on, so a
+version inside it left exactly two options and both were bad: repoint the slug at 5.3 with
+`JESSE_MODEL_GLM_MODEL` — which has always worked, no code change needed — and the picker
+goes on saying 5.2, or rename the id and orphan every device's stored selection. The ids are
+now `glm`, `kimi`, `kimi-codex`, `local`, and the version moved to a key of its own.
+
+**The label is DERIVED from family plus version**, so it cannot go stale independently. A
+bump is two lines in the launch environment and nothing else:
+
+```
+JESSE_MODEL_GLM_MODEL=accounts/fireworks/models/glm-5p3
+JESSE_MODEL_GLM_VERSION=5.3          # picker reads "GLM 5.3"
+```
+
+`JESSE_MODEL_<ID>_VERSION` sits beside the `_MODEL` that has always carried the slug, and a
+declarative entry takes `family` / `version` / `aliases` keys. An explicit `label` still wins
+outright — that is the operator asking for a fixed string and accepting it will not track a
+bump. A blank `_VERSION` means "no version to show" rather than an empty one, so the label is
+the family alone with no trailing space.
+
+**Nothing has to be edited on upgrade, and that is enforced rather than hoped for.** Each
+renamed entry keeps its old id as an ALIAS: `glm-5.2` → `glm`, `kimi-k3` → `kimi`,
+`kimi-k3-codex` → `kimi-codex`. Every lookup in the bridge already goes through
+`ModelRegistry::get`, so one two-pass resolution covers the persisted selection, the per-turn
+`model` field, `POST /jesse/model`, the routing walk, `offload_order` and the schedule's
+`model` key. An exact id always beats an alias — a single-pass lookup would let a stale alias
+shadow a real entry and quietly send a turn to another backend, which is a mis-route rather
+than a miss.
+
+Three consequences worth naming:
+
+- **`POST /jesse/model` persists the CANONICAL id**, not the alias the client sent, so an
+  alias is a one-time resolution rather than a name that lives on in state.
+- **A `[[models]]` entry naming an old id still OVERRIDES the built-in it names.** The merge
+  matches by alias as well as by id; matching on the canonical id alone would have turned
+  every documented override into a second entry beside the one it meant to replace — two GLMs
+  in the picker, one of them the defaults the operator was overriding. The replacement then
+  answers to every name its predecessor answered to.
+- **A dead alias warns at startup** (it collides with a real id, or a second entry claims it)
+  rather than failing anything. An alias grants nothing, so a dead one costs a resolution
+  somebody expected; what it must not be is silent.
+
+`GET /jesse/models` gains `version` and `aliases` on every row. The shape test is updated;
+clients that ignore the new keys are unaffected.
+
 ## [bridge 0.126.0] - 2026-09-09
 
 **A screenshot now arrives on the phone as a picture, and the transport it arrived on is not
