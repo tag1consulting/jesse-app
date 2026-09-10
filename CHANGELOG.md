@@ -14,6 +14,52 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [bridge 0.132.0] - 2026-09-10
+
+**Every main-turn MCP server is spelled once, and the three Codex does not get are named in
+one place. The Codex containment record was deliberately NOT re-recorded.** This is the tools
+half of the model-registry work, and it stops where the plan said to stop: closing the gap needs
+both operator-signed `[[accepted]]` blocks in `containment-codex.toml` re-pointed, which is an
+acceptance edit and the owner's decision.
+
+**What was already true, and is now stated rather than assumed.** The per-server TOOL lists were
+never two lists: `codex_mcp_args` derives each server's `enabled_tools` from the same
+`DEFAULT_ALLOWED_TOOLS` Claude Code's `--allowedTools` reads. The server ENTRIES could not drift
+either — `every_copy_of_the_child_mcp_config_agrees` has long asserted that Codex's set is Claude
+Code's minus the later servers, entry for entry. What they were was two SPELLINGS of the same
+fourteen entries, held in step by that test. Now there is one.
+
+**The Codex gap is three servers, not two.** `build` (0.86.0), `places` (0.100.0) and `inbound`
+(0.115.0). The doc on `Codex::main_mcp_config` named the first two; `inbound`'s own doc already
+said Codex stays on the fourteen-server set.
+
+**Why the three stay withheld.** Adding any of them moves Codex's row labels, and acceptances are
+keyed by row label: `containment-probe --write` carries them across by label, so a re-record would
+leave every known-open at `read` AND `write` unsigned — including the signed write acceptance the
+`codex-write` model on this deployment runs on. Nothing at boot or in CI checks acceptance, so the
+build would stay green while the record stopped vouching for the posture Codex runs at. That is a
+weaker posture accepted quietly, so it was not done.
+
+**What does not change with any server list.** Codex's sandbox scopes writes only; a Codex child
+can read whatever the bridge's unix user can read, at every level. Same tools, different read
+boundary. The remedy is unix-user isolation, not implemented.
+
+### Changed
+- `claude_code.rs`: one macro per server's `mcpServers` entry; every MCP config const — the two
+  live ones and the retired intermediates that still name row labels — is assembled from them.
+  **Byte-identical**: all nine consts were dumped before and after and compared.
+- `CODEX_WITHHELD_MCP_SERVERS = ["build", "places", "inbound"]`: the whole remaining asymmetry.
+- `every_copy_of_the_child_mcp_config_agrees` reads the constant, and gains the harness-level
+  form of its check — `Codex.main_mcp_config()` against `ClaudeCode.main_mcp_config()`, the sets
+  each harness spawns — so a server on one harness and not the other fails the build unless it is
+  named there.
+- Docs corrected: `Codex::main_mcp_config` (all three servers, the acceptance mechanics, the read
+  boundary), the `containment.rs` test comment and `SECURITY.md`, both of which still said Codex
+  "is not armed at `write` on this deployment" — it is, on a signed acceptance.
+
+**Containment: nothing moves.** No record, no acceptance block, no `capability_args` and no MCP
+config byte changes.
+
 ## [bridge 0.131.0] - 2026-09-10
 
 **Every model DECLARES its effort scale, a turn can ask for one of its values, and the value

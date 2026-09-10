@@ -563,6 +563,174 @@ macro_rules! home_assistant_mcp_url {
     };
 }
 
+// ---- ONE declaration of every main-turn MCP server, shared by both harnesses -------
+//
+// Each server's `mcpServers` member is spelled ONCE, as a macro expanding to its JSON text, and
+// every server set below is ASSEMBLED from those. Before this, each set was a hand-written
+// string: `MESSAGES_MCP_CONFIG` (Codex) and `MAIN_CHILD_MCP_CONFIG` (Claude Code) repeated the
+// fourteen shared entries, so one server's arguments could change on one harness and not the
+// other with nothing noticing. Now a server's arguments have exactly one spelling.
+//
+// MACROS RATHER THAN `format!`, because every set must stay a `&'static str`: the containment
+// record commits the argv built from it and the startup gate compares by strict equality, so a
+// runtime-built string would move nothing in behaviour and everything in how the posture is
+// pinned. `concat!` of these expands to byte-for-byte the strings they replace.
+
+macro_rules! mcp_qmd {
+    () => {
+        r#""qmd":{"type":"stdio","command":"qmd","args":["mcp"]}"#
+    };
+}
+macro_rules! mcp_slack {
+    () => {
+        r#""slack":{"type":"stdio","command":"npx","args":["-y","slack-mcp-server@latest","--transport","stdio"]}"#
+    };
+}
+macro_rules! mcp_browser {
+    () => {
+        r#""browser":{"type":"stdio","command":"npx","args":["-y","@playwright/mcp@latest","--headless","--isolated","--output-dir","/tmp/jesse-browser","--output-max-size","104857600"]}"#
+    };
+}
+macro_rules! mcp_homeassistant {
+    () => {
+        concat!(
+            r#""homeassistant":{"type":"http","url":""#,
+            home_assistant_mcp_url!(),
+            r#"","headers":{"Authorization":"Bearer ${HA_MCP_TOKEN}"}}"#
+        )
+    };
+}
+macro_rules! mcp_roon {
+    () => {
+        r#""roon":{"type":"http","url":"http://10.40.0.2:8088/mcp"}"#
+    };
+}
+macro_rules! mcp_google {
+    () => {
+        r#""google":{"type":"stdio","command":"workspace-mcp","args":["--single-user","--read-only","--tools","calendar","gmail","drive"]}"#
+    };
+}
+macro_rules! mcp_github {
+    () => {
+        r#""github":{"type":"stdio","command":"github-mcp-server","args":["stdio","--read-only","--toolsets","repos,actions,issues,pull_requests"]}"#
+    };
+}
+macro_rules! mcp_fastmail {
+    () => {
+        r#""fastmail":{"type":"stdio","command":"npx","args":["-y","github:jeremyandrews/jmap-mcp-server"]}"#
+    };
+}
+macro_rules! mcp_unifi {
+    () => {
+        r#""unifi":{"type":"stdio","command":"unifi-network-mcp","args":[]}"#
+    };
+}
+macro_rules! mcp_routeros {
+    () => {
+        r#""routeros":{"type":"stdio","command":"routeros-mcp","args":[]}"#
+    };
+}
+macro_rules! mcp_proxmox {
+    () => {
+        r#""proxmox":{"type":"stdio","command":"mcp-proxmox","args":[]}"#
+    };
+}
+macro_rules! mcp_whatsapp {
+    () => {
+        r#""whatsapp":{"type":"stdio","command":"whatsapp-mcp","args":[]}"#
+    };
+}
+macro_rules! mcp_imcp {
+    () => {
+        r#""imcp":{"type":"stdio","command":"/Applications/iMCP.app/Contents/MacOS/imcp-server","args":[]}"#
+    };
+}
+macro_rules! mcp_google_perseido {
+    () => {
+        r#""google-perseido":{"type":"stdio","command":"workspace-mcp-perseido","args":["--single-user","--read-only","--tools","calendar","gmail","drive"]}"#
+    };
+}
+macro_rules! mcp_build {
+    () => {
+        r#""build":{"type":"stdio","command":"jesse-build-mcp","args":[]}"#
+    };
+}
+macro_rules! mcp_places {
+    () => {
+        r#""places":{"type":"stdio","command":"jesse-places-mcp","args":[]}"#
+    };
+}
+macro_rules! mcp_inbound {
+    () => {
+        r#""inbound":{"type":"stdio","command":"jesse-inbound-mcp","args":[]}"#
+    };
+}
+
+/// The five house servers, in order.
+macro_rules! house_servers {
+    () => {
+        concat!(
+            mcp_qmd!(),
+            ",",
+            mcp_slack!(),
+            ",",
+            mcp_browser!(),
+            ",",
+            mcp_homeassistant!(),
+            ",",
+            mcp_roon!()
+        )
+    };
+}
+/// The house set plus the six morning-routine servers.
+macro_rules! morning_servers {
+    () => {
+        concat!(
+            house_servers!(),
+            ",",
+            mcp_google!(),
+            ",",
+            mcp_github!(),
+            ",",
+            mcp_fastmail!(),
+            ",",
+            mcp_unifi!(),
+            ",",
+            mcp_routeros!(),
+            ",",
+            mcp_proxmox!()
+        )
+    };
+}
+/// The fourteen servers BOTH harnesses' main turns carry: the morning set plus the two message
+/// sources and the second Google account.
+macro_rules! messages_servers {
+    () => {
+        concat!(
+            morning_servers!(),
+            ",",
+            mcp_whatsapp!(),
+            ",",
+            mcp_imcp!(),
+            ",",
+            mcp_google_perseido!()
+        )
+    };
+}
+
+/// The servers Claude Code's main turn carries and Codex's does NOT — the WHOLE remaining
+/// asymmetry between the two harnesses' server sets, in one place, in the order they landed:
+/// `build` (0.86.0), `places` (0.100.0), `inbound` (0.115.0).
+///
+/// Each was kept off Codex for the same reason, and it is not about the server: adding one moves
+/// Codex's row labels (`…+google-perseido` becomes a new string), which orphans BOTH operator
+/// `[[accepted]]` blocks in `containment-codex.toml` — acceptances are keyed by row label — and
+/// the posture could only be restored by the owner re-signing them against a fresh live battery.
+/// Closing the gap is emptying this list, pointing `CODEX_SHIPPED_ROWS` at the full set, running
+/// that battery and taking that decision; `the_two_harnesses_carry_the_same_mcp_servers_except_the_named_withheld_ones`
+/// makes sure nothing else can differ in the meantime.
+pub const CODEX_WITHHELD_MCP_SERVERS: [&str; 3] = ["build", "places", "inbound"];
+
 /// qmd + Slack + browser + Home Assistant + Roon — the main turn's server set from bridge
 /// 0.67.0 until the morning-routine servers were added in 0.68.0. No shipped spawn site uses
 /// it today; retained for exactly the reason [`QMD_SLACK_BROWSER_MCP_CONFIG`] is, and it had
@@ -570,11 +738,7 @@ macro_rules! home_assistant_mcp_url {
 /// the two were the same string, so growing the main set in place would have silently
 /// re-pointed the `qmd+slack+browser+homeassistant+roon` row label at a set that also reads
 /// Jeremy's mail and holds full control of the network and the hypervisor.
-pub const HOUSE_MCP_CONFIG: &str = concat!(
-    r#"{"mcpServers":{"qmd":{"type":"stdio","command":"qmd","args":["mcp"]},"slack":{"type":"stdio","command":"npx","args":["-y","slack-mcp-server@latest","--transport","stdio"]},"browser":{"type":"stdio","command":"npx","args":["-y","@playwright/mcp@latest","--headless","--isolated","--output-dir","/tmp/jesse-browser","--output-max-size","104857600"]},"homeassistant":{"type":"http","url":""#,
-    home_assistant_mcp_url!(),
-    r#"","headers":{"Authorization":"Bearer ${HA_MCP_TOKEN}"}},"roon":{"type":"http","url":"http://10.40.0.2:8088/mcp"}}}"#
-);
+pub const HOUSE_MCP_CONFIG: &str = concat!(r#"{"mcpServers":{"#, house_servers!(), "}}");
 
 /// The house set PLUS the six morning-routine servers — the main turn's server set from
 /// bridge 0.69.0 until the two message sources and the second Google account were added in
@@ -606,11 +770,7 @@ pub const HOUSE_MCP_CONFIG: &str = concat!(
 /// write-capable by design and the granted tools include every mutator, up to
 /// `proxmox_execute_vm_command` (arbitrary command execution inside a guest). Read SECURITY.md
 /// before narrowing or widening this set.
-pub const MORNING_MCP_CONFIG: &str = concat!(
-    r#"{"mcpServers":{"qmd":{"type":"stdio","command":"qmd","args":["mcp"]},"slack":{"type":"stdio","command":"npx","args":["-y","slack-mcp-server@latest","--transport","stdio"]},"browser":{"type":"stdio","command":"npx","args":["-y","@playwright/mcp@latest","--headless","--isolated","--output-dir","/tmp/jesse-browser","--output-max-size","104857600"]},"homeassistant":{"type":"http","url":""#,
-    home_assistant_mcp_url!(),
-    r#"","headers":{"Authorization":"Bearer ${HA_MCP_TOKEN}"}},"roon":{"type":"http","url":"http://10.40.0.2:8088/mcp"},"google":{"type":"stdio","command":"workspace-mcp","args":["--single-user","--read-only","--tools","calendar","gmail","drive"]},"github":{"type":"stdio","command":"github-mcp-server","args":["stdio","--read-only","--toolsets","repos,actions,issues,pull_requests"]},"fastmail":{"type":"stdio","command":"npx","args":["-y","github:jeremyandrews/jmap-mcp-server"]},"unifi":{"type":"stdio","command":"unifi-network-mcp","args":[]},"routeros":{"type":"stdio","command":"routeros-mcp","args":[]},"proxmox":{"type":"stdio","command":"mcp-proxmox","args":[]}}}"#
-);
+pub const MORNING_MCP_CONFIG: &str = concat!(r#"{"mcpServers":{"#, morning_servers!(), "}}");
 
 /// The morning set PLUS **WhatsApp**, **iMessage** and a SECOND Google account — every main
 /// turn on every harness from bridge 0.73.0. Fourteen servers.
@@ -693,11 +853,7 @@ pub const MORNING_MCP_CONFIG: &str = concat!(
 /// [`crate::CODEX_SHIPPED_ROWS`] still names it, because Codex's record was taken against
 /// exactly these fourteen servers and nothing here has re-probed it. See
 /// [`crate::CodexHarness::main_mcp_config`].
-pub const MESSAGES_MCP_CONFIG: &str = concat!(
-    r#"{"mcpServers":{"qmd":{"type":"stdio","command":"qmd","args":["mcp"]},"slack":{"type":"stdio","command":"npx","args":["-y","slack-mcp-server@latest","--transport","stdio"]},"browser":{"type":"stdio","command":"npx","args":["-y","@playwright/mcp@latest","--headless","--isolated","--output-dir","/tmp/jesse-browser","--output-max-size","104857600"]},"homeassistant":{"type":"http","url":""#,
-    home_assistant_mcp_url!(),
-    r#"","headers":{"Authorization":"Bearer ${HA_MCP_TOKEN}"}},"roon":{"type":"http","url":"http://10.40.0.2:8088/mcp"},"google":{"type":"stdio","command":"workspace-mcp","args":["--single-user","--read-only","--tools","calendar","gmail","drive"]},"github":{"type":"stdio","command":"github-mcp-server","args":["stdio","--read-only","--toolsets","repos,actions,issues,pull_requests"]},"fastmail":{"type":"stdio","command":"npx","args":["-y","github:jeremyandrews/jmap-mcp-server"]},"unifi":{"type":"stdio","command":"unifi-network-mcp","args":[]},"routeros":{"type":"stdio","command":"routeros-mcp","args":[]},"proxmox":{"type":"stdio","command":"mcp-proxmox","args":[]},"whatsapp":{"type":"stdio","command":"whatsapp-mcp","args":[]},"imcp":{"type":"stdio","command":"/Applications/iMCP.app/Contents/MacOS/imcp-server","args":[]},"google-perseido":{"type":"stdio","command":"workspace-mcp-perseido","args":["--single-user","--read-only","--tools","calendar","gmail","drive"]}}}"#
-);
+pub const MESSAGES_MCP_CONFIG: &str = concat!(r#"{"mcpServers":{"#, messages_servers!(), "}}");
 
 /// The fourteen-server set PLUS **`build`** — every **Claude Code** main turn from bridge
 /// 0.86.0 until `places` landed in 0.100.0. Fifteen servers.
@@ -737,9 +893,11 @@ pub const MESSAGES_MCP_CONFIG: &str = concat!(
 /// THIS repository's own binary; installing it on the bridge's `PATH` is host setup,
 /// documented in SECURITY.md.
 pub const MESSAGES_BUILD_MCP_CONFIG: &str = concat!(
-    r#"{"mcpServers":{"qmd":{"type":"stdio","command":"qmd","args":["mcp"]},"slack":{"type":"stdio","command":"npx","args":["-y","slack-mcp-server@latest","--transport","stdio"]},"browser":{"type":"stdio","command":"npx","args":["-y","@playwright/mcp@latest","--headless","--isolated","--output-dir","/tmp/jesse-browser","--output-max-size","104857600"]},"homeassistant":{"type":"http","url":""#,
-    home_assistant_mcp_url!(),
-    r#"","headers":{"Authorization":"Bearer ${HA_MCP_TOKEN}"}},"roon":{"type":"http","url":"http://10.40.0.2:8088/mcp"},"google":{"type":"stdio","command":"workspace-mcp","args":["--single-user","--read-only","--tools","calendar","gmail","drive"]},"github":{"type":"stdio","command":"github-mcp-server","args":["stdio","--read-only","--toolsets","repos,actions,issues,pull_requests"]},"fastmail":{"type":"stdio","command":"npx","args":["-y","github:jeremyandrews/jmap-mcp-server"]},"unifi":{"type":"stdio","command":"unifi-network-mcp","args":[]},"routeros":{"type":"stdio","command":"routeros-mcp","args":[]},"proxmox":{"type":"stdio","command":"mcp-proxmox","args":[]},"whatsapp":{"type":"stdio","command":"whatsapp-mcp","args":[]},"imcp":{"type":"stdio","command":"/Applications/iMCP.app/Contents/MacOS/imcp-server","args":[]},"google-perseido":{"type":"stdio","command":"workspace-mcp-perseido","args":["--single-user","--read-only","--tools","calendar","gmail","drive"]},"build":{"type":"stdio","command":"jesse-build-mcp","args":[]}}}"#
+    r#"{"mcpServers":{"#,
+    messages_servers!(),
+    ",",
+    mcp_build!(),
+    "}}"
 );
 
 /// The fifteen-server set PLUS **`places`** — every **Claude Code** main turn from bridge
@@ -798,9 +956,13 @@ pub const MESSAGES_BUILD_MCP_CONFIG: &str = concat!(
 /// asymmetry is deliberate and recorded rather than quietly introduced. See
 /// [`crate::CodexHarness::main_mcp_config`].
 pub const MESSAGES_BUILD_PLACES_MCP_CONFIG: &str = concat!(
-    r#"{"mcpServers":{"qmd":{"type":"stdio","command":"qmd","args":["mcp"]},"slack":{"type":"stdio","command":"npx","args":["-y","slack-mcp-server@latest","--transport","stdio"]},"browser":{"type":"stdio","command":"npx","args":["-y","@playwright/mcp@latest","--headless","--isolated","--output-dir","/tmp/jesse-browser","--output-max-size","104857600"]},"homeassistant":{"type":"http","url":""#,
-    home_assistant_mcp_url!(),
-    r#"","headers":{"Authorization":"Bearer ${HA_MCP_TOKEN}"}},"roon":{"type":"http","url":"http://10.40.0.2:8088/mcp"},"google":{"type":"stdio","command":"workspace-mcp","args":["--single-user","--read-only","--tools","calendar","gmail","drive"]},"github":{"type":"stdio","command":"github-mcp-server","args":["stdio","--read-only","--toolsets","repos,actions,issues,pull_requests"]},"fastmail":{"type":"stdio","command":"npx","args":["-y","github:jeremyandrews/jmap-mcp-server"]},"unifi":{"type":"stdio","command":"unifi-network-mcp","args":[]},"routeros":{"type":"stdio","command":"routeros-mcp","args":[]},"proxmox":{"type":"stdio","command":"mcp-proxmox","args":[]},"whatsapp":{"type":"stdio","command":"whatsapp-mcp","args":[]},"imcp":{"type":"stdio","command":"/Applications/iMCP.app/Contents/MacOS/imcp-server","args":[]},"google-perseido":{"type":"stdio","command":"workspace-mcp-perseido","args":["--single-user","--read-only","--tools","calendar","gmail","drive"]},"build":{"type":"stdio","command":"jesse-build-mcp","args":[]},"places":{"type":"stdio","command":"jesse-places-mcp","args":[]}}}"#
+    r#"{"mcpServers":{"#,
+    messages_servers!(),
+    ",",
+    mcp_build!(),
+    ",",
+    mcp_places!(),
+    "}}"
 );
 
 /// The sixteen-server set PLUS **`inbound`** — every **Claude Code** main turn from bridge
@@ -858,9 +1020,15 @@ pub const MESSAGES_BUILD_PLACES_MCP_CONFIG: &str = concat!(
 /// `containment-codex.toml` that are keyed by those labels, and demand a live Codex battery
 /// this change does not run.
 pub const MAIN_CHILD_MCP_CONFIG: &str = concat!(
-    r#"{"mcpServers":{"qmd":{"type":"stdio","command":"qmd","args":["mcp"]},"slack":{"type":"stdio","command":"npx","args":["-y","slack-mcp-server@latest","--transport","stdio"]},"browser":{"type":"stdio","command":"npx","args":["-y","@playwright/mcp@latest","--headless","--isolated","--output-dir","/tmp/jesse-browser","--output-max-size","104857600"]},"homeassistant":{"type":"http","url":""#,
-    home_assistant_mcp_url!(),
-    r#"","headers":{"Authorization":"Bearer ${HA_MCP_TOKEN}"}},"roon":{"type":"http","url":"http://10.40.0.2:8088/mcp"},"google":{"type":"stdio","command":"workspace-mcp","args":["--single-user","--read-only","--tools","calendar","gmail","drive"]},"github":{"type":"stdio","command":"github-mcp-server","args":["stdio","--read-only","--toolsets","repos,actions,issues,pull_requests"]},"fastmail":{"type":"stdio","command":"npx","args":["-y","github:jeremyandrews/jmap-mcp-server"]},"unifi":{"type":"stdio","command":"unifi-network-mcp","args":[]},"routeros":{"type":"stdio","command":"routeros-mcp","args":[]},"proxmox":{"type":"stdio","command":"mcp-proxmox","args":[]},"whatsapp":{"type":"stdio","command":"whatsapp-mcp","args":[]},"imcp":{"type":"stdio","command":"/Applications/iMCP.app/Contents/MacOS/imcp-server","args":[]},"google-perseido":{"type":"stdio","command":"workspace-mcp-perseido","args":["--single-user","--read-only","--tools","calendar","gmail","drive"]},"build":{"type":"stdio","command":"jesse-build-mcp","args":[]},"places":{"type":"stdio","command":"jesse-places-mcp","args":[]},"inbound":{"type":"stdio","command":"jesse-inbound-mcp","args":[]}}}"#
+    r#"{"mcpServers":{"#,
+    messages_servers!(),
+    ",",
+    mcp_build!(),
+    ",",
+    mcp_places!(),
+    ",",
+    mcp_inbound!(),
+    "}}"
 );
 
 /// qmd PLUS slack PLUS browser — the main turn's server set from bridge 0.66.0 until Home
@@ -869,19 +1037,27 @@ pub const MAIN_CHILD_MCP_CONFIG: &str = concat!(
 /// than left as an alias of [`MAIN_CHILD_MCP_CONFIG`]: until 0.67.0 the two were the same
 /// string, so growing the main set in place would have silently re-pointed the
 /// `qmd+slack+browser` row label at a set that also actuates the house.
-pub const QMD_SLACK_BROWSER_MCP_CONFIG: &str = r#"{"mcpServers":{"qmd":{"type":"stdio","command":"qmd","args":["mcp"]},"slack":{"type":"stdio","command":"npx","args":["-y","slack-mcp-server@latest","--transport","stdio"]},"browser":{"type":"stdio","command":"npx","args":["-y","@playwright/mcp@latest","--headless","--isolated","--output-dir","/tmp/jesse-browser","--output-max-size","104857600"]}}}"#;
+pub const QMD_SLACK_BROWSER_MCP_CONFIG: &str = concat!(
+    r#"{"mcpServers":{"#,
+    mcp_qmd!(),
+    ",",
+    mcp_slack!(),
+    ",",
+    mcp_browser!(),
+    "}}"
+);
 
 /// qmd PLUS slack — the main turn's server set from bridge 0.57.0 until the browser was
 /// added in 0.66.0. No shipped spawn site uses it today; it is retained because
 /// [`McpSet::QmdSlack`] still names a posture a deployment can express, and because dropping
 /// it would silently re-point that label at a set containing the browser.
-pub const QMD_SLACK_MCP_CONFIG: &str = r#"{"mcpServers":{"qmd":{"type":"stdio","command":"qmd","args":["mcp"]},"slack":{"type":"stdio","command":"npx","args":["-y","slack-mcp-server@latest","--transport","stdio"]}}}"#;
+pub const QMD_SLACK_MCP_CONFIG: &str =
+    concat!(r#"{"mcpServers":{"#, mcp_qmd!(), ",", mcp_slack!(), "}}");
 
 /// The qmd server ALONE — the main turn's server set before slack was added (bridge 0.57.0),
 /// and Codex's until 0.66.0. No shipped spawn site uses it today; retained for the same
 /// reason as [`QMD_SLACK_MCP_CONFIG`].
-pub const QMD_ONLY_MCP_CONFIG: &str =
-    r#"{"mcpServers":{"qmd":{"type":"stdio","command":"qmd","args":["mcp"]}}}"#;
+pub const QMD_ONLY_MCP_CONFIG: &str = concat!(r#"{"mcpServers":{"#, mcp_qmd!(), "}}");
 
 /// An EMPTY MCP server set, passed as `--mcp-config` alongside `--strict-mcp-config` so
 /// the child loads NO MCP servers at all. `--strict-mcp-config` tells the CLI to use only
@@ -3072,7 +3248,7 @@ mod tests {
             (
                 "MESSAGES_MCP_CONFIG",
                 MESSAGES_MCP_CONFIG,
-                vec!["inbound", "places", "build"],
+                CODEX_WITHHELD_MCP_SERVERS.to_vec(),
             ),
         ] {
             let older = servers(older);
@@ -3089,6 +3265,33 @@ mod tests {
                 "{label} should be the main set minus {added:?}"
             );
         }
+
+        // THE HARNESS-LEVEL FORM: what each harness actually SPAWNS, not the consts they happen
+        // to name today. Every server Codex's main turn carries is declared byte-identically on
+        // Claude Code's, and the servers Claude Code's carries beyond it are exactly the named
+        // `CODEX_WITHHELD_MCP_SERVERS` — so a server added to one harness and not the other
+        // fails here unless somebody wrote down that it was withheld, and why.
+        let claude = servers(ClaudeCode.main_mcp_config());
+        let codex = servers(Codex.main_mcp_config());
+        for (name, spec) in &codex {
+            assert_eq!(
+                claude.get(name),
+                Some(spec),
+                "the two harnesses declare the `{name}` server differently"
+            );
+        }
+        let mut only_claude: Vec<&str> = claude
+            .keys()
+            .filter(|k| !codex.contains_key(k.as_str()))
+            .map(String::as_str)
+            .collect();
+        only_claude.sort_unstable();
+        let mut withheld = CODEX_WITHHELD_MCP_SERVERS.to_vec();
+        withheld.sort_unstable();
+        assert_eq!(
+            only_claude, withheld,
+            "a server on one harness and not the other must be named in CODEX_WITHHELD_MCP_SERVERS"
+        );
     }
 
     /// The two argv strings a main-turn site now carries ahead of its MCP flags: the read

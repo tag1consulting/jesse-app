@@ -1531,8 +1531,10 @@ mod tests {
         // until the build server landed on Claude Code alone, and THIS IS THE ASSERTION THAT
         // KEEPS THAT HONEST: a shared assertion would have quietly re-keyed Codex's rows when
         // the other harness grew, orphaning the two operator `[[accepted]]` blocks that are
-        // keyed by these labels and invalidating a record nobody re-ran. Codex is not armed at
-        // `write` on this deployment and gains no build tool; see `CodexHarness::main_mcp_config`.
+        // keyed by these labels and invalidating a record nobody re-ran. Codex IS armed at
+        // `write` on this deployment, on the signed acceptance keyed to exactly these labels; the
+        // three servers it does not get are `CODEX_WITHHELD_MCP_SERVERS`, and why is on
+        // `Codex::main_mcp_config`.
         let cx: Vec<String> = CODEX_SHIPPED_ROWS.iter().map(|r| r.label()).collect();
         assert_eq!(
             cx,
