@@ -14,6 +14,98 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [bridge 0.128.0] - 2026-09-10
+
+**Each model is registered ONCE, on ONE harness, and the built-in Fireworks families are now
+GLM 5.3, Kimi K3 and Qwen 3.8 Max.** The rule: prefer the Anthropic surface (`/v1/messages`,
+a claude-code child) wherever the provider serves the model there, and use the codex harness
+only where it does not. Fireworks serves all three families on `/v1/messages`, so all three
+are claude-code entries, and the registry's built-in rows are `opus`, `glm`, `kimi`, `qwen`,
+`local` — one per family.
+
+**Kimi K3 loses its Codex-surface twin, and that REVERSES the recommendation the twin
+carried.** `kimi_codex_env_entry`'s doc block called the Codex entry the RECOMMENDED path for
+K3, and `jesse.example.toml` said the same. Both predate this rule. The reason behind them was
+K3's tool loop failing on the Anthropic surface through a cross-turn tool-id collision; that
+was fixed on Fireworks' side by 2026-08-04 and does not reproduce today (below). `kimi-codex`
+and `kimi-k3-codex` are now ALIASES of `kimi`, so a device that had selected the twin lands on
+the surviving entry rather than falling back to the ambient default. The Kimi label loses its
+`(Anthropic)` note, which existed only to tell the two apart: it reads `Kimi K3`.
+
+**Verified live on this surface, 2026-09-10, with the Fireworks key on the Studio** — not
+taken from documentation:
+
+- **Catalog.** `GET /v1/accounts/fireworks/models/<slug>` returned `READY`, serverless, tools
+  supported, for `glm-5p3` ("GLM-5.3"), `kimi-k3` ("Kimi K3") and `qwen3p8-max` ("Qwen 3.8
+  Max").
+- **Prices** from the pricing page and each model page (they agree): GLM 5.3 1.40 / 0.26 /
+  4.40, Kimi K3 3.00 / 0.30 / 15.00, Qwen 3.8 Max 2.00 / 0.25 / 6.00, per 1M tokens. All
+  three publish a cached rate, so no deck ships as zero.
+- **`POST /inference/v1/messages`**: all three answered 200 with a `thinking` block before the
+  text and Anthropic-shaped usage keys.
+- **The tool loop**, which is what the Codex twin existed to route around: the pinned claude
+  CLI (2.1.267) straight to Fireworks, `--tools Read`, strict empty MCP, a `Read` in turn one
+  and a `Read` again in a `--resume`d second process. All six tool results paired
+  (`is_error: false`) and every answer was right. Kimi minted `Read_0` then `Read_1`, so the
+  id counter is conversation-scoped and the old collision does not occur.
+
+**`qwen3p8-max` and `qwen3p8-2p4t-a95b` are two catalog resources, not one resource with two
+names.** The second carries the display name "Qwen3.8-2.4T-A95B", is FP8 and text-only with a
+262K window, and has no row on the pricing page. The entry names `qwen3p8-max`, the priced one.
+
+**All three get `REASONING_HEALTH_TIMEOUT_SECS` (15 s).** GLM did not: 5.2 answered the 1-token
+probe in under a second, and 5.3 measured 0.9–1.4 s today — but 5.3, like K3, runs with
+reasoning always on, a `max_tokens: 1` probe does not bound thinking time, and a probe that
+times out keeps a reachable model out of the picker entirely. Qwen returned a thinking block on
+every call, so it is treated the same.
+
+**What a deploy running this build sees:**
+
+- **`glm` moves to GLM 5.3 with no configuration change**, label `GLM 5.3`, deck 1.40 / 0.26 /
+  4.40. Pinning back is `JESSE_MODEL_GLM_MODEL=accounts/fireworks/models/glm-5p2`,
+  `JESSE_MODEL_GLM_VERSION=5.2` and `JESSE_MODEL_GLM_PRICE_CACHED=0.14`. GLM's deck is
+  env-overridable now; it was the one Fireworks deck that was not.
+- **`qwen` ships UNCONFIGURED until `JESSE_MODEL_QWEN_AUTH_TOKEN` is set.** Each family is armed
+  by one variable spelled `JESSE_MODEL_<ID>_AUTH_TOKEN`; the same Fireworks key in all three is
+  fine. `JESSE_MODEL_GLM_AUTH_TOKEN` and `JESSE_MODEL_KIMI_AUTH_TOKEN` are unchanged.
+- **A leftover `JESSE_MODEL_KIMI_CODEX_*` variable arms nothing** and is named by one startup
+  warning each. A deploy that gave the twins separate keys now arms `kimi` from
+  `JESSE_MODEL_KIMI_AUTH_TOKEN` only.
+
+**Not registered, deliberately — follow-ups:** the coder and vision variants on the same
+catalog. Kimi: `kimi-k2p7-code`. Qwen: `qwen3-coder-480b-a35b-instruct`,
+`qwen3-coder-480b-instruct-bf16`, `qwen3-coder-30b-a3b-instruct`, `qwen3-vl-235b-a22b-instruct`,
+`qwen3-vl-235b-a22b-thinking`, `qwen3p8-27b`. GLM: `glm-5p3-flash`, `glm-4p5v`.
+
+**Containment: nothing moves.** No record, no acceptance block, no tool grant and no MCP set
+changes. The three entries are ordinary claude-code models at the default level; the Codex
+record is untouched because no built-in entry uses that harness any more.
+
+### Added
+- `qwen` built-in entry: `accounts/fireworks/models/qwen3p8-max`, version `3.8 Max`, claude-code
+  harness, Anthropic wire, armed by `JESSE_MODEL_QWEN_AUTH_TOKEN`, deck overridable via
+  `JESSE_MODEL_QWEN_PRICE_*`, vision via `JESSE_MODEL_QWEN_VISION`.
+- `FW_GLM_5P3_*` and `FW_QWEN3P8_MAX_*` price constants. `FW_GLM_*` stays GLM 5.2's deck
+  because the shadow audit prices the gateway's `fw-glm` alias, which still names `glm-5p2`.
+- A startup warning per retired `JESSE_MODEL_KIMI_CODEX_*` variable still set.
+- Tests: every Fireworks entry's slug reaches the claude-code child as `ANTHROPIC_MODEL` and
+  `CLAUDE_CODE_SUBAGENT_MODEL`, starting from the armed registry entry (the Anthropic half of
+  the slug-never-reached-the-child failure); each built-in model is registered once on one
+  harness; the retired variables arm nothing; each deck is its own model's, cached rate
+  included.
+
+### Changed
+- `glm`: slug `glm-5p3`, version `5.3`, GLM 5.3's deck, reasoning probe budget.
+- `kimi`: aliases gain `kimi-codex` and `kimi-k3-codex`; label `Kimi K3`.
+- `jesse.example.toml`: the one-model-one-harness rule, the three-family table, the retired
+  twin, and the Codex Kimi example re-ided to `kimi-on-codex` — an example naming `kimi-codex`
+  would now REPLACE the built-in `kimi` through its alias.
+- `bridge/tests/codex_live_turn.rs` no longer claims the tool loop fails on the Anthropic
+  surface; it stays as the test of the codex harness's OpenAI-provider seam.
+
+### Removed
+- The `kimi-codex` built-in entry (`kimi_codex_env_entry`) and its tests.
+
 ## [bridge 0.127.0] - 2026-09-10
 
 **A model's id names its FAMILY and carries no version, so bumping a backend is

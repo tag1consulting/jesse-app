@@ -2391,7 +2391,7 @@ mod tests {
     /// A model on its OWN OpenAI-style provider, as a deploy would declare it.
     fn openai_model(base_url: &str, model: &str, token: &str) -> ActiveModel {
         let mut m = ActiveModel::ambient();
-        m.id = "kimi-k3-codex".to_string();
+        m.id = "kimi-on-codex".to_string();
         m.kind = ModelKind::OpenAi;
         m.harness = CODEX_ID.to_string();
         m.level = Capability::Read;

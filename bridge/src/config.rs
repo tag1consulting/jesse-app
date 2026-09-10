@@ -2312,9 +2312,9 @@ impl ModelRegistry {
     /// Build the registry by MERGING three sources, later overriding earlier BY ID:
     ///   1. the built-in ambient `opus` (always present, never configurable — a declarative
     ///      or env entry that tries to redefine it is refused);
-    ///   2. the `JESSE_MODEL_GLM_*` / `JESSE_MODEL_KIMI_*` / `JESSE_MODEL_LOCAL_*` env triples,
-    ///      preserved with the SAME ids, defaults, and prices as before so nothing deployed
-    ///      breaks;
+    ///   2. the `JESSE_MODEL_GLM_*` / `JESSE_MODEL_KIMI_*` / `JESSE_MODEL_QWEN_*` /
+    ///      `JESSE_MODEL_LOCAL_*` env triples — one entry per model, each on one harness, with
+    ///      every id a model used to answer to kept as an alias so nothing deployed breaks;
     ///   3. the declarative `[[models]]` array from the bridge config file (the same TOML the
     ///      persona loads from — see [`load_local_models`]).
     ///
@@ -2337,7 +2337,11 @@ impl ModelRegistry {
         // over that only when actually set.
         let global_health_timeout = health_timeout_override();
 
-        // Source 2: the preserved env triples (same ids/defaults/prices as before).
+        // Source 2: the built-in env triples. ONE ENTRY PER MODEL, ON ONE HARNESS: each model
+        // is registered once, on the Anthropic surface wherever the provider serves it on
+        // `/v1/messages` (all three Fireworks families do), and on the codex harness only
+        // where it does not. A second entry for the same weights on another harness is two
+        // containment postures for one choice, and the picker cannot explain the difference.
         upsert_model(
             &mut models,
             glm_env_entry(default_health_interval, global_health_timeout),
@@ -2346,13 +2350,11 @@ impl ModelRegistry {
             &mut models,
             kimi_env_entry(default_health_interval, global_health_timeout),
         );
-        // Kimi's OTHER surface, registered right beside it: one model, two transports, each
-        // selectable on its own id. See [`kimi_codex_env_entry`] for why they are not
-        // interchangeable.
         upsert_model(
             &mut models,
-            kimi_codex_env_entry(default_health_interval, global_health_timeout),
+            qwen_env_entry(default_health_interval, global_health_timeout),
         );
+        warn_retired_model_env();
         upsert_model(
             &mut models,
             local_env_entry(default_health_interval, global_health_timeout),
@@ -2507,24 +2509,33 @@ fn upsert_model(models: &mut Vec<RegistryModel>, mut m: RegistryModel) {
     }
 }
 
-/// The `glm` env-triple entry (hosted on Fireworks' Anthropic surface). base + model
-/// DEFAULT; only the token must be supplied, so an operator arms GLM with a single secret
-/// env var.
+/// The Fireworks host every built-in Fireworks entry defaults its `base_url` to: the
+/// Anthropic-compatible surface, to which Claude Code appends `/v1/messages`. No `/v1` suffix
+/// — that is the OpenAI-style API root, a different surface.
+const FIREWORKS_ANTHROPIC_BASE_URL: &str = "https://api.fireworks.ai/inference";
+
+/// The `glm` env-triple entry (hosted on Fireworks' Anthropic surface), pointed at GLM 5.3.
+/// base + model DEFAULT; only the token must be supplied, so an operator arms GLM with a
+/// single secret env var.
 ///
 /// **THE ID IS THE FAMILY, NOT THE VERSION**, and `glm-5.2` is kept as an alias so a
 /// selection persisted before the rename still resolves. The version it displays comes from
 /// `JESSE_MODEL_GLM_VERSION`, beside the slug's own `JESSE_MODEL_GLM_MODEL`, so a bump is
-/// two launch-environment lines and no release.
+/// two launch-environment lines and no release. Pinning a deploy back to 5.2 is those two
+/// lines plus `JESSE_MODEL_GLM_PRICE_CACHED=0.14`, since 5.2's cached rate differs.
+///
+/// One harness, `claude-code`: Fireworks serves GLM 5.3 on `/v1/messages`, verified live on
+/// 2026-09-10 with a resumed two-turn `Read` loop on the pinned CLI.
 fn glm_env_entry(default_interval_secs: u64, global_timeout_secs: Option<u64>) -> RegistryModel {
     let backend = resolve_model_backend(
         "glm",
         env_string("JESSE_MODEL_GLM_BASE_URL"),
         env_string("JESSE_MODEL_GLM_AUTH_TOKEN"),
         env_string("JESSE_MODEL_GLM_MODEL"),
-        Some("https://api.fireworks.ai/inference"),
-        Some("accounts/fireworks/models/glm-5p2"),
+        Some(FIREWORKS_ANTHROPIC_BASE_URL),
+        Some("accounts/fireworks/models/glm-5p3"),
     );
-    let version = model_version_from_env("JESSE_MODEL_GLM", Some("5.2"));
+    let version = model_version_from_env("JESSE_MODEL_GLM", Some("5.3"));
     RegistryModel {
         codex: CodexTuning::default(),
         id: "glm".to_string(),
@@ -2543,19 +2554,27 @@ fn glm_env_entry(default_interval_secs: u64, global_timeout_secs: Option<u64>) -
         auth_scheme: None,
         quirks: DirectQuirks::default(),
         thinking: None,
-        price: PriceDeck {
-            in_per_m: FW_GLM_IN_PER_M,
-            cached_per_m: FW_GLM_CACHED_PER_M,
-            cache_write_per_m: None,
-            out_per_m: FW_GLM_OUT_PER_M,
-        },
+        // GLM 5.3's published deck, NOT 5.2's: the cached rate differs (0.26 against 0.14).
+        // Env-overridable like Kimi's, which GLM's deck was not before this entry moved.
+        price: model_price_from_env(
+            "JESSE_MODEL_GLM",
+            PriceDeck {
+                in_per_m: FW_GLM_5P3_IN_PER_M,
+                cached_per_m: FW_GLM_5P3_CACHED_PER_M,
+                cache_write_per_m: None,
+                out_per_m: FW_GLM_5P3_OUT_PER_M,
+            },
+        ),
         health: HealthConfig {
             interval_secs: default_interval_secs,
-            // GLM answers the 1-token probe in well under a second; the 3 s default stands.
+            // GLM 5.3 runs with reasoning always on, and a `max_tokens: 1` probe does not bound
+            // thinking time. 5.2 answered in under a second and kept the 3 s default; 5.3
+            // measured 0.9–1.4 s on 2026-09-10, which says nothing about a slow day. A probe
+            // that times out keeps a reachable model out of the picker entirely.
             timeout_secs: resolve_health_timeout(
                 None,
                 global_timeout_secs,
-                DEFAULT_HEALTH_TIMEOUT_SECS,
+                REASONING_HEALTH_TIMEOUT_SECS,
             ),
             ..HealthConfig::default()
         },
@@ -2566,11 +2585,21 @@ fn glm_env_entry(default_interval_secs: u64, global_timeout_secs: Option<u64>) -
     }
 }
 
-/// The `kimi-k3` env-triple entry, ARMED — Fireworks serves Kimi K3 on the Anthropic
+/// The `kimi` env-triple entry, ARMED — Fireworks serves Kimi K3 on the Anthropic
 /// `/v1/messages` surface (verified 2026-07-27), so this mirrors [`glm_env_entry`]: the
 /// base_url and slug default to the live Fireworks values and only
 /// `JESSE_MODEL_KIMI_AUTH_TOKEN` must be exported to arm it. Absent that token the entry
 /// still ships UNCONFIGURED and a selection attempt is rejected.
+///
+/// **THE ONLY KIMI ENTRY.** K3 used to be registered twice — this one, and `kimi-codex` on the
+/// Codex harness over Fireworks' Responses API, which that entry's doc block called the
+/// RECOMMENDED path for K3. That recommendation predates the policy this registry now follows
+/// (one model, one harness, and the Anthropic surface wherever the provider serves the model
+/// on `/v1/messages`) and is reversed by it. The reason it was ever the recommendation — K3's
+/// tool loop failing on this surface through a cross-turn tool-id collision — was fixed on
+/// Fireworks' side (2026-08-04) and re-measured on 2026-09-10: a resumed two-turn `Read` loop
+/// minted `Read_0` then `Read_1` and both results paired. `kimi-codex` and `kimi-k3-codex`
+/// are this entry's aliases now, so a selection persisted under either lands here.
 ///
 /// NO vision pairing by default, and that is deliberate rather than an omission: K3 is
 /// natively multimodal, so an UNPAIRED entry sends attachments down the scratch-file +
@@ -2584,20 +2613,25 @@ fn kimi_env_entry(default_interval_secs: u64, global_timeout_secs: Option<u64>) 
         env_string("JESSE_MODEL_KIMI_BASE_URL"),
         env_string("JESSE_MODEL_KIMI_AUTH_TOKEN"),
         env_string("JESSE_MODEL_KIMI_MODEL"),
-        Some("https://api.fireworks.ai/inference"),
+        Some(FIREWORKS_ANTHROPIC_BASE_URL),
         Some("accounts/fireworks/models/kimi-k3"),
     );
     let version = model_version_from_env("JESSE_MODEL_KIMI", Some("K3"));
     RegistryModel {
         codex: CodexTuning::default(),
         id: "kimi".to_string(),
-        // The SURFACE is in the label because there are two Kimi entries and they are not
-        // interchangeable — see [`kimi_codex_env_entry`]. It rides as the derivation's NOTE
-        // rather than as an explicit label, so the version half still tracks
-        // `JESSE_MODEL_KIMI_VERSION`.
-        label: derive_model_label("Kimi", version.as_deref(), Some("(Anthropic)")),
+        // No surface note any more: the note existed to tell two Kimi entries apart, and there
+        // is one. A note on a label with nothing to be distinguished from is noise.
+        label: derive_model_label("Kimi", version.as_deref(), None),
         version,
-        aliases: vec!["kimi-k3".to_string()],
+        // `kimi-k3` from the family rename; `kimi-codex` / `kimi-k3-codex` from the retired
+        // Codex-surface twin, so a device that had selected THAT entry is not dropped back
+        // onto the ambient default when it disappears.
+        aliases: vec![
+            "kimi-k3".to_string(),
+            "kimi-codex".to_string(),
+            "kimi-k3-codex".to_string(),
+        ],
         kind: ModelKind::Hosted,
         wire: model_wire_from_env("JESSE_MODEL_KIMI", "kimi", ModelKind::Hosted),
         subagent_model: backend.as_ref().map(|(_, _, m)| m.clone()),
@@ -2638,96 +2672,113 @@ fn kimi_env_entry(default_interval_secs: u64, global_timeout_secs: Option<u64>) 
     }
 }
 
-/// The `kimi-k3-codex` env-triple entry: the SAME Kimi K3, reached over the surface it
-/// natively speaks.
+/// The `qwen` env-triple entry: Qwen 3.8 Max on Fireworks' Anthropic surface, shaped exactly
+/// like [`glm_env_entry`] — base_url and slug default to the live Fireworks values and only
+/// `JESSE_MODEL_QWEN_AUTH_TOKEN` must be exported to arm it, which is the same
+/// `JESSE_MODEL_<ID>_AUTH_TOKEN` spelling GLM and Kimi are armed by.
 ///
-/// **Not the same model in two costumes, and the picker must not present it as one.** This
-/// entry runs a real `codex exec` child against Fireworks' OpenAI-style Responses API and is
-/// governed by `bridge/containment-codex.toml` — an OS sandbox, reaching the vault through
-/// the shell. Its sibling [`kimi_env_entry`] runs a Claude Code child against the Anthropic
-/// `/v1/messages` surface and is governed by `bridge/containment.toml` — a tool allowlist
-/// plus strict MCP. Same weights, different transport, different containment record, and
-/// different failure modes. Hence the surface in both labels.
+/// **THE SLUG IS `qwen3p8-max`, AND IT IS NOT THE SAME RESOURCE AS `qwen3p8-2p4t-a95b`.** Both
+/// are in Fireworks' catalog (read through the models API on 2026-09-10), as two entries:
+/// `qwen3p8-max` carries the display name "Qwen 3.8 Max", is the one the pricing page lists,
+/// and accepts images; `qwen3p8-2p4t-a95b` ("Qwen3.8-2.4T-A95B") is a separate FP8, text-only
+/// resource with a 262K window and no row on the pricing page. This entry names the priced
+/// one, so the deck below describes the model the turn actually runs.
 ///
-/// ARMED BY THE SAME SECRET AS ITS SIBLING (`JESSE_MODEL_KIMI_AUTH_TOKEN`, one Fireworks
-/// key), because making an operator paste the same key under a second name to get the
-/// RECOMMENDED surface would be a papercut, not a safeguard.
-/// `JESSE_MODEL_KIMI_CODEX_AUTH_TOKEN` overrides it for a deploy that wants them on separate
-/// keys. Note the consequence, which is deliberate: a deploy that already exports the Kimi
-/// key gains this entry the moment it runs a bridge carrying this change.
+/// One harness, `claude-code`: Fireworks serves it on `/v1/messages`, verified live on
+/// 2026-09-10 with the same resumed two-turn `Read` loop as GLM and Kimi. It also emits a
+/// thinking block before its answer, so it gets the reasoning probe budget.
 ///
-/// The `base_url` default differs from the sibling's by a `/v1` suffix and that is not a
-/// typo: an OpenAI-style `base_url` is the API ROOT the harness appends `/responses` to,
-/// while the Anthropic-surface one is the host Claude Code appends `/v1/messages` to.
-fn kimi_codex_env_entry(
-    default_interval_secs: u64,
-    global_timeout_secs: Option<u64>,
-) -> RegistryModel {
+/// NO vision pairing by default, for the same reason as Kimi: the catalog marks it
+/// image-capable, and an unpaired entry hands the model the real image through the CLI's
+/// `Read` tool rather than a helper's transcription of it.
+fn qwen_env_entry(default_interval_secs: u64, global_timeout_secs: Option<u64>) -> RegistryModel {
     let backend = resolve_model_backend(
-        "kimi-codex",
-        env_string("JESSE_MODEL_KIMI_CODEX_BASE_URL"),
-        env_string("JESSE_MODEL_KIMI_CODEX_AUTH_TOKEN")
-            .or_else(|| env_string("JESSE_MODEL_KIMI_AUTH_TOKEN")),
-        env_string("JESSE_MODEL_KIMI_CODEX_MODEL"),
-        Some("https://api.fireworks.ai/inference/v1"),
-        Some("accounts/fireworks/models/kimi-k3"),
+        "qwen",
+        env_string("JESSE_MODEL_QWEN_BASE_URL"),
+        env_string("JESSE_MODEL_QWEN_AUTH_TOKEN"),
+        env_string("JESSE_MODEL_QWEN_MODEL"),
+        Some(FIREWORKS_ANTHROPIC_BASE_URL),
+        Some("accounts/fireworks/models/qwen3p8-max"),
     );
-    // Defaults to the sibling's version for the same reason it defaults to the sibling's
-    // token: it is the same weights on the same provider, so a bump that moves one moves
-    // both. `JESSE_MODEL_KIMI_CODEX_VERSION` splits them for a deploy that needs it.
-    let version = model_version_from_env(
-        "JESSE_MODEL_KIMI_CODEX",
-        model_version_from_env("JESSE_MODEL_KIMI", Some("K3")).as_deref(),
-    );
+    // "3.8 Max" rather than "3.8": the tier is what tells this resource apart from the other
+    // Qwen 3.8 resources on the same catalog, and it has to move with the slug. As the
+    // version it does — `JESSE_MODEL_QWEN_VERSION` changes both halves at once — where a
+    // hard-coded label note would go on saying "Max" after a repoint at a smaller size.
+    let version = model_version_from_env("JESSE_MODEL_QWEN", Some("3.8 Max"));
     RegistryModel {
         codex: CodexTuning::default(),
-        id: "kimi-codex".to_string(),
-        label: derive_model_label("Kimi", version.as_deref(), Some("(Codex)")),
+        id: "qwen".to_string(),
+        label: derive_model_label("Qwen", version.as_deref(), None),
         version,
-        aliases: vec!["kimi-k3-codex".to_string()],
-        kind: ModelKind::OpenAi,
-        wire: model_wire_from_env("JESSE_MODEL_KIMI_CODEX", "kimi-codex", ModelKind::OpenAi),
-        // NO `CLAUDE_CODE_SUBAGENT_MODEL` analogue on this harness: the codex child is not
-        // handed a subagent model, and claiming one here would describe a switch that does
-        // not exist.
-        subagent_model: None,
+        // A new family: no id it used to be called.
+        aliases: Vec::new(),
+        kind: ModelKind::Hosted,
+        wire: model_wire_from_env("JESSE_MODEL_QWEN", "qwen", ModelKind::Hosted),
+        subagent_model: backend.as_ref().map(|(_, _, m)| m.clone()),
         configured: backend.is_some(),
         backend,
+        // No declarative entry, so no `level` key: the default applies. A deploy that wants
+        // one of these at Write says so in the `[[models]]` array.
         level: Capability::Read,
-        harness: CODEX_ID.to_string(),
+        harness: CLAUDE_CODE_ID.to_string(),
         auth_scheme: None,
         quirks: DirectQuirks::default(),
         thinking: None,
-        // The same weights on the same provider, so the same deck as the sibling — shared
-        // `JESSE_MODEL_KIMI_PRICE_*` overrides included, since a reprice moves both.
         price: model_price_from_env(
-            "JESSE_MODEL_KIMI",
+            "JESSE_MODEL_QWEN",
             PriceDeck {
-                in_per_m: FW_KIMI_K3_IN_PER_M,
-                cached_per_m: FW_KIMI_K3_CACHED_PER_M,
+                in_per_m: FW_QWEN3P8_MAX_IN_PER_M,
+                cached_per_m: FW_QWEN3P8_MAX_CACHED_PER_M,
                 cache_write_per_m: None,
-                out_per_m: FW_KIMI_K3_OUT_PER_M,
+                out_per_m: FW_QWEN3P8_MAX_OUT_PER_M,
             },
         ),
         health: HealthConfig {
             interval_secs: default_interval_secs,
-            // Probed at `/chat/completions` on the API root, NOT `/responses` — see
-            // [`DEFAULT_OPENAI_HEALTH_PATH`].
-            path: default_health_path(Wire::Responses).to_string(),
-            // K3 thinks before it answers on this surface too; the 3 s default would keep a
-            // perfectly reachable model out of the picker.
+            // It thinks before it answers (a thinking block came back on every live call), so
+            // the 3 s default is a coin toss on a busy day. See [`REASONING_HEALTH_TIMEOUT_SECS`].
             timeout_secs: resolve_health_timeout(
                 None,
                 global_timeout_secs,
                 REASONING_HEALTH_TIMEOUT_SECS,
             ),
+            ..HealthConfig::default()
         },
-        // Unpaired for the same reason as the sibling: K3 sees images itself, and a helper
-        // would transcribe them to text and hide the pixels from a model that can read them.
-        vision: parse_vision_partners(
-            &env_string("JESSE_MODEL_KIMI_CODEX_VISION").unwrap_or_default(),
-        ),
-        vision_complementary: env_flag_true("JESSE_MODEL_KIMI_CODEX_VISION_COMPLEMENTARY"),
+        vision: parse_vision_partners(&env_string("JESSE_MODEL_QWEN_VISION").unwrap_or_default()),
+        vision_complementary: env_flag_true("JESSE_MODEL_QWEN_VISION_COMPLEMENTARY"),
+    }
+}
+
+/// The per-model variables the retired Codex-surface Kimi entry (`kimi-codex`) read. Nothing
+/// reads them now; they are listed only so a leftover one can be named at startup.
+const RETIRED_KIMI_CODEX_ENV: [&str; 7] = [
+    "JESSE_MODEL_KIMI_CODEX_BASE_URL",
+    "JESSE_MODEL_KIMI_CODEX_AUTH_TOKEN",
+    "JESSE_MODEL_KIMI_CODEX_MODEL",
+    "JESSE_MODEL_KIMI_CODEX_VERSION",
+    "JESSE_MODEL_KIMI_CODEX_WIRE",
+    "JESSE_MODEL_KIMI_CODEX_VISION",
+    "JESSE_MODEL_KIMI_CODEX_VISION_COMPLEMENTARY",
+];
+
+/// Warn once at startup for every retired `JESSE_MODEL_KIMI_CODEX_*` variable still set.
+///
+/// A variable nothing reads is a silent no-op, and this one has a sharp edge: a deploy that
+/// set `JESSE_MODEL_KIMI_CODEX_AUTH_TOKEN` to keep the two Kimi entries on separate keys now
+/// has ONE Kimi entry, armed by a different variable. A warning rather than an error because
+/// the variable grants nothing on its own. Names only, never a value.
+fn warn_retired_model_env() {
+    for var in RETIRED_KIMI_CODEX_ENV {
+        if std::env::var_os(var).is_some() {
+            eprintln!(
+                "jesse-bridge: WARNING {var} is set, and nothing reads it. The Codex-surface \
+                 Kimi entry was retired: `kimi-codex` is now an alias of `kimi`, which runs on \
+                 claude-code and is armed by JESSE_MODEL_KIMI_AUTH_TOKEN. To run K3 on the \
+                 codex harness anyway, declare a [[models]] entry with harness = \"codex\" \
+                 under an id of its own — NOT `kimi-codex`, which as an alias of `kimi` would \
+                 replace it."
+            );
+        }
     }
 }
 
@@ -4450,15 +4501,15 @@ mod tests {
         // 4. The env-triple models take the same default when their `_WIRE` var is unset —
         //    the same rule, reached through the other door.
         let _guard = ENV_LOCK.lock_ok();
-        for var in ["JESSE_MODEL_GLM_WIRE", "JESSE_MODEL_KIMI_CODEX_WIRE"] {
+        for var in ["JESSE_MODEL_GLM_WIRE", "JESSE_MODEL_TEST_OPENAI_WIRE"] {
             std::env::remove_var(var);
         }
         assert_eq!(
-            model_wire_from_env("JESSE_MODEL_GLM", "glm-5.2", ModelKind::Hosted),
+            model_wire_from_env("JESSE_MODEL_GLM", "glm", ModelKind::Hosted),
             Wire::Messages
         );
         assert_eq!(
-            model_wire_from_env("JESSE_MODEL_KIMI_CODEX", "kimi-k3-codex", ModelKind::OpenAi),
+            model_wire_from_env("JESSE_MODEL_TEST_OPENAI", "test-openai", ModelKind::OpenAi),
             Wire::Responses
         );
     }
@@ -4498,7 +4549,7 @@ mod tests {
         );
     }
 
-    /// The nine `JESSE_MODEL_*` env-triple vars, cleared so a test's registry is deterministic.
+    /// The `JESSE_MODEL_*` env-triple vars, cleared so a test's registry is deterministic.
     const MODEL_ENV_VARS: [&str; 12] = [
         "JESSE_MODEL_GLM_BASE_URL",
         "JESSE_MODEL_GLM_AUTH_TOKEN",
@@ -4506,11 +4557,9 @@ mod tests {
         "JESSE_MODEL_KIMI_BASE_URL",
         "JESSE_MODEL_KIMI_AUTH_TOKEN",
         "JESSE_MODEL_KIMI_MODEL",
-        // The Codex-surface sibling FALLS BACK to the shared Kimi token, so a test that
-        // clears the env to reach the unconfigured baseline must clear these too.
-        "JESSE_MODEL_KIMI_CODEX_BASE_URL",
-        "JESSE_MODEL_KIMI_CODEX_AUTH_TOKEN",
-        "JESSE_MODEL_KIMI_CODEX_MODEL",
+        "JESSE_MODEL_QWEN_BASE_URL",
+        "JESSE_MODEL_QWEN_AUTH_TOKEN",
+        "JESSE_MODEL_QWEN_MODEL",
         "JESSE_MODEL_LOCAL_BASE_URL",
         "JESSE_MODEL_LOCAL_AUTH_TOKEN",
         "JESSE_MODEL_LOCAL_MODEL",
@@ -4823,7 +4872,7 @@ mod tests {
     fn an_openai_kind_model_defaults_its_probe_to_the_openai_path() {
         let _g = ENV_LOCK.lock_ok();
         std::env::set_var("JESSE_TEST_OPENAI_TOKEN", "tok");
-        let mut t = model_toml("kimi-k3-codex", "openai", Some("JESSE_TEST_OPENAI_TOKEN"));
+        let mut t = model_toml("kimi-on-codex", "openai", Some("JESSE_TEST_OPENAI_TOKEN"));
         t.harness = Some("codex".into());
 
         let m = registry_model_from_toml(&t, None, None).expect("openai is a valid kind");
@@ -4921,11 +4970,14 @@ mod tests {
         }
         let registry = ModelRegistry::from_env("/nonexistent-home");
 
-        // What a pre-rename device wrote into `model.json`, verbatim.
+        // What a pre-rename device wrote into `model.json`, verbatim. The two Codex-surface
+        // Kimi ids land on the SURVIVING Kimi entry: that entry was retired (one model, one
+        // harness), and a device that had selected it must not fall back to the default.
         for (persisted, family) in [
             ("glm-5.2", "glm"),
             ("kimi-k3", "kimi"),
-            ("kimi-k3-codex", "kimi-codex"),
+            ("kimi-k3-codex", "kimi"),
+            ("kimi-codex", "kimi"),
         ] {
             let resolved = registry
                 .get(persisted)
@@ -4938,9 +4990,15 @@ mod tests {
         }
 
         // ...and the new ids resolve to themselves, which is what the endpoints persist back.
-        for family in ["glm", "kimi", "kimi-codex", "local", "opus"] {
+        for family in ["glm", "kimi", "qwen", "local", "opus"] {
             assert_eq!(registry.canonical_id(family), Some(family));
         }
+        // …and the surviving Kimi entry is the Anthropic-surface one, so the retired id
+        // resolves to a claude-code turn rather than to a codex child.
+        assert_eq!(
+            registry.get("kimi-codex").map(|m| m.harness.as_str()),
+            Some(CLAUDE_CODE_ID)
+        );
     }
 
     /// An exact id BEATS an alias, so a stale alias can never shadow a real entry and
@@ -4963,36 +5021,54 @@ mod tests {
     fn repointing_a_family_moves_slug_version_and_label_together() {
         let _g = ENV_LOCK.lock_ok();
         std::env::set_var("JESSE_MODEL_GLM_AUTH_TOKEN", "tok");
-        std::env::remove_var("JESSE_MODEL_GLM_MODEL");
-        std::env::remove_var("JESSE_MODEL_GLM_VERSION");
+        for var in [
+            "JESSE_MODEL_GLM_MODEL",
+            "JESSE_MODEL_GLM_VERSION",
+            "JESSE_MODEL_GLM_PRICE_CACHED",
+        ] {
+            std::env::remove_var(var);
+        }
 
+        // The built-in default is GLM 5.3 now — the bump this whole mechanism was built for,
+        // made in code once so an operator does not have to make it in every plist.
         let before = glm_env_entry(DEFAULT_HEALTH_INTERVAL_SECS, None);
-        assert_eq!(before.label, "GLM 5.2");
-        assert_eq!(before.version.as_deref(), Some("5.2"));
+        assert_eq!(before.label, "GLM 5.3");
+        assert_eq!(before.version.as_deref(), Some("5.3"));
         assert_eq!(
             before.backend.as_ref().map(|(_, _, m)| m.as_str()),
-            Some("accounts/fireworks/models/glm-5p2")
+            Some("accounts/fireworks/models/glm-5p3")
         );
 
-        // The one configuration change a version bump costs.
-        std::env::set_var("JESSE_MODEL_GLM_MODEL", "accounts/fireworks/models/glm-5p3");
-        std::env::set_var("JESSE_MODEL_GLM_VERSION", "5.3");
+        // The configuration change a version move costs, in the direction a deploy that is
+        // not ready for 5.3 needs: pin back. Three lines, because 5.2's cached rate differs.
+        std::env::set_var("JESSE_MODEL_GLM_MODEL", "accounts/fireworks/models/glm-5p2");
+        std::env::set_var("JESSE_MODEL_GLM_VERSION", "5.2");
+        std::env::set_var("JESSE_MODEL_GLM_PRICE_CACHED", "0.14");
         let after = glm_env_entry(DEFAULT_HEALTH_INTERVAL_SECS, None);
 
         assert_eq!(after.id, "glm", "the id does not move with the version");
-        assert_eq!(after.label, "GLM 5.3");
-        assert_eq!(after.version.as_deref(), Some("5.3"));
+        assert_eq!(after.label, "GLM 5.2");
+        assert_eq!(after.version.as_deref(), Some("5.2"));
         assert_eq!(
             after.backend.as_ref().map(|(_, _, m)| m.as_str()),
-            Some("accounts/fireworks/models/glm-5p3")
+            Some("accounts/fireworks/models/glm-5p2")
         );
-        // The old id keeps resolving across the bump — an alias is about the ID, not the
+        assert_eq!(
+            after.price.cached_per_m, 0.14,
+            "GLM's deck is env-overridable"
+        );
+        // The old id keeps resolving across the move — an alias is about the ID, not the
         // version it was named after.
         assert!(after.aliases.iter().any(|a| a == "glm-5.2"));
 
-        std::env::remove_var("JESSE_MODEL_GLM_AUTH_TOKEN");
-        std::env::remove_var("JESSE_MODEL_GLM_MODEL");
-        std::env::remove_var("JESSE_MODEL_GLM_VERSION");
+        for var in [
+            "JESSE_MODEL_GLM_AUTH_TOKEN",
+            "JESSE_MODEL_GLM_MODEL",
+            "JESSE_MODEL_GLM_VERSION",
+            "JESSE_MODEL_GLM_PRICE_CACHED",
+        ] {
+            std::env::remove_var(var);
+        }
     }
 
     /// A blank `_VERSION` means "no version to show", not an empty version — so the label is
@@ -5078,8 +5154,8 @@ mod tests {
     #[test]
     fn from_env_with_no_model_config_is_todays_behavior_opus_only_selectable() {
         // With no JESSE_MODEL_* and no [[models]], the ONLY selectable (configured) model is
-        // opus — byte-for-byte today: opus present + configured, and the preserved env-triple
-        // placeholders (glm/kimi/local) present but UNCONFIGURED (not selectable). No
+        // opus — byte-for-byte today: opus present + configured, and the built-in env-triple
+        // placeholders (glm/kimi/qwen/local) present but UNCONFIGURED (not selectable). No
         // declarative entry appears.
         let _g = ENV_LOCK.lock_ok();
         let saved: Vec<(&str, Option<String>)> = MODEL_ENV_VARS
@@ -5097,7 +5173,16 @@ mod tests {
         assert_eq!(r.models[0].id, "opus");
         assert!(matches!(r.models[0].kind, ModelKind::Ambient));
         assert!(r.is_configured("opus"), "opus is the only configured model");
-        for id in ["glm-5.2", "kimi-k3", "kimi-k3-codex", "local"] {
+        for id in [
+            "glm",
+            "glm-5.2",
+            "kimi",
+            "kimi-k3",
+            "kimi-k3-codex",
+            "kimi-codex",
+            "qwen",
+            "local",
+        ] {
             let m = r
                 .get(id)
                 .unwrap_or_else(|| panic!("{id} preserved as a placeholder"));
@@ -5106,9 +5191,10 @@ mod tests {
                 "{id} is present but not configured with no env"
             );
         }
+        // One entry per family: the retired `kimi-codex` is an alias above, not a row here.
         assert_eq!(
-            r.models.len(),
-            5,
+            r.models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            ["opus", "glm", "kimi", "qwen", "local"],
             "no declarative entries appear with no config"
         );
 
@@ -5120,72 +5206,102 @@ mod tests {
         }
     }
 
+    /// ONE MODEL, ONE HARNESS. Each built-in model is registered once, and every Fireworks
+    /// family sits on the Anthropic surface because Fireworks serves all three there — each was
+    /// run through a resumed two-turn tool loop on the pinned CLI on 2026-09-10.
+    ///
+    /// What this replaces is a test asserting the opposite: two Kimi entries, one per surface,
+    /// told apart by a parenthetical in the label. That was two containment postures behind one
+    /// choice, and a person picking between them was being asked about transports, not models.
     #[test]
-    fn both_kimi_entries_are_registered_and_are_not_the_same_model_twice() {
-        // The operator ruling this implements: route each model to the surface whose native
-        // contract it speaks, and make BOTH first-class rather than picking a global default.
-        // So the registry must carry two Kimi entries that a person can tell apart and that
-        // the machinery treats as genuinely different postures.
+    fn each_built_in_model_is_registered_once_on_one_harness() {
         let _g = ENV_LOCK.lock_ok();
+        let extra = [
+            "JESSE_CONFIG",
+            "JESSE_STATE_DIR",
+            "JESSE_MODEL_GLM_VERSION",
+            "JESSE_MODEL_KIMI_VERSION",
+            "JESSE_MODEL_QWEN_VERSION",
+        ];
         let saved: Vec<(&str, Option<String>)> = MODEL_ENV_VARS
             .iter()
-            .chain(["JESSE_CONFIG", "JESSE_STATE_DIR"].iter())
+            .chain(extra.iter())
             .map(|k| (*k, std::env::var(k).ok()))
             .collect();
-        for k in MODEL_ENV_VARS {
+        for k in MODEL_ENV_VARS.iter().chain(extra.iter()) {
             std::env::remove_var(k);
         }
-        std::env::remove_var("JESSE_STATE_DIR");
         std::env::set_var("JESSE_CONFIG", "/nonexistent/jesse.local.toml");
-        // ONE secret arms BOTH: the Codex entry falls back to the shared Fireworks key.
-        std::env::set_var("JESSE_MODEL_KIMI_AUTH_TOKEN", "fw-test");
+        // Each family is armed by ITS OWN variable, and the three are spelled the same way.
+        std::env::set_var("JESSE_MODEL_GLM_AUTH_TOKEN", "fw-glm");
+        std::env::set_var("JESSE_MODEL_KIMI_AUTH_TOKEN", "fw-kimi");
+        std::env::set_var("JESSE_MODEL_QWEN_AUTH_TOKEN", "fw-qwen");
 
         let r = ModelRegistry::from_env("");
-        let anthropic = r.get("kimi-k3").expect("the Anthropic-surface entry");
-        let codex = r.get("kimi-k3-codex").expect("the Codex-surface entry");
+        for (id, token, slug, label) in [
+            (
+                "glm",
+                "fw-glm",
+                "accounts/fireworks/models/glm-5p3",
+                "GLM 5.3",
+            ),
+            (
+                "kimi",
+                "fw-kimi",
+                "accounts/fireworks/models/kimi-k3",
+                "Kimi K3",
+            ),
+            (
+                "qwen",
+                "fw-qwen",
+                "accounts/fireworks/models/qwen3p8-max",
+                "Qwen 3.8 Max",
+            ),
+        ] {
+            let m = r.get(id).unwrap_or_else(|| panic!("{id} is registered"));
+            assert!(m.configured, "{id} arms from its own token");
+            assert_eq!(m.harness, CLAUDE_CODE_ID, "{id} runs on claude-code");
+            assert!(matches!(m.kind, ModelKind::Hosted), "{id}");
+            assert_eq!(m.wire, Wire::Messages, "{id} speaks /v1/messages");
+            assert_eq!(
+                m.health.path, "/v1/messages",
+                "{id} probes the surface it runs on"
+            );
+            assert_eq!(
+                m.backend
+                    .as_ref()
+                    .map(|(b, t, s)| (b.as_str(), t.as_str(), s.as_str())),
+                Some((FIREWORKS_ANTHROPIC_BASE_URL, token, slug)),
+                "{id}'s triple"
+            );
+            assert_eq!(
+                m.subagent_model.as_deref(),
+                Some(slug),
+                "{id}'s subagents follow the switch"
+            );
+            assert_eq!(m.label, label, "{id}'s label is derived from its version");
+        }
 
-        assert!(
-            anthropic.configured && codex.configured,
-            "one key arms both"
+        // ONCE each: no two entries run the same slug, and nothing built in is a codex entry.
+        let slugs: Vec<&str> = r
+            .models
+            .iter()
+            .filter_map(|m| m.backend.as_ref().map(|(_, _, s)| s.as_str()))
+            .collect();
+        let unique: std::collections::HashSet<&str> = slugs.iter().copied().collect();
+        assert_eq!(
+            slugs.len(),
+            unique.len(),
+            "a model registered twice: {slugs:?}"
         );
-
-        // Different SURFACE — the whole point of the step.
-        assert!(matches!(anthropic.kind, ModelKind::Hosted));
-        assert!(matches!(codex.kind, ModelKind::OpenAi));
-        assert_eq!(anthropic.harness, CLAUDE_CODE_ID);
-        assert_eq!(codex.harness, CODEX_ID);
-
-        // Different CONTAINMENT RECORD follows from the harness, which is why these are not
-        // one model listed twice: `containment.toml` governs one and `containment-codex.toml`
-        // the other.
-        assert_ne!(anthropic.harness, codex.harness);
-
-        // Labels a person can distinguish in the picker.
-        assert_ne!(anthropic.label, codex.label);
-        assert!(anthropic.label.contains("Anthropic"), "{}", anthropic.label);
-        assert!(codex.label.contains("Codex"), "{}", codex.label);
-
-        // The base_url differs by the `/v1` suffix, and that is load-bearing rather than
-        // cosmetic: one is a host Claude Code appends `/v1/messages` to, the other an API
-        // ROOT the codex harness appends `/responses` to. Swapping them yields a model that
-        // is armed, correct-looking and permanently broken.
-        let base = |m: &RegistryModel| m.backend.as_ref().unwrap().0.clone();
-        assert_eq!(base(anthropic), "https://api.fireworks.ai/inference");
-        assert_eq!(base(codex), "https://api.fireworks.ai/inference/v1");
-
-        // …and the health probe follows the kind, not the sibling.
-        assert_eq!(anthropic.health.path, "/v1/messages");
-        assert_eq!(codex.health.path, "/chat/completions");
-        // Both are reasoning models: the 3 s default would keep them out of the picker.
-        assert_eq!(codex.health.timeout_secs, REASONING_HEALTH_TIMEOUT_SECS);
-
-        // Same weights on the same provider → the same deck; a reprice moves both.
-        assert_eq!(anthropic.price.in_per_m, codex.price.in_per_m);
-
-        // GLM is untouched by any of this.
-        let glm = r.get("glm-5.2").expect("glm still registered");
-        assert_eq!(glm.harness, CLAUDE_CODE_ID);
-        assert!(matches!(glm.kind, ModelKind::Hosted));
+        assert!(
+            r.models.iter().all(|m| m.harness == CLAUDE_CODE_ID),
+            "no built-in entry runs on codex: {:?}",
+            r.models
+                .iter()
+                .map(|m| (&m.id, &m.harness))
+                .collect::<Vec<_>>()
+        );
 
         for (k, v) in saved {
             match v {
@@ -5195,22 +5311,40 @@ mod tests {
         }
     }
 
+    /// The retired Codex-surface Kimi entry's variables arm NOTHING, and the id still resolves.
+    ///
+    /// A deploy that gave the two Kimi entries separate keys exported
+    /// `JESSE_MODEL_KIMI_CODEX_AUTH_TOKEN`. That variable must not quietly arm the surviving
+    /// entry — `kimi` is armed by `JESSE_MODEL_KIMI_AUTH_TOKEN`, and a second name for the same
+    /// switch is exactly the drift this retirement removes. It is named by the startup warning
+    /// instead, so the operator learns it is dead rather than discovering it.
     #[test]
-    fn the_codex_kimi_entry_can_take_its_own_key_when_a_deploy_wants_them_separate() {
+    fn the_retired_codex_kimi_variables_arm_nothing() {
         let _g = ENV_LOCK.lock_ok();
+        let extra = [
+            "JESSE_CONFIG",
+            "JESSE_STATE_DIR",
+            "JESSE_MODEL_KIMI_CODEX_AUTH_TOKEN",
+        ];
         let saved: Vec<(&str, Option<String>)> = MODEL_ENV_VARS
             .iter()
+            .chain(extra.iter())
             .map(|k| (*k, std::env::var(k).ok()))
             .collect();
-        for k in MODEL_ENV_VARS {
+        for k in MODEL_ENV_VARS.iter().chain(extra.iter()) {
             std::env::remove_var(k);
         }
-        // Its OWN var set and the shared one NOT: the entry arms, its sibling does not.
+        std::env::set_var("JESSE_CONFIG", "/nonexistent/jesse.local.toml");
         std::env::set_var("JESSE_MODEL_KIMI_CODEX_AUTH_TOKEN", "fw-codex-only");
-        let codex = kimi_codex_env_entry(DEFAULT_HEALTH_INTERVAL_SECS, None);
-        let anthropic = kimi_env_entry(DEFAULT_HEALTH_INTERVAL_SECS, None);
-        assert!(codex.configured, "its own key arms it");
-        assert!(!anthropic.configured, "and does not arm the sibling");
+
+        let r = ModelRegistry::from_env("");
+        let kimi = r.get("kimi-codex").expect("the retired id still resolves");
+        assert_eq!(kimi.id, "kimi", "…to the surviving Kimi entry");
+        assert!(!kimi.configured, "and the retired variable did not arm it");
+        assert!(
+            RETIRED_KIMI_CODEX_ENV.contains(&"JESSE_MODEL_KIMI_CODEX_AUTH_TOKEN"),
+            "the startup warning names the variable a separate-keys deploy set"
+        );
 
         for (k, v) in saved {
             match v {
@@ -5220,19 +5354,76 @@ mod tests {
         }
     }
 
+    /// Each Fireworks deck is ITS OWN model's published deck, cached rate included.
+    ///
+    /// A missing field is read as ZERO, which does not mean "unknown", it means "free": every
+    /// cache read on that model would be silently under-reported, and on a long conversation
+    /// cache reads are most of the input. GLM is the trap — 5.3 kept 5.2's input and output
+    /// rates but not its cached rate, so a deck copied forward would look right at a glance.
     #[test]
-    fn kimi_probe_budget_is_wider_than_glms_and_yields_to_the_global_override() {
-        // K3 thinks before it answers, so its probe budget must exceed the 3 s default that
-        // GLM is fine with — otherwise a reachable K3 probes as unhealthy and never appears
-        // in the picker. `JESSE_HEALTH_TIMEOUT_SECS` overrides both.
-        assert_eq!(
-            kimi_env_entry(DEFAULT_HEALTH_INTERVAL_SECS, None)
-                .health
-                .timeout_secs,
-            REASONING_HEALTH_TIMEOUT_SECS
+    fn each_fireworks_deck_is_its_own_models_published_deck() {
+        let _g = ENV_LOCK.lock_ok();
+        let price_vars: Vec<String> = ["GLM", "KIMI", "QWEN"]
+            .iter()
+            .flat_map(|id| {
+                ["IN", "CACHED", "OUT", "CACHE_WRITE"]
+                    .iter()
+                    .map(move |f| format!("JESSE_MODEL_{id}_PRICE_{f}"))
+            })
+            .collect();
+        let saved: Vec<(String, Option<String>)> = price_vars
+            .iter()
+            .map(|k| (k.clone(), std::env::var(k).ok()))
+            .collect();
+        for k in &price_vars {
+            std::env::remove_var(k);
+        }
+
+        let deck = |m: RegistryModel| (m.price.in_per_m, m.price.cached_per_m, m.price.out_per_m);
+        let glm = deck(glm_env_entry(DEFAULT_HEALTH_INTERVAL_SECS, None));
+        let kimi = deck(kimi_env_entry(DEFAULT_HEALTH_INTERVAL_SECS, None));
+        let qwen = deck(qwen_env_entry(DEFAULT_HEALTH_INTERVAL_SECS, None));
+        assert_eq!(glm, (1.40, 0.26, 4.40), "GLM 5.3");
+        assert_eq!(kimi, (3.00, 0.30, 15.00), "Kimi K3");
+        assert_eq!(qwen, (2.00, 0.25, 6.00), "Qwen 3.8 Max");
+        assert_ne!(
+            glm.1, FW_GLM_CACHED_PER_M,
+            "GLM 5.2's cached rate carried forward onto 5.3"
         );
+        for (name, d) in [("glm", glm), ("kimi", kimi), ("qwen", qwen)] {
+            assert!(d.1 > 0.0, "{name} ships with no cached rate: {d:?}");
+        }
+
+        for (k, v) in saved {
+            match v {
+                Some(val) => std::env::set_var(&k, val),
+                None => std::env::remove_var(&k),
+            }
+        }
+    }
+
+    #[test]
+    fn every_fireworks_model_gets_the_reasoning_probe_budget_and_yields_to_the_override() {
+        // All three Fireworks families think before they answer — Kimi K3 and GLM 5.3 run with
+        // reasoning always on, and Qwen 3.8 Max returned a thinking block on every live call —
+        // and a `max_tokens: 1` probe does not bound thinking time. So each gets the reasoning
+        // budget rather than the 3 s default, which would mark a reachable model unhealthy and
+        // keep it out of the picker. GLM used to be the exception (5.2 answered in under a
+        // second); it is not one any more. `local` keeps the default: nothing is known about
+        // what an operator loads there. `JESSE_HEALTH_TIMEOUT_SECS` overrides every one.
+        for entry in [
+            glm_env_entry(DEFAULT_HEALTH_INTERVAL_SECS, None),
+            kimi_env_entry(DEFAULT_HEALTH_INTERVAL_SECS, None),
+            qwen_env_entry(DEFAULT_HEALTH_INTERVAL_SECS, None),
+        ] {
+            assert_eq!(
+                entry.health.timeout_secs, REASONING_HEALTH_TIMEOUT_SECS,
+                "{} is a reasoning model",
+                entry.id
+            );
+        }
         assert_eq!(
-            glm_env_entry(DEFAULT_HEALTH_INTERVAL_SECS, None)
+            local_env_entry(DEFAULT_HEALTH_INTERVAL_SECS, None)
                 .health
                 .timeout_secs,
             DEFAULT_HEALTH_TIMEOUT_SECS
@@ -5243,6 +5434,7 @@ mod tests {
         for entry in [
             kimi_env_entry(DEFAULT_HEALTH_INTERVAL_SECS, Some(25)),
             glm_env_entry(DEFAULT_HEALTH_INTERVAL_SECS, Some(25)),
+            qwen_env_entry(DEFAULT_HEALTH_INTERVAL_SECS, Some(25)),
             local_env_entry(DEFAULT_HEALTH_INTERVAL_SECS, Some(25)),
         ] {
             assert_eq!(
@@ -5305,7 +5497,7 @@ auth_token_env = "JESSE_TEST_HI_TOKEN"
 
         let r = ModelRegistry::from_env("");
         // Env-triple models carry no explicit interval → they pick up the global override.
-        for id in ["glm-5.2", "kimi-k3", "kimi-k3-codex", "local"] {
+        for id in ["glm", "kimi", "qwen", "local"] {
             assert_eq!(
                 r.get(id).unwrap().health.interval_secs,
                 600,

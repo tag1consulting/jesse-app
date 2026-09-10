@@ -163,38 +163,53 @@ Answer the question I asked, not the one you wish I had asked.
 #   2. the legacy `JESSE_MODEL_GLM_* / _KIMI_* / _LOCAL_*` env triples (still supported).
 #   3. these `[[models]]` entries.
 #
-# AN ENTRY ID NAMES A FAMILY AND CARRIES NO VERSION — `glm`, `kimi`, `kimi-codex`,
-# `local`. The version lives in its own `version` key (env: `JESSE_MODEL_<ID>_VERSION`) and
-# the picker label is DERIVED from family + version, so repointing a family at a new
-# backend is two launch-environment lines and no release:
+# AN ENTRY ID NAMES A FAMILY AND CARRIES NO VERSION — `glm`, `kimi`, `qwen`, `local`.
+# The version lives in its own `version` key (env: `JESSE_MODEL_<ID>_VERSION`) and the
+# picker label is DERIVED from family + version, so repointing a family at a different
+# backend is launch-environment lines and no release. Pinning GLM back to 5.2, say:
 #
-#     JESSE_MODEL_GLM_MODEL=accounts/fireworks/models/glm-5p3
-#     JESSE_MODEL_GLM_VERSION=5.3          # picker now reads "GLM 5.3"
+#     JESSE_MODEL_GLM_MODEL=accounts/fireworks/models/glm-5p2
+#     JESSE_MODEL_GLM_VERSION=5.2          # picker now reads "GLM 5.2"
+#     JESSE_MODEL_GLM_PRICE_CACHED=0.14    # 5.2's cached rate differs from 5.3's
 #
 # A version inside the ID could not do that: the id is what the switch PERSISTS, so
 # changing it orphans a stored selection, and leaving it stale makes the picker lie.
 #
-# THE OLD VERSIONED IDS STILL RESOLVE, as aliases: `glm-5.2` → `glm`, `kimi-k3` → `kimi`,
-# `kimi-k3-codex` → `kimi-codex`. Nothing has to be edited on upgrade — a device that
-# persisted `glm-5.2` selects `glm`, and the bridge writes the canonical id back the first
-# time. An exact id always beats an alias, and a `[[models]]` entry naming an old id still
-# OVERRIDES the built-in it names rather than appearing beside it.
+# THE OLD IDS STILL RESOLVE, as aliases: `glm-5.2` → `glm`, `kimi-k3` → `kimi`, and
+# `kimi-codex` / `kimi-k3-codex` → `kimi` (see below). Nothing has to be edited on upgrade —
+# a device that persisted an old id selects the entry that replaced it, and the bridge
+# writes the canonical id back the first time. An exact id always beats an alias, and a
+# `[[models]]` entry naming an old id still OVERRIDES the built-in it names rather than
+# appearing beside it.
 #
-# `glm`, `kimi` and `kimi-codex` DEFAULT their base_url + slug to the live
-# Fireworks values, so each is armed by exporting ONE var — `JESSE_MODEL_GLM_AUTH_TOKEN` /
-# `JESSE_MODEL_KIMI_AUTH_TOKEN`. `local` has no defaults: all three vars are required.
+# ONE MODEL, ONE HARNESS. Each model is registered once, on one harness: the ANTHROPIC
+# surface (`/v1/messages`, a claude-code child, contained by the tool allowlist + strict MCP
+# in bridge/containment.toml) wherever the provider serves the model there, and the codex
+# harness only where it does not. Fireworks serves all three families below on
+# `/v1/messages` — each was run through a resumed two-turn tool loop on the pinned claude
+# CLI on 2026-09-10 — so all three are claude-code entries:
 #
-# KIMI K3 IS REGISTERED TWICE, ON PURPOSE, and the two are not one model in two costumes:
-#   * `kimi`           — the ANTHROPIC surface (`/v1/messages`) on a claude-code child,
-#                        contained by the tool allowlist + strict MCP recorded in
-#                        bridge/containment.toml.
-#   * `kimi-codex`     — the OPENAI surface (`/v1/responses`) on a real `codex exec` child,
-#                        contained by the OS sandbox recorded in
-#                        bridge/containment-codex.toml, reaching the vault via the shell.
-# K3 is natively an OpenAI-style model, so the Codex entry is the RECOMMENDED path for it;
-# the Anthropic entry stays first-class. `JESSE_MODEL_KIMI_AUTH_TOKEN` (one Fireworks key)
-# arms BOTH — set `JESSE_MODEL_KIMI_CODEX_AUTH_TOKEN` to give them separate keys.
-# Both default decks are overridable per model via `JESSE_MODEL_<NAME>_PRICE_{IN,CACHED,OUT}`.
+#     id     model                                   version   deck (in / cached / out)
+#     glm    accounts/fireworks/models/glm-5p3       5.3       1.40 / 0.26 / 4.40
+#     kimi   accounts/fireworks/models/kimi-k3       K3        3.00 / 0.30 / 15.00
+#     qwen   accounts/fireworks/models/qwen3p8-max   3.8 Max   2.00 / 0.25 / 6.00
+#
+# Each DEFAULTS its base_url + slug to the live Fireworks values, so each is armed by ONE var
+# holding a Fireworks key, spelled the same way for all three: `JESSE_MODEL_GLM_AUTH_TOKEN`,
+# `JESSE_MODEL_KIMI_AUTH_TOKEN`, `JESSE_MODEL_QWEN_AUTH_TOKEN` (the same key in all three is
+# fine). `local` has no defaults: all three vars are required. Every deck is overridable per
+# model via `JESSE_MODEL_<ID>_PRICE_{IN,CACHED,OUT}`.
+#
+# KIMI K3 USED TO BE REGISTERED TWICE — `kimi` here, and `kimi-codex` on the codex harness
+# over Fireworks' Responses API, which this file once called the RECOMMENDED path for K3.
+# That is reversed: the Codex twin is RETIRED, and `kimi-codex` / `kimi-k3-codex` are now
+# aliases of `kimi`. The recommendation rested on K3's tool loop failing on the Anthropic
+# surface, which was fixed on Fireworks' side and did not reproduce on 2026-09-10. A leftover
+# `JESSE_MODEL_KIMI_CODEX_*` variable arms nothing and is named by a startup warning.
+#
+# `qwen3p8-max` IS NOT `qwen3p8-2p4t-a95b`. Both are in the Fireworks catalog as separate
+# resources; the first is "Qwen 3.8 Max" and has the published price, the second
+# ("Qwen3.8-2.4T-A95B") is a text-only FP8 resource with no row on the pricing page.
 #
 # Adding a model is a PURE CONFIG EDIT here plus ONE env var for its token — no bridge
 # code change. Each model is health-probed on an interval; the apps only offer a model
@@ -426,15 +441,16 @@ Answer the question I asked, not the one you wish I had asked.
 #                  classifier would merely tolerate. Same host, key and model, so a
 #                  passing probe still speaks for the turn.
 #                  A THINKING model needs a wider timeout than 3s — it emits reasoning
-#                  before its first token even at max_tokens 1. Kimi K3 on Fireworks was
-#                  measured at 1.2–5.4s (2026-08-04), so its entry sets 15.
+#                  before its first token even at max_tokens 1, and nothing bounds how long
+#                  that takes. Kimi K3 on Fireworks was measured at 1.2–5.4s (2026-08-04).
+#                  The built-in glm, kimi and qwen entries all think, and all set 15.
 #
 # JESSE_HEALTH_INTERVAL_SECS (env var, optional): a GLOBAL override for the DEFAULT probe
 #   interval, so an operator can probe idle configured models less often without writing a
 #   full [[models]] block. Seconds, floored at 5; a zero/unparseable value is ignored with
 #   a startup warning. Priority per model, highest first: an explicit per-model
 #   health.interval_secs (below) > JESSE_HEALTH_INTERVAL_SECS > the built-in 60s default.
-#   Applies to the env-triple models (glm, kimi, local) and any [[models]] entry
+#   Applies to the env-triple models (glm, kimi, qwen, local) and any [[models]] entry
 #   that omits its own interval_secs. Does NOT change the per-probe timeout or path.
 #
 # THREE WAYS TO REACH AN OPENAI-SHAPED MODEL, and they are not interchangeable:
@@ -477,12 +493,12 @@ Answer the question I asked, not the one you wish I had asked.
 # label = "Fireworks GLM"
 # kind = "hosted"
 # base_url = "https://api.fireworks.ai/inference"
-# model = "accounts/fireworks/models/glm-5p2"
+# model = "accounts/fireworks/models/glm-5p3"
 # auth_token_env = "FIREWORKS_API_KEY"
 # level = "write"                          # GLM: trusted with the vault
 # harness = "claude-code"                  # the default; shown here for completeness
-# price = { in_per_m = 1.40, cached_per_m = 0.14, out_per_m = 4.40 }
-# health = { path = "/v1/messages", interval_secs = 60, timeout_secs = 3 }
+# price = { in_per_m = 1.40, cached_per_m = 0.26, out_per_m = 4.40 }   # GLM 5.3's deck
+# health = { path = "/v1/messages", interval_secs = 60, timeout_secs = 15 }  # it thinks
 
 # An OpenAI-style "codex" model run through the ANTHROPIC-SURFACE GATEWAY, on the
 # claude-code harness. Its native API is `/v1/chat/completions`, so base_url points at a
@@ -512,22 +528,25 @@ Answer the question I asked, not the one you wish I had asked.
 #   * it serves the Responses API at <base_url>/responses, and
 #   * it serves /chat/completions for the health probe (or set health.path explicitly).
 #
-# `kimi-codex` IS NOW A BUILT-IN ENTRY and needs no block here at all: exporting
-# `JESSE_MODEL_KIMI_AUTH_TOKEN` arms it exactly as it arms its Anthropic-surface sibling.
-# The block below is what that built-in is EQUIVALENT TO — write it out only to override a
-# field (a different slug, its own key, `level = "write"`, a different deck).
+# THIS IS NOT A BUILT-IN, and under the one-model-one-harness rule above it is the exception
+# rather than the path: Kimi K3's built-in entry is `kimi`, on claude-code. The block stays
+# as the worked example of the codex harness's provider seam, for a model some provider
+# serves ONLY on the Responses API.
+#
+# DO NOT GIVE IT THE ID `kimi-codex` (or `kimi-k3-codex`). Those are aliases of the built-in
+# `kimi` now, and a `[[models]]` entry naming an alias REPLACES the entry that holds it — so
+# that id would silently move `kimi` itself onto the codex harness. Hence an id of its own.
 #
 # NOTE THE `/v1` ON base_url. It is the API ROOT the codex harness appends `/responses` to,
-# where the Anthropic-surface sibling's base_url is a host claude-code appends
+# where the Anthropic-surface entry's base_url is a host claude-code appends
 # `/v1/messages` to. Swapping the two yields a model that is armed, correct-looking and
 # permanently unreachable.
 #
 # [[models]]
-# id = "kimi-codex"
+# id = "kimi-on-codex"
 # family = "Kimi"
 # version = "K3"
-# aliases = ["kimi-k3-codex"]         # what this entry used to be called
-#                                     # label is derived: "Kimi K3"
+# label = "Kimi K3 (Codex)"                    # explicit, so the picker can tell it from `kimi`
 # kind = "openai"                              # hosting: a provider endpoint
 # # wire = "responses"                         # implied by kind = "openai"; spell it out
 #                                              # only to say something the kind does not,
@@ -639,18 +658,18 @@ Answer the question I asked, not the one you wish I had asked.
 # [[models]]
 # id = "glm"
 # family = "GLM"
-# version = "5.2"                     # label is derived: "GLM 5.2"
+# version = "5.3"                     # label is derived: "GLM 5.3"
 # aliases = ["glm-5.2"]               # what this entry used to be called
 # kind = "hosted"
 # base_url = "https://api.fireworks.ai/inference"
-# model = "accounts/fireworks/models/glm-5p2"
+# model = "accounts/fireworks/models/glm-5p3"
 # auth_token_env = "FIREWORKS_API_KEY"
 # vision = [ { id = "paddleocr-vl", role = "doc" }, { id = "qwen3-vl", role = "general" } ]
 # vision_complementary = false   # true = run BOTH helpers on one attachment, concatenate
 #
 #   Or pair the env-triple models without a [[models]] block:
 #     JESSE_MODEL_GLM_VISION="paddleocr-vl:doc,qwen3-vl:general"
-#     JESSE_MODEL_GLM_VISION_COMPLEMENTARY=off      # (glm / kimi / local supported)
+#     JESSE_MODEL_GLM_VISION_COMPLEMENTARY=off      # (glm / kimi / qwen / local supported)
 #   A single "any" helper handles every attachment type:  JESSE_MODEL_GLM_VISION="qwen3-vl:any"
 #
 # 3) Global vision knobs (env, no rebuild):

@@ -53,16 +53,17 @@ fn codex_model() -> ActiveModel {
     m
 }
 
-/// A model on its OWN OpenAI-style provider, as `jesse.example.toml`'s `kimi-k3-codex`
-/// entry declares it: Kimi K3 on Fireworks' Responses API, served by the Codex harness at
-/// `Read`. `None` when the Fireworks key is not in this shell's environment, so the test
-/// SKIPS rather than failing on a machine that has no key.
+/// A model on its OWN OpenAI-style provider, as `jesse.example.toml`'s declarative
+/// `kind = "openai"` example declares it: Kimi K3 on Fireworks' Responses API, served by the
+/// Codex harness at `Read`. Built here rather than read from the registry, which no longer
+/// ships a Codex-surface Kimi entry. `None` when the Fireworks key is not in this shell's
+/// environment, so the test SKIPS rather than failing on a machine that has no key.
 fn kimi_codex_model() -> Option<ActiveModel> {
     let token = std::env::var("JESSE_MODEL_KIMI_AUTH_TOKEN")
         .ok()
         .filter(|t| !t.trim().is_empty())?;
     let mut m = ActiveModel::ambient();
-    m.id = "kimi-k3-codex".to_string();
+    m.id = "kimi-on-codex".to_string();
     m.kind = ModelKind::OpenAi;
     m.harness = CODEX_ID.to_string();
     m.level = Capability::Read;
@@ -242,11 +243,17 @@ async fn a_codex_turn_answers_and_shows_what_it_was_doing() {
 ///     the bridge's subscription login;
 ///   * through the CODEX harness and its OS sandbox, not through an Anthropic-compatibility
 ///     shim;
-///   * USING A TOOL, which is the case the Anthropic-surface path fails. Kimi has been armed
-///     on `/v1/messages` since 0.36.0 and answers chat there; its tool loop is what does not
-///     survive the translation. So a turn that merely answered would prove nothing — the
-///     assertion that matters is the `Bash` activity, meaning the child actually went and
-///     read the file before speaking.
+///   * USING A TOOL, because a turn that merely answered would prove nothing about the tool
+///     loop — the assertion that matters is the `Bash` activity, meaning the child actually
+///     went and read the file before speaking.
+///
+/// What this test NO LONGER claims: it used to say the tool loop is "the case the
+/// Anthropic-surface path fails". That was true of a cross-turn tool-id collision on
+/// Fireworks' Anthropic surface in July, fixed provider-side by 2026-08-04, and it did not
+/// reproduce on 2026-09-10 (a resumed two-turn `Read` loop on the pinned claude CLI minted
+/// `Read_0` then `Read_1`, both paired). The registry no longer ships a Codex-surface Kimi
+/// entry for that reason; this test stays because it exercises the codex harness's
+/// OpenAI-provider seam, which a declarative `kind = "openai"` entry still reaches.
 ///
 /// Run it with a Fireworks key in the environment; it SKIPS without one:
 ///
