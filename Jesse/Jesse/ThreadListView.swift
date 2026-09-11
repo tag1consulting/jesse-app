@@ -240,6 +240,12 @@ struct ThreadListView: View {
                                                     now: .now))
         }
         .onAppear(perform: pruneEmpty)
+        // …and again when a composer is LEFT. On a pop this list can appear before the popped
+        // composer's departure lands, and then the appear above skips that conversation as
+        // still open; this is where it is judged, after the draft is known. See `mayReap`.
+        .onReceive(NotificationCenter.default.publisher(for: ComposerDrafts.composerLeft)) { _ in
+            pruneEmpty()
+        }
     }
 
     /// "Can't reach the bridge" bar atop the list — the phone's echo of the watch's
@@ -568,11 +574,28 @@ struct ThreadListView: View {
     /// leaves the thread as reapable as it ever was. Answering that question also no longer
     /// faults a to-many relationship for every thread in the list: an id with no stored
     /// draft is answered from a set in memory.
+    ///
+    /// AND AN OPEN COMPOSER PRESERVES A THREAD, which is the half App 1.0 (132) was missing.
+    /// Since 132 a draft exists only once its composer is LEFT, and nothing orders a pop's
+    /// `onAppear` here after the popped composer's `onDisappear`. When this ran first, the
+    /// conversation just typed into still read as empty and was deleted out from under the
+    /// text about to be captured (`ComposerDraftUITests.testDeliberatelyEmptyingThe
+    /// ComposerPersistsAsEmpty` lost that race on hosted CI). `mayReap` is false for a
+    /// conversation whose composer has not left yet, and the departure's
+    /// `ComposerDrafts.composerLeft` runs this again the moment the answer is known.
+    ///
+    /// The SELECTED conversation is never reaped either. A departure is not always a
+    /// leaving: a tab switch fires the composer's `onDisappear` (and so `composerLeft`)
+    /// while the conversation stays on screen in the hidden tab, where it is `path.last`.
+    /// A real pop has already emptied `path` by the time the departure lands, so the
+    /// conversation the user just left is judged, and the one they are still in is not.
     private func pruneEmpty() {
         var changed = false
+        let onScreen = selection?.id
         for thread in threads
         where thread.turns.isEmpty && thread.sessionId == nil
-                && !ComposerDraftStore.shared.hasDraft(thread.id)
+                && thread.id != onScreen
+                && ComposerDraftStore.shared.mayReap(thread.id)
                 && !coordinator.isRunning(thread.id) {
             ComposerDraftStore.shared.delete(thread.id)
             context.delete(thread)

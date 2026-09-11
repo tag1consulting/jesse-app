@@ -14,6 +14,244 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [bridge 0.135.0] - 2026-09-11
+
+**Recorded audio is transcribed on the Studio, by strong open models running inside the
+bridge, and never goes anywhere past it.** App 1.0 (124) put the whole transcription on
+whichever device held the recording — the weakest, battery-bound processor in the system —
+in the name of a privacy rule drawn at the wrong line. The work moves to the Studio: the
+device captures and hands off, the bridge reads.
+
+### Decision zero — an invariant retired, and a stronger one in its place
+- **Retired, deliberately: "audio never goes on the network".** App 1.0 (124) shipped it and
+  `AudioIsNeverAnAttachmentTests` pinned it the day before this was written. It put the
+  boundary at the network interface, which forbids the one thing this needs — reaching the
+  Studio — while protecting nothing the destination rule does not.
+- **Replaced by: audio may reach the Jesse bridge on the Studio and nothing past it.** Not the
+  cloud assistant, not a hosted vision helper, not any registered model, not a hosted speech
+  API. Transcription runs in-process on models loaded from the Studio's disk. Once audio is
+  text, the text is an ordinary message: it goes to whatever model the bridge is configured
+  to use, exactly as typed text does, and nothing downstream moves to local models.
+- **Held in four places, not one:**
+  - ONE DOOR: `POST /jesse/transcriptions` is the only route that accepts audio. The turn
+    attachment gate still refuses every audio container, because a turn attachment can reach a
+    hosted helper or a hosted child. A test holds the two sniffers disjoint.
+  - ONE KIND OF ENGINE: a model file on this disk, loaded into this process. No config key
+    names an engine by address.
+  - NO HANDLE: the pipeline is handed its own parts and nothing else. `scripts/ci-guards.sh`
+    gains guard 6e, which fails the build if any file under `src/speech/` other than `http.rs`
+    names the application state, the model registry, the vision layer, the turn path, a
+    backend call or an outbound POST/PUT, or starts any process but `/usr/bin/afconvert`. The
+    guard self-checks its own pattern.
+  - ON THE WIRE: `recorded_audio_never_reaches_a_hosted_backend` points the active model and its
+    paired vision helper at a server that counts connections. It pushes a recording carrying a
+    canary through the transcription door and through the turn door as an attachment, and
+    fails if that server sees a single connection. It also fails if the status carries the
+    canary, raw or base64.
+
+### Added — the pipeline (`src/speech/`, namespaced)
+- **Intake** (`intake.rs`). The body IS the recording, streamed to disk rather than
+  base64-in-JSON, so an hour of audio is never held in memory twice.
+  - Types admitted: M4A/MP4 audio, WAV, AIFF, CAF, MP3 and FLAC, sniffed from magic bytes and
+    cross-checked against the declared type.
+  - Its own cap: `JESSE_SPEECH_MAX_AUDIO_BYTES`, 1 GiB by default, enforced as the body streams
+    (`413`). The photo and document caps are untouched. The route carries its own body limit
+    in place of the router's base64-sized one.
+- **Custody.** Each recording gets a `0700` directory under `<state_dir>/speech-intake/`,
+  removed by `Drop` when the run ends: success, every failure, cancel, a panic's unwind. Boot
+  deletes everything under the intake root. The decoded 16 kHz working copy lives in the same
+  directory; the conditioned signal is never written. The bridge keeps the transcript (in
+  memory, one hour) and never the audio.
+- **Decode** (`decode.rs`) through `/usr/bin/afconvert`, pinned by absolute path. A 16 kHz WAV
+  is read directly, which is also what lets every test run on Linux.
+- **Engine** (`engine.rs`): whisper.cpp 1.8.3 through `whisper-rs` 0.16, Metal on the Studio
+  with the shader library embedded in the binary. The decode profile is pinned by a test:
+  - greedy, not beam search — beam search collapsed a 47-minute file to one repeated token;
+  - no carried context — a music intro's prior poisoned the speech after it;
+  - non-speech tokens suppressed, with the no-speech and log-probability gates on.
+  - After the engine: known hallucinations over silence (music tags, subtitle credits) are
+    dropped and COUNTED, and repetition loops are collapsed and MARKED in the text
+    (`[repeated ×N, collapsed]`), never deleted silently.
+  - **The cancel poll is installed through whisper-rs's raw API, not its "safe" one.**
+    `set_abort_callback_safe` in 0.16.0 double-boxes the closure and then installs a
+    trampoline typed for the bare closure, so whisper.cpp's first abort poll segfaulted the
+    process. The end-to-end run on the Studio found it; no fake engine could have. The
+    replacement trampoline is typed for exactly the pointer it is handed. An `#[ignore]`d test,
+    `real_whisper_runs_and_honours_cancel`, now drives the real engine when a model path is
+    supplied (`JESSE_WHISPER_TEST_MODEL`), so the next binding upgrade can be checked the same
+    way.
+- **Conditioning** (`condition.rs`): high-pass 150 Hz, low-pass 3.8 kHz, spectral-gating
+  denoise, loudness normalization. Hand-rolled — two biquads and a 512-point FFT — with no
+  native code on the upload path. ADAPTIVE: it runs when speech is quiet (< -30 dBFS) or the
+  floor sits close under it (< 30 dB). `?conditioning=on|off` overrides per recording.
+- **Two readings** (`reconcile.rs`). The configured tier's model reads first, and the other
+  tier's model reads the same conditioned audio. A word-level Myers diff aligns them:
+  - where they agree, the reading stands;
+  - where they differ, the transcript keeps the PRIMARY reading and a disagreement list
+    carries the alternative with its time range;
+  - hunks one agreeing word apart merge ("Marta Esposito" / "Marvin Espino" is one entry);
+  - case and punctuation never count, and neither does a lone article, filler or spelled-out
+    sign ("€4,250" against "4,250 euros"). Every other one-sided word is listed, because
+    short words carry the most meaning per letter: a missing "not" or a missing "14th" is
+    exactly what the list is for. (The first cut filtered by length, which would have hidden
+    "not"; the end-to-end run's `'' vs 'euros'` is what made that visible.)
+  - The comparison is shaped after `vision`'s helper comparison: every result is attributed.
+- **Progress.** Phases name the engine running: `queued`, `downloading_model`, `preparing`,
+  `conditioning`, `transcribing`, `second_reading`, `reconciling`. A long run on a large model
+  never reads as a hang. One run at a time; the rest queue, in custody.
+- **Routes:**
+  - `POST /jesse/transcriptions` and `GET /jesse/transcriptions/{id}`;
+  - `POST /jesse/transcriptions/{id}/cancel`;
+  - `GET /jesse/speech`.
+  - Same bearer auth; the upload counts against the rate limiter, the poll does not.
+
+### Added — models that keep themselves current (`models.rs`)
+- **Where they come from.** Downloaded on first need to `<state_dir>/speech-models/`, verified
+  against a size and SHA-256 pinned in the bridge, and reused. The record (`models.json`)
+  follows `modelstore`'s discipline: atomic, 0600, and a corrupt file loads as nothing
+  installed. The download is the feature's one network request: a body-less GET to a URL
+  fixed at compile time.
+- **"Better" means the KNOWN-GOOD LIST, not upstream's newest.** Each entry has a tier, a rank
+  and a pinned hash, and the check never installs anything off the list. A better model
+  reaches the Studio the week after a bridge release adds it.
+- **The weekly check is a scheduled occurrence**, not a timer of its own. A new built-in job
+  kind (`builtin = "speech-model-update"`) runs Sundays at 04:40 and lands as ran / failed /
+  skipped in `GET /jesse/schedule` and the ledger like every job. An operator entry with the
+  same `builtin` or id replaces the default. A chain of built-ins takes no working-tree lock.
+- **Never with none.** A new model replaces the old only after it has downloaded, verified and
+  LOADED. The superseded file is retired only then.
+- **Upgrades are announced** (pushed, naming what was installed). A week with nothing to do
+  records `speech models current` and is not pushed.
+
+### Measured on the Studio (M3 Ultra, Metal), deciding the defaults
+- **The engine.** whisper-rs builds with Metal in 23 s (after `brew install cmake`). `candle`
+  was not built. Its crate ships Whisper's model but not its decoder: the temperature
+  fallback, the no-speech gates and the timestamp rules live in its examples. Choosing it
+  meant writing exactly the decoder whose failures the brief catalogues.
+- **Speed.** `large-v3` ran a 41 s recording at 0.055 of real time — about 2.6 minutes for a
+  47-minute recording. `large-v3-turbo` ran it at 0.02, about 1 minute. So the defaults are
+  `large-v3` as the primary reading (`JESSE_SPEECH_TIER=accurate`), with turbo as the second
+  reading, ON (`JESSE_SPEECH_SECOND_READING`). Both fit the Studio comfortably.
+- **Conditioning, on a degraded copy** of a parish-hall test script (attenuated, reverb, noise,
+  a tone bed): it turned large-v3's "Berolini", "St. Viscous", "a few classical things" and
+  "starting next night" back into Bertolini, St. Vincent's, practical and next month. Both
+  engines still misread a surname differently from each other, which is exactly what the
+  disagreement list is for. The trigger separated the clean copy (33 dB) from the degraded
+  one (13 dB).
+
+### Deploy notes
+- **`cmake` must be on the build PATH.** whisper.cpp is compiled by `whisper-rs-sys`. The
+  sentinel's deploy PATH includes `/opt/homebrew/bin`, and cmake was installed there on
+  2026-09-11. Linux CI's image carries it.
+- **The first recording pays for the models.** It downloads 3.1 GB (large-v3) and 1.6 GB
+  (turbo) before anything is read; after that, a load is about a second. A state dir is
+  required; without one every route answers `503` saying so.
+
+### Known limits
+- A run lives in memory, so a bridge restart mid-run loses it, and the app reports that the
+  Studio no longer has the run.
+- An interrupted model download restarts from zero.
+- CI builds the engine on Linux on the CPU; the Metal build is exercised on the Studio only.
+
+## [App 1.0 (133)] - 2026-09-11
+
+**A recording is transcribed on the Studio, and this device reads it only when the Studio
+can't be reached — and then says so.** The capture, storage and hand-off from 1.0 (124) are
+unchanged; what changed is where the work happens and what the message says about it. See
+bridge 0.135.0 for the invariant this replaces and how it is held.
+
+### Changed
+- **Studio first.** Both composers build `StudioFirstTranscriber`: the recording is streamed
+  from its working copy to the paired bridge's `/jesse/transcriptions`, then polled. The host
+  and token are the ones every turn uses: loopback when the Mac app runs on the Studio, the
+  tailnet otherwise. The pairing is read at each recording, so a re-pairing takes effect at
+  the next one.
+- **The fallback is automatic and never silent.** The on-device engine
+  (`SpeechAnalyzerFileTranscriber`, unchanged, still the long-form analyzer) runs only when:
+  - the Studio cannot be reached;
+  - it cannot transcribe (no pairing, an older bridge, transcription switched off);
+  - contact is lost mid-run for more than 90 seconds — a lift, a tunnel or a Wi-Fi handover
+    is ridden out.
+  
+  A fallback result carries a notice, shown under the composer until dismissed: "The Studio
+  wasn't used (…), so this was transcribed on this device — expect more mistakes in names,
+  numbers and dates." A Studio that ANSWERS and refuses (too large, unreadable) is shown as
+  that answer, not bypassed.
+- **The message says where it was made.** The header gains `· transcribed on the Studio
+  (Whisper large-v3, checked against Whisper large-v3 turbo)`, or `· transcribed on this
+  device`.
+- **Disagreements travel with the transcript.** Where the Studio's two engines heard a passage
+  differently, an uncertainty block follows the transcript — `[12:03] "14th" — or "15th"` —
+  so the model the message is sent to can resolve a date against the calendar the way a
+  listener would, and say when it cannot. The transcript itself is never edited; it keeps the
+  primary reading. Transcription notes (a failed second reading, a collapsed loop) follow.
+  - The block is part of the composer text, visible and editable before sending, and the
+    shipped flow is unchanged: a shared recording still opens a new conversation with the
+    transcript already in the composer.
+- **Progress names the engine and the phase:** "Sending … to the Studio", "Waiting for the
+  Studio", "Cleaning up the audio", "Cross-checking with a second engine", "Comparing the two
+  readings". An engine line sits under the bar.
+- The language sheet's footer now says where the recording goes: the bridge and nowhere
+  else, never the cloud assistant, deleted in both places once the text exists.
+
+### Fixed — a race App 1.0 (132) introduced: the list could reap a conversation mid-departure
+- **Root cause.** Since 132 a draft exists only once its composer is LEFT: the capture runs in
+  the composer's `onDisappear`. The iPhone list reaps turn-less, draft-less conversations in its
+  own `onAppear`, and nothing orders a pop's list `onAppear` after the popped composer's
+  `onDisappear`. When the list ran first, the reaper judged a conversation the user had just
+  typed into while its draft was still uncaptured, found it empty, and deleted it out from
+  under the text about to land in it. Before 132 the draft was held as you typed, so the order
+  did not matter.
+- **How it showed.** `ComposerDraftUITests.testDeliberatelyEmptyingTheComposerPersistsAsEmpty`
+  lost its witness conversation on both hosted runs of this branch before the fix, while the
+  same test passed on `main` (ad28ed7) and on the last nightly before 132. So the order is
+  timing-dependent, and these runs lost the race; nothing else in this branch touches the
+  draft path. The store's other ways to lose a draft were each ruled out: its writes are
+  chained in order, the launch sweep keeps every conversation that still exists, and the
+  coordinator's deletes need a bridge tombstone or a discarded send.
+- **The fix is an ordering guarantee, not a delay.** A composer is OPEN from its restore to its
+  leave (`ComposerDrafts.leave`, called by both shells' `onDisappear`). `mayReap` is false
+  while a composer is open, and the departure posts `ComposerDrafts.composerLeft`, on which the
+  list runs its reaper again — after the answer is known. An empty `+`-then-back still leaves
+  no row, and a conversation holding a message is never taken. Backgrounding and a refused
+  send remain plain captures: the composer is still on screen after them.
+- **A tab switch is a departure that is not a leaving.** It fires the composer's `onDisappear`
+  while the conversation stays on screen in the hidden tab, so the list never reaps the
+  selected conversation (`path.last`), and a composer that appears again is marked open again.
+  A real pop empties `path` before its departure lands, so it is still judged.
+- **Tests.** Three new `ComposerDraftTests` pin the rule:
+  - an open composer is never the reaper's to judge;
+  - leaving tells the list which conversation was left;
+  - the field sequence (a second conversation emptied and reaped) cannot take the first one's
+    draft, across a cold launch.
+  
+  The UI test gains checkpoints, so a future loss names the step it happened at. They sit after
+  each return to the list, so the sequence the app goes through (type, then straight back) is
+  the one that lost the race.
+
+### Tests
+- `AudioIsNeverAnAttachmentTests` is RETIRED and replaced by `AudioTravelsOnlyToTheStudioTests`:
+  - the attachment whitelist still refuses audio, now because that path can reach hosted
+    models;
+  - an M4A header still sniffs to nothing;
+  - the recording route built from the app's pairing targets that host, that port and
+    `/jesse/transcriptions`.
+- New `StudioTranscriptionTests`, all against a scripted Studio and a fake clock, with no
+  network. Each behaviour has a test:
+  - a Studio run delivers its text, provenance and disagreements, and this device never reads
+    it;
+  - an unreachable Studio falls back with a notice;
+  - a refusal surfaces as a refusal;
+  - a failed run keeps its own reason;
+  - a brief silence is ridden out, and a long one stops the run and reads it here;
+  - a cancel tells the Studio to stop;
+  - an unsupported file goes straight to this device;
+  - the bridge's status JSON decodes;
+  - the only request carrying audio targets the paired bridge;
+  - every phase has its own sentence.
+- `RecordingAttachmentTests` and `RecordingTranscriptTests` cover the notice, the header's
+  provenance, the uncertainty block and the new failure wordings.
+
 ## [App 1.0 (132)] - 2026-09-11
 
 **The composer draft is a dictionary now, written when you leave.** 131 stopped typing from

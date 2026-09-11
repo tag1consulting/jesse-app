@@ -107,6 +107,66 @@ final class RecordingTranscriptTests: XCTestCase {
                                                        language: "Italian",
                                                        transcript: "Buongiorno."))
     }
+
+    // MARK: - Where it was transcribed, and where it is unsure
+
+    func testTheHeaderSaysWhereTheTranscriptWasMade() {
+        XCTAssertEqual(
+            RecordingTranscript.header(sourceName: "memo.m4a", seconds: 192, language: "Italian",
+                                       engine: "the Studio (Whisper large-v3)"),
+            "Recording: “memo.m4a” · 3m 12s · Italian · transcribed on the Studio (Whisper large-v3)")
+        XCTAssertEqual(
+            RecordingTranscript.header(sourceName: "memo.m4a", seconds: 192, language: "Italian",
+                                       engine: "this device"),
+            "Recording: “memo.m4a” · 3m 12s · Italian · transcribed on this device")
+    }
+
+    /// The field case: two engines disagreed on a pickup date. The transcript keeps the
+    /// primary reading untouched; both readings follow it, with where to find them, so the
+    /// model the message goes to can check the weekday against the calendar.
+    func testDisagreementsFollowTheTranscriptWithoutEditingIt() {
+        let body = RecordingTranscript.messageBody(
+            typed: "",
+            sourceName: "hall.m4a",
+            seconds: 2820,
+            language: "English",
+            transcript: "Pickup is on Thursday the 14th.",
+            engine: "the Studio (Whisper large-v3, checked against Whisper large-v3 turbo)",
+            disagreements: [
+                TranscriptDisagreement(startSeconds: 723, endSeconds: 727,
+                                       primary: "14th", alternative: "15th"),
+                TranscriptDisagreement(startSeconds: 3852, endSeconds: 3855,
+                                       primary: "the boiler", alternative: ""),
+            ])
+        XCTAssertEqual(body, """
+        Recording: “hall.m4a” · 47m 0s · English · transcribed on the Studio (Whisper large-v3, checked against Whisper large-v3 turbo)
+
+        Pickup is on Thursday the 14th.
+
+        Uncertain passages — two engines heard these differently; the transcript above follows the first reading:
+        [12:03] “14th” — or “15th”
+        [1:04:12] “the boiler” — or nothing
+        """)
+    }
+
+    func testNotesFollowTheDisagreementsAndBlankOnesAreDropped() {
+        let block = RecordingTranscript.uncertaintyBlock(
+            disagreements: [],
+            notes: ["The second reading failed, so nothing was cross-checked.", "  "])
+        XCTAssertEqual(block, """
+        Transcription notes:
+        - The second reading failed, so nothing was cross-checked.
+        """)
+        XCTAssertNil(RecordingTranscript.uncertaintyBlock(disagreements: [], notes: []),
+                     "a clean single reading adds nothing to the message")
+    }
+
+    func testTimestampsReadLikeAPlayer() {
+        XCTAssertEqual(RecordingTranscript.timestamp(seconds: 0), "0:00")
+        XCTAssertEqual(RecordingTranscript.timestamp(seconds: 65.9), "1:05")
+        XCTAssertEqual(RecordingTranscript.timestamp(seconds: 3852), "1:04:12")
+        XCTAssertEqual(RecordingTranscript.timestamp(seconds: .nan), "0:00")
+    }
 }
 
 final class TranscriptionFailureMessageTests: XCTestCase {
@@ -123,6 +183,8 @@ final class TranscriptionFailureMessageTests: XCTestCase {
             .noSpeechFound,
             .stalled,
             .engineFailed(reason: "the recognizer died"),
+            .studioRefused(reason: "the recording is larger than the Studio accepts"),
+            .studioFailed(reason: "the engine ran out of memory"),
             .cancelled,
         ]
         var seen = Set<String>()

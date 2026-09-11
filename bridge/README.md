@@ -88,6 +88,7 @@ change lives in one focused module:
 | `harness` | the agent program behind **three traits** — `Harness` (identity and policy), `SpawnedHarness` (everything that only means something for a child process), `InProcessHarness` (a harness that answers a turn in this process) — plus `Capability`, `TurnRequest`, the routed jobs' request builders, and the `HarnessRegistry`. `harness::claude_code` and `harness::codex` are the two implementations |
 | `claude` | `run_claude_streaming` (the one branch on `Harness::runner`) and its two arms, plus the outcome vocabulary and the `stream-json` classification helpers (`resolve_stream_outcome`) |
 | `attachments` | base64 decode + length helpers, magic-byte sniff, per-request `ScratchDir`, validation |
+| `speech` (namespaced) | recorded-audio transcription on this machine: the one intake door and its custody (`intake`), the system decoder (`decode`), conditioning (`condition`), the in-process whisper.cpp engine and its clean-up (`engine`), the two-reading disagreement list (`reconcile`), the known-good model list and its weekly check (`models`), the runs (`service`) and the four routes (`http`). See "Recorded audio" below |
 | `apns` | the optional push path (device store, JWT minting, transport, completion→push decision) |
 | `conversations` | the conversation registry: the record, the session -> conversation reverse index, the in-flight claim table, and the one-time title/flag/deletion key migration |
 | `sessions` | the conversation list, hydration, delete and flags handlers, plus the projects-dir scan, the transcript-turn parser, and the GC sweep |
@@ -1618,6 +1619,70 @@ observable before it is a problem.
 With **no state dir** there is no artifact store, and the channel degrades to off: no
 staging directory, no prompt fragment, no metadata. That is the same degradation every
 other store in the bridge already has.
+
+## Recorded audio (`POST /jesse/transcriptions`, 0.135.0)
+
+A recording is transcribed ON THE STUDIO, by whisper.cpp models running inside this process
+(Metal on the Studio's GPU), and the audio is deleted when the run ends. The invariant, and
+how the code holds it, is in `src/speech/mod.rs` and in SECURITY.md → "Recorded audio":
+audio may reach the bridge and nothing past it; once it is text, it is an ordinary message.
+
+### The routes
+
+| Route | What it does |
+|---|---|
+| `POST /jesse/transcriptions?language=it&conditioning=auto&second_reading=auto` | The body IS the recording (not base64), streamed to disk. `Content-Type` declares it and must match the magic bytes: `audio/mp4` (M4A), `audio/wav`, `audio/aiff`, `audio/x-caf`, `audio/mpeg`, `audio/flac`. `202` with the run's first status. `413` past the cap, `503` when this bridge does not transcribe. |
+| `GET /jesse/transcriptions/{id}` | The run: `state` (`running`/`done`/`failed`/`cancelled`), `phase` (`queued`, `downloading_model`, `preparing`, `conditioning`, `transcribing`, `second_reading`, `reconciling`), `fraction`, the `engine` running, then `transcript`, `engines`, `disagreements`, `notes`, or `error.kind`. Kept an hour after it ends. Not rate-limited. |
+| `POST /jesse/transcriptions/{id}/cancel` | Stop the run. Its audio is deleted like every other ending. |
+| `GET /jesse/speech` | Whether this bridge transcribes, the tier, and each model's role and install state. |
+
+### A run
+
+Queued behind the one transcription slot → the model is downloaded on first need → the upload
+is decoded to 16 kHz mono by `/usr/bin/afconvert` → CONDITIONED when it looks like a room mic
+(high-pass 150 Hz, low-pass 3.8 kHz, spectral denoise, loudness normalization; `conditioning=on`
+/`off` overrides) → read by the PRIMARY engine → read again by the SECOND engine (the other tier)
+→ reconciled. Where the two agree the reading stands; where they differ the primary reading stays
+in the transcript and the alternative is listed with its time range. Silence and music that the
+engine wrote down anyway are dropped and counted; repetition loops are collapsed and MARKED in
+the text.
+
+### Models (`<state_dir>/speech-models/`)
+
+| Tier | Model | Measured on the Studio (M3 Ultra) |
+|---|---|---|
+| `accurate` (default primary) | Whisper large-v3, 3.1 GB | 0.055 × real time — about 2.6 min for 47 min of audio |
+| `fast` (default second reading) | Whisper large-v3 turbo, 1.6 GB | 0.02 × real time — about 1 min |
+
+Fetched on first need from a known-good list compiled into the bridge (pinned size and
+SHA-256; nothing off the list is ever installed) and kept. A **weekly check** — the built-in
+`speech-model-update` job, Sunday 04:40, visible in `GET /jesse/schedule` like any other —
+installs each tier's target when a bridge release adds a better one, and retires the one it
+supersedes only after the new one has downloaded, verified and loaded. An upgrade is pushed;
+a check that changed nothing is not. Override the job with a `[[schedule]]` entry of your own:
+
+```toml
+[[schedule]]
+id = "speech-model-update"
+builtin = "speech-model-update"
+at = "03:10"
+days = ["sat"]
+# enabled = false   # to stop the weekly check entirely
+```
+
+### Knobs
+
+| Env | Default | |
+|---|---|---|
+| `JESSE_SPEECH` | on | `off` refuses every recording with a 503 that says so |
+| `JESSE_SPEECH_TIER` | `accurate` | `fast` makes turbo the primary reading and large-v3 the second |
+| `JESSE_SPEECH_SECOND_READING` | on | `off` runs one engine and returns no disagreement list |
+| `JESSE_SPEECH_MAX_AUDIO_BYTES` | 1 GiB | per recording |
+| `JESSE_SPEECH_THREADS` | 8 | CPU threads beside the GPU |
+| `JESSE_SPEECH_RESULT_TTL_SECS` | 3600 | how long a finished transcript is kept for the app |
+
+Building needs `cmake` on the PATH (whisper.cpp is compiled by `whisper-rs-sys`); the
+sentinel's deploy PATH includes `/opt/homebrew/bin`, so `brew install cmake` covers it.
 
 ## Session GC sweep (`JESSE_SESSION_TTL_DAYS`)
 

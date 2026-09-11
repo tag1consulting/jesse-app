@@ -22,12 +22,19 @@ struct MacThreadDetailView: View {
 
     /// Attaching a RECORDING, which on this platform means transcribing it: the Mac has
     /// no attachment pipeline (it never gained one — the phone's chips and caps are
-    /// iOS-only), and it does not need one here, because audio never crosses the network
-    /// on any platform. What lands in the draft is text.
+    /// iOS-only), and it does not need one here: what lands in the draft is text.
     ///
-    /// The same model, the same on-device long-form engine and the same two views as the
-    /// iPhone; only the way a file is chosen differs.
-    @State private var recording = RecordingAttachment()
+    /// The same model, the same Studio-first transcriber and the same views as the iPhone;
+    /// only the way a file is chosen differs. On the Studio itself the bridge is reached over
+    /// loopback, anywhere else over the tailnet, exactly as every turn is; this Mac's own
+    /// engine reads the recording only when the Studio cannot be reached, and says so. The
+    /// pairing is read from the Keychain at each recording rather than captured here, so a
+    /// re-pairing takes effect at the next one.
+    @State private var recording = RecordingAttachment(
+        transcriber: StudioFirstTranscriber(studio: URLSessionStudioTransport(endpoint: {
+            let config = KeychainConfigStore(service: MacConfigStore.keychainService).load()
+            return StudioEndpoint(baseURL: config.endpoint("/"), token: config.token)
+        })))
     @State private var showAudioImporter = false
 
     // ── The DURABLE half of the composer ────────────────────────────────────────────
@@ -69,7 +76,12 @@ struct MacThreadDetailView: View {
         // on `.id(thread.id)`, the app losing the foreground, and a quit. Cmd-Q with the
         // window frontmost may not change the scene phase at all, which is why
         // `willTerminate` is here in its own right and not as a belt to a brace.
-        .onDisappear { captureDraft() }
+        // LEAVING: the detail column is replacing this composer, so it stops exempting its
+        // conversation from the reapers. See `ComposerDrafts.leave`.
+        .onDisappear {
+            guard didRestoreDraft else { return }
+            ComposerDrafts.leave(composerState, for: thread, in: context)
+        }
         .onChange(of: scenePhase) { _, phase in
             if phase != .active { captureDraft() }
         }
@@ -89,7 +101,12 @@ struct MacThreadDetailView: View {
     /// markers all live there, so this shell cannot grow its own idea of them. This Mac
     /// has no attachment pipeline, so `restored.files` is nothing to it.
     private func restoreDraft() {
-        guard !didRestoreDraft else { return }
+        guard !didRestoreDraft else {
+            // Appearing again on a composer whose text is still live: nothing to restore, but
+            // the composer is open again and the reaper must know it.
+            ComposerDraftStore.shared.composerOpened(thread.id)
+            return
+        }
         didRestoreDraft = true
         let restored = ComposerDrafts.restore(
             for: thread, newestUserTurn: newestUserTurn,
@@ -206,6 +223,11 @@ struct MacThreadDetailView: View {
                 Text(error).font(.caption).foregroundStyle(.red)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
+            // Read on this Mac because the Studio could not be reached: said out loud, beside
+            // the draft it produced.
+            if let notice = recording.notice {
+                RecordingNoticeRow(notice: notice, onDismiss: { recording.dismissNotice() })
+            }
             if case .running(let update) = recording.stage {
                 RecordingProgressBar(update: update,
                                      sourceName: recording.sourceName,
@@ -305,8 +327,9 @@ struct MacThreadDetailView: View {
         // state at the next departure.
     }
 
-    /// A picked recording. Transcribed on this Mac, never uploaded, and the working copy
-    /// is deleted however the run ends — the model owns all three.
+    /// A picked recording. Transcribed on the Studio (on this Mac only when the Studio can't
+    /// be reached), sent to the paired bridge and nowhere else, and the working copy is
+    /// deleted however the run ends — the model owns all three.
     private func handleAudioImport(_ result: Result<[URL], Error>) {
         guard case .success(let urls) = result, let url = urls.first else { return }
         let scoped = url.startAccessingSecurityScopedResource()

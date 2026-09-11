@@ -51,7 +51,17 @@ struct ThreadDetailView: View {
     /// One model per conversation, held across the whole flow, because the flow outlives
     /// every individual sheet in it — the language picker, the progress view, and the
     /// error line are three views of one run.
-    @State private var recording = RecordingAttachment()
+    ///
+    /// STUDIO FIRST: the recording goes to the paired Jesse bridge, which transcribes it on
+    /// the Studio with its own, far stronger models and deletes it; this device's engine
+    /// reads it only when the Studio cannot be reached, and the composer then says so. The
+    /// pairing is read at each recording rather than captured here, so a re-pairing takes
+    /// effect at the next one.
+    @State private var recording = RecordingAttachment(
+        transcriber: StudioFirstTranscriber(studio: URLSessionStudioTransport(endpoint: {
+            let config = ConfigStore.load()
+            return StudioEndpoint(baseURL: config.endpoint("/"), token: config.token)
+        })))
     // Whether the composer's frugal glyph has been tapped for its explanation.
     @State private var showFrugalExplanation = false
 
@@ -193,11 +203,15 @@ struct ThreadDetailView: View {
         // composer stops being reachable: the iPhone popping it, the iPad detail column
         // replacing it on `.id(thread.id)`, the app going to the pocket, and a quit.
         //
-        // A tab switch is deliberately NOT in the list, and does not need to be: switching
-        // tabs does not destroy this view, so `input` is still here when the user comes
-        // back, and anything that WOULD destroy it (backgrounding, termination) fires one
-        // of these first.
-        .onDisappear { captureDraft() }
+        // A tab switch does not destroy this view (`input` is still here when the user
+        // comes back), but it DOES fire `onDisappear`, so it captures and reports the
+        // composer left like a pop. That is harmless: the list never reaps the conversation
+        // on screen (`path.last`), and coming back marks the composer open again
+        // (`restoreDraft`).
+        // LEAVING, not just a departure: after this the composer is gone, so it stops
+        // exempting its conversation from the list's reaper — which runs again right after,
+        // because on a pop the list may have appeared before this fired. See `leaveComposer`.
+        .onDisappear { leaveComposer() }
         .onChange(of: scenePhase) { _, phase in
             if phase != .active { captureDraft() }
         }
@@ -532,6 +546,12 @@ struct ThreadDetailView: View {
             // Progress sits IN the composer rather than over the screen: an hour of
             // audio takes minutes to read, the conversation stays usable while it does,
             // and the transcript is landing in the field directly below this row.
+            // The recording was read on this device because the Studio could not be
+            // reached. Not an error — the transcript is in the composer — but a weaker
+            // reading must never arrive looking like the usual one.
+            if let notice = recording.notice {
+                RecordingNoticeRow(notice: notice, onDismiss: { recording.dismissNotice() })
+            }
             if case .running(let update) = recording.stage {
                 RecordingProgressBar(update: update,
                                      sourceName: recording.sourceName,
@@ -785,9 +805,10 @@ struct ThreadDetailView: View {
         }
     }
 
-    /// A picked recording. It is NOT staged as an attachment — audio never crosses the
-    /// network — so it goes to `RecordingAttachment`, which copies it, transcribes it on
-    /// this device, and deletes its copy however the run ends.
+    /// A picked recording. It is NOT staged as an attachment — a turn attachment can reach
+    /// a hosted model, and audio must never — so it goes to `RecordingAttachment`, which
+    /// copies it, has the Studio transcribe it (or this device, when the Studio can't be
+    /// reached), and deletes its copy however the run ends.
     private func handleAudioImport(_ result: Result<[URL], Error>) {
         switch result {
         case .success(let urls):
@@ -927,7 +948,13 @@ struct ThreadDetailView: View {
     /// check, the notice and the one-shot markers; the only thing local to this shell is
     /// turning the shared file value back into the composer's own chip type.
     private func restoreDraft() {
-        guard !didRestoreDraft else { return }
+        guard !didRestoreDraft else {
+            // Appearing AGAIN (an iPad tab switch fires `onDisappear` and then `onAppear` on a
+            // composer that never went away). The text is live and must not be restored over,
+            // but the composer is open again, and the reapers must know it.
+            ComposerDraftStore.shared.composerOpened(thread.id)
+            return
+        }
         didRestoreDraft = true
         let restored = ComposerDrafts.restore(for: thread, newestUserTurn: newestUserTurn,
                                               contextStillAttached: attachedContext != nil)
@@ -976,6 +1003,16 @@ struct ThreadDetailView: View {
         guard didRestoreDraft else { return }
         ComposerDrafts.capture(composerState, for: thread, in: context,
                                terminating: terminating)
+    }
+
+    /// The departure after which this composer is GONE — the iPhone popping it, the iPad's
+    /// detail column replacing it. The same capture, plus closing the composer, which is
+    /// what lets the list's reaper judge this conversation at all: if on a pop the list
+    /// appeared first, it skipped it as still open, and `ComposerDrafts.leave` tells it to
+    /// look again now that the answer is known.
+    private func leaveComposer() {
+        guard didRestoreDraft else { return }
+        ComposerDrafts.leave(composerState, for: thread, in: context)
     }
 
     private func send() {

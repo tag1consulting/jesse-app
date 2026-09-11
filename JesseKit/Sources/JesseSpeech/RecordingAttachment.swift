@@ -27,12 +27,22 @@ public struct CompletedRecording: Equatable, Sendable {
     /// The human name of the language it was read in, as it appears in the header.
     public let language: String
     public let transcript: String
+    /// Where it was transcribed — the Studio and its engines, or this device.
+    public let engine: String?
+    /// Where two engines disagreed, for the uncertainty block under the transcript.
+    public let disagreements: [TranscriptDisagreement]
+    public let notes: [String]
 
-    public init(sourceName: String, durationSeconds: Double, language: String, transcript: String) {
+    public init(sourceName: String, durationSeconds: Double, language: String, transcript: String,
+                engine: String? = nil, disagreements: [TranscriptDisagreement] = [],
+                notes: [String] = []) {
         self.sourceName = sourceName
         self.durationSeconds = durationSeconds
         self.language = language
         self.transcript = transcript
+        self.engine = engine
+        self.disagreements = disagreements
+        self.notes = notes
     }
 
     /// The message body for a composer currently holding `typed`.
@@ -44,7 +54,10 @@ public struct CompletedRecording: Equatable, Sendable {
                                         sourceName: sourceName,
                                         seconds: durationSeconds,
                                         language: language,
-                                        transcript: transcript)
+                                        transcript: transcript,
+                                        engine: engine,
+                                        disagreements: disagreements,
+                                        notes: notes)
     }
 }
 
@@ -84,6 +97,11 @@ public final class RecordingAttachment {
     public private(set) var stage: Stage = .idle
     /// The one sentence explaining the last failure, or nil. Never a generic one.
     public private(set) var errorMessage: String?
+    /// Set when the last transcript was made somewhere other than the Studio — it could not
+    /// be reached — so the composer can say so beside the text. Not an error: the transcript
+    /// arrived. It is the difference between a weaker reading the user knows about and one
+    /// they do not.
+    public private(set) var notice: String?
     /// The languages the picker offers, device-preferred first.
     public private(set) var languages: [Locale] = []
     /// The picker's selection. Pre-set by `resolve`; writable because the picker binds
@@ -202,6 +220,7 @@ public final class RecordingAttachment {
     /// Probe the working copy, load the language list, and raise the picker.
     private func adopt(_ candidate: RecordingSource) async {
         errorMessage = nil
+        notice = nil
         completed = nil
         sourceName = candidate.displayName
 
@@ -261,10 +280,10 @@ public final class RecordingAttachment {
                 Task { @MainActor in self?.advance(update, run: run) }
             }
             do {
-                let text = try await transcriber.transcribe(fileAt: url,
-                                                            locale: locale,
-                                                            onProgress: onProgress)
-                self?.succeed(transcript: text, language: language, run: run)
+                let result = try await transcriber.transcribe(fileAt: url,
+                                                              locale: locale,
+                                                              onProgress: onProgress)
+                self?.succeed(result, language: language, run: run)
             } catch let failure as TranscriptionFailure {
                 self?.fail(failure, named: name, run: run)
             } catch is CancellationError {
@@ -304,6 +323,9 @@ public final class RecordingAttachment {
 
     public func dismissError() { errorMessage = nil }
 
+    /// Put the "not transcribed on the Studio" notice away.
+    public func dismissNotice() { notice = nil }
+
     /// Take the finished transcript, clearing it. The composer calls this once.
     public func takeCompleted() -> CompletedRecording? {
         defer { completed = nil }
@@ -312,12 +334,18 @@ public final class RecordingAttachment {
 
     // MARK: - Ending
 
-    private func succeed(transcript: String, language: String, run: Int) {
+    private func succeed(_ result: TranscriptionResult, language: String, run: Int) {
         guard run == generation, let source else { return }
         completed = CompletedRecording(sourceName: source.displayName,
                                        durationSeconds: source.durationSeconds,
                                        language: language,
-                                       transcript: transcript)
+                                       transcript: result.text,
+                                       engine: result.engine,
+                                       disagreements: result.disagreements,
+                                       notes: result.notes)
+        // A reading made somewhere other than the Studio says so, beside the composer, for
+        // as long as the user wants to see it.
+        notice = result.notice
         work = nil
         settle()
     }

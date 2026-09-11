@@ -1061,8 +1061,18 @@ fn should_push(job: &ScheduleJob, outcome: Outcome, reason: &str, cascaded: bool
     {
         return false;
     }
+    // A weekly model check that found nothing to do is the machine working; "your models are
+    // current" every Sunday is noise. An UPGRADE is announced (it ran, with a reason naming
+    // what was installed), and a failure is pushed like any other.
+    if outcome == Outcome::Ran && reason == SPEECH_MODELS_CURRENT {
+        return false;
+    }
     true
 }
+
+/// The reason a weekly speech-model check records when every tier already had its target.
+/// Compared by value in [`should_push`].
+pub const SPEECH_MODELS_CURRENT: &str = "speech models current";
 
 /// The consecutive-failure counts that send an escalation push, and nothing between them.
 ///
@@ -1297,32 +1307,43 @@ async fn run_chain(sched: Arc<Scheduler>, st: AppState, schedule: Arc<Schedule>,
     // that keeps two agents off the same working tree. The wait is bounded by what is
     // left of this head's catch-up window: a chain that is still queued when its window
     // expires is skipped and recorded, never started hours late.
+    //
+    // A chain made ONLY of built-in jobs (the weekly speech-model check) touches no working
+    // tree, so it neither waits behind nor holds up the lock that keeps two agents off one.
+    let needs_tree = schedule
+        .chain(&run.start_at)
+        .iter()
+        .any(|id| schedule.get(id).is_some_and(|j| j.builtin.is_none()));
     let now = sched.clock().now_ms();
     let deadline_ms = due.due_ms + head.catch_up_secs.saturating_mul(1000);
     let wait = Duration::from_millis(deadline_ms.saturating_sub(now));
-    let permit = match timeout(wait, sched.turn_lock.clone().acquire_owned()).await {
-        Ok(Ok(p)) => p,
-        Ok(Err(_)) => return, // the semaphore is never closed
-        Err(_) => {
-            let reason = format!(
-                "waited {} for another scheduled chain to finish and the catch-up window \
+    let permit = if !needs_tree {
+        None
+    } else {
+        match timeout(wait, sched.turn_lock.clone().acquire_owned()).await {
+            Ok(Ok(p)) => Some(p),
+            Ok(Err(_)) => return, // the semaphore is never closed
+            Err(_) => {
+                let reason = format!(
+                    "waited {} for another scheduled chain to finish and the catch-up window \
                  expired (catch_up_secs = {}s)",
-                human_ms(wait.as_millis() as u64),
-                head.catch_up_secs
-            );
-            sched.finish_job(
-                &st,
-                head,
-                Outcome::Skipped,
-                &reason,
-                None,
-                None,
-                None,
-                None,
-                false,
-            );
-            sched.skip_rest_of_chain(&st, &head_id, &head_id, Outcome::Skipped);
-            return;
+                    human_ms(wait.as_millis() as u64),
+                    head.catch_up_secs
+                );
+                sched.finish_job(
+                    &st,
+                    head,
+                    Outcome::Skipped,
+                    &reason,
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                );
+                sched.skip_rest_of_chain(&st, &head_id, &head_id, Outcome::Skipped);
+                return;
+            }
         }
     };
 
@@ -1368,6 +1389,11 @@ async fn run_chain(sched: Arc<Scheduler>, st: AppState, schedule: Arc<Schedule>,
             // 5. The OUTPUT CONTRACT, checked here rather than in the pure gate because it
             //    is the one that reads the disk: a job whose declared output is already at
             //    or after this occurrence's instant has nothing to do.
+            // A BUILT-IN job runs the bridge's own task in place of a turn — no prompt, no
+            // model slot, no output contract — and lands in the record like any other member.
+            MemberDecision::Run if job.builtin.is_some() => {
+                run_builtin(&sched, &st, job, &run).await
+            }
             MemberDecision::Run => match output_already_fresh(&sched, &st, job, &run) {
                 Some(path) => {
                     broken_by.insert(id.clone(), id.clone());
@@ -1616,6 +1642,55 @@ async fn run_one(
             };
         }
         tokio::time::sleep(SCHEDULED_POLL).await;
+    }
+}
+
+/// Run one BUILT-IN job: the bridge's own task, recorded, ledgered and pushed exactly as a
+/// turn job's run is. There is no turn, so no job id and no reply; the reason carries what
+/// happened.
+async fn run_builtin(
+    sched: &Arc<Scheduler>,
+    st: &AppState,
+    job: &ScheduleJob,
+    run: &ChainRun,
+) -> RunResult {
+    let started = Instant::now();
+    sched
+        .state
+        .started_without_turn(&job.id, system_time_to_ms(SystemTime::now()));
+    let Some(task) = job.builtin else {
+        return RunResult::failed("not a built-in job");
+    };
+    eprintln!(
+        "jesse-bridge: schedule FIRE id={} builtin={}{}",
+        job.id,
+        task.label(),
+        if run.is_operator() { " (operator)" } else { "" }
+    );
+    let (outcome, reason) = match task {
+        BuiltinTask::SpeechModelUpdate => match st.speech.availability() {
+            Err(why) => (Outcome::Skipped, why),
+            Ok(()) => {
+                let report = st.speech.check_models().await;
+                if !report.failures.is_empty() {
+                    (Outcome::Failed, report.summary())
+                } else if report.changed() {
+                    // AN UPGRADE IS ANNOUNCED: this reason is pushed, naming what changed.
+                    (Outcome::Ran, report.summary())
+                } else {
+                    (Outcome::Ran, SPEECH_MODELS_CURRENT.to_string())
+                }
+            }
+        },
+    };
+    RunResult {
+        outcome,
+        reason,
+        job_id: None,
+        duration_ms: Some(started.elapsed().as_millis() as u64),
+        reply: None,
+        conversation_id: None,
+        transient: false,
     }
 }
 
@@ -2133,15 +2208,20 @@ impl Scheduler {
         // this same file against the same list.
         let model_ids: Vec<String> = st.cfg.model_registry.known_ids();
         let vault = PathBuf::from(&st.cfg.vault);
-        let next = validate_schedule_with(
-            &raw,
-            &ValidationContext {
-                vault: (!st.cfg.vault.is_empty()).then_some(vault.as_path()),
-                model_ids: Some(&model_ids),
-                // Reloaded WITH the array, from the same parse of the same file, so
-                // `on_return` is always validated against the entries it shipped beside.
-                profile: profile_table.as_ref(),
-            },
+        // The bridge's own default jobs are re-added exactly as at boot, so a reload can never
+        // quietly drop the weekly model check.
+        let next = with_builtin_defaults(
+            validate_schedule_with(
+                &raw,
+                &ValidationContext {
+                    vault: (!st.cfg.vault.is_empty()).then_some(vault.as_path()),
+                    model_ids: Some(&model_ids),
+                    // Reloaded WITH the array, from the same parse of the same file, so
+                    // `on_return` is always validated against the entries it shipped beside.
+                    profile: profile_table.as_ref(),
+                },
+            ),
+            st.speech.availability().is_ok(),
         );
         if next.is_fatal() {
             return ReloadOutcome {
@@ -2313,7 +2393,12 @@ fn schedule_row(sched: &Scheduler, schedule: &Schedule, job: &ScheduleJob) -> Va
         // job it knew about.
         "profiles": job.profiles.names(),
         "mode": job.mode,
-        "prompt": job.prompt.label(),
+        // A built-in job has no prompt; it says which task it runs instead.
+        "prompt": match job.builtin {
+            Some(task) => format!("builtin:{}", task.label()),
+            None => job.prompt.label(),
+        },
+        "builtin": job.builtin.map(|t| t.label()),
         "notify": job.notify,
         "timeout_secs": job.timeout_secs,
         "catch_up_secs": job.is_head().then_some(job.catch_up_secs),
@@ -2649,6 +2734,140 @@ mod tests {
             ..Default::default()
         }]);
         s.jobs.into_iter().next().unwrap()
+    }
+
+    // ---- built-in jobs: the weekly speech-model check -------------------------
+
+    use crate::speech::decode::SystemDecoder;
+    use crate::speech::engine::fakes::ScriptedLoader;
+    use crate::speech::models::fakes::{entry, FakeFetcher};
+    use crate::speech::{SpeechConfig, SpeechService, SpeechTier};
+
+    /// A bridge that transcribes, with the weekly check in its schedule and fake models.
+    fn transcribing_state(fetch_error: Option<&str>) -> (AppState, PathBuf) {
+        let root = std::env::temp_dir().join(format!("jesse-sched-speech-{}", random_hex()));
+        let mut cfg = crate::testutil::test_config();
+        cfg.speech = SpeechConfig::at(&root);
+        cfg.schedule = Arc::new(with_builtin_defaults(Schedule::default(), true));
+        let mut st = AppState::new(cfg);
+        let acc = entry("acc-1", SpeechTier::Accurate, 10, b"accurate weights");
+        let fast = entry("fast-1", SpeechTier::Fast, 10, b"fast weights");
+        let fetcher =
+            FakeFetcher::serving(&[(&acc, b"accurate weights"), (&fast, b"fast weights")]);
+        *fetcher.fail.lock_ok() = fetch_error.map(str::to_string);
+        st.speech = Arc::new(SpeechService::with_parts(
+            st.cfg.speech.clone(),
+            vec![acc, fast],
+            Arc::new(fetcher),
+            Arc::new(ScriptedLoader::default()),
+            Arc::new(SystemDecoder::default()),
+        ));
+        (st, root)
+    }
+
+    /// Sunday 04:40 in the scheduler's zone — an occurrence the weekly check's `days` admits.
+    fn sunday_run(id: &str) -> ChainRun {
+        let due_ms = Local
+            .with_ymd_and_hms(2026, 9, 13, 4, 40, 0)
+            .earliest()
+            .expect("a valid local instant")
+            .timestamp_millis() as u64;
+        ChainRun::scheduled(
+            id.to_string(),
+            DueFire {
+                due_ms,
+                lateness_ms: 0,
+                missed_earlier: 0,
+            },
+        )
+    }
+
+    fn weekly_check(st: &AppState) -> ScheduleJob {
+        st.scheduler
+            .schedule()
+            .get(SPEECH_MODEL_UPDATE_JOB_ID)
+            .cloned()
+            .expect("the weekly check is in a transcribing bridge's schedule")
+    }
+
+    #[tokio::test]
+    async fn the_weekly_model_check_installs_then_goes_quiet_and_announces_only_the_upgrade() {
+        let (st, root) = transcribing_state(None);
+        let job = weekly_check(&st);
+
+        let first = run_builtin(&st.scheduler, &st, &job, &sunday_run(&job.id)).await;
+        assert_eq!(first.outcome, Outcome::Ran, "{}", first.reason);
+        assert!(first.reason.contains("installed"), "{}", first.reason);
+        assert!(
+            should_push(&job, first.outcome, &first.reason, false),
+            "an upgrade is announced"
+        );
+        assert_eq!(first.job_id, None, "there is no turn to fetch");
+        let rec = st.scheduler.state.get(&job.id);
+        assert!(rec.last_fire_ms.is_some(), "the fire is recorded");
+        assert_eq!(rec.last_job_id, None);
+
+        let second = run_builtin(&st.scheduler, &st, &job, &sunday_run(&job.id)).await;
+        assert_eq!(second.outcome, Outcome::Ran);
+        assert_eq!(second.reason, SPEECH_MODELS_CURRENT);
+        assert!(
+            !should_push(&job, second.outcome, &second.reason, false),
+            "a week with nothing to do is not pushed"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_check_that_cannot_fetch_fails_with_the_reason_and_pushes() {
+        let (st, root) = transcribing_state(Some("could not reach huggingface.co"));
+        let job = weekly_check(&st);
+        let r = run_builtin(&st.scheduler, &st, &job, &sunday_run(&job.id)).await;
+        assert_eq!(r.outcome, Outcome::Failed);
+        assert!(
+            r.reason.contains("could not reach huggingface.co"),
+            "{}",
+            r.reason
+        );
+        assert!(should_push(&job, r.outcome, &r.reason, false));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_bridge_that_does_not_transcribe_skips_the_check_and_says_why() {
+        // The fixture's speech is off.
+        let st = crate::testutil::test_state();
+        let job = with_builtin_defaults(Schedule::default(), true)
+            .get(SPEECH_MODEL_UPDATE_JOB_ID)
+            .cloned()
+            .unwrap();
+        let r = run_builtin(&st.scheduler, &st, &job, &sunday_run(&job.id)).await;
+        assert_eq!(r.outcome, Outcome::Skipped);
+        assert!(r.reason.contains("JESSE_SPEECH"), "{}", r.reason);
+    }
+
+    /// The model check touches no working tree, so it must not queue behind an agent's
+    /// overnight chain — and must not make one wait either.
+    #[tokio::test]
+    async fn a_chain_of_built_ins_neither_waits_for_nor_holds_the_tree_lock() {
+        let (st, root) = transcribing_state(None);
+        let sched = st.scheduler.clone();
+        let _agent = sched
+            .turn_lock
+            .clone()
+            .try_acquire_owned()
+            .expect("the tree lock is free");
+        let run = sunday_run(SPEECH_MODEL_UPDATE_JOB_ID);
+        timeout(
+            Duration::from_secs(10),
+            run_chain(sched.clone(), st.clone(), sched.schedule(), run),
+        )
+        .await
+        .expect("a built-in chain must not wait for the tree lock");
+        assert_eq!(
+            sched.state.get(SPEECH_MODEL_UPDATE_JOB_ID).last_outcome,
+            "ran"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

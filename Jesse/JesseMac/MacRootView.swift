@@ -183,7 +183,7 @@ struct MacRootView: View {
         for t in threads where t.turns.isEmpty
             && (t.sessionId ?? "").isEmpty
             && t.registeredAt == nil
-            && !ComposerDraftStore.shared.hasDraft(t.id)
+            && ComposerDraftStore.shared.mayReap(t.id)
             && !(coordinator.isRunning && coordinator.activeThreadID == t.id) {
             if selection == t.id { selection = nil }
             if let cid = t.conversationId, !cid.isEmpty { MacCursorStore.clear(cid) }

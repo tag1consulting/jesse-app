@@ -1,5 +1,6 @@
 import XCTest
 @testable import Jesse
+import JesseNetworking
 import JesseSpeech
 
 // The app's half of a shared recording: the hand-off the share extension left behind is
@@ -74,21 +75,35 @@ final class SharedRecordingRoutingTests: XCTestCase {
 }
 
 // The one claim about the recording path that belongs to the APP rather than to the
-// package: audio is not, and must never become, an attachment.
+// package: a recording travels to the paired Jesse bridge by its own route, and NEVER as a
+// turn attachment.
+//
+// THIS REPLACES `AudioIsNeverAnAttachmentTests`, deliberately. That class pinned the rule
+// App 1.0 (124) shipped — "audio never crosses the network; the transcript is what
+// travels" — and that rule was retired in App 1.0 (133) / bridge 0.135.0: recordings are now
+// transcribed on the Studio, so they DO cross the network, to the bridge and nowhere past
+// it. The line moved from the network interface to the DESTINATION, and the replacement is
+// held in three places rather than one:
+//
+//   * here: the turn attachment path — which can lead to a hosted vision helper or a hosted
+//     child — still refuses every audio type, and the recording route is built from the
+//     same pairing every turn uses;
+//   * in `JesseSpeechTests.StudioWireTests`: the only request that carries audio targets the
+//     paired bridge's transcription route;
+//   * in the bridge, on the wire: `recorded_audio_never_reaches_a_hosted_backend` fails if a
+//     single connection reaches a hosted backend while a recording is in the bridge.
 //
 // `@MainActor` because the app module compiles with `SWIFT_DEFAULT_ACTOR_ISOLATION =
 // MainActor`, so `AttachmentLimits` is main-actor isolated.
 @MainActor
-final class AudioIsNeverAnAttachmentTests: XCTestCase {
+final class AudioTravelsOnlyToTheStudioTests: XCTestCase {
 
     func testTheAttachmentWhitelistStillRefusesAudio() {
-        // The brief's explicit out-of-scope item, pinned so a later "while we're here"
-        // cannot quietly add it. The bridge sniffs magic bytes and accepts images and
-        // PDF only; the client mirrors that list, and an audio MIME appearing in it
-        // would mean recordings were being uploaded.
+        // Recordings travel now, but never as a turn attachment: that path hands files to
+        // models that may be hosted, and the audio egress ban forbids exactly that.
         for mime in ["audio/mp4", "audio/mpeg", "audio/wav", "audio/x-m4a", "audio/aiff"] {
             XCTAssertFalse(AttachmentLimits.allowedMimes.contains(mime),
-                           "\(mime) must never be attachable — the transcript is what travels")
+                           "\(mime) must never be a turn attachment — recordings take the Studio's own route")
         }
     }
 
@@ -97,5 +112,22 @@ final class AudioIsNeverAnAttachmentTests: XCTestCase {
         // be mistaken for one.
         let m4a = Data([0x00, 0x00, 0x00, 0x20]) + Data("ftypM4A ".utf8) + Data(count: 8)
         XCTAssertNil(JesseAttachment.sniffMime(m4a))
+    }
+
+    func testTheRecordingRouteIsThePairedBridgeAndNothingElse() throws {
+        // The composers build their Studio endpoint from the same pairing every turn uses,
+        // with exactly this expression; the audio goes to that host, that port, that route.
+        let config = JesseConfig(host: "studio.example.ts.net", port: 8765, token: "tok")
+        let endpoint = try XCTUnwrap(StudioEndpoint(baseURL: config.endpoint("/"), token: config.token))
+        let request = URLSessionStudioTransport.uploadRequest(endpoint: endpoint, language: "it",
+                                                              contentType: "audio/mp4")
+        XCTAssertEqual(request.url?.host, config.normalizedHost)
+        XCTAssertEqual(request.url?.port, config.effectivePort)
+        XCTAssertEqual(request.url?.path, "/jesse/transcriptions")
+        XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer tok")
+
+        // And an unpaired app has no Studio to send anything to.
+        let unpaired = JesseConfig(host: "", port: 8765, token: "")
+        XCTAssertNil(StudioEndpoint(baseURL: unpaired.endpoint("/"), token: unpaired.token))
     }
 }

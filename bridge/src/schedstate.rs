@@ -330,6 +330,20 @@ impl ScheduleStateStore {
         });
     }
 
+    /// A BUILT-IN job started for this id: the same record as [`started`](Self::started),
+    /// with no job id, because there is no turn to fetch — an empty id would send a client
+    /// to `GET /jesse/result/` for nothing.
+    pub fn started_without_turn(&self, id: &str, fire_ms: u64) {
+        self.update(id, |r| {
+            r.last_fire_ms = Some(fire_ms);
+            r.last_job_id = None;
+            r.last_completion_ms = None;
+            r.last_duration_ms = None;
+            r.last_outcome = String::new();
+            r.last_reason = String::new();
+        });
+    }
+
     /// The occurrence reached its outcome. `duration_ms` is `None` for a skip (nothing
     /// ran to be timed).
     pub fn finished(

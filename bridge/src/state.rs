@@ -126,6 +126,12 @@ pub struct AppState {
     // return `None` and leaves every turn byte-for-byte what it is today. See
     // [`crate::artifacts`].
     pub artifacts: Arc<ArtifactStore>,
+    // RECORDED-AUDIO TRANSCRIPTION ON THIS MACHINE: the one door audio may enter by, the
+    // in-process engines, their models, and the runs in flight. Always present so the routes
+    // answer on every deploy; UNAVAILABLE (a 503 that says why) with no state dir or with
+    // `JESSE_SPEECH=off`. Its pipeline is handed none of the rest of this struct — see
+    // `crate::speech`.
+    pub speech: Arc<crate::speech::SpeechService>,
 }
 
 impl AppState {
@@ -181,7 +187,13 @@ impl AppState {
         // dir, in which case the whole channel is off). The startup eviction pass and the
         // usage log run in `main`, beside the other startup work, not here.
         let artifacts = Arc::new(ArtifactStore::from_cfg(&cfg));
+        // Loads the model record; downloads nothing and loads no model until a recording
+        // needs one. The boot purge of abandoned audio runs in `main`.
+        let speech = Arc::new(crate::speech::SpeechService::from_config(
+            cfg.speech.clone(),
+        ));
         let st = AppState {
+            speech,
             cfg: Arc::new(cfg),
             jobs: Arc::new(JobStore::new(job_ttl, retrieval_grace, jobs_dir)),
             slots,

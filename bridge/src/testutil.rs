@@ -102,6 +102,9 @@ pub(crate) fn test_config() -> Config {
         // No `[direct]` table in the fixture: the direct harness is not registered here, so
         // every setting is inert and every existing turn assertion is unaffected.
         direct: DirectSettings::default(),
+        // Speech transcription OFF in the fixture: no intake or models directory is ever
+        // touched. The speech tests build their own service over a scratch root and fakes.
+        speech: crate::speech::SpeechConfig::disabled(),
     }
 }
 pub(crate) fn test_state() -> AppState {

@@ -317,6 +317,13 @@ final class ComposerDraftUITests: XCTestCase {
 
         type("AAA111", into: newConversation(app))       // the witness, kept
         backToList(app)
+        // CHECKPOINTS, so a loss names the step it happened at rather than surfacing only
+        // after a relaunch. They come AFTER each return, so the app still goes through the
+        // exact sequence (type, then straight back) that lost the witness on hosted CI:
+        // the list could appear before the witness's composer left, judge it empty, and
+        // reap it.
+        XCTAssertTrue(draftRows(app).element(boundBy: 0).waitForExistence(timeout: 10),
+                      "the witness is still in the list once it is left")
 
         let doomed = newConversation(app)                 // newer, and emptied
         type("BBB222", into: doomed)
@@ -324,6 +331,8 @@ final class ComposerDraftUITests: XCTestCase {
         doomed.typeText(String(repeating: XCUIKeyboardKey.delete.rawValue, count: 12))
         XCTAssertFalse(text(of: doomed).contains("BBB222"), "precondition: emptied")
         backToList(app)
+        XCTAssertTrue(draftRows(app).element(boundBy: 0).waitForExistence(timeout: 10),
+                      "the witness survived the emptied conversation being reaped")
 
         app.terminate()
         app.launch()

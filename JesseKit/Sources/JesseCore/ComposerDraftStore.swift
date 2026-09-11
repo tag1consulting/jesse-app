@@ -432,6 +432,31 @@ public final class ComposerDraftStore {
     /// Whether anything at all is held for `id`. Tests read it; nothing else needs to.
     public func holdsDraft(_ id: UUID) -> Bool { drafts[id] != nil }
 
+    // MARK: - Open composers
+
+    /// Conversations whose composer is ON SCREEN: restored and not yet left. In memory only —
+    /// after a launch nothing is open.
+    private var openComposers: Set<UUID> = []
+
+    /// A composer appeared. Called by `ComposerDrafts.restore`, once per composer.
+    public func composerOpened(_ id: UUID) { openComposers.insert(id) }
+
+    /// A composer was LEFT. Called by `ComposerDrafts.leave`.
+    public func composerClosed(_ id: UUID) { openComposers.remove(id) }
+
+    public func isComposerOpen(_ id: UUID) -> Bool { openComposers.contains(id) }
+
+    /// WHAT BOTH SHELLS' REAPERS ASK: nothing held, and no composer still open on it.
+    ///
+    /// The second clause removes the one ordering this design depended on. A draft exists
+    /// only once its composer is LEFT, and nothing orders an iPhone pop's list `onAppear` —
+    /// where the reaper runs — after the popped composer's `onDisappear` delivers that
+    /// departure. When the list ran first, asking `hasDraft` alone judged a conversation the
+    /// user had just typed into as empty, and deleted it (App 1.0 (132)). An open composer is
+    /// never the reaper's to judge; its departure posts `ComposerDrafts.composerLeft` and the
+    /// reaper runs then.
+    public func mayReap(_ id: UUID) -> Bool { !hasDraft(id) && !isComposerOpen(id) }
+
     // MARK: - Capture
 
     /// Record a composer's state, because it is being left. THE ONLY MUTATOR A DEPARTURE
@@ -639,6 +664,9 @@ public enum ComposerDrafts {
                                contextStillAttached: Bool,
                                store: ComposerDraftStore = .shared)
     -> ComposerDraftRestoration {
+        // THE COMPOSER IS OPEN from here until `leave`, and no reaper may judge its
+        // conversation meanwhile. See `ComposerDraftStore.mayReap`.
+        store.composerOpened(thread.id)
         let saved = store.snapshot(for: thread.id)
         // A draft whose message ALREADY WENT is not a draft. The turn is persisted before
         // the draft is released, so a kill between the two leaves both on disk; this is
@@ -667,6 +695,32 @@ public enum ComposerDrafts {
     public static func release(for thread: JesseThread,
                                store: ComposerDraftStore = .shared) -> ComposerDraftSnapshot {
         store.release(for: thread.id)
+    }
+
+    /// Posted when a composer is LEFT, with the conversation's id as the object. The iPhone
+    /// list runs its reaper on it: if on a pop the list appeared first, it skipped the
+    /// conversation as still open, and this is the first moment its draft is known.
+    public static let composerLeft = Notification.Name("JesseComposerDraftLeft")
+
+    /// The composer is being LEFT — the departure after which it is gone: the iPhone popping
+    /// it, the iPad or Mac detail column replacing it. Capture it as any departure does, stop
+    /// exempting its conversation from the reapers, and say so.
+    ///
+    /// The scene going to the background and a refused send are departures too, but the
+    /// composer is still on screen after them, so they call `capture` and leave it open.
+    /// Reaping stays the list's: a departure never deletes anything itself, because a tab
+    /// switch on the iPad also fires `onDisappear` on a composer that is still showing.
+    ///
+    /// - Returns: whether the draft changed.
+    @discardableResult
+    public static func leave(_ state: ComposerDraftCapture,
+                             for thread: JesseThread,
+                             in context: ModelContext,
+                             store: ComposerDraftStore = .shared) -> Bool {
+        let changed = capture(state, for: thread, in: context, store: store)
+        store.composerClosed(thread.id)
+        NotificationCenter.default.post(name: composerLeft, object: thread.id)
+        return changed
     }
 }
 

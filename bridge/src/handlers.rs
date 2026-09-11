@@ -2670,6 +2670,23 @@ pub fn app(state: AppState) -> Router {
         .route("/jesse/schedule/reload", post(jesse_schedule_reload))
         .route("/jesse/schedule/:id/fire", post(jesse_schedule_fire))
         .route("/jesse/schedule/:id/enable", post(jesse_schedule_enable))
+        // RECORDED AUDIO, transcribed on this machine. The upload route is THE ONE DOOR audio
+        // enters by, and it carries its own limit — the audio cap, enforced as the body
+        // streams — in place of the one below, which is sized for base64 photos. See
+        // `crate::speech` for the egress ban these four routes sit behind.
+        .route("/jesse/speech", get(crate::speech::jesse_speech))
+        .route(
+            "/jesse/transcriptions",
+            post(crate::speech::jesse_transcribe).layer(DefaultBodyLimit::disable()),
+        )
+        .route(
+            "/jesse/transcriptions/:id",
+            get(crate::speech::jesse_transcription),
+        )
+        .route(
+            "/jesse/transcriptions/:id/cancel",
+            post(crate::speech::jesse_transcription_cancel),
+        )
         .layer(DefaultBodyLimit::max(body_limit))
         .with_state(state)
 }

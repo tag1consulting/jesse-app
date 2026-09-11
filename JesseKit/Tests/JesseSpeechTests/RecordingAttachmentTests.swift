@@ -17,6 +17,8 @@ import XCTest
 private final class FakeTranscriber: AudioFileTranscribing, Sendable {
     enum Behaviour: Sendable {
         case succeed(String)
+        /// A full result — provenance, disagreements, a fallback notice.
+        case deliver(TranscriptionResult)
         case fail(TranscriptionFailure)
         /// Report progress, then wait forever — the shape a Cancel has to interrupt.
         case hang
@@ -47,7 +49,7 @@ private final class FakeTranscriber: AudioFileTranscribing, Sendable {
 
     func transcribe(fileAt url: URL,
                     locale: Locale,
-                    onProgress: @escaping @Sendable (TranscriptionUpdate) -> Void) async throws -> String {
+                    onProgress: @escaping @Sendable (TranscriptionUpdate) -> Void) async throws -> TranscriptionResult {
         let behaviour = state.withLock { state -> Behaviour in
             state.calls.append(Call(url: url, locale: locale))
             return state.behaviour
@@ -56,7 +58,9 @@ private final class FakeTranscriber: AudioFileTranscribing, Sendable {
         onProgress(TranscriptionUpdate(phase: .transcribing, fraction: 0.5, transcript: "partial"))
         switch behaviour {
         case .succeed(let text):
-            return text
+            return TranscriptionResult(text: text, engine: "the fake engine")
+        case .deliver(let result):
+            return result
         case .fail(let failure):
             throw failure
         case .hang:
@@ -188,14 +192,60 @@ final class RecordingAttachmentTests: XCTestCase {
         XCTAssertEqual(completed.messageBody(typed: "From the site visit."), """
         From the site visit.
 
-        Recording: “Nuova registrazione 3.m4a” · 3m 12s · \(completed.language)
+        Recording: “Nuova registrazione 3.m4a” · 3m 12s · \(completed.language) · transcribed on the fake engine
 
         Buongiorno, sono il pizzaiolo.
         """)
 
         XCTAssertNil(model.errorMessage)
+        XCTAssertNil(model.notice, "the usual path has nothing to confess")
         XCTAssertEqual(model.stage, .idle)
         XCTAssertEqual(workingFiles, [], "the working copy must be gone once the transcript exists")
+    }
+
+    func testAReadingMadeHereBecauseTheStudioWasUnreachableSaysSo() async throws {
+        let notice = "The Studio wasn’t used (offline), so this was transcribed on this device — expect more mistakes in names, numbers and dates."
+        let model = makeModel(FakeTranscriber(.deliver(
+            TranscriptionResult(text: "Letto qui.", engine: "this device", notice: notice))))
+        await model.begin(pickedFileAt: try pickedFile())
+        model.confirmLanguage()
+        await waitUntil("completion") { model.completed != nil }
+
+        XCTAssertEqual(model.notice, notice)
+        XCTAssertNil(model.errorMessage, "a fallback is not a failure")
+        let completed = try XCTUnwrap(model.takeCompleted())
+        XCTAssertTrue(completed.messageBody(typed: "").contains("· transcribed on this device"),
+                      "the message itself says where it was made")
+        XCTAssertEqual(workingFiles, [])
+
+        model.dismissNotice()
+        XCTAssertNil(model.notice)
+
+        // And the next recording does not inherit it.
+        let studio = makeModel(FakeTranscriber(.deliver(
+            TranscriptionResult(text: "x", engine: "this device", notice: notice))))
+        await studio.begin(pickedFileAt: try pickedFile())
+        studio.confirmLanguage()
+        await waitUntil("completion") { studio.completed != nil }
+        await studio.begin(pickedFileAt: try pickedFile(named: "second.m4a"))
+        XCTAssertNil(studio.notice, "a new recording starts without the last one's notice")
+        studio.abandon()
+    }
+
+    func testAStudioReadingCarriesItsDisagreementsIntoTheMessage() async throws {
+        let model = makeModel(FakeTranscriber(.deliver(TranscriptionResult(
+            text: "Pickup is Thursday the 14th.",
+            engine: "the Studio (Whisper large-v3, checked against Whisper large-v3 turbo)",
+            disagreements: [TranscriptDisagreement(startSeconds: 6, endSeconds: 11,
+                                                   primary: "14th", alternative: "15th")]))))
+        await model.begin(pickedFileAt: try pickedFile())
+        model.confirmLanguage()
+        await waitUntil("completion") { model.completed != nil }
+
+        let body = try XCTUnwrap(model.takeCompleted()).messageBody(typed: "")
+        XCTAssertTrue(body.contains("Pickup is Thursday the 14th."), body)
+        XCTAssertTrue(body.contains("[0:06] “14th” — or “15th”"), body)
+        XCTAssertNil(model.notice)
     }
 
     func testTakeCompletedYieldsTheTranscriptExactlyOnce() async throws {
