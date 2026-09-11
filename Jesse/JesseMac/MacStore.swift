@@ -367,11 +367,13 @@ final class MacCoordinator {
         userTurn.thread = thread
         context.insert(userTurn)
         thread.updatedAt = Date()
-        // ── The composer's DRAFT is spent in the SAME save as the turn that replaces it.
-        // The Mac has no outbox, so the persisted user turn IS the durable record of this
-        // message, and the transaction that writes it is the transaction that stops the
-        // draft being one. `release` hands back what it took so a throw can undo it.
-        let releasedDraft = ComposerDraft.release(from: thread, in: context)
+        // ── The DRAFT IS NOT RELEASED HERE, and that is the ordering rule the two-store
+        // design rests on: the turn is persisted FIRST, and the composer releases the draft
+        // SECOND, only on a true return (see `MacThreadDetailView.send`). A save that
+        // throws below therefore leaves the draft exactly where it was, with nothing to put
+        // back. `ComposerDraftStaleness` closes the reverse window — a kill after this save
+        // and before the release.
+        //
         // Real error handling, not the `try?` this used to be. A staging save that fails is
         // the case where the user's message exists nowhere on disk, and swallowing it meant
         // going on to send a turn whose transcript might never persist — and, now, clearing
@@ -379,7 +381,6 @@ final class MacCoordinator {
         do {
             try save(context)
         } catch {
-            ComposerDraft.restore(releasedDraft, to: thread, in: context)
             // The screen context goes back too. It was spent above on the assumption that
             // this send was going to happen; leaving it spent would mean the preserved
             // draft, sent again, went WITHOUT the reading the conversation was opened
@@ -776,6 +777,7 @@ final class MacCoordinator {
         // (turns cascade) and clear its hydration cursor.
         for cid in plan.deleteLocalConversationIds {
             guard let t = byConversation[cid] else { continue }
+            ComposerDraftStore.shared.delete(t.id)
             context.delete(t)
             MacCursorStore.clear(cid)
         }

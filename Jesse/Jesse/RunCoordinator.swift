@@ -679,14 +679,15 @@ final class RunCoordinator {
                 OutboxAttachment(filename: att.filename, mime: att.mime, data: att.data))
         }
         context.insert(item)
-        // ── The composer's DRAFT is spent in the SAME save. This is the ownership
-        // transfer, and it is atomic on purpose: the transaction that makes the outbox the
-        // owner of this message is the transaction that stops the draft being one. There is
-        // no instant in which a kill would leave the message in neither place (the old
-        // "clear the composer, then call the coordinator" order), and none in which it is
-        // in both (a draft the user would find waiting after their message had already
-        // gone). `release` hands back what it took so a throw below can undo it.
-        let releasedDraft = ComposerDraft.release(from: thread, in: context)
+        // ── The composer's DRAFT IS NOT RELEASED HERE. It lives outside the object graph
+        // now (see `ComposerDraftStore`), so it cannot ride this save, and the ordering
+        // rule that replaces that atomicity is: persist the turn FIRST, release the draft
+        // SECOND, and only on a `true` return. A save that throws below therefore leaves
+        // the draft exactly where it was, with nothing to put back; a kill in the window
+        // AFTER this save and before the release is closed on restore by
+        // `ComposerDraftStaleness`, which discards a draft that is already the thread's
+        // newest user turn.
+        //
         // Real error handling, not `try?`. If this throws the user message is shown
         // but neither it nor the outbox record is persisted, and proceeding would
         // attach the reply to a thread that may never persist. Surface a recoverable
@@ -695,11 +696,9 @@ final class RunCoordinator {
             try save(context)
         } catch {
             Log.run.error("optimistic user-turn + outbox save failed for thread \(threadID): \(error.localizedDescription) — aborting the turn")
-            // Nothing was persisted, so the draft was never really spent. Put it back
-            // before surfacing the failure: the composer keeps its text (it clears only on
-            // a `true` return) and the model now agrees with it again.
-            ComposerDraft.restore(releasedDraft, to: thread, in: context)
-            // And put the SCREEN CONTEXT back with it. It was spent above on the
+            // Nothing was persisted and nothing was released, so the composer keeps its
+            // text (it clears only on a `true` return).
+            // Put the SCREEN CONTEXT back. It was spent above on the
             // assumption that this send was going to happen; leaving it spent would mean
             // the preserved draft, sent again, went WITHOUT the reading the conversation
             // was opened about — the same message turning into a different one.
@@ -1129,6 +1128,7 @@ final class RunCoordinator {
         for cid in plan.deleteLocalConversationIds {
             guard let thread = byConversation[cid] else { continue }
             cancel(thread.id)
+            ComposerDraftStore.shared.delete(thread.id)
             context.delete(thread)
             hydrationCursorStore.clear(cid)
             changed = true
@@ -1540,6 +1540,7 @@ final class RunCoordinator {
                 context.delete(turn)
             }
             if remaining.isEmpty && thread.sessionId == nil {
+                ComposerDraftStore.shared.delete(thread.id)
                 context.delete(thread)
             }
         }

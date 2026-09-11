@@ -190,7 +190,20 @@ public final class JesseThread {
     // about what it was about. Doubles as the thread's list title for an ask.
     public var askScopeTitle: String?
 
-    // ── The composer's UNSENT DRAFT, per conversation and per device ─────────────
+    // ── LEGACY: the composer's unsent draft, as it was stored in V5 ──────────────
+    //
+    // NOTHING WRITES THESE ANY MORE. The draft moved out of the object graph because
+    // keeping it here cost a sqlite transaction per keystroke: the view's main context has
+    // autosave on, so a dirtied context saved itself on the run loop regardless of the
+    // debounce in front of `save()` — 197 saves for 200 characters, measured. The draft now
+    // lives in `ComposerDraftStore`, one small file per conversation, written off the main
+    // thread on a quiet period and at every point the composer stops being reachable.
+    //
+    // The columns STAY DECLARED, empty, on purpose: this store migrates by SwiftData's
+    // automatic lightweight migration with no staged plan (see `JesseSchema.swift`), and
+    // dropping an entity and four attributes is precisely the non-lightweight change that
+    // would need one — which has stranded users behind the store-error banner once already.
+    // `ComposerDraftMigration` empties them once, at the first launch after the change.
     //
     // What the user has typed here and not yet sent. Before this it lived only in the
     // detail view's `@State`, which meant two guaranteed losses: navigating away destroys
@@ -245,19 +258,9 @@ public final class JesseThread {
     @Relationship(deleteRule: .cascade, inverse: \DraftAttachment.thread)
     public var draftAttachments: [DraftAttachment] = []
 
-    /// Whether this conversation is holding an unsent composer draft worth keeping alive.
-    ///
-    /// Read by both shells' empty-thread reapers: a never-sent conversation with a draft is
-    /// not an abandoned `+`-then-back, it is a message in progress, and reaping it would be
-    /// the very loss this draft exists to prevent. A deliberately EMPTIED draft (`""`) is
-    /// not worth keeping a turn-less thread alive for, so it reads false and the reaper may
-    /// take the thread as it always did.
-    public var hasComposerDraft: Bool {
-        !(draftText ?? "").isEmpty || !draftAttachments.isEmpty
-    }
-
     /// Draft files in a stable order (the relationship itself is unordered), matching how
-    /// `OutboxItem.orderedAttachments` orders its own.
+    /// `OutboxItem.orderedAttachments` orders its own. Read only by
+    /// `ComposerDraftMigration`, which empties these rows once and for all.
     public var orderedDraftAttachments: [DraftAttachment] {
         draftAttachments.sorted { $0.createdAt < $1.createdAt }
     }

@@ -33,12 +33,16 @@ struct MacThreadDetailView: View {
     //
     // `draft` above is view state, and this view carries `.id(thread.id)` in the split
     // view's detail column — so selecting another conversation destroys it, and quitting
-    // takes it regardless. `draft` is now a MIRROR of `thread`'s persisted draft, through
-    // the same shared `ComposerDraft` the phone uses.
-    @State private var drafts = ComposerDraftAutosave()
+    // takes it regardless. `draft` is now a MIRROR of the durable draft, through the same
+    // shared `ComposerDraftStore` the phone uses — which is NOT the object graph, so a
+    // keystroke here costs a dictionary assignment and nothing else.
+    private var drafts: ComposerDraftStore { .shared }
     /// Guards the restore so it happens once per composer; a second one would overwrite
     /// live typing with a stale value.
     @State private var didRestoreDraft = false
+    /// Guards the once-per-composer save that puts this conversation on disk. See
+    /// `ComposerDraftThreadInsertion`.
+    @State private var didPersistThread = false
     /// What a restored draft lost, if anything (a recording mid-transcription, or the
     /// screen context the conversation was opened about). Nil almost always.
     @State private var draftNotice: String?
@@ -60,9 +64,9 @@ struct MacThreadDetailView: View {
             restoreDraft()
         }
         // Close the pending-write window wherever this composer stops being reachable.
-        .onDisappear { drafts.flush() }
+        .onDisappear { drafts.flush(thread.id) }
         .onChange(of: scenePhase) { _, phase in
-            if phase != .active { drafts.flush() }
+            if phase != .active { drafts.flushAll() }
         }
         .task(id: thread.id) {
             await coordinator.hydrate(thread: thread, context: context)
@@ -75,31 +79,46 @@ struct MacThreadDetailView: View {
     private func restoreDraft() {
         guard !didRestoreDraft else { return }
         didRestoreDraft = true
-        let saved = ComposerDraft.snapshot(of: thread)
+        let saved = drafts.snapshot(for: thread.id)
+        // A draft whose message already went is not a draft: the turn is saved before the
+        // draft is released, so a kill between the two leaves both on disk. Same rule as
+        // the phone's, through the same helper.
+        guard !ComposerDraftStaleness.isSpent(saved, newestUserTurn: newestUserTurn) else {
+            drafts.delete(thread.id)
+            return
+        }
         draft = saved.text
         draftNotice = ComposerDraftNotice.message(
             for: saved,
             contextStillAttached: coordinator.attachedContext(for: thread.id) != nil)
         if saved.pendingRecording != nil || saved.contextLabel != nil {
-            ComposerDraft.clearNotices(on: thread)
-            drafts.arm { persistDraft() }
+            drafts.clearNotices(for: thread.id)
         }
     }
 
-    /// Record the composer's text against THIS thread. The model write is immediate; the
-    /// save trails the last keystroke.
-    private func recordDraft() {
-        guard didRestoreDraft else { return }
-        let changed = ComposerDraft.write(
-            text: draft,
-            pendingRecording: recording.isInFlight ? recording.sourceName : nil,
-            contextLabel: coordinator.attachment(for: thread.id)?.contextLabel,
-            to: thread, in: context)
-        if changed { drafts.arm { persistDraft() } }
+    /// The visible text and date of this conversation's newest user turn. `visibleText`
+    /// because the turn's `text` may carry a screen context the composer never held.
+    private var newestUserTurn: (text: String, createdAt: Date)? {
+        guard let turn = thread.orderedTurns.last(where: { $0.isUser }) else { return nil }
+        return (turn.visibleText, turn.createdAt)
     }
 
-    private func persistDraft() {
-        try? context.save()
+    /// Record the composer's text against THIS thread. THE KEYSTROKE PATH: one dictionary
+    /// assignment in `ComposerDraftStore` and nothing else.
+    private func recordDraft() {
+        guard didRestoreDraft else { return }
+        let pending = recording.isInFlight ? recording.sourceName : nil
+        let label = coordinator.attachment(for: thread.id)?.contextLabel
+        // The one SwiftData write near a keystroke, and it happens at most once per
+        // composer: a draft whose conversation was never persisted is a draft with no way
+        // back to it.
+        if !didPersistThread, !draft.isEmpty || pending != nil || label != nil {
+            didPersistThread = true
+            ComposerDraftThreadInsertion.persistIfNeeded(thread, in: context,
+                                                         hasSomethingToKeep: true)
+        }
+        drafts.write(text: draft, pendingRecording: pending, contextLabel: label,
+                     for: thread.id)
     }
 
     /// The window subtitle. This used to read "Not yet started" off `sessionId == nil`, which
@@ -309,22 +328,20 @@ struct MacThreadDetailView: View {
     }
 
     /// THE COMPOSER IS CLEARED ONLY ON A DURABLE STAGE. `stageAndSend` persists the user
-    /// turn synchronously — in the same save that releases this thread's draft — and returns
-    /// whether that succeeded. A refused send and a staging save that threw both return
-    /// false, leave the draft in place, and leave the text on screen.
+    /// turn synchronously and returns whether that succeeded. A refused send and a staging
+    /// save that threw both return false, leave the draft in place, and leave the text on
+    /// screen — the release below is ORDERED AFTER the save and simply never runs.
     private func send() {
         guard canSend else { return }
         guard coordinator.stageAndSend(text: draft, mode: mode, thread: thread,
                                        context: context) else {
-            // The draft is still the truth, and `stageAndSend` may just have put it back
-            // after a failed save. Get it to disk now rather than wait on a debounce.
-            drafts.disarm()
-            persistDraft()
+            // Nothing was released, so the draft is still the truth. Get it to disk rather
+            // than wait out a quiet period.
+            drafts.flush(thread.id)
             return
         }
-        // Staged. The staging save persisted the release, so an armed draft write is both
-        // stale and unnecessary.
-        drafts.disarm()
+        // Durably staged: the user turn is on disk. Only now is the draft released.
+        drafts.release(for: thread.id)
         draft = ""
         draftNotice = nil
     }

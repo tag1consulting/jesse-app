@@ -1,5 +1,6 @@
 import SwiftUI
 import SwiftData
+import JesseCore
 import JesseSpeech
 
 // Thread history + concurrent threads. The thread list is the root; each thread
@@ -53,6 +54,17 @@ struct JesseApp: App {
             RootTabView(storeError: store.openFailure, replayerBox: replayerBox)
                 .environment(coordinator)
                 .task {
+                    // The draft store's launch chores, in order and before any composer
+                    // can restore: move anything still in the V5 SwiftData columns into
+                    // the file store (once, ever), then drop stored drafts for
+                    // conversations that no longer exist — the backstop for a delete this
+                    // store never saw, such as one that arrived from another device.
+                    let context = store.container.mainContext
+                    ComposerDraftMigration.runIfNeeded(context: context,
+                                                       store: .shared)
+                    if let live = try? context.fetch(FetchDescriptor<JesseThread>()) {
+                        ComposerDraftStore.shared.sweep(keeping: Set(live.map(\.id)))
+                    }
                     // Let the background worker reach the live coordinator, so a reply
                     // fetched while the app was in a pocket also clears the spinner and
                     // ends the Live Activity rather than waiting for the next foreground

@@ -63,12 +63,18 @@ struct ThreadDetailView: View {
     // `input` and `attachments` are now a MIRROR of `thread`'s persisted draft —
     // restored from it on appearance, written through to it on every edit.
     //
-    // The autosaver debounces only the DISK write; the model-side write happens on the
-    // keystroke itself. See `ComposerDraftAutosave`.
-    @State private var drafts = ComposerDraftAutosave()
+    // The draft does NOT live in the object graph, and a keystroke does not reach SwiftData
+    // or sqlite at all: `ComposerDraftStore.write` is one dictionary assignment on the main
+    // actor, and the file behind it is written off-main on a quiet period and at every
+    // point this composer stops being reachable. See `ComposerDraftStore`.
+    private var drafts: ComposerDraftStore { .shared }
     /// Guards the restore so it happens exactly once per composer, whatever SwiftUI does
     /// with `onAppear` — a second restore would overwrite live typing with a stale value.
     @State private var didRestoreDraft = false
+    /// Guards the once-per-composer save that puts this conversation on disk. See
+    /// `ComposerDraftThreadInsertion` — a draft whose conversation was never persisted is a
+    /// draft the user can never get back to.
+    @State private var didPersistThread = false
     /// The one-line honesty notice for a restored draft that lost something: a recording
     /// mid-transcription, or the screen context the conversation was opened about. Nil
     /// almost always. See `ComposerDraftNotice`.
@@ -191,9 +197,9 @@ struct ThreadDetailView: View {
         // stop being reachable. Neither of these is the durability mechanism — the debounce
         // is, and the model-side write has already happened — they just make the window
         // zero at the two moments it would otherwise matter most.
-        .onDisappear { drafts.flush() }
+        .onDisappear { drafts.flush(thread.id) }
         .onChange(of: scenePhase) { _, phase in
-            if phase != .active { drafts.flush() }
+            if phase != .active { drafts.flushAll() }
         }
         // DECLARATION ORDER IS LEFT-TO-RIGHT, ordered by taps per day: the star is a
         // one-tap toggle that undoes itself, so it is declared LAST and sits farthest
@@ -927,7 +933,15 @@ struct ThreadDetailView: View {
     private func restoreDraft() {
         guard !didRestoreDraft else { return }
         didRestoreDraft = true
-        let saved = ComposerDraft.snapshot(of: thread)
+        let saved = drafts.snapshot(for: thread.id)
+        // A draft whose message ALREADY WENT is not a draft. The turn is persisted before
+        // the draft is released, so a kill between the two leaves both on disk; this is
+        // where that window is closed, rather than by pretending the two stores share a
+        // transaction. See `ComposerDraftStaleness`.
+        guard !ComposerDraftStaleness.isSpent(saved, newestUserTurn: newestUserTurn) else {
+            drafts.delete(thread.id)
+            return
+        }
         input = saved.text
         attachments = saved.files.map {
             JesseAttachment(filename: $0.filename, mime: $0.mime, data: $0.data)
@@ -937,21 +951,30 @@ struct ThreadDetailView: View {
         draftNotice = ComposerDraftNotice.message(for: saved,
                                                   contextStillAttached: attachedContext != nil)
         if saved.pendingRecording != nil || saved.contextLabel != nil {
-            ComposerDraft.clearNotices(on: thread)
-            drafts.arm { persistDraft() }
+            drafts.clearNotices(for: thread.id)
         }
     }
 
+    /// The visible text and date of this conversation's newest user turn, for the
+    /// already-sent check above. `visibleText` and not `text`: the turn's `text` may carry
+    /// a screen context composed ahead of what the user typed, and the draft only ever
+    /// held the user's own half.
+    private var newestUserTurn: (text: String, createdAt: Date)? {
+        guard let turn = turns.last(where: { $0.isUser }) else { return nil }
+        return (turn.visibleText, turn.createdAt)
+    }
+
     /// Record the composer's text (and its two situational markers) against THIS thread.
-    /// The model write is immediate; the save trails the last keystroke.
+    /// THE KEYSTROKE PATH: one dictionary assignment in `ComposerDraftStore` and nothing
+    /// else. No model mutation, no `save`, no disk.
     private func recordDraft() {
         guard didRestoreDraft else { return }
-        let changed = ComposerDraft.write(
-            text: input,
-            pendingRecording: recording.isInFlight ? recording.sourceName : nil,
-            contextLabel: attachment?.contextLabel,
-            to: thread, in: context)
-        if changed { drafts.arm { persistDraft() } }
+        let pending = recording.isInFlight ? recording.sourceName : nil
+        let label = attachment?.contextLabel
+        persistThreadOnce(hasSomethingToKeep: !input.isEmpty || pending != nil
+                            || label != nil || !attachments.isEmpty)
+        drafts.write(text: input, pendingRecording: pending, contextLabel: label,
+                     for: thread.id)
     }
 
     /// Record the composer's staged files. Separate from `recordDraft` because it is the
@@ -961,17 +984,18 @@ struct ThreadDetailView: View {
         let files = attachments.map {
             ComposerDraftFile(filename: $0.filename, mime: $0.mime, data: $0.data)
         }
-        if ComposerDraft.writeFiles(files, to: thread, in: context) {
-            drafts.arm { persistDraft() }
-        }
+        persistThreadOnce(hasSomethingToKeep: !files.isEmpty || !input.isEmpty)
+        drafts.writeFiles(files, for: thread.id)
     }
 
-    private func persistDraft() {
-        do {
-            try context.save()
-        } catch {
-            Log.run.error("composer draft save failed: \(error.localizedDescription)")
-        }
+    /// The ONE SwiftData write anywhere near a keystroke, and it happens at most once per
+    /// composer: the conversation a draft belongs to has to exist on disk, or the draft is
+    /// a file with no way back to it. Every subsequent character returns on the guard.
+    private func persistThreadOnce(hasSomethingToKeep: Bool) {
+        guard !didPersistThread, hasSomethingToKeep else { return }
+        didPersistThread = true
+        ComposerDraftThreadInsertion.persistIfNeeded(thread, in: context,
+                                                     hasSomethingToKeep: true)
     }
 
     private func send() {
@@ -996,16 +1020,16 @@ struct ThreadDetailView: View {
         // return false, leave the draft in place, and leave the text on screen.
         guard coordinator.send(thread: thread, text: text, voice: false, context: context,
                                attachments: outgoing) else {
-            // The draft is still the truth, and `send` may just have put it back after a
-            // failed save. Get it to disk now rather than wait on a debounce that this
-            // send's arrival may have already consumed.
-            drafts.disarm()
-            persistDraft()
+            // Refused, or its staging save threw. Nothing was released — the release is
+            // ORDERED AFTER the save now — so the draft is still the truth. Get it to disk
+            // rather than wait out a quiet period.
+            drafts.flush(thread.id)
             return
         }
-        // Staged. The staging save persisted the release, so any armed draft write is both
-        // stale and unnecessary — drop it rather than let it fire after the handoff.
-        drafts.disarm()
+        // Durably staged: the user turn and its outbox item are on disk. ONLY NOW is the
+        // draft released, and that order is the whole of the replacement for the single
+        // save this used to ride in. See `ComposerDraftStore`'s header.
+        drafts.release(for: thread.id)
         input = ""
         attachments = []
         attachError = nil

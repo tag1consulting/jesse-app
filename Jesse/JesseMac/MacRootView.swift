@@ -183,10 +183,11 @@ struct MacRootView: View {
         for t in threads where t.turns.isEmpty
             && (t.sessionId ?? "").isEmpty
             && t.registeredAt == nil
-            && !t.hasComposerDraft
+            && !ComposerDraftStore.shared.hasDraft(t.id)
             && !(coordinator.isRunning && coordinator.activeThreadID == t.id) {
             if selection == t.id { selection = nil }
             if let cid = t.conversationId, !cid.isEmpty { MacCursorStore.clear(cid) }
+            ComposerDraftStore.shared.delete(t.id)
             context.delete(t)
             pruned += 1
         }
@@ -476,6 +477,9 @@ struct MacRootView: View {
             coordinator.enqueueSessionDeletion(cid)
             MacCursorStore.clear(cid)
         }
+        // The draft no longer cascades with the row (it lives outside the object graph),
+        // so it is dropped explicitly here.
+        ComposerDraftStore.shared.delete(thread.id)
         context.delete(thread)
         try? context.save()
     }
