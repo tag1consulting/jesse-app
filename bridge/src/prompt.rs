@@ -80,9 +80,40 @@ summary for text-to-speech — plain prose, no markdown, no lists, no URLs.)";
 
 // Appended to non-voice prompts so replies stay readable on a narrow phone
 // screen. Mutually exclusive with VOICE_SUFFIX (voice forbids markdown entirely).
+//
+// This governs SHAPE, not just typography: where the answer goes, how long a
+// list runs, and where a reply stops. The earlier text asked only for short
+// paragraphs and bullets, which left replies free to open with context, bury
+// the conclusion, and close with an offer to do more.
+//
+// Three properties are load-bearing and are pinned by a test:
+//  1. ASCII only, so the const survives log and transcript round trips (the
+//     previous text carried a literal en dash in "2-3 narrow columns").
+//  2. No em dash, en dash, or double hyphen: house style, and the reply tends
+//     to mirror the punctuation it is instructed in.
+//  3. Short. It rides on EVERY non-voice turn, so its length is a permanent
+//     per-turn token cost; a rule that needs a paragraph does not belong here.
+// It is also deliberately free of owner pronouns: unlike the preambles and
+// floors, this const is pushed raw, never run through `Persona` placeholder
+// rendering, so a gendered word here would outlive a persona that sets another.
 pub const PHONE_FORMAT: &str = "\n\n(Formatting: this reply is shown on a narrow phone \
-screen. Prefer short paragraphs and bullet lists. Use Markdown. If a table is the \
-clearest form, keep it to 2–3 narrow columns; otherwise avoid tables.)";
+screen and read once, fast. Shape it so the answer cannot be missed.\n\
+1. The first line is the answer, the number, or the action. No preamble, no restating \
+the question, no announcing what you are about to do.\n\
+2. More than one thing to do: a numbered list, one action per step, the fewest steps \
+that work.\n\
+3. Cap any list at 5 items, ranked. Past 5, split into now and later.\n\
+4. Short paragraphs and bullets. Use Markdown. A table only when it is the clearest \
+form, 2 or 3 narrow columns.\n\
+5. Bold the one number, name, or path a paragraph turns on. At most one per paragraph.\n\
+6. When something failed: what failed, the cause, the fix. No softening, no 'uh oh'.\n\
+7. When work is still in flight, say where it stands ('2 of 4 done, next is X'). \
+Nothing offscreen is remembered.\n\
+8. A second issue is not folded in. Finish what was asked, then offer it in one line.\n\
+9. End when the answer ends. Add one concrete next step only if something is still \
+open. No recap, no summary of what you wrote, no 'let me know if'.\n\
+Asked to explain or compare, the body runs as long as the topic needs; the shape stays \
+and headers keep it skimmable.)";
 
 // Standing capability note appended to every turn, ahead of the voice/phone
 // suffix so the voice `SPOKEN:` line still comes last. Two jobs:
@@ -1549,6 +1580,40 @@ day, scanners, currency, or cheatsheets, and do not rebuild Today.md."
         assert!(!with_voice.contains(PHONE_FORMAT));
         let without = bp("ask", "q", false, false, None, None);
         assert!(!without.contains(VOICE_SUFFIX));
+    }
+    // The phone-format suffix rides on every non-voice turn and never on a voice
+    // one, and its text is a permanent per-turn token cost, so the three properties
+    // the const's doc comment claims are asserted here rather than trusted: plain
+    // ASCII (it round-trips through logs and transcripts), no em dash, en dash or
+    // double hyphen (house style, and the reply mirrors what it is instructed in),
+    // and short enough that nobody grows it a paragraph at a time.
+    #[test]
+    fn phone_format_is_plain_ascii_and_rides_every_non_voice_turn() {
+        assert!(
+            PHONE_FORMAT.is_ascii(),
+            "PHONE_FORMAT must be ASCII so it survives log/transcript round trips"
+        );
+        for banned in ["\u{2014}", "\u{2013}", "--"] {
+            assert!(
+                !PHONE_FORMAT.contains(banned),
+                "PHONE_FORMAT must not contain {banned:?}"
+            );
+        }
+        let words = PHONE_FORMAT.split_whitespace().count();
+        assert!(
+            words < 250,
+            "PHONE_FORMAT is appended to every non-voice turn; {words} words is too many"
+        );
+        // Both non-voice modes carry it...
+        for mode in ["ask", "tell"] {
+            let fresh = bp(mode, "q", false, false, None, None);
+            assert!(fresh.ends_with(PHONE_FORMAT), "{mode} fresh");
+            let followup = bp(mode, "q", true, false, None, None);
+            assert!(followup.ends_with(PHONE_FORMAT), "{mode} followup");
+            // ...and neither carries it by voice, which forbids markdown outright.
+            let spoken = bp(mode, "q", false, true, None, None);
+            assert!(!spoken.contains(PHONE_FORMAT), "{mode} voice");
+        }
     }
     #[test]
     fn build_prompt_override_substitutes_active_wrapper() {
