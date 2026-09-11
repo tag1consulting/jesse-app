@@ -1,52 +1,61 @@
 import Foundation
 import SwiftData
-#if os(iOS)
-import UIKit
-#elseif os(macOS)
-import AppKit
-#endif
 
-// The composer's unsent draft: where it lives, what a keystroke costs, and how a send
-// takes ownership of it.
+// The composer's unsent draft: what it is, when it is written, and what a keystroke costs.
 //
-// ── WHY THIS IS NOT IN SWIFTDATA ─────────────────────────────────────────────────────
-// It was, and typing paid for it. The draft's first shape put the text on `JesseThread`
-// and wrote it on every keystroke. The write itself is cheap — 23 µs, measured — but the
-// view's main `ModelContext` has autosave on, so a dirtied context saves itself on the
-// run loop whatever the debounce in front of `save()` intends. Measured in the simulator,
-// 200 keystrokes into a conversation produced 197 sqlite transactions, 246 ms of
-// main-thread time inside `save`, and 391 extra `ThreadDetailView` body evaluations from
-// the fan-out those saves triggered on every `@Query` over the container. The 250 ms
-// debounce never decided anything.
+// ── NOTHING REACTS TO TYPING ─────────────────────────────────────────────────────────
+// While a composer is on screen, its own `@State` IS the draft. No keystroke touches
+// anything else in the app: not this store, not a `ModelContext`, not a file, not a
+// `Task`. There is no per-character hook to be cheap about, because there is no
+// per-character hook.
 //
-// So the draft is not a model object. It is a small per-device file per conversation, and
-// the keystroke path is one dictionary assignment on the main actor: no SwiftData
-// mutation, no save, no `@Query` refetch, no file I/O. `ComposerDraftStoreTests`
-// asserts that with a counting writer and `context.hasChanges`.
+// The draft is captured at DEPARTURES, and there are four: the chat view disappearing,
+// the app leaving the foreground, termination, and send. Each capture updates one
+// dictionary and writes it, once, off the main thread. Those are human-scale events — a
+// few dozen a day — so there is no debounce, no quiet period, no timer, no dirty set and
+// no generation counter here to go wrong.
 //
-// ── WHAT THAT COSTS, STATED PLAINLY ──────────────────────────────────────────────────
-// The old shape could hand a draft to a send ATOMICALLY: the save that persisted the
-// outbox item was the same save that dropped the draft, so the message was never in
-// neither place and never in both. Two stores cannot do that, and this one does not
-// claim to. The replacement is an ORDER plus a RECONCILIATION:
+// Two everyday things this has to survive, and it is shaped by both:
 //
-//   1. The turn is persisted FIRST (`RunCoordinator.send` / `MacStore.send` save it).
-//   2. The draft is released SECOND, and only on a `true` return — so a refused send or
-//      a staging save that threw never releases anything, and the text stays on screen.
-//   3. The window between them is a real one: a kill there leaves the turn on disk and
-//      the draft file beside it. `ComposerDraftStaleness.isSpent` closes it on RESTORE —
-//      a draft whose text is the thread's newest user turn, and which predates that turn,
-//      has already been sent and is discarded rather than shown again.
+//   1. Switching conversations to go and read something earlier, then coming back. Every
+//      conversation typed into holds its own text, several at a time — that is the
+//      DICTIONARY, and a switch costs one `onDisappear` capture.
+//   2. Leaving the app and coming back much later, to a process the system has reclaimed.
+//      A cold launch has to put the drafts back — that is the FILE, read once at launch
+//      before any composer can appear.
 //
-// The exposure that remains is the one the requirement actually wants: a hard kill can
-// lose the seconds since the last quiet period. Nothing is lost on navigation,
-// backgrounding, a clean quit, a relaunch or a send — those flush unconditionally.
+// ── WHAT IS DELIBERATELY LOST ────────────────────────────────────────────────────────
+// Two things, both stated in the CHANGELOG rather than hidden here:
+//
+//   * A kill that runs NO CODE (a crash; Force Quit on the Mac with the window frontmost)
+//     loses whatever was typed since the last departure. On the phone that window is
+//     effectively zero, because reaching the app switcher backgrounds the app first. An
+//     ORDINARY quit is not in this category: the termination capture writes on the calling
+//     thread, precisely because an async write there may never get a turn.
+//   * Staged FILES are held in the dictionary and never written to disk, so they survive a
+//     switch between conversations and do not survive a cold launch. A draft that comes
+//     back without them SAYS SO, the way the recording and context notices already do.
+//
+// ── WHY NOT SWIFTDATA (still true, and the reason 131 existed) ───────────────────────
+// The draft's first shape put the text on `JesseThread` and wrote it on every keystroke.
+// The write itself was cheap — 23 µs — but the view's main `ModelContext` has autosave on,
+// so a dirtied context saves itself on the run loop whatever any debounce intends: 200
+// keystrokes produced 197 sqlite transactions and 391 extra body evaluations from the
+// `@Query` fan-out. The draft is therefore not a model object, and now it is not even a
+// per-keystroke dictionary assignment.
+//
+// ── THE SEND HANDOFF ─────────────────────────────────────────────────────────────────
+// The draft and the turn live in two stores, so a send cannot be one atomic save. The
+// replacement is an ORDER plus a RECONCILIATION: the turn is persisted FIRST, the draft is
+// released SECOND and only on a `true` return, and on restore `ComposerDraftStaleness`
+// discards a draft that is already the thread's newest user turn. A refused send or a
+// staging save that threw releases nothing and leaves the text on screen.
 
 /// One file staged in a composer, as a value — the platform-neutral shape of a draft
 /// attachment.
 ///
-/// The iOS composer's own `JesseAttachment` lives in the app target and carries a
-/// UI identity; this is the same bytes without it, so the shared draft layer never has to
+/// The iOS composer's own `JesseAttachment` lives in the app target and carries a UI
+/// identity; this is the same bytes without it, so the shared draft layer never has to
 /// know what a chip looks like.
 public nonisolated struct ComposerDraftFile: Equatable, Sendable, Codable {
     public var filename: String
@@ -60,194 +69,275 @@ public nonisolated struct ComposerDraftFile: Equatable, Sendable, Codable {
     }
 }
 
+/// A composer's current state, as the thing a departure hands over.
+///
+/// Every departure on both shells builds one of these and passes it to
+/// `ComposerDrafts.capture`. It is the whole contract between a view and this layer: a
+/// shell that has different values to hand converts them into this and calls that one
+/// function — it never reaches past it to mutate the dictionary or write the file.
+public nonisolated struct ComposerDraftCapture: Equatable, Sendable {
+    /// The unsent text, byte-for-byte as the composer holds it.
+    public var text: String
+    /// The staged files. Held in memory only; see the header.
+    public var files: [ComposerDraftFile]
+    /// A recording whose transcription is still running as the composer is left.
+    public var pendingRecording: String?
+    /// The label of the screen context attached to this conversation, if any.
+    public var contextLabel: String?
+
+    public init(text: String, files: [ComposerDraftFile] = [],
+                pendingRecording: String? = nil, contextLabel: String? = nil) {
+        self.text = text
+        self.files = files
+        self.pendingRecording = pendingRecording
+        self.contextLabel = contextLabel
+    }
+
+    /// Whether there is anything here at all — what decides whether a never-saved
+    /// conversation is worth inserting for.
+    public var isEmpty: Bool {
+        text.isEmpty && files.isEmpty && pendingRecording == nil && contextLabel == nil
+    }
+}
+
 /// Everything a composer needs to put itself back the way the user left it.
 public nonisolated struct ComposerDraftSnapshot: Equatable, Sendable {
-    /// The unsent text, byte-for-byte as it was recorded: newlines, Unicode and
-    /// whitespace all preserved. Empty for a composer the user deliberately emptied AND
-    /// for one that never had a draft — the difference matters to the reaper (see
+    /// The unsent text, byte-for-byte as it was recorded: newlines, Unicode and whitespace
+    /// all preserved. Empty for a composer the user deliberately emptied AND for one that
+    /// never had a draft — the difference matters to the reaper (see
     /// `ComposerDraftStore.hasDraft`), never to what gets shown.
     public var text: String
     public var files: [ComposerDraftFile]
-    /// A recording whose transcription was still running when this draft was recorded.
+    /// A recording whose transcription was still running when this draft was captured.
     /// Non-nil on restore means that run never finished (see `ComposerDraftNotice`).
     public var pendingRecording: String?
-    /// The label of the screen context attached when this draft was recorded, if any.
+    /// The label of the screen context attached when this draft was captured, if any.
     public var contextLabel: String?
-    /// When this draft was last recorded. Nil for a draft that was never recorded. Read
-    /// by `ComposerDraftStaleness` to tell a live draft from one a send already spent.
+    /// When this draft was last captured. Nil for a draft that was never captured. Read by
+    /// `ComposerDraftStaleness` to tell a live draft from one a send already spent.
     public var updatedAt: Date?
+    /// How many staged files this draft HAD and does not have now — the count that was
+    /// captured, less what is still in memory. Non-zero after a cold launch (files are
+    /// never written to disk) or an eviction, and what `ComposerDraftNotice` names.
+    public var lostFiles: Int
 
     public init(text: String, files: [ComposerDraftFile] = [],
                 pendingRecording: String? = nil, contextLabel: String? = nil,
-                updatedAt: Date? = nil) {
+                updatedAt: Date? = nil, lostFiles: Int = 0) {
         self.text = text
         self.files = files
         self.pendingRecording = pendingRecording
         self.contextLabel = contextLabel
         self.updatedAt = updatedAt
+        self.lostFiles = lostFiles
     }
 
-    /// Whether there is anything here at all — used to decide whether a draft is worth
-    /// inserting a not-yet-persisted conversation for.
     public var isEmpty: Bool {
         text.isEmpty && files.isEmpty && pendingRecording == nil && contextLabel == nil
     }
 
     /// Whether this draft is worth keeping a turn-less conversation alive for. The two
-    /// one-shot markers deliberately do NOT count, exactly as they never did: a draft is
-    /// text or files.
+    /// one-shot markers deliberately do NOT count: a draft is text or files.
     public var isWorthKeeping: Bool { !text.isEmpty || !files.isEmpty }
 }
 
-// MARK: - Persistence
-
-/// What one conversation's draft looks like on disk. Split from `ComposerDraftSnapshot`
-/// so the attachment BYTES stay out of the json: the manifest names them, the writer puts
-/// each one in its own file, and a 20 MB staged photo is never base64'd into a document
-/// that gets rewritten every quiet period.
+/// One conversation's draft as the dictionary holds it: everything, files included.
 public nonisolated struct ComposerDraftRecord: Equatable, Sendable {
     public var text: String
     public var pendingRecording: String?
     public var contextLabel: String?
     public var updatedAt: Date
     public var files: [ComposerDraftFile]
+    /// How many files were staged when this draft was captured. Survives the trip to disk
+    /// even though the bytes do not, so a restored composer can SAY what is missing
+    /// instead of quietly turning into a different message.
+    public var stagedFileCount: Int
 
     public init(text: String, pendingRecording: String? = nil, contextLabel: String? = nil,
-                updatedAt: Date, files: [ComposerDraftFile] = []) {
+                updatedAt: Date, files: [ComposerDraftFile] = [],
+                stagedFileCount: Int? = nil) {
         self.text = text
         self.pendingRecording = pendingRecording
         self.contextLabel = contextLabel
         self.updatedAt = updatedAt
         self.files = files
+        self.stagedFileCount = stagedFileCount ?? files.count
     }
 
     public var snapshot: ComposerDraftSnapshot {
         ComposerDraftSnapshot(text: text, files: files, pendingRecording: pendingRecording,
-                              contextLabel: contextLabel, updatedAt: updatedAt)
+                              contextLabel: contextLabel, updatedAt: updatedAt,
+                              lostFiles: max(0, stagedFileCount - files.count))
+    }
+
+    /// How much of the in-memory budget this record is using.
+    var retainedBytes: Int {
+        text.utf8.count + files.reduce(0) { $0 + $1.data.count }
     }
 }
 
-/// The store's back end. A protocol so a test can COUNT writes — which is the only way to
-/// assert the thing this whole change exists for, that typing does not write anything.
+// MARK: - Persistence
+
+/// One conversation's draft as DISK holds it: the same thing without the bytes.
 ///
-/// Reads are synchronous and writes are not, deliberately. A composer has to be put back
-/// the instant its view exists (an `await` there is a visible frame of empty field), and
-/// one small file read on first appearance is nothing; a WRITE on the other hand must
-/// never be on the main thread, and never on the keystroke.
-public protocol ComposerDraftWriting: Sendable {
-    /// Every conversation id that has something stored. Called once, at startup.
-    func storedIDs() -> Set<UUID>
-    /// Read one conversation's draft. Synchronous; nil when there is none.
-    func load(_ id: UUID) -> ComposerDraftRecord?
-    /// Write one conversation's draft. `generation` is monotonic per id; a writer that
-    /// has already written a HIGHER generation for that id must drop this call, because
-    /// `Task` ordering into an actor is not FIFO and a stale write would resurrect text
-    /// the user has already changed or sent.
-    func write(_ record: ComposerDraftRecord, for id: UUID, generation: UInt64) async
-    /// Remove one conversation's draft entirely. Ordered against `write` by the SAME
-    /// monotonic `generation`: a release followed by a restore (a draft put back) must not
-    /// be beaten by its own delete, and a delete must not be beaten by a stale write.
-    func delete(_ id: UUID, generation: UInt64) async
+/// Staged files are deliberately absent. Writing them would mean recopying a 20 MB photo
+/// at every departure, for a case — a cold launch with an unsent photo attached — that the
+/// composer can honestly report instead of silently paying for.
+public nonisolated struct ComposerDraftPersisted: Equatable, Sendable, Codable {
+    public var text: String
+    public var pendingRecording: String?
+    public var contextLabel: String?
+    public var updatedAt: Date
+    /// How many files were staged. The COUNT crosses to disk even though the bytes do not,
+    /// so a cold-launched composer can name what is missing.
+    public var stagedFileCount: Int
+
+    public init(text: String, pendingRecording: String? = nil, contextLabel: String? = nil,
+                updatedAt: Date, stagedFileCount: Int = 0) {
+        self.text = text
+        self.pendingRecording = pendingRecording
+        self.contextLabel = contextLabel
+        self.updatedAt = updatedAt
+        self.stagedFileCount = stagedFileCount
+    }
+
+    // Hand-written so a document missing a key decodes rather than taking EVERY draft in
+    // the file down with it. The map is one document: a throw here is total loss.
+    private enum CodingKeys: String, CodingKey {
+        case text, pendingRecording, contextLabel, updatedAt, stagedFileCount
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        text = try c.decodeIfPresent(String.self, forKey: .text) ?? ""
+        pendingRecording = try c.decodeIfPresent(String.self, forKey: .pendingRecording)
+        contextLabel = try c.decodeIfPresent(String.self, forKey: .contextLabel)
+        updatedAt = try c.decodeIfPresent(Date.self, forKey: .updatedAt) ?? Date()
+        stagedFileCount = try c.decodeIfPresent(Int.self, forKey: .stagedFileCount) ?? 0
+    }
 }
 
-/// The on-disk writer: one directory per conversation under Application Support.
+/// The store's back end, and the only thing in the app that knows the draft file's format
+/// or its path.
 ///
-///     ComposerDrafts/<conversation uuid>/draft.json      text, markers, manifest
-///     ComposerDrafts/<conversation uuid>/files/<n>-<name>  the staged bytes
+/// A protocol so a test can COUNT writes — which is how the two claims this change exists
+/// for are asserted at all: that typing writes nothing, and that every departure path on
+/// both shells routes through this one door.
 ///
-/// An actor, so writes for one conversation are serialized against each other and none of
-/// them is on the main thread.
+/// `load` is synchronous and `write` is not, deliberately. The map has to be in hand
+/// before any composer can appear (an `await` there is a visible frame of empty field),
+/// and it is one small text-only document; a WRITE on the other hand must never be on the
+/// main thread.
+public protocol ComposerDraftWriting: Sendable {
+    /// Every stored draft, read once at launch.
+    func load() -> [UUID: ComposerDraftPersisted]
+    /// Replace the stored map with this one. Called only by `ComposerDraftStore.persist`.
+    func write(_ map: [UUID: ComposerDraftPersisted]) async
+    /// The same write, on the CALLING thread, for termination and nothing else.
+    ///
+    /// A quit is the one departure where an asynchronous write may never get a turn: the
+    /// handler returns and the process is gone. Everywhere else the main thread must not
+    /// be made to wait on a file, so everywhere else uses `write`.
+    func writeNow(_ map: [UUID: ComposerDraftPersisted])
+}
+
+/// The on-disk writer: ONE file under Application Support holding every conversation's
+/// draft text.
+///
+///     ComposerDrafts.json     { "<conversation uuid>": { text, markers, updatedAt } }
+///
+/// An actor, so the write is off the main thread and one write cannot interleave with
+/// another. It holds no schedule and no state beyond its own path: it writes the map it is
+/// handed.
 public actor ComposerDraftFileWriter: ComposerDraftWriting {
-    private let root: URL
-    /// The highest generation written per id, so an out-of-order `Task` is dropped rather
-    /// than allowed to write backwards.
-    private var written: [UUID: UInt64] = [:]
+    private let file: URL
+    /// The 131-and-earlier shape, adopted and removed once. See `load`.
+    private let legacyDirectory: URL
 
     public init(root: URL = ComposerDraftFileWriter.defaultRoot) {
-        self.root = root
+        self.file = root.appendingPathComponent("ComposerDrafts.json")
+        self.legacyDirectory = root.appendingPathComponent("ComposerDrafts", isDirectory: true)
     }
 
     public static var defaultRoot: URL {
-        let base = (try? FileManager.default.url(for: .applicationSupportDirectory,
-                                                 in: .userDomainMask,
-                                                 appropriateFor: nil, create: true))
+        (try? FileManager.default.url(for: .applicationSupportDirectory,
+                                      in: .userDomainMask,
+                                      appropriateFor: nil, create: true))
             ?? FileManager.default.temporaryDirectory
-        return base.appendingPathComponent("ComposerDrafts", isDirectory: true)
     }
 
-    private nonisolated func directory(_ id: UUID) -> URL {
-        root.appendingPathComponent(id.uuidString, isDirectory: true)
-    }
-
-    public nonisolated func storedIDs() -> Set<UUID> {
-        let names = (try? FileManager.default.contentsOfDirectory(atPath: root.path)) ?? []
-        return Set(names.compactMap(UUID.init(uuidString:)))
-    }
-
-    public nonisolated func load(_ id: UUID) -> ComposerDraftRecord? {
-        let dir = directory(id)
-        guard let data = try? Data(contentsOf: dir.appendingPathComponent("draft.json")),
-              let doc = try? JSONDecoder().decode(StoredDraft.self, from: data)
-        else { return nil }
-        let files: [ComposerDraftFile] = doc.files.compactMap { entry in
-            guard let bytes = try? Data(contentsOf: dir.appendingPathComponent("files",
-                                                                               isDirectory: true)
-                .appendingPathComponent(entry.storedName)) else { return nil }
-            return ComposerDraftFile(filename: entry.filename, mime: entry.mime, data: bytes)
+    public nonisolated func load() -> [UUID: ComposerDraftPersisted] {
+        var map: [UUID: ComposerDraftPersisted] = [:]
+        if let data = try? Data(contentsOf: file),
+           let stored = try? JSONDecoder().decode([String: ComposerDraftPersisted].self,
+                                                  from: data) {
+            for (key, value) in stored {
+                guard let id = UUID(uuidString: key) else { continue }
+                map[id] = value
+            }
         }
-        return ComposerDraftRecord(text: doc.text, pendingRecording: doc.pendingRecording,
-                                   contextLabel: doc.contextLabel,
-                                   updatedAt: doc.updatedAt, files: files)
+        adoptLegacyDrafts(into: &map)
+        return map
     }
 
-    public func write(_ record: ComposerDraftRecord, for id: UUID, generation: UInt64) async {
-        guard generation > (written[id] ?? 0) else { return }
-        written[id] = generation
-        let dir = directory(id)
-        let filesDir = dir.appendingPathComponent("files", isDirectory: true)
+    /// Take over what 131's per-conversation directories are still holding, then delete
+    /// them.
+    ///
+    /// 131 wrote `ComposerDrafts/<uuid>/draft.json` plus a `files/` directory beside it.
+    /// Upgrading without this would both lose a draft in progress and leave those
+    /// directories on disk forever. A one-shot in practice: it removes the tree, so the
+    /// second launch finds nothing and the directory listing costs one failed `stat`.
+    /// The attachment bytes are NOT adopted — nothing writes them any more.
+    private nonisolated func adoptLegacyDrafts(into map: inout [UUID: ComposerDraftPersisted]) {
+        let names = (try? FileManager.default.contentsOfDirectory(atPath: legacyDirectory.path))
+        guard let names, !names.isEmpty else {
+            try? FileManager.default.removeItem(at: legacyDirectory)
+            return
+        }
+        for name in names {
+            guard let id = UUID(uuidString: name), map[id] == nil else { continue }
+            let url = legacyDirectory.appendingPathComponent(name, isDirectory: true)
+                .appendingPathComponent("draft.json")
+            guard let data = try? Data(contentsOf: url),
+                  let doc = try? JSONDecoder().decode(LegacyDraft.self, from: data)
+            else { continue }
+            map[id] = ComposerDraftPersisted(text: doc.text,
+                                             pendingRecording: doc.pendingRecording,
+                                             contextLabel: doc.contextLabel,
+                                             updatedAt: doc.updatedAt,
+                                             stagedFileCount: doc.files.count)
+        }
+        try? FileManager.default.removeItem(at: legacyDirectory)
+    }
+
+    public func write(_ map: [UUID: ComposerDraftPersisted]) async {
+        Self.encode(map, to: file)
+    }
+
+    public nonisolated func writeNow(_ map: [UUID: ComposerDraftPersisted]) {
+        Self.encode(map, to: file)
+    }
+
+    /// The write itself, written once and reached from both doors above.
+    private nonisolated static func encode(_ map: [UUID: ComposerDraftPersisted],
+                                           to file: URL) {
         do {
-            try FileManager.default.createDirectory(at: filesDir, withIntermediateDirectories: true)
-            // Attachment bytes are rewritten only when the manifest changes; a keystroke
-            // never reaches here at all, and a quiet-period flush that only changed the
-            // text must not recopy megabytes. Compared by (name, mime, byte count), the
-            // same identity `writeFiles` uses.
-            let existing = (try? FileManager.default.contentsOfDirectory(atPath: filesDir.path)) ?? []
-            var entries: [StoredDraft.FileEntry] = []
-            var keep: Set<String> = []
-            for (offset, file) in record.files.enumerated() {
-                let storedName = "\(offset)-\(file.filename.replacingOccurrences(of: "/", with: "_"))"
-                keep.insert(storedName)
-                let url = filesDir.appendingPathComponent(storedName)
-                let size = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size]
-                            as? Int) ?? nil
-                if size != file.data.count {
-                    try file.data.write(to: url, options: .atomic)
-                }
-                entries.append(StoredDraft.FileEntry(filename: file.filename, mime: file.mime,
-                                                     storedName: storedName))
+            guard !map.isEmpty else {
+                try? FileManager.default.removeItem(at: file)
+                return
             }
-            for stale in existing where !keep.contains(stale) {
-                try? FileManager.default.removeItem(at: filesDir.appendingPathComponent(stale))
-            }
-            let doc = StoredDraft(text: record.text, pendingRecording: record.pendingRecording,
-                                  contextLabel: record.contextLabel, updatedAt: record.updatedAt,
-                                  files: entries)
-            let data = try JSONEncoder().encode(doc)
-            try data.write(to: dir.appendingPathComponent("draft.json"), options: .atomic)
+            var stored: [String: ComposerDraftPersisted] = [:]
+            for (id, record) in map { stored[id.uuidString] = record }
+            try JSONEncoder().encode(stored).write(to: file, options: .atomic)
         } catch {
             // A draft that could not be written is a draft that will be written again at
-            // the next quiet period or flush point. Nothing here is worth taking the app
-            // down for, and there is no user-facing action.
+            // the next departure. Nothing here is worth taking the app down for, and there
+            // is no user-facing action.
         }
     }
 
-    public func delete(_ id: UUID, generation: UInt64) async {
-        guard generation > (written[id] ?? 0) else { return }
-        written[id] = generation
-        try? FileManager.default.removeItem(at: directory(id))
-    }
-
-    private struct StoredDraft: Codable {
+    /// 131's per-conversation document, read once on the way out.
+    private struct LegacyDraft: Codable {
         struct FileEntry: Codable {
             var filename: String
             var mime: String
@@ -263,14 +353,15 @@ public actor ComposerDraftFileWriter: ComposerDraftWriting {
 
 // MARK: - The store
 
-/// The one place a composer's unsent draft is read and written, on both shells.
+/// The drafts, as one dictionary on the main actor with one file behind it.
 ///
-/// Main-actor and in-memory in front, a serialized off-main writer behind. Every method
-/// here except `flush`/`flushAll`/`release`/`delete` is pure memory.
+/// A plain class and NOT `@Observable`: nothing observes it. A composer reads it once on
+/// appear and writes it once per departure, so an observation relationship would only buy
+/// body evaluations nobody asked for.
 @MainActor
 public final class ComposerDraftStore {
 
-    /// The app's store. Views and the reapers use this.
+    /// The app's store. Views, the migration and the reapers use this.
     ///
     /// A `var` so a test can substitute one over a temporary directory: the reapers and the
     /// delete paths reach for `shared` by name, and pointing them at a scratch store is the
@@ -278,66 +369,37 @@ public final class ComposerDraftStore {
     /// Nothing in the app assigns it.
     public static var shared = ComposerDraftStore()
 
+    /// How many bytes of draft may be held in memory at once, across every conversation.
+    /// Three conversations' worth of a full 20 MB attachment set, which is far more than
+    /// anyone stages and still bounded.
+    public nonisolated static let defaultByteCap = 64 * 1024 * 1024
+
     private let writer: ComposerDraftWriting
-    /// How long after the last edit an idle draft reaches disk. A BACKSTOP, not the
-    /// contract: the contract is the unconditional flush at every point the composer stops
-    /// being reachable. Two seconds because losing the last couple of seconds of typing to
-    /// a hard kill is acceptable and paying for durability on every keystroke is not.
-    public let quietPeriod: Duration
+    private let byteCap: Int
 
-    /// The live drafts, by conversation id. The keystroke path writes here and nowhere
-    /// else.
-    private var drafts: [UUID: ComposerDraftRecord] = [:]
-    /// Ids whose disk copy has not been read into `drafts` yet.
-    private var unloaded: Set<UUID>
-    /// Ids with an unwritten change, and the monotonic stamp the writer orders by.
-    private var dirty: Set<UUID> = []
-    private var generation: UInt64 = 0
-    /// The single in-flight quiet-period task. ONE per burst of typing, not one per
-    /// keystroke: `arm` re-reads `lastEdit` when it wakes and sleeps again if the burst is
-    /// still going, so a hundred characters allocate one `Task`, not a hundred.
-    private var timer: Task<Void, Never>?
-    private var lastEdit: ContinuousClock.Instant = .now
+    /// The live drafts, by conversation id. One entry per conversation, any number at once.
+    private var drafts: [UUID: ComposerDraftRecord]
 
-    /// The lifecycle observers, in a box a `nonisolated deinit` may touch: a test's own
-    /// store must not leave them behind, and the deinit cannot reach main-actor state.
-    private nonisolated final class LifecycleTokens: @unchecked Sendable {
-        var tokens: [NSObjectProtocol] = []
-        deinit { for t in tokens { NotificationCenter.default.removeObserver(t) } }
-    }
-    private nonisolated let lifecycleTokens = LifecycleTokens()
+    /// The write in flight, so the next one can be chained behind it. NOT a schedule and
+    /// not a dirty set: it exists only so two departures a microsecond apart reach disk in
+    /// the order they happened, without a generation counter to keep in step.
+    private var writeTask: Task<Void, Never>?
+    /// Set by the terminating write. After it, nothing else reaches disk — the process is
+    /// on its way out and that map is the last word.
+    private var terminated = false
 
+    /// Reads the stored map ONCE, synchronously, so every draft is in hand before any
+    /// composer can appear.
     public init(writer: ComposerDraftWriting = ComposerDraftFileWriter(),
-                quietPeriod: Duration = .seconds(2),
-                observesAppLifecycle: Bool = true) {
+                byteCap: Int = ComposerDraftStore.defaultByteCap) {
         self.writer = writer
-        self.quietPeriod = quietPeriod
-        self.unloaded = writer.storedIDs()
-        if observesAppLifecycle { observeAppLifecycle() }
-    }
-
-    /// THE DURABILITY CONTRACT, and it lives here rather than in each shell's view so it
-    /// cannot be half-wired. The quiet period is a backstop; these are the guarantee.
-    /// Backgrounding, resigning active and terminating all flush unconditionally — which,
-    /// with the composers' own `onDisappear` and the send path, leaves exactly one way to
-    /// lose text: a hard kill inside the quiet period. That loss is accepted.
-    private func observeAppLifecycle() {
-        #if os(iOS)
-        let names: [Notification.Name] = [UIApplication.willResignActiveNotification,
-                                          UIApplication.didEnterBackgroundNotification,
-                                          UIApplication.willTerminateNotification]
-        #elseif os(macOS)
-        let names: [Notification.Name] = [NSApplication.willResignActiveNotification,
-                                          NSApplication.willTerminateNotification]
-        #else
-        let names: [Notification.Name] = []
-        #endif
-        for name in names {
-            lifecycleTokens.tokens.append(
-                NotificationCenter.default.addObserver(forName: name, object: nil,
-                                                       queue: .main) { [weak self] _ in
-                    MainActor.assumeIsolated { self?.flushAll() }
-                })
+        self.byteCap = byteCap
+        self.drafts = writer.load().mapValues {
+            // Files are not on disk, and `stagedFileCount` is how the composer knows to
+            // say so rather than silently coming back as a different message.
+            ComposerDraftRecord(text: $0.text, pendingRecording: $0.pendingRecording,
+                                contextLabel: $0.contextLabel, updatedAt: $0.updatedAt,
+                                files: [], stagedFileCount: $0.stagedFileCount)
         }
     }
 
@@ -348,10 +410,9 @@ public final class ComposerDraftStore {
 
     // MARK: - Reading
 
-    /// What the composer should be showing for `id`. Synchronous: reads one small file the
-    /// first time a conversation is touched, then pure memory.
+    /// What the composer should be showing for `id`. Pure memory.
     public func snapshot(for id: UUID) -> ComposerDraftSnapshot {
-        load(id)?.snapshot ?? ComposerDraftSnapshot(text: "")
+        drafts[id]?.snapshot ?? ComposerDraftSnapshot(text: "")
     }
 
     /// Whether this conversation is holding an unsent draft worth keeping alive.
@@ -362,199 +423,268 @@ public final class ComposerDraftStore {
     /// not worth keeping a turn-less thread alive for, so it reads false and the reaper may
     /// take the thread as it always did.
     ///
-    /// Costs nothing for the overwhelming majority of conversations: an id with no stored
-    /// draft is answered from a set in memory without touching the disk. That is also the
-    /// fix for the reaper's old cost, which faulted `draftAttachments` for EVERY thread in
-    /// the list to answer the same question.
+    /// One dictionary lookup, for every thread in the list. That is also the fix for the
+    /// reaper's old cost, which faulted `draftAttachments` for EVERY thread to answer it.
     public func hasDraft(_ id: UUID) -> Bool {
-        guard drafts[id] != nil || unloaded.contains(id) else { return false }
-        return load(id)?.snapshot.isWorthKeeping ?? false
+        drafts[id]?.snapshot.isWorthKeeping ?? false
     }
 
-    private func load(_ id: UUID) -> ComposerDraftRecord? {
-        if let held = drafts[id] { return held }
-        guard unloaded.remove(id) != nil else { return nil }
-        guard let stored = writer.load(id) else { return nil }
-        drafts[id] = stored
-        return stored
-    }
+    /// Whether anything at all is held for `id`. Tests read it; nothing else needs to.
+    public func holdsDraft(_ id: UUID) -> Bool { drafts[id] != nil }
 
-    // MARK: - Writing
+    // MARK: - Capture
 
-    /// Record the composer's TEXT and its two situational markers. THE KEYSTROKE PATH.
+    /// Record a composer's state, because it is being left. THE ONLY MUTATOR A DEPARTURE
+    /// REACHES, and the only thing that ever writes the file.
     ///
-    /// One dictionary assignment and a comparison. No model mutation, no `save`, no file
-    /// I/O, no `Task` unless a quiet period is not already running. Returns whether
-    /// anything actually changed.
+    /// Call it through `ComposerDrafts.capture`, which also puts the conversation on disk.
+    /// Returns whether anything actually changed — a departure from an untouched composer
+    /// writes nothing.
     ///
-    /// `id` is passed explicitly and is the ONLY conversation touched. That is what makes
-    /// an asynchronous picker or transcription completion safe: it writes to the
-    /// conversation it was started from, whatever the user is looking at now.
+    /// `id` is passed explicitly and is the ONLY conversation touched. That is what makes a
+    /// late departure safe: it records the conversation it was typed in, whatever the user
+    /// is looking at now.
     @discardableResult
-    public func write(text: String,
-                      pendingRecording: String? = nil,
-                      contextLabel: String? = nil,
-                      for id: UUID,
-                      now: Date = Date()) -> Bool {
-        let current = load(id)
-        guard current?.text != text
-                || current?.pendingRecording != pendingRecording
-                || current?.contextLabel != contextLabel else { return false }
-        var record = current ?? ComposerDraftRecord(text: "", updatedAt: now)
-        record.text = text
-        record.pendingRecording = pendingRecording
-        record.contextLabel = contextLabel
-        record.updatedAt = now
-        drafts[id] = record
-        markDirty(id)
+    public func capture(_ state: ComposerDraftCapture, for id: UUID,
+                        now: Date = Date(), terminating: Bool = false) -> Bool {
+        let current = drafts[id]
+        // An untouched composer being left is the common case and must cost nothing.
+        if let current,
+           current.text == state.text,
+           current.pendingRecording == state.pendingRecording,
+           current.contextLabel == state.contextLabel,
+           sameFiles(current.files, state.files) {
+            return false
+        }
+        if current == nil && state.isEmpty { return false }
+        drafts[id] = ComposerDraftRecord(text: state.text,
+                                         pendingRecording: state.pendingRecording,
+                                         contextLabel: state.contextLabel,
+                                         updatedAt: now,
+                                         files: state.files)
+        evictIfOverBudget(keeping: id)
+        persist(synchronously: terminating)
         return true
     }
 
-    /// Record the composer's staged FILES, replacing whatever was there.
-    ///
-    /// Compared by (filename, mime, byte count) rather than by bytes: two staged files with
-    /// the same name, type and length are the same file for this purpose, and hashing
-    /// megabytes on every composer render to prove it would cost more than the write it
-    /// saves. Files change on a picker, never on a keystroke.
-    @discardableResult
-    public func writeFiles(_ files: [ComposerDraftFile], for id: UUID,
-                           now: Date = Date()) -> Bool {
-        let current = load(id)
-        let existing = current?.files ?? []
-        let unchanged = existing.count == files.count
-            && zip(existing, files).allSatisfy {
-                $0.filename == $1.filename && $0.mime == $1.mime
-                    && $0.data.count == $1.data.count
-            }
-        if unchanged { return false }
-        var record = current ?? ComposerDraftRecord(text: "", updatedAt: now)
-        record.files = files
-        record.updatedAt = now
-        drafts[id] = record
-        markDirty(id)
-        return true
+    /// Files compared by (filename, mime, byte count) rather than by bytes: two staged
+    /// files with the same name, type and length are the same file for this purpose, and
+    /// hashing megabytes at every departure to prove it would cost more than the write it
+    /// saves.
+    private func sameFiles(_ lhs: [ComposerDraftFile], _ rhs: [ComposerDraftFile]) -> Bool {
+        lhs.count == rhs.count && zip(lhs, rhs).allSatisfy {
+            $0.filename == $1.filename && $0.mime == $1.mime && $0.data.count == $1.data.count
+        }
     }
 
     /// Report and clear the two one-shot markers, so a notice is shown once and not on
     /// every subsequent appearance.
+    ///
+    /// IN MEMORY ONLY, and no write: this runs on appear, which is not a departure. The
+    /// composer's next departure records the markers afresh from what is actually true
+    /// then — which for a transcription that never finished is nothing. The cost of a kill
+    /// in between is that the notice is shown twice, over text that is still correct.
     public func clearNotices(for id: UUID) {
-        guard var record = load(id),
+        guard var record = drafts[id],
               record.pendingRecording != nil || record.contextLabel != nil else { return }
         record.pendingRecording = nil
         record.contextLabel = nil
         drafts[id] = record
-        markDirty(id)
     }
 
     // MARK: - The send handoff
 
     /// Give up the draft because its message has been persisted.
     ///
-    /// Called AFTER the turn is on disk and only on a successful stage — which is the
-    /// whole of the ordering rule this file's header states. Returns what was released so
-    /// a caller can put it back, though with the release moved after the save there is no
-    /// longer a failure path that needs to.
+    /// Called AFTER the turn is on disk and only on a successful stage, which is the whole
+    /// of the ordering rule this file's header states. Returns what was released.
     @discardableResult
     public func release(for id: UUID) -> ComposerDraftSnapshot {
         let released = snapshot(for: id)
-        drafts[id] = nil
-        unloaded.remove(id)
-        dirty.remove(id)
-        scheduleDelete(id)
+        if drafts.removeValue(forKey: id) != nil { persist() }
         return released
-    }
-
-    /// Put a released draft back. In memory; the next flush persists it.
-    public func restore(_ released: ComposerDraftSnapshot, for id: UUID,
-                        now: Date = Date()) {
-        guard !released.isEmpty else { return }
-        drafts[id] = ComposerDraftRecord(text: released.text,
-                                         pendingRecording: released.pendingRecording,
-                                         contextLabel: released.contextLabel,
-                                         updatedAt: now,
-                                         files: released.files)
-        markDirty(id)
     }
 
     /// Forget a conversation's draft because the conversation itself is gone.
     public func delete(_ id: UUID) {
-        drafts[id] = nil
-        unloaded.remove(id)
-        dirty.remove(id)
-        scheduleDelete(id)
+        if drafts.removeValue(forKey: id) != nil { persist() }
     }
 
-    private func scheduleDelete(_ id: UUID) {
-        generation &+= 1
-        let stamp = generation
-        let writer = self.writer
-        Task { await writer.delete(id, generation: stamp) }
-    }
-
-    /// Drop stored drafts for conversations that no longer exist. The backstop for a
-    /// delete this store never saw — a cross-device delete, or one on a path that forgot
-    /// to call `delete`. Run once at launch.
+    /// Drop stored drafts for conversations that no longer exist. The backstop for a delete
+    /// this store never saw — a cross-device delete, or one on a path that forgot to call
+    /// `delete`. Run once at launch.
     public func sweep(keeping live: Set<UUID>) {
-        for id in unloaded.union(drafts.keys) where !live.contains(id) {
-            delete(id)
-        }
+        let doomed = drafts.keys.filter { !live.contains($0) }
+        guard !doomed.isEmpty else { return }
+        for id in doomed { drafts.removeValue(forKey: id) }
+        persist()
     }
 
-    // MARK: - Flushing
+    // MARK: - Writing
 
-    /// Persist one conversation's draft NOW, if it has unwritten changes.
+    /// THE ONE WRITE. Every departure, release, delete and sweep ends here and nothing
+    /// else in the app reaches the writer at all.
     ///
-    /// Called at every point the composer stops being reachable — the view disappearing,
-    /// the scene leaving the foreground, and a send — which is where the durability
-    /// guarantee actually comes from. The quiet period is only a backstop.
-    public func flush(_ id: UUID) {
-        guard dirty.remove(id) != nil, let record = drafts[id] else { return }
-        generation &+= 1
-        let stamp = generation
+    /// Chained behind whatever is already in flight so two writes cannot land out of
+    /// order, and handed a TEXT-ONLY map so the off-main task never retains a staged
+    /// photo.
+    private func persist(synchronously: Bool = false) {
+        guard !terminated else { return }
+        let map = drafts.mapValues {
+            ComposerDraftPersisted(text: $0.text, pendingRecording: $0.pendingRecording,
+                                   contextLabel: $0.contextLabel, updatedAt: $0.updatedAt,
+                                   stagedFileCount: $0.stagedFileCount)
+        }
+        // A QUIT. The handler returns and the process is gone, so an asynchronous write
+        // may never get a turn — the one place it is right to make the main thread wait
+        // on a small file. Nothing may be written after it: this map is the last word, and
+        // an in-flight write carrying an older one must not land on top of it.
+        if synchronously {
+            terminated = true
+            writer.writeNow(map)
+            writeTask = nil
+            return
+        }
+        let previous = writeTask
         let writer = self.writer
-        Task { await writer.write(record, for: id, generation: stamp) }
-    }
-
-    /// Persist every unwritten draft. The scene-phase and termination hook.
-    public func flushAll() {
-        timer?.cancel()
-        timer = nil
-        flushDirty()
-    }
-
-    /// Whether anything is waiting to reach disk. Tests read it; nothing else needs to.
-    public var hasUnwrittenChanges: Bool { !dirty.isEmpty }
-
-    private func flushDirty() {
-        for id in dirty {
-            guard let record = drafts[id] else { continue }
-            generation &+= 1
-            let stamp = generation
-            let writer = self.writer
-            Task { await writer.write(record, for: id, generation: stamp) }
-        }
-        dirty.removeAll()
-    }
-
-    private func markDirty(_ id: UUID) {
-        dirty.insert(id)
-        lastEdit = .now
-        // One task per BURST. An already-running quiet period re-reads `lastEdit` when it
-        // wakes and goes back to sleep, so typing allocates nothing after the first
-        // character.
-        guard timer == nil else { return }
-        timer = Task { @MainActor [weak self] in
-            while let live = self {
-                let due = live.lastEdit.advanced(by: live.quietPeriod)
-                if ContinuousClock.now >= due { break }
-                try? await Task.sleep(until: due, clock: .continuous)
-                if Task.isCancelled { return }
-            }
-            guard let self else { return }
-            self.timer = nil
-            self.flushDirty()
+        writeTask = Task { @MainActor in
+            await previous?.value
+            await writer.write(map)
         }
     }
+
+    /// Wait for every write asked for so far to reach disk. For tests; the app never
+    /// waits on a draft.
+    public func settle() async { await writeTask?.value }
+
+    /// Keep the in-memory bytes bounded. Staged files go first, oldest conversation first;
+    /// only if dropping every other conversation's files is still not enough does a whole
+    /// entry (and with it its TEXT) go — text last, and in practice never, because the
+    /// whole map's text is a few kilobytes.
+    ///
+    /// `keeping` is the conversation just captured: it is never the one thrown away.
+    private func evictIfOverBudget(keeping: UUID) {
+        var total = drafts.values.reduce(0) { $0 + $1.retainedBytes }
+        guard total > byteCap else { return }
+        let oldestFirst = drafts
+            .filter { $0.key != keeping }
+            .sorted { $0.value.updatedAt < $1.value.updatedAt }
+            .map(\.key)
+        for id in oldestFirst where total > byteCap {
+            guard var record = drafts[id], !record.files.isEmpty else { continue }
+            total -= record.files.reduce(0) { $0 + $1.data.count }
+            record.files = []
+            drafts[id] = record
+        }
+        // Still over: the captured conversation alone is bigger than the budget. Its files
+        // are the only thing left that is large.
+        if total > byteCap, var record = drafts[keeping], !record.files.isEmpty {
+            total -= record.files.reduce(0) { $0 + $1.data.count }
+            record.files = []
+            drafts[keeping] = record
+        }
+        // Text last, oldest first. Unreachable with any realistic cap; here so the budget
+        // is a real bound rather than a hopeful one.
+        for id in oldestFirst where total > byteCap {
+            guard let record = drafts.removeValue(forKey: id) else { continue }
+            total -= record.retainedBytes
+        }
+    }
+}
+
+// MARK: - The one implementation every call site reaches
+
+/// Capture, restore and release — one function each, shared by both shells.
+///
+/// The per-shell code is the departure hooks, the restore call, and a small adapter
+/// between a view's own attachment type and `ComposerDraftFile`. If a behaviour has to be
+/// described twice, once for each shell, it is in the wrong place and belongs here: that
+/// is what stops the two shells growing two ideas of what a draft is.
+@MainActor
+public enum ComposerDrafts {
+
+    /// A composer is being left. Record what it holds, and make sure the conversation it
+    /// belongs to exists on disk.
+    ///
+    /// Every departure on both shells calls THIS: the chat view disappearing, the scene
+    /// leaving the foreground, termination, and a send that was refused. A hook with
+    /// different arguments to hand converts them and calls it; none of them writes
+    /// anything itself.
+    ///
+    /// - Returns: whether the draft changed.
+    @discardableResult
+    public static func capture(_ state: ComposerDraftCapture,
+                               for thread: JesseThread,
+                               in context: ModelContext,
+                               store: ComposerDraftStore = .shared,
+                               now: Date = Date(),
+                               terminating: Bool = false) -> Bool {
+        // A draft is keyed on `JesseThread.id` and stored outside the object graph, so a
+        // draft whose conversation is not persisted is a file nothing can ever lead the
+        // user back to. THIS is where that is fixed — not on the first keystroke.
+        ComposerDraftThreadInsertion.persistIfNeeded(thread, in: context,
+                                                     hasSomethingToKeep: !state.isEmpty)
+        return store.capture(state, for: thread.id, now: now, terminating: terminating)
+    }
+
+    /// Put a composer back the way the user left it. Called once per composer, on appear.
+    ///
+    /// - Parameters:
+    ///   - newestUserTurn: the visible text and creation date of the thread's newest user
+    ///     turn, for the already-sent check.
+    ///   - contextStillAttached: whether the coordinator still holds the screen context
+    ///     this conversation was opened with.
+    public static func restore(for thread: JesseThread,
+                               newestUserTurn: (text: String, createdAt: Date)?,
+                               contextStillAttached: Bool,
+                               store: ComposerDraftStore = .shared)
+    -> ComposerDraftRestoration {
+        let saved = store.snapshot(for: thread.id)
+        // A draft whose message ALREADY WENT is not a draft. The turn is persisted before
+        // the draft is released, so a kill between the two leaves both on disk; this is
+        // where that window is closed, rather than by pretending the two stores share a
+        // transaction. See `ComposerDraftStaleness`.
+        guard !ComposerDraftStaleness.isSpent(saved, newestUserTurn: newestUserTurn) else {
+            store.delete(thread.id)
+            return .nothing
+        }
+        // Say what did NOT come back, if anything did not. Both markers are one-shot: they
+        // describe the moment the composer was left, so they are reported once and cleared.
+        let notice = ComposerDraftNotice.message(for: saved,
+                                                 contextStillAttached: contextStillAttached)
+        if saved.pendingRecording != nil || saved.contextLabel != nil {
+            store.clearNotices(for: thread.id)
+        }
+        return ComposerDraftRestoration(text: saved.text, files: saved.files, notice: notice)
+    }
+
+    /// The message went. Give up the draft.
+    ///
+    /// Called only after the turn is durably staged — a refused send and a staging save
+    /// that threw both call `capture` instead, leaving the text on screen and getting it
+    /// to disk.
+    @discardableResult
+    public static func release(for thread: JesseThread,
+                               store: ComposerDraftStore = .shared) -> ComposerDraftSnapshot {
+        store.release(for: thread.id)
+    }
+}
+
+/// What a composer gets back on appear: its text, its files, and the sentence to show if
+/// something that was part of the pending message is not coming back with it.
+public nonisolated struct ComposerDraftRestoration: Equatable, Sendable {
+    public var text: String
+    public var files: [ComposerDraftFile]
+    public var notice: String?
+
+    public init(text: String, files: [ComposerDraftFile] = [], notice: String? = nil) {
+        self.text = text
+        self.files = files
+        self.notice = notice
+    }
+
+    /// Nothing to put back.
+    public static let nothing = ComposerDraftRestoration(text: "")
 }
 
 // MARK: - A draft a send already spent
@@ -564,7 +694,7 @@ public final class ComposerDraftStore {
 /// With the turn and the draft in two stores, a kill between "the turn is saved" and "the
 /// draft is deleted" leaves both on disk, and the composer would put the sent message back
 /// as if it were unsent. So a restore DISCARDS a draft that is already a turn: same text,
-/// and recorded no later than the turn that carries it.
+/// and captured no later than the turn that carries it.
 ///
 /// Both halves are load-bearing. Text alone would eat a genuine "send it again" the user
 /// retyped; the timestamp alone would eat any draft on a thread that had ever been sent to.
@@ -588,8 +718,8 @@ public nonisolated enum ComposerDraftStaleness {
 /// The sentence a restored composer shows when something that WAS part of the pending
 /// message is not coming back with it.
 ///
-/// Both cases are the same shape of honesty: the text is restored, and the thing that is
-/// gone is NAMED, because a draft that quietly turns into a different message is worse
+/// All three cases are the same shape of honesty: the text is restored, and the thing that
+/// is gone is NAMED, because a draft that quietly turns into a different message is worse
 /// than one that says what it lost.
 public nonisolated enum ComposerDraftNotice {
 
@@ -597,7 +727,7 @@ public nonisolated enum ComposerDraftNotice {
     ///
     /// - `contextStillAttached`: whether the coordinator still holds the screen context
     ///   this conversation was opened with. Attached context lives in memory and dies with
-    ///   the process, so a draft recorded against one and restored after a relaunch would
+    ///   the process, so a draft captured against one and restored after a relaunch would
     ///   otherwise send as a bare message on a conversation whose entire subject was the
     ///   reading it was opened about.
     public static func message(for snapshot: ComposerDraftSnapshot,
@@ -612,6 +742,17 @@ public nonisolated enum ComposerDraftNotice {
         if let label = snapshot.contextLabel, !label.isEmpty, !contextStillAttached {
             parts.append(
                 "\(label) is no longer attached, so this message will be sent on its own.")
+        }
+        // Staged files live in memory and are never written to disk, so a draft that comes
+        // back from a cold launch comes back without them. Named rather than dropped: the
+        // text is right there, and "I attached a photo to this" must not become quietly
+        // untrue.
+        if snapshot.lostFiles > 0 {
+            parts.append(snapshot.lostFiles == 1
+                         ? "The file you attached isn’t here any more — attach it again "
+                           + "before sending."
+                         : "The \(snapshot.lostFiles) files you attached aren’t here any "
+                           + "more — attach them again before sending.")
         }
         return parts.isEmpty ? nil : parts.joined(separator: " ")
     }

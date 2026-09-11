@@ -59,25 +59,20 @@ struct ThreadDetailView: View {
     //
     // Everything above is view state, and view state is exactly what this screen keeps
     // losing: navigating away destroys this view (the iPhone pops it, the iPad's detail
-    // column carries `.id(thread.id)`), and process termination takes it regardless. So
-    // `input` and `attachments` are now a MIRROR of `thread`'s persisted draft —
-    // restored from it on appearance, written through to it on every edit.
+    // column carries `.id(thread.id)`), and process termination takes it regardless.
     //
-    // The draft does NOT live in the object graph, and a keystroke does not reach SwiftData
-    // or sqlite at all: `ComposerDraftStore.write` is one dictionary assignment on the main
-    // actor, and the file behind it is written off-main on a quiet period and at every
-    // point this composer stops being reachable. See `ComposerDraftStore`.
-    private var drafts: ComposerDraftStore { .shared }
+    // NOTHING REACTS TO TYPING. While this composer is on screen `input` and `attachments`
+    // ARE the draft, and a keystroke touches nothing else in the app — no store, no
+    // `ModelContext`, no file, no `Task`. The draft is handed over at DEPARTURES, all four
+    // of them below (`onDisappear`, the scene leaving the foreground, termination, send),
+    // each through the one shared `ComposerDrafts.capture`. See `ComposerDraftStore`.
+
     /// Guards the restore so it happens exactly once per composer, whatever SwiftUI does
     /// with `onAppear` — a second restore would overwrite live typing with a stale value.
     @State private var didRestoreDraft = false
-    /// Guards the once-per-composer save that puts this conversation on disk. See
-    /// `ComposerDraftThreadInsertion` — a draft whose conversation was never persisted is a
-    /// draft the user can never get back to.
-    @State private var didPersistThread = false
     /// The one-line honesty notice for a restored draft that lost something: a recording
-    /// mid-transcription, or the screen context the conversation was opened about. Nil
-    /// almost always. See `ComposerDraftNotice`.
+    /// mid-transcription, the screen context the conversation was opened about, or the
+    /// files staged against it. Nil almost always. See `ComposerDraftNotice`.
     @State private var draftNotice: String?
 
     @Environment(\.scenePhase) private var scenePhase
@@ -193,14 +188,22 @@ struct ThreadDetailView: View {
             restoreDraft()
             if attachedContext != nil && turns.isEmpty { inputFocused = true }
         }
-        // Close the pending-write window at every point where this composer is about to
-        // stop being reachable. Neither of these is the durability mechanism — the debounce
-        // is, and the model-side write has already happened — they just make the window
-        // zero at the two moments it would otherwise matter most.
-        .onDisappear { drafts.flush(thread.id) }
+        // ── THE DEPARTURES ────────────────────────────────────────────────────────────
+        // Three of the four (the fourth is `send`). Between them they cover every way this
+        // composer stops being reachable: the iPhone popping it, the iPad detail column
+        // replacing it on `.id(thread.id)`, the app going to the pocket, and a quit.
+        //
+        // A tab switch is deliberately NOT in the list, and does not need to be: switching
+        // tabs does not destroy this view, so `input` is still here when the user comes
+        // back, and anything that WOULD destroy it (backgrounding, termination) fires one
+        // of these first.
+        .onDisappear { captureDraft() }
         .onChange(of: scenePhase) { _, phase in
-            if phase != .active { drafts.flushAll() }
+            if phase != .active { captureDraft() }
         }
+        // Backgrounding covers almost every real exit on the phone; this covers the rest.
+        .onReceive(NotificationCenter.default.publisher(
+            for: UIApplication.willTerminateNotification)) { _ in captureDraft(terminating: true) }
         // DECLARATION ORDER IS LEFT-TO-RIGHT, ordered by taps per day: the star is a
         // one-tap toggle that undoes itself, so it is declared LAST and sits farthest
         // right; the model picker is set once for a conversation and rarely touched
@@ -597,19 +600,9 @@ struct ThreadDetailView: View {
             input = done.messageBody(typed: input)
             inputFocused = true
         }
-        // ── Every path into the composer ends up here ──────────────────────────────────
-        // `input` is written by the text view's delegate on every keystroke, paste and
-        // dictation update, and by the transcript landing above — so watching the binding
-        // itself catches all of them, with no per-gesture hooks to keep in sync.
-        .onChange(of: input) { _, _ in recordDraft() }
-        // Keyed on the IDs, not the values: `JesseAttachment` is Equatable over its bytes,
-        // and `onChange` compares on every body evaluation — which during a streaming reply
-        // would mean memcmp-ing up to 20 MB many times a second. A staged file is immutable
-        // once created, so the id list changes exactly when the set does.
-        .onChange(of: attachments.map(\.id)) { _, _ in recordDraftFiles() }
-        // A recording in flight is part of the pending message; the draft records its name
-        // so a composer restored without it can say so.
-        .onChange(of: recording.stage) { _, _ in recordDraft() }
+        // NO `onChange(of: input)`, and none for the attachments or the recording stage
+        // either. Typing, staging a file and starting a transcription all change only this
+        // view's own state; what they are is read off that state at the next departure.
         .onChange(of: photoItems) { _, items in
             guard !items.isEmpty else { return }
             Task { await handlePhotoItems(items) }
@@ -928,31 +921,21 @@ struct ThreadDetailView: View {
 
     // MARK: - The durable draft
 
-    /// Put the composer back the way the user left it. Runs once, before any edit can be
-    /// recorded, so the first `onChange` never writes an empty `input` over a real draft.
+    /// Put the composer back the way the user left it. Runs once per composer, on appear.
+    ///
+    /// One call into the shared `ComposerDrafts.restore`, which owns the already-sent
+    /// check, the notice and the one-shot markers; the only thing local to this shell is
+    /// turning the shared file value back into the composer's own chip type.
     private func restoreDraft() {
         guard !didRestoreDraft else { return }
         didRestoreDraft = true
-        let saved = drafts.snapshot(for: thread.id)
-        // A draft whose message ALREADY WENT is not a draft. The turn is persisted before
-        // the draft is released, so a kill between the two leaves both on disk; this is
-        // where that window is closed, rather than by pretending the two stores share a
-        // transaction. See `ComposerDraftStaleness`.
-        guard !ComposerDraftStaleness.isSpent(saved, newestUserTurn: newestUserTurn) else {
-            drafts.delete(thread.id)
-            return
-        }
-        input = saved.text
-        attachments = saved.files.map {
+        let restored = ComposerDrafts.restore(for: thread, newestUserTurn: newestUserTurn,
+                                              contextStillAttached: attachedContext != nil)
+        input = restored.text
+        attachments = restored.files.map {
             JesseAttachment(filename: $0.filename, mime: $0.mime, data: $0.data)
         }
-        // Say what did NOT come back, if anything did not. Both markers are one-shot: they
-        // describe the moment the composer was lost, so they are reported once and cleared.
-        draftNotice = ComposerDraftNotice.message(for: saved,
-                                                  contextStillAttached: attachedContext != nil)
-        if saved.pendingRecording != nil || saved.contextLabel != nil {
-            drafts.clearNotices(for: thread.id)
-        }
+        draftNotice = restored.notice
     }
 
     /// The visible text and date of this conversation's newest user turn, for the
@@ -964,38 +947,35 @@ struct ThreadDetailView: View {
         return (turn.visibleText, turn.createdAt)
     }
 
-    /// Record the composer's text (and its two situational markers) against THIS thread.
-    /// THE KEYSTROKE PATH: one dictionary assignment in `ComposerDraftStore` and nothing
-    /// else. No model mutation, no `save`, no disk.
-    private func recordDraft() {
-        guard didRestoreDraft else { return }
-        let pending = recording.isInFlight ? recording.sourceName : nil
-        let label = attachment?.contextLabel
-        persistThreadOnce(hasSomethingToKeep: !input.isEmpty || pending != nil
-                            || label != nil || !attachments.isEmpty)
-        drafts.write(text: input, pendingRecording: pending, contextLabel: label,
-                     for: thread.id)
+    /// What this composer is holding right now, as the shared draft layer's value type.
+    ///
+    /// The two situational markers are READ HERE, at the departure, rather than tracked as
+    /// they change: a transcription that is still running as the user leaves is exactly the
+    /// one the restored composer has to apologise for, and asking at the moment of leaving
+    /// is both simpler and more accurate than watching for it.
+    private var composerState: ComposerDraftCapture {
+        ComposerDraftCapture(
+            text: input,
+            files: attachments.map {
+                ComposerDraftFile(filename: $0.filename, mime: $0.mime, data: $0.data)
+            },
+            pendingRecording: recording.isInFlight ? recording.sourceName : nil,
+            contextLabel: attachment?.contextLabel)
     }
 
-    /// Record the composer's staged files. Separate from `recordDraft` because it is the
-    /// expensive half and it changes on a picker, never on a keystroke.
-    private func recordDraftFiles() {
+    /// A DEPARTURE. Hand the composer over; the shared function does everything else,
+    /// including putting a never-saved conversation on disk so the draft has somewhere to
+    /// belong.
+    ///
+    /// Guarded on the restore, because a capture before one would record an empty composer
+    /// over a real draft.
+    ///
+    /// `terminating` is the quit: there the write happens on this thread, because an
+    /// asynchronous one may never get a turn before the process is gone.
+    private func captureDraft(terminating: Bool = false) {
         guard didRestoreDraft else { return }
-        let files = attachments.map {
-            ComposerDraftFile(filename: $0.filename, mime: $0.mime, data: $0.data)
-        }
-        persistThreadOnce(hasSomethingToKeep: !files.isEmpty || !input.isEmpty)
-        drafts.writeFiles(files, for: thread.id)
-    }
-
-    /// The ONE SwiftData write anywhere near a keystroke, and it happens at most once per
-    /// composer: the conversation a draft belongs to has to exist on disk, or the draft is
-    /// a file with no way back to it. Every subsequent character returns on the guard.
-    private func persistThreadOnce(hasSomethingToKeep: Bool) {
-        guard !didPersistThread, hasSomethingToKeep else { return }
-        didPersistThread = true
-        ComposerDraftThreadInsertion.persistIfNeeded(thread, in: context,
-                                                     hasSomethingToKeep: true)
+        ComposerDrafts.capture(composerState, for: thread, in: context,
+                               terminating: terminating)
     }
 
     private func send() {
@@ -1021,15 +1001,15 @@ struct ThreadDetailView: View {
         guard coordinator.send(thread: thread, text: text, voice: false, context: context,
                                attachments: outgoing) else {
             // Refused, or its staging save threw. Nothing was released — the release is
-            // ORDERED AFTER the save now — so the draft is still the truth. Get it to disk
-            // rather than wait out a quiet period.
-            drafts.flush(thread.id)
+            // ORDERED AFTER the save now — so the composer is still the truth. A refused
+            // send is a departure like any other: capture it.
+            captureDraft()
             return
         }
         // Durably staged: the user turn and its outbox item are on disk. ONLY NOW is the
         // draft released, and that order is the whole of the replacement for the single
         // save this used to ride in. See `ComposerDraftStore`'s header.
-        drafts.release(for: thread.id)
+        ComposerDrafts.release(for: thread)
         input = ""
         attachments = []
         attachError = nil

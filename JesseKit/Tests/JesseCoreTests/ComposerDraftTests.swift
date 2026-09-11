@@ -2,20 +2,22 @@ import XCTest
 import SwiftData
 @testable import JesseCore
 
-/// The composer's unsent draft, at the layer the defect lives at: STORAGE.
+/// The composer's unsent draft, at the layer the defects live at.
 ///
-/// Two defects, in order. The FIRST was the absence of a durable write at all — the text
-/// lived in a SwiftUI `@State`, so navigating away (which destroys the view) and quitting
-/// (which destroys the process) both took it. Every persistence test below therefore does
-/// the one thing an in-memory fake cannot: it writes through a REAL store, drops it, and
-/// opens it again.
+/// THREE defects, in order, and every one of them is still pinned below.
 ///
-/// The SECOND was what that durable write cost. Putting the draft on `JesseThread` meant a
-/// keystroke dirtied the view's main `ModelContext`, whose autosave then wrote sqlite on
-/// the run loop whatever the debounce in front of `save()` intended: 197 saves for 200
-/// characters, measured in the simulator. `testTypingProducesNoModelMutationAndNoWrite` is
-/// the regression for that, and it FAILS against the shape that shipped in 129 — there,
-/// every keystroke left `context.hasChanges` true.
+///   1. There was no durable write at all: the text lived in a SwiftUI `@State`, so
+///      navigating away (which destroys the view) and quitting (which destroys the
+///      process) both took it. Every persistence test therefore does the one thing an
+///      in-memory fake cannot: it writes through a REAL store, drops it, and opens it
+///      again.
+///   2. The durable write was on `JesseThread`, so a keystroke dirtied the view's main
+///      `ModelContext` and its autosave wrote sqlite on the run loop: 197 saves for 200
+///      characters, measured in the simulator.
+///   3. The fix for (2) still ran code on every keystroke — a dictionary assignment, a
+///      dirty set, a quiet-period `Task`. Now NOTHING runs on a keystroke, because there
+///      is no keystroke hook: the draft is captured at DEPARTURES.
+///      `testTypingCostsNothingAndOneDepartureCostsOneWrite` is the regression for that.
 @MainActor
 final class ComposerDraftTests: XCTestCase {
 
@@ -31,44 +33,41 @@ final class ComposerDraftTests: XCTestCase {
     private func remove(_ dir: URL) { try? FileManager.default.removeItem(at: dir) }
 
     /// A store over `dir`. Called twice per persistence test — once to write, once to
-    /// reopen — which is what makes "survives a relaunch" a real assertion rather than a
-    /// claim about a dictionary. `observesAppLifecycle: false` so a test's store does not
-    /// answer the host process's own notifications.
-    private func store(at dir: URL, quietPeriod: Duration = .seconds(60)) -> ComposerDraftStore {
-        ComposerDraftStore(writer: ComposerDraftFileWriter(root: dir),
-                           quietPeriod: quietPeriod,
-                           observesAppLifecycle: false)
+    /// reopen — which is what makes "survives a cold launch" a real assertion rather than
+    /// a claim about a dictionary.
+    private func store(at dir: URL) -> ComposerDraftStore {
+        ComposerDraftStore(writer: ComposerDraftFileWriter(root: dir))
     }
 
-    /// The store hands its writes to an actor, so a test that asserts what reached disk has
-    /// to let that actor run. Polls rather than sleeps a fixed amount.
-    private func settle(_ dir: URL, expecting ids: [UUID] = [],
-                        timeout: TimeInterval = 3) async {
-        let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
-            let stored = ComposerDraftFileWriter(root: dir).storedIDs()
-            if ids.allSatisfy(stored.contains) { break }
-            await Task.yield()
-            try? await Task.sleep(for: .milliseconds(5))
-        }
-        // One more turn, so a delete or an overwrite that has no id to wait on has landed.
-        try? await Task.sleep(for: .milliseconds(30))
+    /// A capture, spelled the way a composer builds one.
+    private func typed(_ text: String, files: [ComposerDraftFile] = [],
+                       recording: String? = nil,
+                       context label: String? = nil) -> ComposerDraftCapture {
+        ComposerDraftCapture(text: text, files: files, pendingRecording: recording,
+                             contextLabel: label)
+    }
+
+    private func file(_ name: String, _ bytes: Int, fill: UInt8 = 0x41) -> ComposerDraftFile {
+        ComposerDraftFile(filename: name, mime: "image/png",
+                          data: Data(repeating: fill, count: bytes))
     }
 
     // MARK: - THE COST REGRESSION
 
-    /// **The point of the whole change.** Two hundred keystrokes mutate no model, dirty no
-    /// `ModelContext`, and write nothing to disk.
+    /// **The point of the whole change.** Typing runs nothing: no write, no `Task`, no
+    /// model mutation. One departure then writes exactly ONCE, however much was typed.
     ///
-    /// Fails against App 1.0 (129): there `ComposerDraft.write` set four properties on the
-    /// thread, so `context.hasChanges` was true after the first character and the view's
-    /// autosaving main context turned that into a sqlite transaction per keystroke.
-    func testTypingProducesNoModelMutationAndNoWrite() async throws {
+    /// The keystroke loop below is what both composers now do — append to the view's own
+    /// state and call nothing — and the counting writer proves the store never heard about
+    /// it: `holdsDraft` is false for the whole burst, where 131 would have held the text,
+    /// marked it dirty and armed a quiet-period `Task` from the first character. A write
+    /// count of zero IS a `Task` count of zero, because `persist()` is the only place this
+    /// store ever creates one and every `Task` it creates ends in a `write`.
+    func testTypingCostsNothingAndOneDepartureCostsOneWrite() async throws {
         let dir = draftDirectory()
         defer { remove(dir) }
         let counting = CountingWriter(inner: ComposerDraftFileWriter(root: dir))
-        let drafts = ComposerDraftStore(writer: counting, quietPeriod: .seconds(60),
-                                        observesAppLifecycle: false)
+        let drafts = ComposerDraftStore(writer: counting)
 
         let container = try ModelContainer(
             for: jesseCurrentSchema,
@@ -80,29 +79,66 @@ final class ComposerDraftTests: XCTestCase {
         try context.save()
         XCTAssertFalse(context.hasChanges, "precondition: the context is clean")
 
-        var typed = ""
+        // Two hundred keystrokes, as the composer takes them: into its own state.
+        var composer = ""
         for i in 0..<200 {
-            typed.append(Character(UnicodeScalar(97 + (i % 26))!))
-            drafts.write(text: typed, for: thread.id)
-            XCTAssertFalse(context.hasChanges,
-                           "keystroke \(i) dirtied the model context")
+            composer.append(Character(UnicodeScalar(97 + (i % 26))!))
+            XCTAssertFalse(context.hasChanges, "keystroke \(i) dirtied the model context")
+            XCTAssertFalse(drafts.holdsDraft(thread.id),
+                           "keystroke \(i) reached the draft store")
         }
-
-        let writesDuringTyping = await counting.writes
-        XCTAssertEqual(writesDuringTyping, 0, "typing wrote nothing to disk")
+        let duringTyping = await counting.writes
+        XCTAssertEqual(duringTyping, 0, "typing wrote nothing and created no task")
         XCTAssertNil(thread.draftText, "and nothing was recorded on the thread row")
         XCTAssertTrue(thread.draftAttachments.isEmpty)
-        XCTAssertTrue(drafts.hasUnwrittenChanges, "the text is held, waiting for a flush")
 
-        // And the flush that follows is ONE write for the whole burst, not two hundred.
-        drafts.flush(thread.id)
-        await settle(dir, expecting: [thread.id])
-        let writesAfterFlush = await counting.writes
-        XCTAssertEqual(writesAfterFlush, 1, "two hundred keystrokes, one write")
+        // One departure. One write, for all two hundred characters.
+        ComposerDrafts.capture(typed(composer), for: thread, in: context, store: drafts)
+        await drafts.settle()
+        let writeCount1 = await counting.writes
+        XCTAssertEqual(writeCount1, 1, "two hundred keystrokes, one write")
+        XCTAssertEqual(store(at: dir).snapshot(for: thread.id).text, composer)
     }
 
-    /// The same guarantee for the picker: staging files is not a keystroke, but it must
-    /// still not touch the object graph.
+    /// A departure from an UNTOUCHED composer writes nothing either — otherwise every
+    /// backgrounding and every conversation switch would pay for a file write for no
+    /// reason.
+    func testDeparturesThatChangeNothingWriteNothing() async throws {
+        let dir = draftDirectory()
+        defer { remove(dir) }
+        let counting = CountingWriter(inner: ComposerDraftFileWriter(root: dir))
+        let drafts = ComposerDraftStore(writer: counting)
+        let container = try ModelContainer(
+            for: jesseCurrentSchema,
+            configurations: ModelConfiguration(schema: jesseCurrentSchema,
+                                               isStoredInMemoryOnly: true))
+        let context = ModelContext(container)
+        let thread = JesseThread(mode: .ask)
+        context.insert(thread)
+        try context.save()
+
+        // Ten departures from a composer nobody ever typed in.
+        for _ in 0..<10 {
+            XCTAssertFalse(ComposerDrafts.capture(typed(""), for: thread, in: context,
+                                                  store: drafts))
+        }
+        let writeCount2 = await counting.writes
+        XCTAssertEqual(writeCount2, 0)
+        XCTAssertNil(thread.draftText)
+
+        // One real edit, then ten more departures with nothing changed.
+        XCTAssertTrue(ComposerDrafts.capture(typed("something"), for: thread, in: context,
+                                             store: drafts))
+        for _ in 0..<10 {
+            XCTAssertFalse(ComposerDrafts.capture(typed("something"), for: thread,
+                                                  in: context, store: drafts))
+        }
+        await drafts.settle()
+        let writeCount3 = await counting.writes
+        XCTAssertEqual(writeCount3, 1, "one edit, one write, ten free departures")
+    }
+
+    /// Staging a file is not a keystroke, but it must still not touch the object graph.
     func testStagingFilesDoesNotDirtyTheModelContext() throws {
         let dir = draftDirectory()
         defer { remove(dir) }
@@ -116,11 +152,109 @@ final class ComposerDraftTests: XCTestCase {
         context.insert(thread)
         try context.save()
 
-        drafts.writeFiles([ComposerDraftFile(filename: "a.png", mime: "image/png",
-                                             data: Data([1, 2, 3]))], for: thread.id)
+        drafts.capture(typed("", files: [file("a.png", 3)]), for: thread.id)
         XCTAssertFalse(context.hasChanges)
         XCTAssertEqual(try context.fetch(FetchDescriptor<DraftAttachment>()).count, 0,
                        "no DraftAttachment row is ever written again")
+    }
+
+    // MARK: - THE SINGLE WRITER
+
+    /// Every route that can change a draft ends at ONE writer, and there is no other way
+    /// to produce a write. The counting fake is the whole proof: if a future call site
+    /// reached the file directly, this number would not move.
+    func testEveryRouteThatChangesADraftGoesThroughTheOneWriter() async throws {
+        let dir = draftDirectory()
+        defer { remove(dir) }
+        let counting = CountingWriter(inner: ComposerDraftFileWriter(root: dir))
+        let drafts = ComposerDraftStore(writer: counting)
+        let a = UUID(), b = UUID()
+
+        let writeCount4 = await counting.writes
+        XCTAssertEqual(writeCount4, 0, "opening the store writes nothing")
+
+        drafts.capture(typed("one"), for: a)              // a departure
+        drafts.capture(typed("two"), for: b)              // another conversation's
+        drafts.release(for: a)                            // a send
+        drafts.delete(b)                                  // a conversation deleted
+        drafts.capture(typed("three"), for: a)
+        drafts.sweep(keeping: [])                         // the launch backstop
+        await drafts.settle()
+        let writeCount5 = await counting.writes
+        XCTAssertEqual(writeCount5, 6, "six changes, six writes, no others")
+
+        // And the no-ops in the same family write nothing at all.
+        drafts.release(for: a)
+        drafts.delete(b)
+        drafts.sweep(keeping: [])
+        drafts.clearNotices(for: a)
+        await drafts.settle()
+        let writeCount6 = await counting.writes
+        XCTAssertEqual(writeCount6, 6,
+                       "releasing, deleting and sweeping nothing costs nothing")
+    }
+
+    /// Writes land in the order they were asked for. Two departures a microsecond apart —
+    /// `onDisappear` followed by the scene leaving the foreground — must not race, and
+    /// there is no generation counter here to keep them in step.
+    func testTwoDeparturesInARowLandInOrder() async throws {
+        let dir = draftDirectory()
+        defer { remove(dir) }
+        let drafts = store(at: dir)
+        let id = UUID()
+
+        for i in 0..<40 { drafts.capture(typed("edit \(i)"), for: id) }
+        await drafts.settle()
+
+        XCTAssertEqual(store(at: dir).snapshot(for: id).text, "edit 39",
+                       "the last departure is what is on disk")
+    }
+
+    // MARK: - Several conversations at once
+
+    /// **The everyday case this is shaped for.** Three conversations, each holding its own
+    /// unsent text at the same time, surviving both a switch between them and a cold
+    /// launch.
+    func testThreeConversationsHoldTheirOwnDraftsAcrossASwitchAndAColdLaunch() async throws {
+        let dir = draftDirectory()
+        defer { remove(dir) }
+        let a = UUID(), b = UUID(), c = UUID()
+
+        let live = store(at: dir)
+        // A → B → C, each departure capturing the one being left.
+        live.capture(typed("about the invoice"), for: a)
+        live.capture(typed("re: Thursday\n\nsecond paragraph"), for: b)
+        live.capture(typed("   "), for: c)
+        // Back to A, edit, leave again. B and C are untouched by it.
+        live.capture(typed("about the invoice — and the credit note"), for: a)
+
+        XCTAssertEqual(live.snapshot(for: a).text, "about the invoice — and the credit note")
+        XCTAssertEqual(live.snapshot(for: b).text, "re: Thursday\n\nsecond paragraph")
+        XCTAssertEqual(live.snapshot(for: c).text, "   ")
+
+        await live.settle()
+        let coldLaunch = store(at: dir)
+        XCTAssertEqual(coldLaunch.snapshot(for: a).text,
+                       "about the invoice — and the credit note")
+        XCTAssertEqual(coldLaunch.snapshot(for: b).text, "re: Thursday\n\nsecond paragraph")
+        XCTAssertEqual(coldLaunch.snapshot(for: c).text, "   ")
+    }
+
+    /// A late departure — a picker or a transcription finishing after the user has moved
+    /// on — records the conversation it belongs to, not the one on screen.
+    func testALateDepartureLandsOnItsOwnConversation() {
+        let dir = draftDirectory()
+        defer { remove(dir) }
+        let drafts = store(at: dir)
+        let origin = UUID(), visible = UUID()
+
+        drafts.capture(typed("typed in the visible one"), for: visible)
+        drafts.capture(typed("", files: [file("late.png", 1)]), for: origin)
+
+        XCTAssertEqual(drafts.snapshot(for: origin).files.map(\.filename), ["late.png"])
+        XCTAssertEqual(drafts.snapshot(for: visible).text, "typed in the visible one")
+        XCTAssertTrue(drafts.snapshot(for: visible).files.isEmpty,
+                      "and not on the one the user is looking at")
     }
 
     // MARK: - Exactness
@@ -129,7 +263,7 @@ final class ComposerDraftTests: XCTestCase {
     /// Newlines, leading and trailing whitespace, tabs, combining marks, emoji with
     /// modifiers, RTL, and a lone CR — all byte-for-byte, because a draft that comes back
     /// nearly right is a draft the user has to re-read and re-edit.
-    func testExactMultilineUnicodeTextSurvivesAStoreReopen() async throws {
+    func testExactMultilineUnicodeTextSurvivesAColdLaunch() async throws {
         let dir = draftDirectory()
         defer { remove(dir) }
         let id = UUID()
@@ -138,12 +272,8 @@ final class ComposerDraftTests: XCTestCase {
             + "  trailing spaces   "
 
         let first = store(at: dir)
-        for prefix in stride(from: 0, to: exact.count, by: 7) {
-            first.write(text: String(exact.prefix(prefix)), for: id)
-        }
-        first.write(text: exact, for: id)
-        first.flush(id)
-        await settle(dir, expecting: [id])
+        first.capture(typed(exact), for: id)
+        await first.settle()
 
         XCTAssertEqual(store(at: dir).snapshot(for: id).text, exact)
     }
@@ -156,10 +286,9 @@ final class ComposerDraftTests: XCTestCase {
         let id = UUID()
 
         let first = store(at: dir)
-        first.write(text: "half a thought", for: id)
-        first.write(text: "", for: id)
-        first.flush(id)
-        await settle(dir, expecting: [id])
+        first.capture(typed("half a thought"), for: id)
+        first.capture(typed(""), for: id)
+        await first.settle()
 
         let reopened = store(at: dir)
         XCTAssertEqual(reopened.snapshot(for: id).text, "",
@@ -168,111 +297,117 @@ final class ComposerDraftTests: XCTestCase {
                        "and an emptied draft does not keep a turn-less conversation alive")
     }
 
-    /// Two conversations, two drafts, no bleed. A → B → A is the navigation this exists for.
-    func testTwoConversationsKeepTheirOwnDrafts() async throws {
-        let dir = draftDirectory()
-        defer { remove(dir) }
-        let a = UUID(), b = UUID()
+    // MARK: - Staged files: in memory, and honest about it
 
-        let first = store(at: dir)
-        first.write(text: "for A", for: a)
-        first.write(text: "for B", for: b)
-        first.flushAll()
-        await settle(dir, expecting: [a, b])
-
-        let reopened = store(at: dir)
-        XCTAssertEqual(reopened.snapshot(for: a).text, "for A")
-        XCTAssertEqual(reopened.snapshot(for: b).text, "for B")
-    }
-
-    /// A picker or a transcription that completes AFTER the user has navigated away writes
-    /// to the conversation it was started from, not the one on screen.
-    func testAnAsynchronousWriteLandsOnItsOwnConversation() {
+    /// Staged files survive a SWITCH between conversations, bytes intact. That is what the
+    /// dictionary is for.
+    func testStagedFilesSurviveASwitchBetweenConversations() {
         let dir = draftDirectory()
         defer { remove(dir) }
         let drafts = store(at: dir)
-        let origin = UUID(), visible = UUID()
-
-        drafts.write(text: "typed in the visible one", for: visible)
-        drafts.writeFiles([ComposerDraftFile(filename: "late.png", mime: "image/png",
-                                             data: Data([9]))], for: origin)
-
-        XCTAssertEqual(drafts.snapshot(for: origin).files.map(\.filename), ["late.png"],
-                       "the late picker landed on the conversation it was started from")
-        XCTAssertEqual(drafts.snapshot(for: visible).text, "typed in the visible one")
-        XCTAssertTrue(drafts.snapshot(for: visible).files.isEmpty,
-                      "and not on the one the user is looking at")
-    }
-
-    // MARK: - Attachments
-
-    /// Staged files survive a reopen with their bytes intact — and the bytes live in their
-    /// own files, not base64'd into the document that gets rewritten every quiet period.
-    func testStagedFilesSurviveAReopenWithTheirBytes() async throws {
-        let dir = draftDirectory()
-        defer { remove(dir) }
-        let id = UUID()
+        let a = UUID(), b = UUID()
         let png = Data(repeating: 0x42, count: 4096)
         let pdf = Data(repeating: 0x25, count: 2048)
 
-        let first = store(at: dir)
-        first.write(text: "look at these", for: id)
-        first.writeFiles([
+        drafts.capture(ComposerDraftCapture(text: "look at these", files: [
             ComposerDraftFile(filename: "shot.png", mime: "image/png", data: png),
             ComposerDraftFile(filename: "invoice.pdf", mime: "application/pdf", data: pdf),
-        ], for: id)
-        first.flush(id)
-        await settle(dir, expecting: [id])
+        ]), for: a)
+        drafts.capture(typed("something else entirely"), for: b)
 
-        let restored = store(at: dir).snapshot(for: id)
-        XCTAssertEqual(restored.text, "look at these")
-        XCTAssertEqual(restored.files.map(\.filename), ["shot.png", "invoice.pdf"],
+        let back = drafts.snapshot(for: a)
+        XCTAssertEqual(back.text, "look at these")
+        XCTAssertEqual(back.files.map(\.filename), ["shot.png", "invoice.pdf"],
                        "in the order they were staged")
-        XCTAssertEqual(restored.files.map(\.data), [png, pdf])
-
-        let json = try Data(contentsOf: dir.appendingPathComponent(id.uuidString)
-            .appendingPathComponent("draft.json"))
-        XCTAssertLessThan(json.count, 1024,
-                          "the document names the files; it does not carry their bytes")
+        XCTAssertEqual(back.files.map(\.data), [png, pdf])
+        XCTAssertEqual(back.lostFiles, 0, "nothing was lost, so nothing is claimed lost")
     }
 
-    /// Replacing the staged set removes what is no longer staged.
-    func testWritingFilesReplacesTheStagedSet() {
+    /// **The trade, stated as a test.** Staged files do NOT survive a cold launch — they
+    /// are never written to disk — and the restored composer SAYS SO rather than quietly
+    /// becoming a message with no attachment.
+    func testStagedFilesDoNotSurviveAColdLaunchAndTheComposerSaysSo() async throws {
+        let dir = draftDirectory()
+        defer { remove(dir) }
+        let id = UUID()
+
+        let first = store(at: dir)
+        first.capture(ComposerDraftCapture(text: "here are the two pages", files: [
+            file("page-1.png", 4096), file("page-2.png", 4096),
+        ]), for: id)
+        await first.settle()
+
+        let coldLaunch = store(at: dir).snapshot(for: id)
+        XCTAssertEqual(coldLaunch.text, "here are the two pages", "the text came back")
+        XCTAssertTrue(coldLaunch.files.isEmpty, "the bytes did not")
+        XCTAssertEqual(coldLaunch.lostFiles, 2)
+        let notice = ComposerDraftNotice.message(for: coldLaunch, contextStillAttached: false)
+        XCTAssertTrue(notice?.contains("2 files") ?? false,
+                      "and it is named, not silently dropped: \(notice ?? "nil")")
+    }
+
+    /// Replacing the staged set replaces what is held, and drops the loss claim with it.
+    func testCapturingADifferentFileSetReplacesIt() {
         let dir = draftDirectory()
         defer { remove(dir) }
         let drafts = store(at: dir)
         let id = UUID()
-        let a = ComposerDraftFile(filename: "a.png", mime: "image/png", data: Data([1, 2, 3]))
-        let b = ComposerDraftFile(filename: "b.png", mime: "image/png", data: Data([4, 5, 6]))
 
-        drafts.writeFiles([a, b], for: id)
+        drafts.capture(typed("", files: [file("a.png", 3), file("b.png", 3, fill: 0x42)]),
+                       for: id)
         XCTAssertEqual(drafts.snapshot(for: id).files.count, 2)
-        drafts.writeFiles([b], for: id)
+        drafts.capture(typed("", files: [file("b.png", 3, fill: 0x42)]), for: id)
         XCTAssertEqual(drafts.snapshot(for: id).files.map(\.filename), ["b.png"])
+        XCTAssertEqual(drafts.snapshot(for: id).lostFiles, 0)
     }
 
-    /// Both writers report whether anything changed, so a caller can skip work for an edit
-    /// that was not one.
-    func testWritesReportWhetherAnythingChanged() {
+    /// The in-memory budget is a real bound. Staged files go first, oldest conversation
+    /// first, and the conversation just captured is never the one thrown away.
+    func testTheByteCapEvictsTheOldestFilesFirstAndKeepsTheText() {
         let dir = draftDirectory()
         defer { remove(dir) }
-        let drafts = store(at: dir)
-        let id = UUID()
-        let file = ComposerDraftFile(filename: "a.png", mime: "image/png", data: Data([1, 2, 3]))
+        // Room for roughly two of the three file sets below.
+        let drafts = ComposerDraftStore(writer: ComposerDraftFileWriter(root: dir),
+                                        byteCap: 250_000)
+        let oldest = UUID(), middle = UUID(), newest = UUID()
+        let base = Date(timeIntervalSince1970: 1_700_000_000)
 
-        XCTAssertTrue(drafts.write(text: "hello", for: id))
-        XCTAssertFalse(drafts.write(text: "hello", for: id), "the same text is not an edit")
-        XCTAssertTrue(drafts.write(text: "hello!", for: id))
-        XCTAssertTrue(drafts.writeFiles([file], for: id))
-        XCTAssertFalse(drafts.writeFiles([file], for: id),
-                       "the same file, by name, type and length, is not a change")
+        drafts.capture(typed("oldest text", files: [file("o.png", 100_000)]),
+                       for: oldest, now: base)
+        drafts.capture(typed("middle text", files: [file("m.png", 100_000)]),
+                       for: middle, now: base.addingTimeInterval(60))
+        drafts.capture(typed("newest text", files: [file("n.png", 100_000)]),
+                       for: newest, now: base.addingTimeInterval(120))
+
+        XCTAssertTrue(drafts.snapshot(for: oldest).files.isEmpty,
+                      "the least recently updated conversation lost its files")
+        XCTAssertEqual(drafts.snapshot(for: oldest).lostFiles, 1, "and says so")
+        XCTAssertEqual(drafts.snapshot(for: oldest).text, "oldest text",
+                       "TEXT LAST: it kept its text")
+        XCTAssertEqual(drafts.snapshot(for: middle).files.count, 1, "the middle one is intact")
+        XCTAssertEqual(drafts.snapshot(for: newest).files.count, 1,
+                       "and the one just captured is never the one thrown away")
+    }
+
+    /// A single conversation staging more than the whole budget drops its own files rather
+    /// than blowing the bound.
+    func testAConversationBiggerThanTheWholeBudgetDropsItsOwnFiles() {
+        let dir = draftDirectory()
+        defer { remove(dir) }
+        let drafts = ComposerDraftStore(writer: ComposerDraftFileWriter(root: dir),
+                                        byteCap: 50_000)
+        let id = UUID()
+        drafts.capture(typed("too much", files: [file("huge.png", 200_000)]), for: id)
+
+        XCTAssertTrue(drafts.snapshot(for: id).files.isEmpty)
+        XCTAssertEqual(drafts.snapshot(for: id).lostFiles, 1)
+        XCTAssertEqual(drafts.snapshot(for: id).text, "too much")
     }
 
     // MARK: - The reaper exemption
 
-    /// `hasDraft` is what both shells' empty-thread reapers consult, so pin its three
-    /// answers. A conversation the store has never heard of must answer false without
-    /// touching the disk at all — that is the reaper's whole cost now.
+    /// `hasDraft` is what both shells' empty-thread reapers consult, so pin its answers. It
+    /// is one dictionary lookup — that is the reaper's whole cost now.
     func testHasDraftIsTheReaperExemption() {
         let dir = draftDirectory()
         defer { remove(dir) }
@@ -282,40 +417,33 @@ final class ComposerDraftTests: XCTestCase {
         XCTAssertFalse(drafts.hasDraft(id), "a conversation with no draft is reapable")
         XCTAssertFalse(drafts.hasDraft(UUID()), "and so is one the store has never seen")
 
-        drafts.write(text: "unsent", for: id)
+        drafts.capture(typed("unsent"), for: id)
         XCTAssertTrue(drafts.hasDraft(id), "a typed draft exempts it")
 
-        drafts.write(text: "", for: id)
+        drafts.capture(typed(""), for: id)
         XCTAssertFalse(drafts.hasDraft(id), "a deliberately emptied draft does not")
 
-        drafts.writeFiles([ComposerDraftFile(filename: "a.pdf", mime: "application/pdf",
-                                             data: Data([1]))], for: id)
+        drafts.capture(typed("", files: [file("a.pdf", 1)]), for: id)
         XCTAssertTrue(drafts.hasDraft(id), "a staged file exempts it on its own")
     }
 
-    /// Deleting a conversation deletes its draft and its staged bytes — which is now an
-    /// explicit call rather than a SwiftData cascade, so it is worth pinning.
-    func testDeletingAConversationDeletesItsDraftAndItsFiles() async throws {
+    /// Deleting a conversation deletes its draft — an explicit call now, not a SwiftData
+    /// cascade, so it is worth pinning.
+    func testDeletingAConversationDeletesItsDraft() async throws {
         let dir = draftDirectory()
         defer { remove(dir) }
         let id = UUID()
 
         let drafts = store(at: dir)
-        drafts.write(text: "unsent", for: id)
-        drafts.writeFiles([ComposerDraftFile(filename: "big.png", mime: "image/png",
-                                             data: Data(repeating: 0x11, count: 4096))],
-                          for: id)
-        drafts.flush(id)
-        await settle(dir, expecting: [id])
-        XCTAssertTrue(FileManager.default.fileExists(
-            atPath: dir.appendingPathComponent(id.uuidString).path))
+        drafts.capture(typed("unsent", files: [file("big.png", 4096)]), for: id)
+        await drafts.settle()
+        XCTAssertEqual(store(at: dir).snapshot(for: id).text, "unsent")
 
         drafts.delete(id)
-        await settle(dir)
-        XCTAssertFalse(FileManager.default.fileExists(
-            atPath: dir.appendingPathComponent(id.uuidString).path),
-            "the draft and its bytes are gone from disk")
-        XCTAssertEqual(store(at: dir).snapshot(for: id).text, "")
+        await drafts.settle()
+        XCTAssertFalse(drafts.holdsDraft(id))
+        XCTAssertEqual(store(at: dir).snapshot(for: id).text, "",
+                       "gone from disk too, not just from memory")
     }
 
     /// The backstop for a delete this store never saw — one that arrived from another
@@ -326,18 +454,16 @@ final class ComposerDraftTests: XCTestCase {
         let live = UUID(), gone = UUID()
 
         let first = store(at: dir)
-        first.write(text: "still here", for: live)
-        first.write(text: "orphaned", for: gone)
-        first.flushAll()
-        await settle(dir, expecting: [live, gone])
+        first.capture(typed("still here"), for: live)
+        first.capture(typed("orphaned"), for: gone)
+        await first.settle()
 
         let reopened = store(at: dir)
         reopened.sweep(keeping: [live])
-        await settle(dir)
+        await reopened.settle()
 
         XCTAssertEqual(store(at: dir).snapshot(for: live).text, "still here")
-        XCTAssertEqual(store(at: dir).snapshot(for: gone).text, "",
-                       "the orphan is gone")
+        XCTAssertEqual(store(at: dir).snapshot(for: gone).text, "", "the orphan is gone")
     }
 
     // MARK: - The send handoff
@@ -348,10 +474,8 @@ final class ComposerDraftTests: XCTestCase {
         defer { remove(dir) }
         let drafts = store(at: dir)
         let id = UUID()
-        drafts.write(text: "on its way", pendingRecording: "memo.m4a",
-                     contextLabel: "Lunch · Aug 22", for: id)
-        drafts.writeFiles([ComposerDraftFile(filename: "a.png", mime: "image/png",
-                                             data: Data([1]))], for: id)
+        drafts.capture(typed("on its way", files: [file("a.png", 1)],
+                             recording: "memo.m4a", context: "Lunch · Aug 22"), for: id)
 
         let released = drafts.release(for: id)
         XCTAssertEqual(released.text, "on its way")
@@ -361,33 +485,90 @@ final class ComposerDraftTests: XCTestCase {
 
         XCTAssertEqual(drafts.snapshot(for: id).text, "")
         XCTAssertFalse(drafts.hasDraft(id))
-        await settle(dir)
+        await drafts.settle()
         XCTAssertEqual(store(at: dir).snapshot(for: id).text, "",
                        "and it is gone from disk too, not just from memory")
     }
 
-    /// A released draft can be put back whole.
-    func testRestorePutsAReleasedDraftBackWhole() async throws {
+    // MARK: - Restore, as both shells call it
+
+    /// The one shared restore: text, files and the notice, in one call.
+    func testRestoreReturnsTheTextTheFilesAndTheNotice() throws {
         let dir = draftDirectory()
         defer { remove(dir) }
-        let id = UUID()
+        let drafts = store(at: dir)
+        let container = try ModelContainer(
+            for: jesseCurrentSchema,
+            configurations: ModelConfiguration(schema: jesseCurrentSchema,
+                                               isStoredInMemoryOnly: true))
+        let context = ModelContext(container)
+        let thread = JesseThread(mode: .ask)
+        context.insert(thread)
 
-        let first = store(at: dir)
-        first.write(text: "kept after all", pendingRecording: "memo.m4a",
-                    contextLabel: "Lunch · Aug 22", for: id)
-        first.writeFiles([ComposerDraftFile(filename: "a.png", mime: "image/png",
-                                            data: Data([1, 2, 3]))], for: id)
-        let released = first.release(for: id)
-        first.restore(released, for: id)
-        first.flush(id)
-        await settle(dir, expecting: [id])
+        drafts.capture(typed("mid sentence", files: [file("a.png", 8)],
+                             recording: "memo.m4a"), for: thread.id)
 
-        let restored = store(at: dir).snapshot(for: id)
-        XCTAssertEqual(restored.text, "kept after all")
-        XCTAssertEqual(restored.pendingRecording, "memo.m4a")
-        XCTAssertEqual(restored.contextLabel, "Lunch · Aug 22")
+        let restored = ComposerDrafts.restore(for: thread, newestUserTurn: nil,
+                                              contextStillAttached: false, store: drafts)
+        XCTAssertEqual(restored.text, "mid sentence")
         XCTAssertEqual(restored.files.map(\.filename), ["a.png"])
-        XCTAssertEqual(restored.files.first?.data, Data([1, 2, 3]))
+        XCTAssertTrue(restored.notice?.contains("memo.m4a") ?? false)
+
+        // The markers are one-shot: a second restore says nothing.
+        let again = ComposerDrafts.restore(for: thread, newestUserTurn: nil,
+                                           contextStillAttached: false, store: drafts)
+        XCTAssertEqual(again.text, "mid sentence", "the text is untouched")
+        XCTAssertNil(again.notice)
+    }
+
+    /// A restore discards a draft whose message already went, and takes the file with it.
+    func testRestoreDiscardsADraftTheSendAlreadySpent() throws {
+        let dir = draftDirectory()
+        defer { remove(dir) }
+        let drafts = store(at: dir)
+        let container = try ModelContainer(
+            for: jesseCurrentSchema,
+            configurations: ModelConfiguration(schema: jesseCurrentSchema,
+                                               isStoredInMemoryOnly: true))
+        let context = ModelContext(container)
+        let thread = JesseThread(mode: .ask)
+        context.insert(thread)
+        let sent = Date()
+        drafts.capture(typed("the message"), for: thread.id,
+                       now: sent.addingTimeInterval(-0.2))
+
+        let restored = ComposerDrafts.restore(
+            for: thread, newestUserTurn: (text: "the message", createdAt: sent),
+            contextStillAttached: false, store: drafts)
+        XCTAssertEqual(restored, .nothing, "a sent message does not come back as unsent")
+        XCTAssertFalse(drafts.holdsDraft(thread.id))
+    }
+
+    /// A never-saved conversation is inserted at the CAPTURE, so a draft restored after a
+    /// cold launch still has a conversation to belong to — and an untouched composer still
+    /// inserts nothing.
+    func testCaptureInsertsANeverSavedConversationAndOnlyThen() throws {
+        let dir = draftDirectory()
+        defer { remove(dir) }
+        let drafts = store(at: dir)
+        let container = try ModelContainer(
+            for: jesseCurrentSchema,
+            configurations: ModelConfiguration(schema: jesseCurrentSchema,
+                                               isStoredInMemoryOnly: true))
+        let context = ModelContext(container)
+
+        let staged = JesseThread(mode: .ask)
+        XCTAssertNil(staged.modelContext, "precondition: not in the store")
+
+        ComposerDrafts.capture(typed(""), for: staged, in: context, store: drafts)
+        XCTAssertNil(staged.modelContext,
+                     "a departure from an empty composer is still a +-then-back")
+
+        ComposerDrafts.capture(typed("about this reading"), for: staged, in: context,
+                               store: drafts)
+        XCTAssertNotNil(staged.modelContext)
+        XCTAssertFalse(context.hasChanges, "and the insert was SAVED, not left pending")
+        XCTAssertEqual(try context.fetch(FetchDescriptor<JesseThread>()).count, 1)
     }
 
     // MARK: - A draft a send already spent
@@ -434,14 +615,13 @@ final class ComposerDraftTests: XCTestCase {
 
     // MARK: - Notices
 
-    /// A recording still transcribing when the composer was lost is NAMED on restore, once.
+    /// A recording still transcribing when the composer was left is NAMED on restore, once.
     func testAPendingRecordingIsReportedOnceAndThenCleared() {
         let dir = draftDirectory()
         defer { remove(dir) }
         let drafts = store(at: dir)
         let id = UUID()
-        drafts.write(text: "typed while it read the audio", pendingRecording: "memo.m4a",
-                     for: id)
+        drafts.capture(typed("typed while it read the audio", recording: "memo.m4a"), for: id)
 
         let first = drafts.snapshot(for: id)
         XCTAssertEqual(first.pendingRecording, "memo.m4a")
@@ -452,6 +632,24 @@ final class ComposerDraftTests: XCTestCase {
         XCTAssertEqual(second.text, "typed while it read the audio", "the text is untouched")
         XCTAssertNil(second.pendingRecording, "the marker is one-shot")
         XCTAssertNil(ComposerDraftNotice.message(for: second, contextStillAttached: false))
+    }
+
+    /// Clearing the notices writes nothing: it happens on APPEAR, which is not a departure.
+    func testClearingNoticesIsNotADeparture() async throws {
+        let dir = draftDirectory()
+        defer { remove(dir) }
+        let counting = CountingWriter(inner: ComposerDraftFileWriter(root: dir))
+        let drafts = ComposerDraftStore(writer: counting)
+        let id = UUID()
+        drafts.capture(typed("x", recording: "memo.m4a"), for: id)
+        await drafts.settle()
+        let afterCapture = await counting.writes
+
+        drafts.clearNotices(for: id)
+        await drafts.settle()
+        let writeCount7 = await counting.writes
+        XCTAssertEqual(writeCount7, afterCapture,
+                       "appearing costs no write; the next departure records the truth")
     }
 
     /// The recording notice names the file and says the audio is already gone.
@@ -472,13 +670,14 @@ final class ComposerDraftTests: XCTestCase {
                      "still attached, nothing was lost, nothing to say")
     }
 
-    /// Both losses at once are reported together.
-    func testBothLossesAreReportedTogether() {
+    /// All three losses at once are reported together.
+    func testEveryLossIsReportedTogether() {
         let snapshot = ComposerDraftSnapshot(text: "x", pendingRecording: "memo.m4a",
-                                             contextLabel: "Lunch · Aug 22")
+                                             contextLabel: "Lunch · Aug 22", lostFiles: 1)
         let notice = ComposerDraftNotice.message(for: snapshot, contextStillAttached: false)
         XCTAssertTrue(notice?.contains("memo.m4a") ?? false)
         XCTAssertTrue(notice?.contains("Lunch · Aug 22") ?? false)
+        XCTAssertTrue(notice?.contains("attach it again") ?? false)
     }
 
     /// An ordinary draft says nothing at all.
@@ -489,73 +688,104 @@ final class ComposerDraftTests: XCTestCase {
 
     // MARK: - The durability boundary
 
-    /// The quiet period fires on its own. Nothing about durability depends on a
-    /// disappearance or a termination callback — those only make the window ZERO.
-    func testAnIdleDraftReachesDiskOnItsOwnAfterTheQuietPeriod() async throws {
-        let dir = draftDirectory()
-        defer { remove(dir) }
-        let id = UUID()
-        let drafts = store(at: dir, quietPeriod: .milliseconds(20))
-        drafts.write(text: "left alone for a moment", for: id)
-        XCTAssertTrue(drafts.hasUnwrittenChanges)
-
-        await settle(dir, expecting: [id], timeout: 4)
-        XCTAssertEqual(store(at: dir).snapshot(for: id).text, "left alone for a moment",
-                       "the trailing write fires without anyone asking it to")
-        XCTAssertFalse(drafts.hasUnwrittenChanges)
-    }
-
-    /// A burst of typing coalesces to ONE write. That is the difference between this shape
-    /// and the one it replaces, stated at the store's own layer.
-    func testABurstOfEditsCoalescesToOneWrite() async throws {
-        let dir = draftDirectory()
-        defer { remove(dir) }
-        let counting = CountingWriter(inner: ComposerDraftFileWriter(root: dir))
-        let drafts = ComposerDraftStore(writer: counting, quietPeriod: .milliseconds(20),
-                                        observesAppLifecycle: false)
-        let id = UUID()
-        for i in 0..<50 { drafts.write(text: String(repeating: "x", count: i + 1), for: id) }
-        let midBurst = await counting.writes
-        XCTAssertEqual(midBurst, 0, "nothing has been written mid-burst")
-
-        await settle(dir, expecting: [id], timeout: 4)
-        let afterBurst = await counting.writes
-        XCTAssertEqual(afterBurst, 1, "fifty keystrokes, one write")
-    }
-
-    /// **THE DURABILITY BOUNDARY THE TESTS ACTUALLY DEMONSTRATE.** An edit followed by the
-    /// one lifecycle event that really happens — leaving the composer — is on disk, with no
-    /// termination handler, no scene-phase callback and no host autosave. The quiet period
-    /// here is sixty seconds, so nothing but the explicit flush can have written it.
-    func testAnEditFollowedByAFlushIsOnDiskWithNoFurtherLifecycleEvent() async throws {
+    /// **THE GUARANTEE.** A departure puts the text on disk with no further lifecycle
+    /// event, no timer and no host autosave.
+    func testADepartureIsOnDiskWithNoFurtherLifecycleEvent() async throws {
         let dir = draftDirectory()
         defer { remove(dir) }
         let id = UUID()
 
-        let drafts = store(at: dir, quietPeriod: .seconds(60))
-        drafts.write(text: "typed and then the phone died", for: id)
-        drafts.flush(id)
-        await settle(dir, expecting: [id])
+        let drafts = store(at: dir)
+        drafts.capture(typed("typed and then the phone died"), for: id)
+        await drafts.settle()
 
         XCTAssertEqual(store(at: dir).snapshot(for: id).text,
                        "typed and then the phone died")
     }
 
-    /// And the loss that IS accepted, pinned so nobody mistakes the guarantee for a
-    /// stronger one: a process that dies inside the quiet period, with no flush, loses that
-    /// window's typing. Two seconds in the app.
-    func testTextTypedAndNeverFlushedInsideTheQuietPeriodIsLost() async throws {
+    /// **AND THE LOSS THAT IS ACCEPTED**, pinned so nobody mistakes the guarantee for a
+    /// stronger one: a kill that runs no code loses whatever was typed since the last
+    /// departure. On the phone that window is effectively zero, because reaching the app
+    /// switcher backgrounds the app first.
+    func testTypingSinceTheLastDepartureIsLostToAKillThatRunsNoCode() async throws {
         let dir = draftDirectory()
         defer { remove(dir) }
         let id = UUID()
 
-        let drafts = store(at: dir, quietPeriod: .seconds(60))
-        drafts.write(text: "the last few seconds", for: id)
-        // No flush, no lifecycle event: the process is simply gone.
+        let drafts = store(at: dir)
+        drafts.capture(typed("the first half"), for: id)
+        await drafts.settle()
+        // …and then the user types more, and the process is simply gone. No departure ran.
 
-        XCTAssertEqual(store(at: dir).snapshot(for: id).text, "",
-                       "a hard kill inside the quiet period loses that window — by design")
-        XCTAssertTrue(drafts.hasUnwrittenChanges)
+        XCTAssertEqual(store(at: dir).snapshot(for: id).text, "the first half",
+                       "what reached the last departure survives; the rest does not")
+    }
+
+    /// A QUIT writes on the calling thread, so the draft is on disk by the time the
+    /// handler returns — no `await`, no run-loop turn, nothing left to schedule. Fails
+    /// against a terminating capture that only queues an async write.
+    func testATerminatingCaptureIsOnDiskBeforeItReturns() {
+        let dir = draftDirectory()
+        defer { remove(dir) }
+        let drafts = store(at: dir)
+        let id = UUID()
+
+        drafts.capture(typed("typed, then Cmd-Q"), for: id, terminating: true)
+
+        // No `settle()`, deliberately: the process is supposed to be able to die here.
+        XCTAssertEqual(store(at: dir).snapshot(for: id).text, "typed, then Cmd-Q")
+    }
+
+    /// And nothing reaches disk after it: the terminating map is the last word, so an
+    /// in-flight write carrying an older one cannot land on top of it.
+    func testNothingIsWrittenAfterATerminatingCapture() async throws {
+        let dir = draftDirectory()
+        defer { remove(dir) }
+        let drafts = store(at: dir)
+        let id = UUID()
+
+        drafts.capture(typed("the last word"), for: id, terminating: true)
+        drafts.capture(typed("a ghost from a dying process"), for: id)
+        await drafts.settle()
+
+        XCTAssertEqual(store(at: dir).snapshot(for: id).text, "the last word")
+    }
+
+    // MARK: - Off the 131 shape
+
+    /// 131 wrote one directory per conversation. Upgrading adopts what they hold and
+    /// removes them, so a draft in progress is not lost and the directories do not linger.
+    func testTheOneThirtyOneDirectoriesAreAdoptedAndRemoved() async throws {
+        let dir = draftDirectory()
+        defer { remove(dir) }
+        let id = UUID()
+        let legacy = dir.appendingPathComponent("ComposerDrafts", isDirectory: true)
+            .appendingPathComponent(id.uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: legacy.appendingPathComponent("files"), withIntermediateDirectories: true)
+        let doc: [String: Any] = [
+            "text": "typed on the old build",
+            "pendingRecording": "memo.m4a",
+            "updatedAt": Date().timeIntervalSinceReferenceDate,
+            "files": [["filename": "a.png", "mime": "image/png", "storedName": "0-a.png"]],
+        ]
+        try JSONSerialization.data(withJSONObject: doc)
+            .write(to: legacy.appendingPathComponent("draft.json"))
+
+        let upgraded = store(at: dir)
+        let snapshot = upgraded.snapshot(for: id)
+        XCTAssertEqual(snapshot.text, "typed on the old build", "the text came across")
+        XCTAssertEqual(snapshot.pendingRecording, "memo.m4a")
+        XCTAssertEqual(snapshot.lostFiles, 1, "and the staged file is named as lost")
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: dir.appendingPathComponent("ComposerDrafts").path),
+            "the old directories are gone, not left to linger")
+
+        // And the adopted draft is durable from here on.
+        upgraded.capture(typed("typed on the old build, plus more"), for: id)
+        await upgraded.settle()
+        XCTAssertEqual(store(at: dir).snapshot(for: id).text,
+                       "typed on the old build, plus more")
     }
 
     // MARK: - Migration off the V5 columns
@@ -605,9 +835,12 @@ final class ComposerDraftTests: XCTestCase {
                                                          defaults: defaults), 0,
                        "the second launch does not run it again")
 
-        // It reached disk, so the next launch reads it from there.
-        await settle(dir, expecting: [thread.id])
-        XCTAssertEqual(store(at: dir).snapshot(for: thread.id).text, "typed on the old build")
+        // The TEXT reached disk, so the next launch reads it from there; the staged file
+        // did not, and the next launch says so.
+        await drafts.settle()
+        let next = store(at: dir).snapshot(for: thread.id)
+        XCTAssertEqual(next.text, "typed on the old build")
+        XCTAssertEqual(next.lostFiles, 1)
     }
 
     /// The V5 entity set is still declared, so a V5 store opens under the current schema
@@ -643,9 +876,9 @@ final class ComposerDraftTests: XCTestCase {
         XCTAssertTrue(migrated.draftAttachments.isEmpty)
     }
 
-    /// The draft is LOCAL AND UNSYNCED — and now it is not even in the object graph, so
-    /// everything hydration, a title mint, a model switch and a flag reconcile write cannot
-    /// reach it. Drives those real writes and asserts the draft is exactly as it was.
+    /// The draft is LOCAL AND UNSYNCED — and not in the object graph, so everything
+    /// hydration, a title mint, a model switch and a flag reconcile write cannot reach it.
+    /// Drives those real writes and asserts the draft is exactly as it was.
     func testHydrationTitlesModelSwitchesAndFlagSyncAllLeaveTheDraftAlone() async throws {
         let dir = draftDirectory()
         defer { remove(dir) }
@@ -659,11 +892,8 @@ final class ComposerDraftTests: XCTestCase {
         context.insert(thread)
 
         let drafts = store(at: dir)
-        drafts.write(text: draft, for: thread.id)
-        drafts.writeFiles([ComposerDraftFile(filename: "a.png", mime: "image/png",
-                                             data: Data([1, 2, 3]))], for: thread.id)
-        drafts.flush(thread.id)
-        await settle(dir, expecting: [thread.id])
+        drafts.capture(typed(draft, files: [file("a.png", 3)]), for: thread.id)
+        await drafts.settle()
 
         // Everything a sync, a hydration or a switch actually writes.
         thread.title = "A title derived from the first turn"
@@ -681,92 +911,33 @@ final class ComposerDraftTests: XCTestCase {
         thread.updatedAt = Date()
         try context.save()
 
-        let after = store(at: dir).snapshot(for: thread.id)
-        XCTAssertEqual(after.text, draft,
+        XCTAssertEqual(drafts.snapshot(for: thread.id).text, draft,
                        "a title mint, a model switch, a flag sync and an incoming reply do not touch the draft")
-        XCTAssertEqual(after.files.map(\.filename), ["a.png"])
-    }
-
-    // MARK: - Inserting a staged conversation
-
-    /// A conversation not yet in the store is inserted by its FIRST character, and by
-    /// nothing else — a bare `+`-then-back still costs nothing.
-    func testTypingInsertsAStagedConversation() throws {
-        let container = try ModelContainer(
-            for: jesseCurrentSchema,
-            configurations: ModelConfiguration(schema: jesseCurrentSchema,
-                                               isStoredInMemoryOnly: true))
-        let context = ModelContext(container)
-
-        let staged = JesseThread(mode: .ask)
-        XCTAssertNil(staged.modelContext, "precondition: not in the store")
-
-        XCTAssertFalse(ComposerDraftThreadInsertion.persistIfNeeded(
-            staged, in: context, hasSomethingToKeep: false),
-            "an empty composer does not insert an abandoned +-then-back")
-        XCTAssertNil(staged.modelContext)
-
-        XCTAssertTrue(ComposerDraftThreadInsertion.persistIfNeeded(
-            staged, in: context, hasSomethingToKeep: true),
-            "the first character inserts it")
-        XCTAssertNotNil(staged.modelContext)
-        XCTAssertFalse(context.hasChanges, "and the insert was SAVED, not left pending")
-        XCTAssertEqual(try context.fetch(FetchDescriptor<JesseThread>()).count, 1)
-    }
-
-    /// The regression `ComposerDraftUITests.testTheDraftSurvivesARelaunch` caught: a
-    /// conversation the `+` button INSERTED but nobody saved. The draft used to ride a
-    /// debounced `context.save()`, and that save was what quietly persisted the pending
-    /// insert as well; with the draft out of the graph there is no such save, so a
-    /// brand-new conversation stayed in memory and vanished on relaunch — taking the
-    /// draft's only way back with it.
-    func testAnInsertedButUnsavedConversationIsPersistedForItsDraft() throws {
-        let dir = draftDirectory()
-        defer { remove(dir) }
-        let url = dir.appendingPathComponent("store.sqlite")
-        let schema = jesseCurrentSchema
-        let id = UUID()
-
-        do {
-            let context = ModelContext(try ModelContainer(
-                for: schema, configurations: ModelConfiguration(schema: schema, url: url)))
-            // Exactly what the `+` button does: insert, and save nothing.
-            let fresh = JesseThread(mode: .ask)
-            fresh.id = id
-            context.insert(fresh)
-            XCTAssertNotNil(fresh.modelContext, "inserted…")
-            XCTAssertTrue(context.hasChanges, "…but not on disk")
-
-            XCTAssertTrue(ComposerDraftThreadInsertion.persistIfNeeded(
-                fresh, in: context, hasSomethingToKeep: true),
-                "the first character puts it on disk")
-            XCTAssertFalse(context.hasChanges)
-        }
-
-        let reopened = ModelContext(try ModelContainer(
-            for: schema, configurations: ModelConfiguration(schema: schema, url: url)))
-        XCTAssertEqual(try reopened.fetch(FetchDescriptor<JesseThread>()).count, 1,
-                       "the conversation the draft belongs to outlived the process")
+        XCTAssertEqual(drafts.snapshot(for: thread.id).files.map(\.filename), ["a.png"])
+        XCTAssertEqual(store(at: dir).snapshot(for: thread.id).text, draft)
     }
 }
 
-/// A writer that counts. The only way to assert the thing this change exists for — that
-/// typing writes NOTHING — is to ask the back end how many times it was called.
+/// A writer that counts. The only way to assert the two things this change exists for —
+/// that typing writes NOTHING, and that every departure on both shells routes through this
+/// one door — is to ask the back end how many times it was called.
 private actor CountingWriter: ComposerDraftWriting {
     private let inner: ComposerDraftFileWriter
     private(set) var writes = 0
 
     init(inner: ComposerDraftFileWriter) { self.inner = inner }
 
-    nonisolated func storedIDs() -> Set<UUID> { inner.storedIDs() }
-    nonisolated func load(_ id: UUID) -> ComposerDraftRecord? { inner.load(id) }
+    nonisolated func load() -> [UUID: ComposerDraftPersisted] { inner.load() }
 
-    func write(_ record: ComposerDraftRecord, for id: UUID, generation: UInt64) async {
+    func write(_ map: [UUID: ComposerDraftPersisted]) async {
         writes += 1
-        await inner.write(record, for: id, generation: generation)
+        await inner.write(map)
     }
 
-    func delete(_ id: UUID, generation: UInt64) async {
-        await inner.delete(id, generation: generation)
+    nonisolated func writeNow(_ map: [UUID: ComposerDraftPersisted]) {
+        Task { await self.countSynchronousWrite() }
+        inner.writeNow(map)
     }
+
+    private func countSynchronousWrite() { writes += 1 }
 }

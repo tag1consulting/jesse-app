@@ -187,6 +187,53 @@ final class ComposerDraftUITests: XCTestCase {
         clearNewestDrafts(app, 2)
     }
 
+    /// **Three at once, across a switch AND a cold launch.** Two conversations prove
+    /// nothing leaks; three prove the store is a DICTIONARY and not a most-recent slot,
+    /// and the relaunch proves every one of them reached disk rather than only the last
+    /// one left.
+    func testThreeConversationsHoldTheirOwnDraftsAcrossASwitchAndARelaunch() {
+        let app = launched()
+        let marks = ["AAA111", "BBB222", "CCC333"]
+        for mark in marks {
+            type(mark, into: newConversation(app))
+            backToList(app)
+        }
+
+        // Before the relaunch: each of the three rows holds exactly one mark, and the
+        // three marks are all different.
+        XCTAssertTrue(draftRows(app).element(boundBy: 2).waitForExistence(timeout: 20),
+                      "all three drafted conversations are in the list")
+        var beforeRelaunch: [String] = []
+        for row in 0..<3 {
+            draftRows(app).element(boundBy: row).tap()
+            let held = text(of: composer(app))
+            beforeRelaunch.append(marks.first { held.contains($0) } ?? "none")
+            XCTAssertEqual(marks.filter { held.contains($0) }.count, 1,
+                           "row \(row) holds exactly one draft, never two")
+            backToList(app)
+        }
+        XCTAssertEqual(Set(beforeRelaunch).count, 3,
+                       "three conversations, three different drafts, held at the same time")
+
+        app.terminate()
+        app.launch()
+        openChatsTab(app)
+
+        XCTAssertTrue(draftRows(app).element(boundBy: 2).waitForExistence(timeout: 20),
+                      "all three survived the cold launch")
+        var afterRelaunch: [String] = []
+        for row in 0..<3 {
+            draftRows(app).element(boundBy: row).tap()
+            let held = text(of: composer(app))
+            afterRelaunch.append(marks.first { held.contains($0) } ?? "none")
+            backToList(app)
+        }
+        XCTAssertEqual(afterRelaunch, beforeRelaunch,
+                       "each conversation came back with its OWN draft, in its own row")
+
+        clearNewestDrafts(app, 3)
+    }
+
     // MARK: - Symptom two: leaving the app
 
     /// A relaunch — a genuinely new process, not a re-render — finds the draft.
@@ -209,9 +256,9 @@ final class ComposerDraftUITests: XCTestCase {
     }
 
     /// Termination with NO navigation first: straight from the last keystroke to a dead
-    /// process. This is the boundary the coalesced write claims — the model-side write is
-    /// synchronous on the keystroke and the trailing save follows the last one closely, so
-    /// there is no "leave the screen properly or lose it" rule.
+    /// process. Nothing wrote anything while the text was being typed, so this is the test
+    /// that the TERMINATION departure really fires and really captures — there is no
+    /// "leave the screen properly or lose it" rule, and no timer standing in for one.
     func testTheDraftSurvivesTerminationImmediatelyAfterAnEdit() {
         let app = launched()
         let field = newConversation(app)
@@ -291,5 +338,63 @@ final class ComposerDraftUITests: XCTestCase {
 
         backToList(app)
         clearNewestDrafts(app, 1)
+    }
+
+    // MARK: - The other way a composer is destroyed
+
+    /// The `.id(thread.id)` DETAIL-COLUMN REPLACEMENT, which is the iPad's shape and the
+    /// Mac's. Switching there does not pop anything: SwiftUI throws the old view away and
+    /// builds a new one, and the outgoing composer's only chance to hand its text over is
+    /// the `onDisappear` that identity change fires.
+    ///
+    /// That path is newly load-bearing. Until this change the dictionary was already up to
+    /// date on every keystroke and a timer would have written it anyway; now the departure
+    /// IS the mechanism, so it needs a test of its own rather than an assumption about
+    /// SwiftUI.
+    ///
+    /// SKIPPED on a compact-width device, which is where CI runs this suite: there is no
+    /// split view on an iPhone and the same gestures would quietly measure the pop path
+    /// instead. Run it on an iPad:
+    ///
+    ///     xcodebuild test -scheme Jesse \
+    ///       -destination 'platform=iOS Simulator,name=iPad Pro 11-inch (M5)' \
+    ///       -only-testing:JesseUITests/ComposerDraftUITests/\
+    ///         testTheDetailColumnReplacementCapturesTheOutgoingDraft
+    func testTheDetailColumnReplacementCapturesTheOutgoingDraft() throws {
+        let app = XCUIApplication()
+        app.launch()
+        // iPad puts the tabs in a floating bar rather than a `tabBars` element.
+        let chats = app.tabBars.buttons["Chats"].exists
+            ? app.tabBars.buttons["Chats"] : app.buttons["Chats"].firstMatch
+        if chats.waitForExistence(timeout: 30) { chats.tap() }
+
+        // The split view opens with its sidebar collapsed, and the sidebar is the only
+        // place the compose button and the rows live. Its absence is also how this test
+        // knows it is on a phone.
+        let showSidebar = app.buttons["Show Sidebar"]
+        try XCTSkipUnless(showSidebar.waitForExistence(timeout: 10),
+                          "compact width: no split view, so no .id() replacement to test")
+        showSidebar.tap()
+        XCTAssertTrue(app.navigationBars.buttons["New conversation"].waitForExistence(timeout: 30),
+                      "the sidebar is up")
+
+        type("AAA111", into: newConversation(app))
+        type("BBB222", into: newConversation(app))
+
+        // Selecting a sidebar row REPLACES the detail column — no back button is involved.
+        let rows = draftRows(app)
+        XCTAssertTrue(rows.element(boundBy: 1).waitForExistence(timeout: 20),
+                      "both drafted conversations are in the sidebar")
+        rows.element(boundBy: 1).tap()
+        let first = text(of: composer(app))
+        rows.element(boundBy: 0).tap()
+        let second = text(of: composer(app))
+
+        XCTAssertNotEqual(first.contains("AAA111"), first.contains("BBB222"),
+                          "a conversation holds exactly one of the two drafts — got \(first.debugDescription)")
+        XCTAssertNotEqual(first.contains("AAA111"), second.contains("AAA111"),
+                          "the replaced composer handed its own text over on the way out")
+
+        clearNewestDrafts(app, 2)
     }
 }

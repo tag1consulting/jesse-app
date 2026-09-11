@@ -59,10 +59,9 @@ struct JesseMacApp: App {
                 }
                 .onChange(of: scenePhase) { _, phase in
                     notifier.isActive = (phase == .active)
-                    // A clean quit and a background are both "this composer may stop being
-                    // reachable", and the quiet period is only a backstop. Get every
-                    // unwritten draft to disk here rather than rely on it.
-                    if phase != .active { ComposerDraftStore.shared.flushAll() }
+                    // No draft handling here. Only the composer knows what it is holding,
+                    // so the scene-phase departure belongs to `MacThreadDetailView` and is
+                    // wired there, beside the other three.
                 }
                 .onOpenURL { url in
                     // One payload, both halves. The three sentinel keys are ADDITIVE, so a
