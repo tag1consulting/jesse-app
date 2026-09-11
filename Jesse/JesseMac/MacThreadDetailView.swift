@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 import SwiftData
 import JesseCore
 import JesseNetworking
@@ -33,16 +34,16 @@ struct MacThreadDetailView: View {
     //
     // `draft` above is view state, and this view carries `.id(thread.id)` in the split
     // view's detail column — so selecting another conversation destroys it, and quitting
-    // takes it regardless. `draft` is now a MIRROR of the durable draft, through the same
-    // shared `ComposerDraftStore` the phone uses — which is NOT the object graph, so a
-    // keystroke here costs a dictionary assignment and nothing else.
-    private var drafts: ComposerDraftStore { .shared }
+    // takes it regardless.
+    //
+    // NOTHING REACTS TO TYPING here either: while this composer is on screen `draft` IS
+    // the draft, and it is handed over at DEPARTURES through the same shared
+    // `ComposerDrafts.capture` the phone uses. The only per-shell code is which hooks
+    // count as a departure.
+
     /// Guards the restore so it happens once per composer; a second one would overwrite
     /// live typing with a stale value.
     @State private var didRestoreDraft = false
-    /// Guards the once-per-composer save that puts this conversation on disk. See
-    /// `ComposerDraftThreadInsertion`.
-    @State private var didPersistThread = false
     /// What a restored draft lost, if anything (a recording mid-transcription, or the
     /// screen context the conversation was opened about). Nil almost always.
     @State private var draftNotice: String?
@@ -63,10 +64,18 @@ struct MacThreadDetailView: View {
             mode = thread.modeValue
             restoreDraft()
         }
-        // Close the pending-write window wherever this composer stops being reachable.
-        .onDisappear { drafts.flush(thread.id) }
+        // ── THE DEPARTURES ────────────────────────────────────────────────────────────
+        // Three of the four (the fourth is `send`): the detail column replacing this view
+        // on `.id(thread.id)`, the app losing the foreground, and a quit. Cmd-Q with the
+        // window frontmost may not change the scene phase at all, which is why
+        // `willTerminate` is here in its own right and not as a belt to a brace.
+        .onDisappear { captureDraft() }
         .onChange(of: scenePhase) { _, phase in
-            if phase != .active { drafts.flushAll() }
+            if phase != .active { captureDraft() }
+        }
+        .onReceive(NotificationCenter.default.publisher(
+            for: NSApplication.willTerminateNotification)) { _ in
+            captureDraft(terminating: true)
         }
         .task(id: thread.id) {
             await coordinator.hydrate(thread: thread, context: context)
@@ -75,25 +84,18 @@ struct MacThreadDetailView: View {
 
     // MARK: - The durable draft
 
-    /// Put the composer back the way the user left it, before any edit can be recorded.
+    /// Put the composer back the way the user left it. One call into the shared
+    /// `ComposerDrafts.restore` — the already-sent check, the notice and the one-shot
+    /// markers all live there, so this shell cannot grow its own idea of them. This Mac
+    /// has no attachment pipeline, so `restored.files` is nothing to it.
     private func restoreDraft() {
         guard !didRestoreDraft else { return }
         didRestoreDraft = true
-        let saved = drafts.snapshot(for: thread.id)
-        // A draft whose message already went is not a draft: the turn is saved before the
-        // draft is released, so a kill between the two leaves both on disk. Same rule as
-        // the phone's, through the same helper.
-        guard !ComposerDraftStaleness.isSpent(saved, newestUserTurn: newestUserTurn) else {
-            drafts.delete(thread.id)
-            return
-        }
-        draft = saved.text
-        draftNotice = ComposerDraftNotice.message(
-            for: saved,
+        let restored = ComposerDrafts.restore(
+            for: thread, newestUserTurn: newestUserTurn,
             contextStillAttached: coordinator.attachedContext(for: thread.id) != nil)
-        if saved.pendingRecording != nil || saved.contextLabel != nil {
-            drafts.clearNotices(for: thread.id)
-        }
+        draft = restored.text
+        draftNotice = restored.notice
     }
 
     /// The visible text and date of this conversation's newest user turn. `visibleText`
@@ -103,22 +105,24 @@ struct MacThreadDetailView: View {
         return (turn.visibleText, turn.createdAt)
     }
 
-    /// Record the composer's text against THIS thread. THE KEYSTROKE PATH: one dictionary
-    /// assignment in `ComposerDraftStore` and nothing else.
-    private func recordDraft() {
+    /// What this composer is holding right now. The two situational markers are read HERE,
+    /// at the departure, rather than tracked as they change.
+    private var composerState: ComposerDraftCapture {
+        ComposerDraftCapture(
+            text: draft,
+            pendingRecording: recording.isInFlight ? recording.sourceName : nil,
+            contextLabel: coordinator.attachment(for: thread.id)?.contextLabel)
+    }
+
+    /// A DEPARTURE. Hand the composer over; the shared function does the rest, including
+    /// putting a never-saved conversation on disk so the draft has somewhere to belong.
+    ///
+    /// `terminating` is the quit: there the write happens on this thread, because an
+    /// asynchronous one may never get a turn before the process is gone.
+    private func captureDraft(terminating: Bool = false) {
         guard didRestoreDraft else { return }
-        let pending = recording.isInFlight ? recording.sourceName : nil
-        let label = coordinator.attachment(for: thread.id)?.contextLabel
-        // The one SwiftData write near a keystroke, and it happens at most once per
-        // composer: a draft whose conversation was never persisted is a draft with no way
-        // back to it.
-        if !didPersistThread, !draft.isEmpty || pending != nil || label != nil {
-            didPersistThread = true
-            ComposerDraftThreadInsertion.persistIfNeeded(thread, in: context,
-                                                         hasSomethingToKeep: true)
-        }
-        drafts.write(text: draft, pendingRecording: pending, contextLabel: label,
-                     for: thread.id)
+        ComposerDrafts.capture(composerState, for: thread, in: context,
+                               terminating: terminating)
     }
 
     /// The window subtitle. This used to read "Not yet started" off `sessionId == nil`, which
@@ -296,13 +300,9 @@ struct MacThreadDetailView: View {
             guard value != nil, let done = recording.takeCompleted() else { return }
             draft = done.messageBody(typed: draft)
         }
-        // Every path into the composer ends up here: `draft` is written by the text view's
-        // delegate on every keystroke, paste and dictation update, and by the transcript
-        // landing above.
-        .onChange(of: draft) { _, _ in recordDraft() }
-        // A recording in flight is part of the pending message; the draft records its name
-        // so a composer restored without it can say so.
-        .onChange(of: recording.stage) { _, _ in recordDraft() }
+        // NO `onChange(of: draft)` and none for the recording stage. Typing changes this
+        // view's own state and nothing else; what the composer holds is read off that
+        // state at the next departure.
     }
 
     /// A picked recording. Transcribed on this Mac, never uploaded, and the working copy
@@ -335,13 +335,13 @@ struct MacThreadDetailView: View {
         guard canSend else { return }
         guard coordinator.stageAndSend(text: draft, mode: mode, thread: thread,
                                        context: context) else {
-            // Nothing was released, so the draft is still the truth. Get it to disk rather
-            // than wait out a quiet period.
-            drafts.flush(thread.id)
+            // Nothing was released, so the composer is still the truth. A refused send is
+            // a departure like any other: capture it.
+            captureDraft()
             return
         }
         // Durably staged: the user turn is on disk. Only now is the draft released.
-        drafts.release(for: thread.id)
+        ComposerDrafts.release(for: thread)
         draft = ""
         draftNotice = nil
     }

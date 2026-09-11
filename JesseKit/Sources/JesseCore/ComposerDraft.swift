@@ -45,16 +45,18 @@ public enum ComposerDraftMigration {
             // A draft the file store already holds wins: it is the newer of the two by
             // construction (nothing writes the columns any more).
             if store.snapshot(for: thread.id).updatedAt == nil {
-                store.write(text: text ?? "",
-                            pendingRecording: thread.draftPendingRecording,
-                            contextLabel: thread.draftContextLabel,
-                            for: thread.id,
-                            now: thread.draftUpdatedAt ?? Date())
-                if !rows.isEmpty {
-                    store.writeFiles(rows.map {
+                // Through the same one door every departure uses. One write per moved
+                // conversation, on a pass that runs once in the life of an install and in
+                // practice moves nothing or one thing.
+                store.capture(ComposerDraftCapture(
+                    text: text ?? "",
+                    files: rows.map {
                         ComposerDraftFile(filename: $0.filename, mime: $0.mime, data: $0.data)
-                    }, for: thread.id, now: thread.draftUpdatedAt ?? Date())
-                }
+                    },
+                    pendingRecording: thread.draftPendingRecording,
+                    contextLabel: thread.draftContextLabel),
+                              for: thread.id,
+                              now: thread.draftUpdatedAt ?? Date())
                 moved += 1
             }
             for row in rows { context.delete(row) }
@@ -64,7 +66,6 @@ public enum ComposerDraftMigration {
             thread.draftPendingRecording = nil
             thread.draftContextLabel = nil
         }
-        store.flushAll()
         if moved > 0 || context.hasChanges { try? context.save() }
         return moved
     }
@@ -77,8 +78,7 @@ public enum ComposerDraftMigration {
 /// Two ways that happens, and this covers both:
 ///
 ///   * A STAGED conversation (a Health ask, a Today discussion) is deliberately not
-///     inserted until its first send, so a bare `+`-then-back costs nothing. Typing into
-///     one IS the intent a `+`-then-back was not, so the first character inserts it.
+///     inserted until its first send, so a bare `+`-then-back costs nothing.
 ///   * A conversation the `+` button inserted but NOBODY SAVED. This is the one the first
 ///     cut of this change got wrong: the draft used to ride a debounced `context.save()`,
 ///     and that save was what quietly persisted the pending insert too. Removing it left a
@@ -86,9 +86,14 @@ public enum ComposerDraftMigration {
 ///     draft's way back with it, which `ComposerDraftUITests.testTheDraftSurvivesARelaunch`
 ///     caught.
 ///
-/// Called ONCE per composer, on the first draft it records — never per keystroke. The
-/// caller owns that guard (`didPersistThread` in both detail views), because only the view
-/// knows when a composer began.
+/// A STAGED conversation is inserted the first time a departure finds something in its
+/// composer — typing into one IS the intent a `+`-then-back was not — and a departure from
+/// an untouched composer still inserts nothing.
+///
+/// Called from `ComposerDrafts.capture`, so at DEPARTURES and never from a keystroke —
+/// there is no keystroke hook left to call it from. No caller-side guard is needed: a
+/// clean context falls out on `hasChanges` in a couple of instructions, and a departure
+/// happens a few dozen times a day.
 @MainActor
 public enum ComposerDraftThreadInsertion {
 

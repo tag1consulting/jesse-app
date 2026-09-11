@@ -31,8 +31,7 @@ final class MacComposerDraftTests: XCTestCase {
         directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("jesse-mac-draft-\(UUID().uuidString)", isDirectory: true)
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        drafts = ComposerDraftStore(writer: ComposerDraftFileWriter(root: directory),
-                                    quietPeriod: .seconds(60), observesAppLifecycle: false)
+        drafts = ComposerDraftStore(writer: ComposerDraftFileWriter(root: directory))
         previousShared = ComposerDraftStore.shared
         ComposerDraftStore.shared = drafts
     }
@@ -46,14 +45,34 @@ final class MacComposerDraftTests: XCTestCase {
     /// `MacThreadDetailView.send()`'s handoff rule, in one place: stage, and release ONLY on
     /// a true return.
     @discardableResult
+    ///
+    /// `recording` and `contextLabel` are the two situational markers the real view reads
+    /// off its own state at the departure; they are passed here for the same reason, so a
+    /// refused send captures the WHOLE composer and not just its text.
     private func composerSend(_ coord: MacCoordinator, text: String, mode: JesseMode = .ask,
-                              thread: JesseThread, context: ModelContext) -> Bool {
+                              thread: JesseThread, context: ModelContext,
+                              recording: String? = nil,
+                              contextLabel: String? = nil) -> Bool {
         guard coord.stageAndSend(text: text, mode: mode, thread: thread, context: context) else {
-            drafts.flush(thread.id)
+            // A refused send is a departure: capture what is still on screen.
+            capture(text, recording: recording, contextLabel: contextLabel,
+                    for: thread, in: context)
             return false
         }
-        drafts.release(for: thread.id)
+        ComposerDrafts.release(for: thread, store: drafts)
         return true
+    }
+
+    /// A DEPARTURE, spelled exactly as `MacThreadDetailView` spells it. Every test below
+    /// leaves a draft this way, because that is the only way the app leaves one.
+    @discardableResult
+    private func capture(_ text: String, recording: String? = nil,
+                         contextLabel: String? = nil, for thread: JesseThread,
+                         in context: ModelContext, now: Date = Date()) -> Bool {
+        ComposerDrafts.capture(
+            ComposerDraftCapture(text: text, pendingRecording: recording,
+                                 contextLabel: contextLabel),
+            for: thread, in: context, store: drafts, now: now)
     }
 
     private func coordinator(
@@ -76,35 +95,41 @@ final class MacComposerDraftTests: XCTestCase {
 
     // MARK: - Persistence on this platform
 
-    /// The Mac's own reopen test: the draft is written through the shared
-    /// `ComposerDraftStore`, so a relaunch of this app finds it exactly as the phone would.
-    func testTheDraftSurvivesAReopenOnThisPlatform() async throws {
-        let id = UUID()
+    /// The Mac's own cold-launch test: one departure puts the draft through the shared
+    /// store, so a relaunch of this app finds it exactly as the phone would.
+    func testTheDraftSurvivesAColdLaunchOnThisPlatform() async throws {
+        let context = try MacTestFixtures.context()
+        let thread = JesseThread(mode: .ask); context.insert(thread); try context.save()
         let exact = "an unsent reply\n\nwith a blank line and a — no, an em space\u{2003}kept"
 
-        drafts.write(text: exact, for: id)
-        drafts.flush(id)
-        await settle()
+        capture(exact, for: thread, in: context)
+        await drafts.settle()
 
         let relaunched = ComposerDraftStore(
-            writer: ComposerDraftFileWriter(root: directory), observesAppLifecycle: false)
-        XCTAssertEqual(relaunched.snapshot(for: id).text, exact)
+            writer: ComposerDraftFileWriter(root: directory))
+        XCTAssertEqual(relaunched.snapshot(for: thread.id).text, exact)
     }
 
-    /// And typing costs the Mac nothing either: the composer's own path leaves the model
-    /// context clean.
-    func testTypingDoesNotDirtyTheModelContextOnThisPlatform() throws {
+    /// And typing costs the Mac nothing either: the composer's own path never leaves this
+    /// view's state, so a hundred keystrokes reach neither the model context nor the draft
+    /// store — only the departure after them does.
+    func testTypingCostsNothingOnThisPlatform() throws {
         let context = try MacTestFixtures.context()
         let thread = JesseThread(mode: .ask); context.insert(thread); try context.save()
         XCTAssertFalse(context.hasChanges)
 
-        var typed = ""
+        var composer = ""
         for i in 0..<100 {
-            typed.append(Character(UnicodeScalar(97 + (i % 26))!))
-            drafts.write(text: typed, for: thread.id)
+            composer.append(Character(UnicodeScalar(97 + (i % 26))!))
+            XCTAssertFalse(context.hasChanges, "keystroke \(i) dirtied the model context")
+            XCTAssertFalse(drafts.holdsDraft(thread.id),
+                           "keystroke \(i) reached the draft store")
         }
-        XCTAssertFalse(context.hasChanges, "a hundred keystrokes dirtied nothing")
         XCTAssertNil(thread.draftText)
+
+        capture(composer, for: thread, in: context)
+        XCTAssertEqual(drafts.snapshot(for: thread.id).text, composer,
+                       "and the one departure after them records the lot")
     }
 
     // MARK: - The handoff
@@ -116,7 +141,7 @@ final class MacComposerDraftTests: XCTestCase {
         let context = try MacTestFixtures.context()
         let thread = JesseThread(mode: .ask); context.insert(thread); try context.save()
         let coord = coordinator(ackingClient())
-        drafts.write(text: "the message", for: thread.id)
+        capture("the message", for: thread, in: context)
 
         let staged = coord.stageAndSend(text: "the message", mode: .ask, thread: thread,
                                         context: context)
@@ -130,7 +155,7 @@ final class MacComposerDraftTests: XCTestCase {
         XCTAssertTrue(coord.isRunning(thread.id),
                       "the run gate closed synchronously, so a second click cannot double-stage")
 
-        drafts.release(for: thread.id)
+        ComposerDrafts.release(for: thread, store: drafts)
         XCTAssertFalse(drafts.hasDraft(thread.id), "and only now is it given up")
     }
 
@@ -140,8 +165,8 @@ final class MacComposerDraftTests: XCTestCase {
         let context = try MacTestFixtures.context()
         let thread = JesseThread(mode: .ask); context.insert(thread); try context.save()
         let coord = coordinator(ackingClient())
-        drafts.write(text: "the message", for: thread.id,
-                     now: Date(timeIntervalSince1970: 1_700_000_000))
+        capture("the message", for: thread, in: context,
+                now: Date(timeIntervalSince1970: 1_700_000_000))
 
         XCTAssertTrue(coord.stageAndSend(text: "the message", mode: .ask, thread: thread,
                                          context: context))
@@ -157,6 +182,10 @@ final class MacComposerDraftTests: XCTestCase {
 
     /// A refused send costs nothing. Empty, whitespace-only and unconfigured all return
     /// false and leave the draft alone.
+    ///
+    /// The draft IS the composer's text here, in every row, because that is now the only
+    /// state there is: `send()` sends `draft`, so a draft holding something the composer
+    /// does not is not a situation the app can be in.
     func testARefusedSendLeavesTheDraftExactlyWhereItWas() throws {
         for (label, text, config) in [
             ("empty", "", MacTestFixtures.configured()),
@@ -167,13 +196,12 @@ final class MacComposerDraftTests: XCTestCase {
             let thread = JesseThread(mode: .ask); context.insert(thread); try context.save()
             let fake = ackingClient()
             let coord = coordinator(fake, config: config)
-            drafts.write(text: text.isEmpty ? "kept" : text, for: thread.id)
-            let recorded = drafts.snapshot(for: thread.id).text
+            capture(text, for: thread, in: context)
 
             XCTAssertFalse(composerSend(coord, text: text, thread: thread, context: context),
                            "\(label): refused")
-            XCTAssertEqual(drafts.snapshot(for: thread.id).text, recorded,
-                           "\(label): the draft is untouched")
+            XCTAssertEqual(drafts.snapshot(for: thread.id).text, text,
+                           "\(label): the draft is untouched — nothing was released")
             XCTAssertTrue(thread.orderedTurns.isEmpty, "\(label): and no turn was created")
             XCTAssertTrue(fake.sentTexts.isEmpty, "\(label): and nothing reached the bridge")
         }
@@ -186,11 +214,10 @@ final class MacComposerDraftTests: XCTestCase {
         let thread = JesseThread(mode: .ask); context.insert(thread); try context.save()
         let fake = ackingClient()
         let coord = coordinator(fake, save: { _ in throw SaveRefused() })
-        drafts.write(text: "please don't lose this", pendingRecording: "memo.m4a",
-                     for: thread.id)
+        capture("please don't lose this", recording: "memo.m4a", for: thread, in: context)
 
         XCTAssertFalse(composerSend(coord, text: "please don't lose this", thread: thread,
-                                    context: context))
+                                    context: context, recording: "memo.m4a"))
         XCTAssertEqual(drafts.snapshot(for: thread.id).text, "please don't lose this",
                        "the draft is still there")
         XCTAssertEqual(drafts.snapshot(for: thread.id).pendingRecording, "memo.m4a",
@@ -208,11 +235,11 @@ final class MacComposerDraftTests: XCTestCase {
         let coord = coordinator(ackingClient(), save: { _ in throw SaveRefused() })
         coord.attach(AttachedContext(body: "a page of numbers", title: "Lunch · Aug 22"),
                      to: thread.id)
-        drafts.write(text: "why is this so high?", contextLabel: "Lunch · Aug 22",
-                     for: thread.id)
+        capture("why is this so high?", contextLabel: "Lunch · Aug 22",
+                for: thread, in: context)
 
         XCTAssertFalse(composerSend(coord, text: "why is this so high?", thread: thread,
-                                    context: context))
+                                    context: context, contextLabel: "Lunch · Aug 22"))
         XCTAssertEqual(drafts.snapshot(for: thread.id).text, "why is this so high?",
                        "the draft is still there")
         XCTAssertEqual(coord.attachedContext(for: thread.id), "a page of numbers",
@@ -228,7 +255,7 @@ final class MacComposerDraftTests: XCTestCase {
         let thread = JesseThread(mode: .ask); context.insert(thread); try context.save()
         let fake = MacFakeBridgeClient(sendError: JesseError.cannotConnect("offline"))
         let coord = coordinator(fake)
-        drafts.write(text: "goes out later", for: thread.id)
+        capture("goes out later", for: thread, in: context)
 
         XCTAssertTrue(composerSend(coord, text: "goes out later", thread: thread,
                                    context: context))
@@ -261,7 +288,7 @@ final class MacComposerDraftTests: XCTestCase {
         XCTAssertFalse(drafts.hasDraft(thread.id), "the staged send took the draft with it")
 
         // The user starts the next message while the first is still being answered.
-        drafts.write(text: "meanwhile, a newer thought", for: thread.id)
+        capture("meanwhile, a newer thought", for: thread, in: context)
 
         await gate.open()
         let deadline = Date().addingTimeInterval(4)
@@ -279,9 +306,9 @@ final class MacComposerDraftTests: XCTestCase {
         let staged = JesseThread(mode: .ask)
         XCTAssertNil(staged.modelContext)
 
-        ComposerDraftThreadInsertion.persistIfNeeded(staged, in: context,
-                                                     hasSomethingToKeep: true)
-        drafts.write(text: "about this item", for: staged.id)
+        // The capture is what inserts it — that is the whole of the insertion rule now.
+        capture("about this item", for: staged, in: context)
+        XCTAssertNotNil(staged.modelContext, "the departure put it on disk")
         XCTAssertEqual(try context.fetch(FetchDescriptor<JesseThread>()).count, 1)
 
         XCTAssertTrue(composerSend(coord, text: "about this item", thread: staged,
@@ -298,10 +325,11 @@ final class MacComposerDraftTests: XCTestCase {
         let coord = coordinator(ackingClient())
 
         let drafted = JesseThread(mode: .ask); context.insert(drafted)
-        drafts.write(text: "unsent", for: drafted.id)
+        capture("unsent", for: drafted, in: context)
         let abandoned = JesseThread(mode: .ask); context.insert(abandoned)
         let emptied = JesseThread(mode: .ask); context.insert(emptied)
-        drafts.write(text: "", for: emptied.id)
+        capture("half a thought", for: emptied, in: context)
+        capture("", for: emptied, in: context)
         try context.save()
 
         func reapable(_ t: JesseThread) -> Bool {

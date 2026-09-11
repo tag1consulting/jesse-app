@@ -14,6 +14,66 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [App 1.0 (132)] - 2026-09-11
+
+**The composer draft is a dictionary now, written when you leave.** 131 stopped typing from
+writing to the database; this stops typing from doing anything at all. Nothing reacts to a
+keystroke, because there is no keystroke hook left to react with.
+
+### Changed
+
+- **Nothing runs on a keystroke.** While a composer is on screen its own `@State` IS the
+  draft: no store, no `ModelContext`, no file, no `Task`. The draft is captured at
+  DEPARTURES, and there are four — the chat view disappearing, the app leaving the
+  foreground, termination, and send. Those are human-scale events, a few dozen a day, so
+  the quiet-period timer, the dirty set, the generation counters, the per-conversation
+  files and the launch sweep of that directory are all gone, and so are the three
+  `onChange` handlers on each shell that fed the draft (and with them the `context.save()`
+  they fired on the first character typed into every composer).
+
+- **One dictionary, keyed by conversation, holding any number of drafts at once.** Switch
+  away to read something earlier and come back, several times over, and every conversation
+  still holds its own text. Behind it is ONE small text-only file, read once at launch
+  before any composer can appear and written off the main thread by the capture function —
+  the only thing in the app that writes it.
+
+- **One implementation, several call sites.** `ComposerDrafts.capture`, `.restore` and
+  `.release` live in `JesseCore` and are shared by both shells. The per-shell code is which
+  hooks count as a departure and a small adapter between the view's own attachment type and
+  the shared value type; the notice text, the already-sent reconciliation and the
+  conversation insertion are not described twice.
+
+- **A never-saved conversation is put on disk at the capture point**, not at the first
+  character. A `+`-then-back still costs nothing; a departure from a composer with
+  something in it inserts the conversation the draft belongs to, so the draft has somewhere
+  to come back to after a cold launch.
+
+- **Two losses, traded deliberately and said out loud.** A draft restored after a COLD
+  LAUNCH comes back WITHOUT its staged files — attachment bytes are held in memory only,
+  never written — and the composer names what is missing rather than quietly becoming a
+  message with no attachment, the way the in-flight recording and the lost screen context
+  already did. And a kill that runs NO CODE (a crash, or Force Quit on the Mac with the
+  window frontmost) loses whatever was typed since the last departure; on the phone that
+  window is effectively zero, because reaching the app switcher backgrounds the app first.
+  An ordinary quit is NOT in that category: the termination capture writes on the calling
+  thread, because an asynchronous write there may never get a turn before the process is
+  gone. The in-memory bytes are capped, evicting the least recently updated conversation's
+  files first and its text last.
+
+- **Upgrading adopts 131's drafts.** The per-conversation directories are read once, their
+  text taken over, and the tree removed — so a draft in progress survives the upgrade and
+  the directories do not linger. The V5 SwiftData draft columns stay declared and empty, as
+  131 decided, and `ComposerDraftMigration` is unchanged in what it does.
+
+### Notes
+
+- Measured in the simulator only. No numbers were taken on a physical device for this
+  change, so it makes no claim about one: it is landed because it is less work by
+  construction — zero calls on the typing path, against 131's one dictionary assignment,
+  one dirty-set insert and one timer check per character. Whether the phone's remaining
+  slowness since App 128 lives elsewhere (App 125's one `UITextView` per reply is the
+  first candidate) is still an open question.
+
 ## [App 1.0 (131)] - 2026-09-11
 
 **Typing in the composer no longer writes to the database on every keystroke.** The unsent
