@@ -315,13 +315,13 @@ final class ComposerDraftUITests: XCTestCase {
     func testDeliberatelyEmptyingTheComposerPersistsAsEmpty() {
         let app = launched()
 
-        let witness = newConversation(app)                // the witness, kept
-        type("AAA111", into: witness)
-        XCTAssertTrue(text(of: witness).contains("AAA111"), "precondition: the witness took its text")
+        type("AAA111", into: newConversation(app))       // the witness, kept
         backToList(app)
         // CHECKPOINTS, so a loss names the step it happened at rather than surfacing only
-        // after a relaunch. The first is the one App 1.0 (132) failed: the list appeared
-        // before the witness's composer left, judged it empty, and reaped it.
+        // after a relaunch. They come AFTER each return, so the app still goes through the
+        // exact sequence (type, then straight back) that lost the witness on hosted CI:
+        // the list could appear before the witness's composer left, judge it empty, and
+        // reap it.
         XCTAssertTrue(draftRows(app).element(boundBy: 0).waitForExistence(timeout: 10),
                       "the witness is still in the list once it is left")
 

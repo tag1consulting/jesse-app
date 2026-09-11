@@ -194,17 +194,21 @@ bridge 0.135.0 for the invariant this replaces and how it is held.
 - The language sheet's footer now says where the recording goes: the bridge and nowhere
   else, never the cloud assistant, deleted in both places once the text exists.
 
-### Fixed — a regression App 1.0 (132) shipped: the list could reap a conversation mid-departure
+### Fixed — a race App 1.0 (132) introduced: the list could reap a conversation mid-departure
 - **Root cause.** Since 132 a draft exists only once its composer is LEFT: the capture runs in
   the composer's `onDisappear`. The iPhone list reaps turn-less, draft-less conversations in its
-  own `onAppear`, and on a pop the list appears BEFORE the popped composer disappears. So the
-  reaper judged a conversation the user had just typed into while its draft was still
-  uncaptured, found it empty, and deleted it out from under the text about to land in it.
-  Before 132 the draft was held as you typed, so the order did not matter.
+  own `onAppear`, and nothing orders a pop's list `onAppear` after the popped composer's
+  `onDisappear`. When the list ran first, the reaper judged a conversation the user had just
+  typed into while its draft was still uncaptured, found it empty, and deleted it out from
+  under the text about to land in it. Before 132 the draft was held as you typed, so the order
+  did not matter.
 - **How it showed.** `ComposerDraftUITests.testDeliberatelyEmptyingTheComposerPersistsAsEmpty`
-  failed deterministically once hosted CI first ran it after 132, twice on the same commit.
-  It lost the first conversation after a second, emptied one was reaped. The same test passed
-  on the last nightly before 132.
+  lost its witness conversation on both hosted runs of this branch before the fix, while the
+  same test passed on `main` (ad28ed7) and on the last nightly before 132. So the order is
+  timing-dependent, and these runs lost the race; nothing else in this branch touches the
+  draft path. The store's other ways to lose a draft were each ruled out: its writes are
+  chained in order, the launch sweep keeps every conversation that still exists, and the
+  coordinator's deletes need a bridge tombstone or a discarded send.
 - **The fix is an ordering guarantee, not a delay.** A composer is OPEN from its restore to its
   leave (`ComposerDrafts.leave`, called by both shells' `onDisappear`). `mayReap` is false
   while a composer is open, and the departure posts `ComposerDrafts.composerLeft`, on which the
@@ -221,7 +225,9 @@ bridge 0.135.0 for the invariant this replaces and how it is held.
   - the field sequence (a second conversation emptied and reaped) cannot take the first one's
     draft, across a cold launch.
   
-  The UI test gains checkpoints, so a future loss names the step it happened at.
+  The UI test gains checkpoints, so a future loss names the step it happened at. They sit after
+  each return to the list, so the sequence the app goes through (type, then straight back) is
+  the one that lost the race.
 
 ### Tests
 - `AudioIsNeverAnAttachmentTests` is RETIRED and replaced by `AudioTravelsOnlyToTheStudioTests`:

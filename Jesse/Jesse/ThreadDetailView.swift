@@ -210,7 +210,7 @@ struct ThreadDetailView: View {
         // (`restoreDraft`).
         // LEAVING, not just a departure: after this the composer is gone, so it stops
         // exempting its conversation from the list's reaper — which runs again right after,
-        // because on a pop the list appeared BEFORE this fired. See `leaveComposer`.
+        // because on a pop the list may have appeared before this fired. See `leaveComposer`.
         .onDisappear { leaveComposer() }
         .onChange(of: scenePhase) { _, phase in
             if phase != .active { captureDraft() }
@@ -1007,8 +1007,8 @@ struct ThreadDetailView: View {
 
     /// The departure after which this composer is GONE — the iPhone popping it, the iPad's
     /// detail column replacing it. The same capture, plus closing the composer, which is
-    /// what lets the list's reaper judge this conversation at all: on a pop the list
-    /// appeared first and skipped it as still open, and `ComposerDrafts.leave` tells it to
+    /// what lets the list's reaper judge this conversation at all: if on a pop the list
+    /// appeared first, it skipped it as still open, and `ComposerDrafts.leave` tells it to
     /// look again now that the answer is known.
     private func leaveComposer() {
         guard didRestoreDraft else { return }

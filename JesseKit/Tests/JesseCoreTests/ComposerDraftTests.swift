@@ -427,9 +427,9 @@ final class ComposerDraftTests: XCTestCase {
         XCTAssertTrue(drafts.hasDraft(id), "a staged file exempts it on its own")
     }
 
-    /// AN OPEN COMPOSER IS NEVER THE REAPER'S TO JUDGE — the regression App 1.0 (132)
-    /// shipped. A draft exists only once its composer is left, and on an iPhone pop the list
-    /// (where the reaper runs) appears BEFORE that departure; so the reaper must read
+    /// AN OPEN COMPOSER IS NEVER THE REAPER'S TO JUDGE — the race App 1.0 (132) introduced.
+    /// A draft exists only once its composer is left, and nothing orders an iPhone pop's list
+    /// appearance (where the reaper runs) after that departure; so the reaper must read
     /// "still open" as "keep", whatever the draft says at that instant.
     func testAnOpenComposerIsNeverTheReapersToJudge() throws {
         let dir = draftDirectory()

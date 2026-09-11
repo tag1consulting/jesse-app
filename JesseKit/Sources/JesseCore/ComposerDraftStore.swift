@@ -448,12 +448,13 @@ public final class ComposerDraftStore {
 
     /// WHAT BOTH SHELLS' REAPERS ASK: nothing held, and no composer still open on it.
     ///
-    /// The second clause is the fix for the one ordering this design depends on. A draft
-    /// exists only once its composer is LEFT, and on an iPhone pop the list's `onAppear` —
-    /// where the reaper runs — fires BEFORE the popped composer's `onDisappear` delivers that
-    /// departure. Asking `hasDraft` alone there judged a conversation the user had just typed
-    /// into as empty, and deleted it (App 1.0 (132)). An open composer is never the reaper's
-    /// to judge; its departure posts `ComposerDrafts.composerLeft` and the reaper runs then.
+    /// The second clause removes the one ordering this design depended on. A draft exists
+    /// only once its composer is LEFT, and nothing orders an iPhone pop's list `onAppear` —
+    /// where the reaper runs — after the popped composer's `onDisappear` delivers that
+    /// departure. When the list ran first, asking `hasDraft` alone judged a conversation the
+    /// user had just typed into as empty, and deleted it (App 1.0 (132)). An open composer is
+    /// never the reaper's to judge; its departure posts `ComposerDrafts.composerLeft` and the
+    /// reaper runs then.
     public func mayReap(_ id: UUID) -> Bool { !hasDraft(id) && !isComposerOpen(id) }
 
     // MARK: - Capture
@@ -697,7 +698,7 @@ public enum ComposerDrafts {
     }
 
     /// Posted when a composer is LEFT, with the conversation's id as the object. The iPhone
-    /// list runs its reaper on it: on a pop the list appeared first and skipped the
+    /// list runs its reaper on it: if on a pop the list appeared first, it skipped the
     /// conversation as still open, and this is the first moment its draft is known.
     public static let composerLeft = Notification.Name("JesseComposerDraftLeft")
 

@@ -240,9 +240,9 @@ struct ThreadListView: View {
                                                     now: .now))
         }
         .onAppear(perform: pruneEmpty)
-        // …and again when a composer is LEFT. On a pop this list appears before the popped
-        // composer's departure lands, so the appear above skips that conversation as still
-        // open; this is where it is judged, after the draft is known. See `mayReap`.
+        // …and again when a composer is LEFT. On a pop this list can appear before the popped
+        // composer's departure lands, and then the appear above skips that conversation as
+        // still open; this is where it is judged, after the draft is known. See `mayReap`.
         .onReceive(NotificationCenter.default.publisher(for: ComposerDrafts.composerLeft)) { _ in
             pruneEmpty()
         }
@@ -576,11 +576,11 @@ struct ThreadListView: View {
     /// draft is answered from a set in memory.
     ///
     /// AND AN OPEN COMPOSER PRESERVES A THREAD, which is the half App 1.0 (132) was missing.
-    /// Since 132 a draft exists only once its composer is LEFT, and on a pop this list's
-    /// `onAppear` fires BEFORE the popped composer's `onDisappear` — so this ran while the
-    /// conversation just typed into still read as empty, and deleted it out from under the
+    /// Since 132 a draft exists only once its composer is LEFT, and nothing orders a pop's
+    /// `onAppear` here after the popped composer's `onDisappear`. When this ran first, the
+    /// conversation just typed into still read as empty and was deleted out from under the
     /// text about to be captured (`ComposerDraftUITests.testDeliberatelyEmptyingThe
-    /// ComposerPersistsAsEmpty`, deterministic on hosted CI). `mayReap` is false for a
+    /// ComposerPersistsAsEmpty` lost that race on hosted CI). `mayReap` is false for a
     /// conversation whose composer has not left yet, and the departure's
     /// `ComposerDrafts.composerLeft` runs this again the moment the answer is known.
     ///
