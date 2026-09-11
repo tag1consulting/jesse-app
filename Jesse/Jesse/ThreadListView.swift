@@ -542,6 +542,10 @@ struct ThreadListView: View {
             if let sessionId = thread.sessionId, !sessionId.isEmpty {
                 coordinator.enqueueSessionDeletion(sessionId)
             }
+            // The draft lives outside the object graph, so it no longer cascades with the
+            // row — say so here. `ComposerDraftStore.sweep` at launch is the backstop for
+            // any path that forgets.
+            ComposerDraftStore.shared.delete(thread.id)
             context.delete(thread)
         }
         do {
@@ -560,13 +564,17 @@ struct ThreadListView: View {
     /// a message into is not an abandoned `+`-then-back, and reaping it would be exactly
     /// the loss the durable draft exists to prevent — the user would come back to find both
     /// the message and the conversation gone. A draft the user deliberately EMPTIED does
-    /// not count (`hasComposerDraft` is false for `""`), so an emptied composer leaves the
-    /// thread as reapable as it ever was.
+    /// not count (`ComposerDraftStore.hasDraft` is false for `""`), so an emptied composer
+    /// leaves the thread as reapable as it ever was. Answering that question also no longer
+    /// faults a to-many relationship for every thread in the list: an id with no stored
+    /// draft is answered from a set in memory.
     private func pruneEmpty() {
         var changed = false
         for thread in threads
-        where thread.turns.isEmpty && thread.sessionId == nil && !thread.hasComposerDraft
+        where thread.turns.isEmpty && thread.sessionId == nil
+                && !ComposerDraftStore.shared.hasDraft(thread.id)
                 && !coordinator.isRunning(thread.id) {
+            ComposerDraftStore.shared.delete(thread.id)
             context.delete(thread)
             changed = true
         }

@@ -38,6 +38,19 @@ struct JesseMacApp: App {
         WindowGroup {
             MacShellView(storeError: store.openFailure)
                 .environment(coordinator)
+                .task {
+                    // The draft store's launch chores, in order and before any composer
+                    // can restore: move anything still in the V5 SwiftData columns into
+                    // the file store (once, ever), then drop stored drafts for
+                    // conversations that no longer exist — the backstop for a delete this
+                    // store never saw, such as one that arrived from another device.
+                    let context = store.container.mainContext
+                    ComposerDraftMigration.runIfNeeded(context: context,
+                                                       store: .shared)
+                    if let live = try? context.fetch(FetchDescriptor<JesseThread>()) {
+                        ComposerDraftStore.shared.sweep(keeping: Set(live.map(\.id)))
+                    }
+                }
                 .onAppear {
                     notifier.requestAuthorization()
                     coordinator.onTurnFinished = { thread, reply in
@@ -46,6 +59,10 @@ struct JesseMacApp: App {
                 }
                 .onChange(of: scenePhase) { _, phase in
                     notifier.isActive = (phase == .active)
+                    // A clean quit and a background are both "this composer may stop being
+                    // reachable", and the quiet period is only a backstop. Get every
+                    // unwritten draft to disk here rather than rely on it.
+                    if phase != .active { ComposerDraftStore.shared.flushAll() }
                 }
                 .onOpenURL { url in
                     // One payload, both halves. The three sentinel keys are ADDITIVE, so a

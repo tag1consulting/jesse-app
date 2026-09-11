@@ -14,6 +14,68 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [App 1.0 (131)] - 2026-09-11
+
+**Typing in the composer no longer writes to the database on every keystroke.** The unsent
+draft that arrived in 129 is still there and still survives navigation, backgrounding and a
+relaunch — it just stopped costing a sqlite transaction per character.
+
+### Changed
+
+- **The draft moved out of the SwiftData object graph.** It was stored on `JesseThread` and
+  written on every keystroke. The write itself was cheap (23 µs, measured), but the view's
+  main `ModelContext` has autosave on, so a dirtied context saved itself on the run loop
+  whatever the 250 ms debounce in front of `save()` intended. Measured in the simulator,
+  200 keystrokes into a 200-turn conversation produced **197 saves, 246 ms of main-thread
+  time inside `save`, and 391 extra `ThreadDetailView` body evaluations** from the fan-out
+  those saves triggered on every `@Query` over the container. The same run now produces
+  **0 saves and 0 extra body evaluations** — the floor a run with the draft path disabled
+  entirely measures. Animation hitches over the same run fell from 359 to 257, against a
+  floor of 252, and the worst frame from 80 ms to 61 ms.
+
+- **`ComposerDraftStore`** is the new home: one small file per conversation under
+  Application Support, an in-memory index on the main actor in front, and a serialized
+  actor doing the file I/O off the main thread. A keystroke is one dictionary assignment.
+  Attachment bytes live in their own files beside the document rather than inside it, so a
+  quiet-period write never recopies a staged photo it already has.
+
+- **The durability contract is now the flush points, not the debounce.** The draft is
+  written unconditionally when the composer disappears, when the scene leaves the
+  foreground, on termination, and on send; the trailing quiet period (2 s, was 250 ms) is
+  only a backstop. The accepted loss is stated plainly and pinned by a test: a hard kill
+  inside the quiet period loses that window's typing. Nothing else loses anything.
+
+- **The send handoff gave up its one-save atomicity, and says so.** The draft used to be
+  released inside the same save that persisted the outbox item, so the message was never in
+  neither place and never in both. Two stores cannot do that. The replacement is an order
+  plus a reconciliation: the turn is persisted first, the draft is released second and only
+  on a durable stage, and on restore a draft whose text is the thread's newest user turn
+  and which predates that turn is discarded as already sent (`ComposerDraftStaleness`).
+  A refused send and a staging save that throws still leave the text on screen — now
+  because nothing was taken, rather than because it was put back.
+
+- **Four smaller costs on and around the typing path**, none of which turned out to matter
+  next to the saves (they are together about 0.1% of the old bill) but each wrong on its own
+  terms: the per-keystroke `draftAttachments` relationship fault is gone (the draft no
+  longer consults the object graph at all); the debounce allocates one `Task` per burst of
+  typing instead of one per character; `release` no longer materializes every staged
+  attachment's bytes to build an undo value the success path discards; and the empty-thread
+  reapers no longer fault `draftAttachments` for every thread in the list — a conversation
+  with no stored draft is answered from a set in memory.
+
+- **The V5 draft columns stay declared and empty.** `JesseThread.draftText`,
+  `draftUpdatedAt`, `draftPendingRecording`, `draftContextLabel` and the `DraftAttachment`
+  entity are never written again, but they are not dropped: this store migrates by
+  SwiftData's automatic lightweight migration with no staged plan, and dropping an entity
+  and four attributes is exactly the non-lightweight change that needs one — which has
+  stranded users behind the store-error banner once already. `ComposerDraftMigration` moves
+  anything still in them into the file store on the first launch after this build, once,
+  and empties them.
+
+- Deleting a conversation deletes its draft explicitly at every delete path (it no longer
+  cascades with the row), with a launch-time sweep as the backstop for a delete this device
+  never saw.
+
 ## [App 1.0 (130)] - 2026-09-10
 
 **"Ask about this" now works on the Ops screens.** A long press on iOS, or a right click on
