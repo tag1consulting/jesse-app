@@ -271,10 +271,14 @@ let package = Package(
                 .swiftLanguageMode(.v6),
             ]
         ),
-        // Turning a RECORDED FILE into text, on device. It holds the file-transcription
-        // seam (`AudioFileTranscribing`) and its one production implementation over
-        // iOS/macOS 26's `SpeechAnalyzer` + `SpeechTranscriber`, plus everything around
-        // that decision which is pure and therefore assertable: which language a
+        // Turning a RECORDED FILE into text — on the Studio, by the paired bridge's own
+        // models, with this device's engine as the fallback when the Studio cannot be
+        // reached. It holds the file-transcription seam (`AudioFileTranscribing`), the
+        // Studio-first implementation and its transport (`StudioTranscription.swift`: the
+        // only code that sends a recording anywhere, and only to the paired bridge), the
+        // on-device implementation over iOS/macOS 26's `SpeechAnalyzer` +
+        // `SpeechTranscriber`, plus everything around those which is pure and therefore
+        // assertable: which language a
         // recording is read in, the progress-based give-up rule that replaces a
         // wall-clock timeout, how a transcript composes into a message, and the storage
         // rules that guarantee the working copy is deleted on every exit path.

@@ -96,6 +96,8 @@ pub fn test_config() -> Config {
         // No `[direct]` table in the fixture: the direct harness is not registered here, so
         // every setting is inert and every existing turn assertion is unaffected.
         direct: DirectSettings::default(),
+        // Speech OFF, as in the unit fixture: no intake or models directory is touched.
+        speech: jesse_bridge::speech::SpeechConfig::disabled(),
     }
 }
 pub fn test_state() -> AppState {

@@ -147,6 +147,12 @@ mod scheduler;
 // deploy build IS `cargo build --release`, and that is what has to produce the sentinel
 // binary. Nothing on the bridge's turn path references it.
 pub mod sentinel;
+// RECORDED-AUDIO TRANSCRIPTION, namespaced rather than flattened, for the sentinel's reason
+// and one more. Its vocabulary (`Segment`, `Phase`, `Job`, `Readiness`) would collide with the
+// turn path's; and namespacing is part of the audio egress ban — the pipeline reaches the rest
+// of the crate only through `crate::` paths the source guard in `scripts/ci-guards.sh` can
+// read, and the rest of the crate reaches it only as `crate::speech::…`. See `speech/mod.rs`.
+pub mod speech;
 
 mod sessions;
 mod shadow;

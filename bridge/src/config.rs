@@ -1043,6 +1043,10 @@ pub struct Config {
     // temp dir. Set JESSE_SCRATCH_DIR to point this at a sandbox-mounted path if
     // the bridge is ever confined so it can't read the system temp dir.
     pub scratch_dir: Option<String>,
+    // Recorded-audio transcription on this machine (`JESSE_SPEECH*`): the intake and models
+    // directories under the state dir, the audio cap, the tier and the second reading. See
+    // `crate::speech::SpeechConfig`.
+    pub speech: crate::speech::SpeechConfig,
     // Whether the hosted MICRONUTRIENT COMPLETION pass runs on the local diet route
     // (env `JESSE_DIET_MICRO_COMPLETE`, default TRUE — off is the old, broken
     // behavior in which a locally-logged row kept three or more knowable nutrient
@@ -3928,6 +3932,15 @@ impl Config {
         // names something the registry resolves, so rejecting it here would fail the whole
         // schedule file at boot over a name that works everywhere else.
         let model_ids: Vec<String> = model_registry.known_ids();
+        // Resolved before the literal because two fields hang off it: the state dir itself,
+        // and the speech settings whose intake and models directories live under it (and
+        // whose availability decides whether the weekly model check joins the schedule).
+        let state_dir = env_string("JESSE_STATE_DIR").or_else(|| {
+            // Default: a dotdir under HOME. Empty HOME → no default
+            // (persistence off) rather than writing to a bare "/.jesse-bridge".
+            (!home.is_empty()).then(|| format!("{home}/.jesse-bridge"))
+        });
+        let speech = crate::speech::SpeechConfig::from_env(state_dir.as_deref());
         Config {
             token: env_string("JESSE_TOKEN").unwrap_or_default(),
             // Capture HOME once — session-path lookups read `cfg.home`, not the env.
@@ -3979,11 +3992,7 @@ impl Config {
                 DEFAULT_RETRIEVAL_GRACE_SECS,
             ),
             session_ttl_days: env_parse("JESSE_SESSION_TTL_DAYS", DEFAULT_SESSION_TTL_DAYS),
-            state_dir: env_string("JESSE_STATE_DIR").or_else(|| {
-                // Default: a dotdir under HOME. Empty HOME → no default
-                // (persistence off) rather than writing to a bare "/.jesse-bridge".
-                (!home.is_empty()).then(|| format!("{home}/.jesse-bridge"))
-            }),
+            state_dir: state_dir.clone(),
             // NO DEFAULT, DELIBERATELY. `JESSE_VAULT` would have been the obvious one and it
             // is the wrong one: the shared instruction bundle is a thing an operator PUBLISHES
             // into a root, and defaulting to the vault would make every deployment that has
@@ -4012,6 +4021,7 @@ impl Config {
                 DEFAULT_ARTIFACT_STORE_MAX_BYTES,
             ),
             scratch_dir: env_string("JESSE_SCRATCH_DIR"),
+            speech: speech.clone(),
             // Micronutrient completion defaults to TRUE (same truthiness convention as
             // probation/badge): OFF is the old behavior that left knowable nutrient
             // columns blank, so an operator must opt OUT explicitly. Independent of
@@ -4070,13 +4080,18 @@ impl Config {
             // first link promoted into the clock slot it vacated — see
             // `promote_over_missing_heads`), and a `model` that names nothing in the
             // registry disables that entry rather than failing one turn a night later.
-            schedule: Arc::new(validate_schedule_with(
-                &load_schedule(&home),
-                &ValidationContext {
-                    vault: (!vault.is_empty()).then(|| Path::new(&vault)),
-                    model_ids: Some(&model_ids),
-                    profile: profile_table.as_ref(),
-                },
+            // Plus the bridge's own default jobs — today the weekly speech-model check, added
+            // only where this bridge transcribes (see `with_builtin_defaults`).
+            schedule: Arc::new(with_builtin_defaults(
+                validate_schedule_with(
+                    &load_schedule(&home),
+                    &ValidationContext {
+                        vault: (!vault.is_empty()).then(|| Path::new(&vault)),
+                        model_ids: Some(&model_ids),
+                        profile: profile_table.as_ref(),
+                    },
+                ),
+                speech.intake_dir().is_some(),
             )),
             // The selectable-model registry, MERGED from the built-in ambient opus, the
             // JESSE_MODEL_* env triples, and the declarative `[[models]]` config file (see

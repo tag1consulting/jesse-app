@@ -371,6 +371,41 @@ if [ "$sc_swift" != "$sc_want" ]; then
 fi
 rm -rf "$guard_selfcheck_dir"
 
+# 6e) THE AUDIO EGRESS BAN, at the source. Recorded audio may reach the bridge and nothing
+#     past it (bridge/src/speech/mod.rs). A runtime test pins that on the wire; this pins
+#     the SHAPE that makes it true: no file of the speech pipeline except its HTTP boundary
+#     (http.rs) names a surface a turn reaches — the application state, the model registry,
+#     the vision layer, the turn path, a backend call, an outbound POST or PUT — so there is
+#     no handle through which a later change could route audio anywhere without first
+#     tripping this. Comment lines are exempt: the module docs NAME these surfaces to forbid
+#     them. The one process the pipeline may start is the system audio decoder.
+SPEECH="$SRC/speech"
+SPEECH_DENY='AppState|model_registry|RegistryModel|vision::|VisionInput|ResolvedPartner|call_helper|start_turn|JesseRequest|backend_call|\.post\(|\.put\(|Command::new\("claude'
+# Self-check the pattern before trusting it, as 5a does for its own.
+for bad in 'let r = &st.cfg.model_registry;' 'vision::transcribe_input(' 'client.post(url)' 'start_turn(&st, req, None)'; do
+  printf '%s\n' "$bad" | grep -qE "$SPEECH_DENY" \
+    || flag "the speech egress pattern no longer matches a known-bad sample" "$bad"
+done
+if [ -d "$SPEECH" ]; then
+  speech_hits="$(grep -nE "$SPEECH_DENY" "$SPEECH"/*.rs \
+    | grep -v "^$SPEECH/http.rs:" \
+    | grep -vE '^[^:]+:[0-9]+:[[:space:]]*//' || true)"
+  if [ -n "$speech_hits" ]; then
+    flag "a speech pipeline file names a surface recorded audio must never reach (the audio egress ban — see bridge/src/speech/mod.rs)" "$speech_hits"
+  fi
+  spawn_hits="$(grep -nE 'Command::new' "$SPEECH"/*.rs \
+    | grep -vE '^[^:]+:[0-9]+:[[:space:]]*//' \
+    | grep -vF 'Command::new(&self.tool)' || true)"
+  if [ -n "$spawn_hits" ]; then
+    flag "a speech pipeline file starts a process other than the system audio decoder" "$spawn_hits"
+  fi
+  if ! grep -q 'pub const AFCONVERT: &str = "/usr/bin/afconvert";' "$SPEECH/decode.rs"; then
+    flag "the speech decoder is no longer pinned to the system's /usr/bin/afconvert" "$SPEECH/decode.rs"
+  fi
+else
+  flag "bridge/src/speech is missing, so the audio egress guard has nothing to check" "$SPEECH"
+fi
+
 # 7) (Versioning) Mandatory version bumps. A change to a component's sources must
 #    bump that component's version and update CHANGELOG.md. Delegated to the
 #    dedicated version-guard.sh (shared with the pre-push hook); it skips cleanly

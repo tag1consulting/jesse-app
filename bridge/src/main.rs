@@ -328,6 +328,34 @@ async fn main() {
     // as it did before. `build_apns` logs whether push is enabled or why it isn't.
     state.apns = build_apns();
 
+    // RECORDED AUDIO: delete whatever a killed process left in custody, then say whether this
+    // bridge transcribes. Runs live in memory, so anything under the intake root at boot is
+    // abandoned by definition — the Studio-side half of "the bridge keeps the transcript,
+    // never the audio". COUNT ONLY, never a name.
+    let purged = state.speech.purge_abandoned();
+    if purged > 0 {
+        eprintln!("jesse-bridge: deleted {purged} abandoned recording(s) from the speech intake");
+    }
+    match state.speech.availability() {
+        Ok(()) => eprintln!(
+            "jesse-bridge: speech transcription ON — {} tier{}, models under {} (fetched on \
+             first need)",
+            state.speech.config.tier.label(),
+            if state.speech.config.second_reading {
+                " with a second reading"
+            } else {
+                ""
+            },
+            state
+                .speech
+                .config
+                .models_dir()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+        ),
+        Err(why) => eprintln!("jesse-bridge: speech transcription OFF — {why}"),
+    }
+
     // Pairing QR — scan it from the app's Settings to fill in host/port/token.
     // The advertised host defaults to the bound IP (reliably reachable on the
     // tailnet; the ts.net name can have DNS quirks). Override with

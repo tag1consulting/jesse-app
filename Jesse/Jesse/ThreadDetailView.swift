@@ -51,7 +51,17 @@ struct ThreadDetailView: View {
     /// One model per conversation, held across the whole flow, because the flow outlives
     /// every individual sheet in it — the language picker, the progress view, and the
     /// error line are three views of one run.
-    @State private var recording = RecordingAttachment()
+    ///
+    /// STUDIO FIRST: the recording goes to the paired Jesse bridge, which transcribes it on
+    /// the Studio with its own, far stronger models and deletes it; this device's engine
+    /// reads it only when the Studio cannot be reached, and the composer then says so. The
+    /// pairing is read at each recording rather than captured here, so a re-pairing takes
+    /// effect at the next one.
+    @State private var recording = RecordingAttachment(
+        transcriber: StudioFirstTranscriber(studio: URLSessionStudioTransport(endpoint: {
+            let config = ConfigStore.load()
+            return StudioEndpoint(baseURL: config.endpoint("/"), token: config.token)
+        })))
     // Whether the composer's frugal glyph has been tapped for its explanation.
     @State private var showFrugalExplanation = false
 
@@ -532,6 +542,12 @@ struct ThreadDetailView: View {
             // Progress sits IN the composer rather than over the screen: an hour of
             // audio takes minutes to read, the conversation stays usable while it does,
             // and the transcript is landing in the field directly below this row.
+            // The recording was read on this device because the Studio could not be
+            // reached. Not an error — the transcript is in the composer — but a weaker
+            // reading must never arrive looking like the usual one.
+            if let notice = recording.notice {
+                RecordingNoticeRow(notice: notice, onDismiss: { recording.dismissNotice() })
+            }
             if case .running(let update) = recording.stage {
                 RecordingProgressBar(update: update,
                                      sourceName: recording.sourceName,
@@ -785,9 +801,10 @@ struct ThreadDetailView: View {
         }
     }
 
-    /// A picked recording. It is NOT staged as an attachment — audio never crosses the
-    /// network — so it goes to `RecordingAttachment`, which copies it, transcribes it on
-    /// this device, and deletes its copy however the run ends.
+    /// A picked recording. It is NOT staged as an attachment — a turn attachment can reach
+    /// a hosted model, and audio must never — so it goes to `RecordingAttachment`, which
+    /// copies it, has the Studio transcribe it (or this device, when the Studio can't be
+    /// reached), and deletes its copy however the run ends.
     private func handleAudioImport(_ result: Result<[URL], Error>) {
         switch result {
         case .success(let urls):

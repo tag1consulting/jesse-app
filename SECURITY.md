@@ -2561,6 +2561,89 @@ Files attached to a turn are untrusted input and handled defensively:
 - **Scratch is always cleaned up.** A `Drop` guard removes the whole scratch
   directory when the turn ends — success, error, or timeout — and survives the
   internal retry loop, so decoded files never outlive the turn.
+- **Audio is not an attachment, and must not become one.** A turn attachment can be
+  read by a hosted vision helper or by a hosted child, so the whitelist excludes every
+  audio container. Recordings enter by the transcription route below, whose engines run
+  inside the bridge. A test holds the two sniffers apart: no byte sequence is admitted by
+  both.
+
+## Recorded audio (`speech`, 0.135.0)
+
+Recorded audio is transcribed on the Studio, by open speech models running inside the
+bridge process. The code-level statement of what follows is the module documentation of
+`bridge/src/speech/mod.rs`.
+
+### The invariant
+
+**Recorded audio may reach the bridge and nothing past it.** It arrives from the phone over
+the tailnet, or over loopback from the Mac app running on the Studio, and it never leaves
+the Studio: not to the cloud assistant, not to a hosted vision helper, not to any registered
+model, not to a hosted speech API. It is transcribed in-process by models loaded from the
+Studio's own disk, and then deleted. Once audio is text, the text is an ordinary message and
+nothing further is restricted: it is sent, like typed text, to whichever model the bridge is
+configured to use.
+
+This **replaced** an earlier rule on purpose. App 1.0 (124) shipped "audio never goes on the
+network": recordings were transcribed on whatever device held them, and a test
+(`AudioIsNeverAnAttachmentTests`) pinned it. That put the line at the network interface,
+which forbade reaching the strongest machine in the system while protecting nothing the new
+rule does not. The line that matters is the destination.
+
+### Transport
+
+The recording travels on the connection the app already uses for every turn — no new port,
+listener or protocol. Over the tailnet it is WireGuard-encrypted end to end to the Studio;
+when the two devices cannot connect directly, Tailscale's relay carries ciphertext it cannot
+read. The upload is the raw request body (not base64 inside JSON), streamed to disk, under
+the same bearer token and the same rate limiter as every other request.
+
+### How the code holds it
+
+1. **One door.** `POST /jesse/transcriptions` is the only route that accepts audio. Its bytes
+   are sniffed from magic bytes (M4A/MP4 audio, WAV, AIFF, CAF, MP3, FLAC), cross-checked
+   against the declared type, and capped (`JESSE_SPEECH_MAX_AUDIO_BYTES`, default 1 GiB)
+   while they stream.
+2. **One kind of engine.** An engine exists only as a model file on the Studio's disk loaded
+   into the bridge process (whisper.cpp through `whisper-rs`, Metal on the Studio). No
+   configuration key names an engine by address.
+3. **No handle on anything else.** The pipeline is handed its own parts and nothing more —
+   no application state, no model registry, no vision layer. `scripts/ci-guards.sh` fails
+   the build if any pipeline file other than the HTTP boundary names one of those, or starts
+   a process other than the system audio decoder.
+4. **The wire test.** `speech::http::tests::recorded_audio_never_reaches_a_hosted_backend`
+   points the active model and its vision helper at a server that counts connections, pushes
+   a recording through the transcription route and through the turn route as an attachment,
+   and fails if that server sees a single connection.
+
+### Custody and deletion
+
+- Each recording lives in its own `0700` directory under `<state_dir>/speech-intake/`, with
+  bridge-chosen `0600` file names (the client's filename is never used). The decoded 16 kHz
+  working copy is written into the same directory; the conditioned signal is never written.
+- The directory is removed by a `Drop` guard when the run ends — success, every failure,
+  cancel, and a panic's unwind — and everything under the intake root is deleted at boot,
+  because runs live in memory and anything left there was abandoned by a killed process.
+- The bridge keeps the TRANSCRIPT, in memory, for an hour so the app can collect it. It never
+  keeps the audio, and it logs sizes and outcomes, never a filename or a word of transcript.
+- Audio is decoded by the system's `/usr/bin/afconvert` (pinned by absolute path), which runs
+  without network, in the bridge's account, writing only into the custody directory.
+
+### Model downloads
+
+The one network request the feature makes is fetching model weights: a body-less GET, on
+first need and from the weekly check, for a URL on a known-good list compiled into the
+bridge. Every file is verified against a pinned size and SHA-256 before it is loaded, and a
+new model replaces the one in use only once it has also loaded. Nothing off the list is ever
+installed, whatever the distribution host serves.
+
+### Residual risk, named
+
+- A recording sits in plaintext on the Studio's disk for the length of its run. The file
+  modes are all the bridge adds; at-rest protection is FileVault's.
+- whisper.cpp is native code reading model files. Model files come only from the pinned list,
+  so a tampered file is refused before it is parsed; the audio itself is parsed by the
+  system decoder, not by whisper.cpp.
+- One run at a time: a queued recording waits on disk, in custody, until the slot frees.
 
 ## Inbound documents (`inbound`, 0.115.0)
 

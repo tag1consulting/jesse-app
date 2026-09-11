@@ -380,6 +380,90 @@ pub struct ScheduleJob {
     /// the key existed is untouched by it. See [`Profiles`] and
     /// [`crate::scheduler::PROFILE_SKIP`].
     pub profiles: Profiles,
+    /// `Some` for a job the BRIDGE runs itself instead of a turn — see [`BuiltinTask`].
+    /// A built-in job has no prompt (its `prompt` is an empty inline placeholder that is
+    /// never loaded), no mode, no model and no output contract; everything else — its clock,
+    /// its days, its record, its ledger line, its push — is exactly a turn job's.
+    pub builtin: Option<BuiltinTask>,
+}
+
+/// WORK THE BRIDGE DOES ON A SCHEDULE WITHOUT AN AGENT TURN.
+///
+/// There is exactly one scheduler in this process, built for recurring work on an always-on
+/// Mac with no cron and no launchd job, and it already guarantees what a recurring
+/// maintenance task needs: every due occurrence ends as ran, failed or skipped, each is
+/// recorded and ledgered, and a failure pushes. So a built-in task is a scheduled occurrence
+/// like any other rather than a timer of its own — a second timer would be a second place a
+/// job could stop firing without anyone noticing, which is the failure the scheduler exists
+/// to end.
+///
+/// A built-in job holds no working-tree lock: it does not touch the vault, so a chain made
+/// only of built-ins does not wait behind (or hold up) an agent's chain.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BuiltinTask {
+    /// The weekly speech-model check: install each tier's known-good target, retire what it
+    /// supersedes. See `crate::speech::models`.
+    SpeechModelUpdate,
+}
+
+impl BuiltinTask {
+    pub fn parse(raw: &str) -> Result<BuiltinTask, String> {
+        match raw.trim() {
+            "speech-model-update" => Ok(BuiltinTask::SpeechModelUpdate),
+            other => Err(format!(
+                "`builtin` names {other:?}, which is not a built-in task (known: \
+                 speech-model-update)"
+            )),
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            BuiltinTask::SpeechModelUpdate => "speech-model-update",
+        }
+    }
+}
+
+/// The id of the default weekly speech-model check.
+pub const SPEECH_MODEL_UPDATE_JOB_ID: &str = "speech-model-update";
+
+/// Add the bridge's own default jobs to a validated schedule: today, the weekly speech-model
+/// check, when this bridge transcribes at all.
+///
+/// An operator's entry for the same task — any entry with `builtin = "speech-model-update"`,
+/// or any entry that has taken the default id — REPLACES the default rather than running
+/// beside it, which is how the time, the days or `enabled = false` are changed. A schedule
+/// that failed as a whole (duplicate ids, a cycle) is returned untouched; it is refusing the
+/// boot anyway.
+pub fn with_builtin_defaults(mut s: Schedule, speech_available: bool) -> Schedule {
+    if s.is_fatal() || !speech_available {
+        return s;
+    }
+    let declared = s.jobs.iter().any(|j| {
+        j.builtin == Some(BuiltinTask::SpeechModelUpdate) || j.id == SPEECH_MODEL_UPDATE_JOB_ID
+    }) || s.invalid.iter().any(|e| e.id == SPEECH_MODEL_UPDATE_JOB_ID);
+    if !declared {
+        s.jobs.push(ScheduleJob {
+            id: SPEECH_MODEL_UPDATE_JOB_ID.to_string(),
+            enabled: true,
+            // Sunday at 04:40, clear of the nightly chains and well before anyone records.
+            trigger: Trigger::At(NaiveTime::from_hms_opt(4, 40, 0).expect("a valid time")),
+            days: Days::parse(&["sun".to_string()]).expect("a valid day"),
+            prompt: PromptSource::Inline(String::new()),
+            mode: DEFAULT_SCHEDULE_MODE.to_string(),
+            timeout_secs: None,
+            notify: true,
+            // A Studio asleep or restarting at 04:40 still gets its week's check that
+            // morning, rather than a skip and a seven-day wait.
+            catch_up_secs: 12 * 3600,
+            expect_output: Vec::new(),
+            model: None,
+            promoted_from: None,
+            profiles: Profiles::ALL,
+            builtin: Some(BuiltinTask::SpeechModelUpdate),
+        });
+    }
+    s
 }
 
 impl ScheduleJob {
@@ -526,6 +610,8 @@ pub struct ScheduleToml {
     pub expect_output: Option<Vec<String>>,
     pub model: Option<String>,
     pub profiles: Option<Vec<String>>,
+    /// A task the bridge runs itself, in place of a prompt — see [`BuiltinTask`].
+    pub builtin: Option<String>,
     #[serde(flatten)]
     pub extra: HashMap<String, toml::Value>,
 }
@@ -646,23 +732,47 @@ fn validate_entry(t: &ScheduleToml, ctx: &ValidationContext) -> Result<ScheduleJ
         );
     }
 
-    let prompt = match (t.prompt.as_deref(), t.prompt_file.as_deref()) {
-        (Some(p), None) => {
+    // A BUILT-IN job runs no turn, so every turn-shaped key on one is a mistake worth naming
+    // rather than a key that silently does nothing.
+    let builtin = match t.builtin.as_deref() {
+        None => None,
+        Some(raw) => {
+            let task = BuiltinTask::parse(raw)?;
+            for (present, key) in [
+                (t.prompt.is_some(), "prompt"),
+                (t.prompt_file.is_some(), "prompt_file"),
+                (t.mode.is_some(), "mode"),
+                (t.model.is_some(), "model"),
+                (t.expect_output.is_some(), "expect_output"),
+            ] {
+                if present {
+                    return Err(format!(
+                        "`{key}` is set on a `builtin` job, which runs no turn"
+                    ));
+                }
+            }
+            Some(task)
+        }
+    };
+
+    let prompt = match (builtin, t.prompt.as_deref(), t.prompt_file.as_deref()) {
+        (Some(_), _, _) => PromptSource::Inline(String::new()),
+        (None, Some(p), None) => {
             if p.trim().is_empty() {
                 return Err("`prompt` is empty".to_string());
             }
             PromptSource::Inline(p.to_string())
         }
-        (None, Some(f)) => {
+        (None, None, Some(f)) => {
             if f.trim().is_empty() {
                 return Err("`prompt_file` is empty".to_string());
             }
             PromptSource::File(PathBuf::from(f.trim()))
         }
-        (Some(_), Some(_)) => {
+        (None, Some(_), Some(_)) => {
             return Err("has both `prompt` and `prompt_file` — exactly one is required".to_string())
         }
-        (None, None) => {
+        (None, None, None) => {
             return Err(
                 "has neither `prompt` nor `prompt_file` — exactly one is required".to_string(),
             )
@@ -730,6 +840,7 @@ fn validate_entry(t: &ScheduleToml, ctx: &ValidationContext) -> Result<ScheduleJ
         model,
         promoted_from: None,
         profiles,
+        builtin,
     })
 }
 
@@ -1106,6 +1217,121 @@ mod tests {
             after: Some(after.to_string()),
             ..toml_entry(id)
         }
+    }
+
+    // ---- built-in jobs -------------------------------------------------------
+
+    fn builtin(id: &str, task: &str) -> ScheduleToml {
+        ScheduleToml {
+            id: Some(id.to_string()),
+            at: Some("03:10".to_string()),
+            builtin: Some(task.to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_builtin_entry_validates_with_no_prompt_and_says_what_it_runs() {
+        let s = validate_schedule(&[builtin("models", "speech-model-update")]);
+        assert!(s.invalid.is_empty(), "{:?}", s.invalid);
+        let job = s.get("models").unwrap();
+        assert_eq!(job.builtin, Some(BuiltinTask::SpeechModelUpdate));
+        assert_eq!(job.at_label().as_deref(), Some("03:10"));
+        // A turn job carries no built-in.
+        let turn = validate_schedule(&[head("nightly", "02:30")]);
+        assert_eq!(turn.get("nightly").unwrap().builtin, None);
+    }
+
+    /// A turn-shaped key on a built-in is a mistake worth NAMING, not a key that silently
+    /// does nothing — the rule every other key on an entry already follows.
+    #[test]
+    fn a_builtin_that_also_carries_a_turn_key_is_disabled_by_name() {
+        let cases = [
+            (
+                ScheduleToml {
+                    prompt: Some("go".into()),
+                    ..builtin("a", "speech-model-update")
+                },
+                "`prompt` is set on a `builtin` job",
+            ),
+            (
+                ScheduleToml {
+                    model: Some("opus".into()),
+                    ..builtin("b", "speech-model-update")
+                },
+                "`model` is set on a `builtin` job",
+            ),
+            (
+                ScheduleToml {
+                    expect_output: Some(vec!["Inbox/x.md".into()]),
+                    ..builtin("c", "speech-model-update")
+                },
+                "`expect_output` is set on a `builtin` job",
+            ),
+            (builtin("d", "defrag-the-vault"), "not a built-in task"),
+        ];
+        for (entry, needle) in cases {
+            let s = validate_schedule(&[entry]);
+            assert_eq!(s.jobs.len(), 0);
+            assert!(
+                s.invalid[0].reason.contains(needle),
+                "{} should say {needle:?}",
+                s.invalid[0].reason
+            );
+        }
+    }
+
+    #[test]
+    fn the_weekly_model_check_joins_a_schedule_only_where_the_bridge_transcribes() {
+        let with = with_builtin_defaults(validate_schedule(&[head("nightly", "02:30")]), true);
+        let check = with.get(SPEECH_MODEL_UPDATE_JOB_ID).expect("injected");
+        assert_eq!(check.builtin, Some(BuiltinTask::SpeechModelUpdate));
+        assert_eq!(check.at_label().as_deref(), Some("04:40"));
+        assert_eq!(check.days.names(), vec!["sun"], "weekly, not nightly");
+        assert!(check.notify, "an upgrade or a failure must reach the phone");
+        assert!(
+            with.get("nightly").is_some(),
+            "the operator's jobs are untouched"
+        );
+
+        let without = with_builtin_defaults(validate_schedule(&[head("nightly", "02:30")]), false);
+        assert!(without.get(SPEECH_MODEL_UPDATE_JOB_ID).is_none());
+        assert_eq!(without.jobs.len(), 1);
+    }
+
+    #[test]
+    fn an_operator_entry_replaces_the_default_check_rather_than_running_beside_it() {
+        // By task: a differently named entry that runs the same built-in.
+        let mine = with_builtin_defaults(
+            validate_schedule(&[ScheduleToml {
+                days: Some(vec!["sat".into()]),
+                ..builtin("my-models", "speech-model-update")
+            }]),
+            true,
+        );
+        assert_eq!(mine.jobs.len(), 1);
+        assert_eq!(mine.jobs[0].id, "my-models");
+        assert_eq!(mine.jobs[0].days.names(), vec!["sat"]);
+
+        // By id: an entry that takes the default's name, even a disabled one.
+        let off = with_builtin_defaults(
+            validate_schedule(&[ScheduleToml {
+                enabled: Some(false),
+                ..builtin(SPEECH_MODEL_UPDATE_JOB_ID, "speech-model-update")
+            }]),
+            true,
+        );
+        assert_eq!(off.jobs.len(), 1);
+        assert!(
+            !off.jobs[0].enabled,
+            "enabled = false turns the weekly check off"
+        );
+
+        // A schedule that refuses the boot is left exactly as it is.
+        let fatal = validate_schedule(&[head("dup", "02:30"), head("dup", "03:30")]);
+        assert!(fatal.is_fatal());
+        let n = fatal.jobs.len();
+        assert_eq!(with_builtin_defaults(fatal, true).jobs.len(), n);
     }
 
     /// UTC as a `TimeZone`, for the zone-independent resolution tests.

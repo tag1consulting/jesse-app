@@ -1,6 +1,6 @@
 [package]
 name = "jesse-bridge"
-version = "0.134.0"
+version = "0.135.0"
 edition = "2021"
 license = "Apache-2.0"
 
@@ -181,6 +181,25 @@ chrono-tz = { version = "0.10.4", default-features = false }
 # dependencies, not who may depend on it. Verified before this line was written; the resulting
 # lock diff adds `jesse-agent` and the `regex` trio it pulls, and nothing else moves.
 jesse-agent = { path = "../agent" }
+# --- Recorded-audio transcription (`src/speech`) ---------------------------------
+#
+# whisper-rs: Rust bindings over whisper.cpp (1.8.3, vendored and built by its `-sys` crate).
+# The ONE native dependency this feature adds, and it earns it: the engine runs IN THIS
+# PROCESS on the Studio, which is the whole of the audio egress ban's "transcription is local"
+# half — no speech API, no sidecar server, no Python. Chosen over `candle` by measurement and
+# for its decoder (see `src/speech/engine.rs`). Unlicense; whisper.cpp is MIT.
+#
+# BUILD REQUIREMENT: the `-sys` crate drives CMake, so `cmake` must be on the PATH of whatever
+# builds the bridge — the sentinel's deploy build included (its PATH has /opt/homebrew/bin;
+# `brew install cmake`). Linux CI's runner image carries cmake already. Bindings are generated
+# with libclang when it is present and fall back to the crate's bundled ones when it is not.
+whisper-rs = "0.16"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }   # ServiceExt::oneshot
+
+# Metal on macOS — the Studio's GPU — with the shader library EMBEDDED in the binary, so a
+# deployed bridge needs nothing beside it. Other targets build the same engine on the CPU,
+# which is what lets CI compile and test every line of it.
+[target.'cfg(target_os = "macos")'.dependencies]
+whisper-rs = { version = "0.16", features = ["metal"] }

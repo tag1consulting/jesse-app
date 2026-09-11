@@ -24,10 +24,15 @@ import Speech
 // and is untouched: seconds of speech wanting a prompt answer is exactly the job that
 // interface is right for, and its 30-second bound is a sensible guard there.
 //
-// NOTHING LEAVES THE DEVICE. `SpeechTranscriber` runs against a locally installed model;
-// the only network traffic in this file is `AssetInstallationRequest.downloadAndInstall`
-// fetching Apple's language model, once per language per device. The recording itself is
-// never uploaded anywhere by anyone.
+// THIS IS THE FALLBACK, not the default. Recordings are transcribed on the Studio when it
+// can be reached (`StudioFirstTranscriber`), because its models are far stronger than a
+// phone's on exactly the hard audio this feature exists for; this engine runs when the
+// Studio cannot be reached, and its result says so.
+//
+// NOTHING LEAVES THE DEVICE on this path. `SpeechTranscriber` runs against a locally
+// installed model; the only network traffic in this file is
+// `AssetInstallationRequest.downloadAndInstall` fetching Apple's language model, once per
+// language per device.
 
 /// Speech authorization, requested lazily and answered as a plain bool.
 ///
@@ -72,7 +77,14 @@ public struct SpeechAnalyzerFileTranscriber: AudioFileTranscribing {
 
     public func transcribe(fileAt url: URL,
                            locale: Locale,
-                           onProgress: @escaping @Sendable (TranscriptionUpdate) -> Void) async throws -> String {
+                           onProgress: @escaping @Sendable (TranscriptionUpdate) -> Void) async throws -> TranscriptionResult {
+        let text = try await transcribeText(fileAt: url, locale: locale, onProgress: onProgress)
+        return TranscriptionResult(text: text, engine: TranscriptionPlace.thisDevice)
+    }
+
+    private func transcribeText(fileAt url: URL,
+                                locale: Locale,
+                                onProgress: @escaping @Sendable (TranscriptionUpdate) -> Void) async throws -> String {
         onProgress(TranscriptionUpdate(phase: .preparing, fraction: 0))
         guard await SpeechAuthorization.ensure() else {
             throw TranscriptionFailure.speechPermissionDenied
