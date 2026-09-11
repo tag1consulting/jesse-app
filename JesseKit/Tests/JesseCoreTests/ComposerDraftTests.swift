@@ -427,6 +427,105 @@ final class ComposerDraftTests: XCTestCase {
         XCTAssertTrue(drafts.hasDraft(id), "a staged file exempts it on its own")
     }
 
+    /// AN OPEN COMPOSER IS NEVER THE REAPER'S TO JUDGE — the regression App 1.0 (132)
+    /// shipped. A draft exists only once its composer is left, and on an iPhone pop the list
+    /// (where the reaper runs) appears BEFORE that departure; so the reaper must read
+    /// "still open" as "keep", whatever the draft says at that instant.
+    func testAnOpenComposerIsNeverTheReapersToJudge() throws {
+        let dir = draftDirectory()
+        defer { remove(dir) }
+        let drafts = store(at: dir)
+        let context = try inMemoryContext()
+        let thread = JesseThread(mode: .ask)
+        context.insert(thread)                                // as the list's `newThread` does
+
+        XCTAssertTrue(drafts.mayReap(thread.id), "a conversation nobody opened is reapable")
+        _ = ComposerDrafts.restore(for: thread, newestUserTurn: nil,
+                                   contextStillAttached: false, store: drafts)
+        XCTAssertFalse(drafts.hasDraft(thread.id), "precondition: nothing captured yet")
+        XCTAssertFalse(drafts.mayReap(thread.id),
+                       "the list appearing before the composer leaves must not take it")
+
+        // A departure that leaves the composer on screen (the scene backgrounding, a refused
+        // send) keeps it open.
+        ComposerDrafts.capture(typed(""), for: thread, in: context, store: drafts)
+        XCTAssertFalse(drafts.mayReap(thread.id))
+
+        // Leaving with a message: kept for the draft.
+        ComposerDrafts.leave(typed("AAA111"), for: thread, in: context, store: drafts)
+        XCTAssertFalse(drafts.mayReap(thread.id), "a left composer holding text is kept")
+
+        // Opened again and left empty: now, and only now, it is the reaper's.
+        _ = ComposerDrafts.restore(for: thread, newestUserTurn: nil,
+                                   contextStillAttached: false, store: drafts)
+        ComposerDrafts.leave(typed(""), for: thread, in: context, store: drafts)
+        XCTAssertTrue(drafts.mayReap(thread.id), "left empty, it is an abandoned +-then-back")
+    }
+
+    /// The departure tells the list, so the reaper runs AFTER the answer is known rather
+    /// than before it — which is what keeps an empty `+`-then-back from lingering as a row.
+    func testLeavingTellsTheListWhichConversationWasLeft() throws {
+        let dir = draftDirectory()
+        defer { remove(dir) }
+        let drafts = store(at: dir)
+        let context = try inMemoryContext()
+        let thread = JesseThread(mode: .ask)
+        context.insert(thread)
+        _ = ComposerDrafts.restore(for: thread, newestUserTurn: nil,
+                                   contextStillAttached: false, store: drafts)
+
+        let id = thread.id
+        let told = expectation(forNotification: ComposerDrafts.composerLeft, object: nil) {
+            ($0.object as? UUID) == id
+        }
+        ComposerDrafts.leave(typed(""), for: thread, in: context, store: drafts)
+        wait(for: [told], timeout: 1)
+        XCTAssertTrue(drafts.mayReap(thread.id), "and by the time it is told, it may reap")
+    }
+
+    /// THE FIELD SEQUENCE, end to end at this layer: type into a new conversation, go back
+    /// (the list appears first), open a second, type and empty it, go back, and cold-launch.
+    /// The first conversation's text must be on disk and its conversation must be kept.
+    func testAnEmptiedSecondConversationCannotTakeTheFirstOnesDraft() async throws {
+        let dir = draftDirectory()
+        defer { remove(dir) }
+        let context = try inMemoryContext()
+        let reapable: (JesseThread, ComposerDraftStore) -> Bool = { thread, drafts in
+            thread.turns.isEmpty && thread.sessionId == nil && drafts.mayReap(thread.id)
+        }
+        let drafts = store(at: dir)
+
+        let witness = JesseThread(mode: .ask)
+        context.insert(witness)
+        _ = ComposerDrafts.restore(for: witness, newestUserTurn: nil,
+                                   contextStillAttached: false, store: drafts)
+        XCTAssertFalse(reapable(witness, drafts), "the list appears before the witness leaves")
+        ComposerDrafts.leave(typed("AAA111"), for: witness, in: context, store: drafts)
+
+        let doomed = JesseThread(mode: .ask)
+        context.insert(doomed)
+        _ = ComposerDrafts.restore(for: doomed, newestUserTurn: nil,
+                                   contextStillAttached: false, store: drafts)
+        XCTAssertFalse(reapable(doomed, drafts), "nor may it take the one being emptied")
+        ComposerDrafts.leave(typed(""), for: doomed, in: context, store: drafts)
+        XCTAssertTrue(reapable(doomed, drafts), "the emptied one is reapable once left")
+        XCTAssertFalse(reapable(witness, drafts), "and the witness never is")
+        await drafts.settle()
+
+        let reopened = store(at: dir)
+        XCTAssertEqual(reopened.snapshot(for: witness.id).text, "AAA111")
+        XCTAssertTrue(reopened.mayReap(doomed.id))
+        XCTAssertFalse(reopened.mayReap(witness.id))
+    }
+
+    private func inMemoryContext() throws -> ModelContext {
+        let container = try ModelContainer(
+            for: jesseCurrentSchema,
+            configurations: ModelConfiguration(schema: jesseCurrentSchema,
+                                               isStoredInMemoryOnly: true))
+        return ModelContext(container)
+    }
+
     /// Deleting a conversation deletes its draft — an explicit call now, not a SwiftData
     /// cascade, so it is worth pinning.
     func testDeletingAConversationDeletesItsDraft() async throws {

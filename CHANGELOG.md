@@ -194,6 +194,35 @@ bridge 0.135.0 for the invariant this replaces and how it is held.
 - The language sheet's footer now says where the recording goes: the bridge and nowhere
   else, never the cloud assistant, deleted in both places once the text exists.
 
+### Fixed — a regression App 1.0 (132) shipped: the list could reap a conversation mid-departure
+- **Root cause.** Since 132 a draft exists only once its composer is LEFT: the capture runs in
+  the composer's `onDisappear`. The iPhone list reaps turn-less, draft-less conversations in its
+  own `onAppear`, and on a pop the list appears BEFORE the popped composer disappears. So the
+  reaper judged a conversation the user had just typed into while its draft was still
+  uncaptured, found it empty, and deleted it out from under the text about to land in it.
+  Before 132 the draft was held as you typed, so the order did not matter.
+- **How it showed.** `ComposerDraftUITests.testDeliberatelyEmptyingTheComposerPersistsAsEmpty`
+  failed deterministically once hosted CI first ran it after 132, twice on the same commit.
+  It lost the first conversation after a second, emptied one was reaped. The same test passed
+  on the last nightly before 132.
+- **The fix is an ordering guarantee, not a delay.** A composer is OPEN from its restore to its
+  leave (`ComposerDrafts.leave`, called by both shells' `onDisappear`). `mayReap` is false
+  while a composer is open, and the departure posts `ComposerDrafts.composerLeft`, on which the
+  list runs its reaper again — after the answer is known. An empty `+`-then-back still leaves
+  no row, and a conversation holding a message is never taken. Backgrounding and a refused
+  send remain plain captures: the composer is still on screen after them.
+- **A tab switch is a departure that is not a leaving.** It fires the composer's `onDisappear`
+  while the conversation stays on screen in the hidden tab, so the list never reaps the
+  selected conversation (`path.last`), and a composer that appears again is marked open again.
+  A real pop empties `path` before its departure lands, so it is still judged.
+- **Tests.** Three new `ComposerDraftTests` pin the rule:
+  - an open composer is never the reaper's to judge;
+  - leaving tells the list which conversation was left;
+  - the field sequence (a second conversation emptied and reaped) cannot take the first one's
+    draft, across a cold launch.
+  
+  The UI test gains checkpoints, so a future loss names the step it happened at.
+
 ### Tests
 - `AudioIsNeverAnAttachmentTests` is RETIRED and replaced by `AudioTravelsOnlyToTheStudioTests`:
   - the attachment whitelist still refuses audio, now because that path can reach hosted

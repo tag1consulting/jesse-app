@@ -203,11 +203,15 @@ struct ThreadDetailView: View {
         // composer stops being reachable: the iPhone popping it, the iPad detail column
         // replacing it on `.id(thread.id)`, the app going to the pocket, and a quit.
         //
-        // A tab switch is deliberately NOT in the list, and does not need to be: switching
-        // tabs does not destroy this view, so `input` is still here when the user comes
-        // back, and anything that WOULD destroy it (backgrounding, termination) fires one
-        // of these first.
-        .onDisappear { captureDraft() }
+        // A tab switch does not destroy this view (`input` is still here when the user
+        // comes back), but it DOES fire `onDisappear`, so it captures and reports the
+        // composer left like a pop. That is harmless: the list never reaps the conversation
+        // on screen (`path.last`), and coming back marks the composer open again
+        // (`restoreDraft`).
+        // LEAVING, not just a departure: after this the composer is gone, so it stops
+        // exempting its conversation from the list's reaper — which runs again right after,
+        // because on a pop the list appeared BEFORE this fired. See `leaveComposer`.
+        .onDisappear { leaveComposer() }
         .onChange(of: scenePhase) { _, phase in
             if phase != .active { captureDraft() }
         }
@@ -944,7 +948,13 @@ struct ThreadDetailView: View {
     /// check, the notice and the one-shot markers; the only thing local to this shell is
     /// turning the shared file value back into the composer's own chip type.
     private func restoreDraft() {
-        guard !didRestoreDraft else { return }
+        guard !didRestoreDraft else {
+            // Appearing AGAIN (an iPad tab switch fires `onDisappear` and then `onAppear` on a
+            // composer that never went away). The text is live and must not be restored over,
+            // but the composer is open again, and the reapers must know it.
+            ComposerDraftStore.shared.composerOpened(thread.id)
+            return
+        }
         didRestoreDraft = true
         let restored = ComposerDrafts.restore(for: thread, newestUserTurn: newestUserTurn,
                                               contextStillAttached: attachedContext != nil)
@@ -993,6 +1003,16 @@ struct ThreadDetailView: View {
         guard didRestoreDraft else { return }
         ComposerDrafts.capture(composerState, for: thread, in: context,
                                terminating: terminating)
+    }
+
+    /// The departure after which this composer is GONE — the iPhone popping it, the iPad's
+    /// detail column replacing it. The same capture, plus closing the composer, which is
+    /// what lets the list's reaper judge this conversation at all: on a pop the list
+    /// appeared first and skipped it as still open, and `ComposerDrafts.leave` tells it to
+    /// look again now that the answer is known.
+    private func leaveComposer() {
+        guard didRestoreDraft else { return }
+        ComposerDrafts.leave(composerState, for: thread, in: context)
     }
 
     private func send() {

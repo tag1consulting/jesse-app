@@ -76,7 +76,12 @@ struct MacThreadDetailView: View {
         // on `.id(thread.id)`, the app losing the foreground, and a quit. Cmd-Q with the
         // window frontmost may not change the scene phase at all, which is why
         // `willTerminate` is here in its own right and not as a belt to a brace.
-        .onDisappear { captureDraft() }
+        // LEAVING: the detail column is replacing this composer, so it stops exempting its
+        // conversation from the reapers. See `ComposerDrafts.leave`.
+        .onDisappear {
+            guard didRestoreDraft else { return }
+            ComposerDrafts.leave(composerState, for: thread, in: context)
+        }
         .onChange(of: scenePhase) { _, phase in
             if phase != .active { captureDraft() }
         }
@@ -96,7 +101,12 @@ struct MacThreadDetailView: View {
     /// markers all live there, so this shell cannot grow its own idea of them. This Mac
     /// has no attachment pipeline, so `restored.files` is nothing to it.
     private func restoreDraft() {
-        guard !didRestoreDraft else { return }
+        guard !didRestoreDraft else {
+            // Appearing again on a composer whose text is still live: nothing to restore, but
+            // the composer is open again and the reaper must know it.
+            ComposerDraftStore.shared.composerOpened(thread.id)
+            return
+        }
         didRestoreDraft = true
         let restored = ComposerDrafts.restore(
             for: thread, newestUserTurn: newestUserTurn,
