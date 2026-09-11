@@ -217,16 +217,26 @@ pub fn reconcile(primary: &[Segment], alternative: &[Segment]) -> Reconciled {
     }
 }
 
-/// A difference not worth a reader's attention: one side heard nothing and the other a single
-/// short word with no digit in it — "on the Friday" against "on Friday". A digit always
-/// matters: "on the 14th" against "on the" is exactly the kind of thing this list is for.
+/// Words one engine writes and the other leaves out WITHOUT changing what was said: articles
+/// and fillers, and the spelled-out form of a sign the other engine wrote as a sign ("€4,250"
+/// against "4,250 euros"). Deliberately short, and deliberately a LIST rather than a length:
+/// the short words carry the most meaning per letter, and "the pickup is not on Friday"
+/// against "the pickup is on Friday" must never be filtered out as noise.
+const INERT_WORDS: &[&str] = &[
+    // English articles and fillers.
+    "the", "a", "an", "uh", "um", "er", "erm", "ah", "oh", "mm", "hmm", "okay", "ok",
+    // Italian articles and fillers.
+    "il", "lo", "la", "i", "gli", "le", "un", "uno", "una", "ehm", "eh",
+    // Signs one engine spells out.
+    "euro", "euros", "dollar", "dollars", "percent",
+];
+
+/// A difference not worth a reader's attention: one side heard nothing and the other a
+/// single [`INERT_WORDS`] word — "on the Friday" against "on Friday". Any other one-sided
+/// word is listed, a digit or a "not" above all.
 fn trivial(a: &[Word], b: &[Word]) -> bool {
-    let lone_short = |ws: &[Word]| {
-        ws.len() == 1
-            && ws[0].norm.chars().count() <= 3
-            && !ws[0].norm.chars().any(|c| c.is_ascii_digit())
-    };
-    (a.is_empty() && lone_short(b)) || (b.is_empty() && lone_short(a))
+    let inert = |ws: &[Word]| ws.len() == 1 && INERT_WORDS.contains(&ws[0].norm.as_str());
+    (a.is_empty() && inert(b)) || (b.is_empty() && inert(a))
 }
 
 /// One step of an edit script.
@@ -380,13 +390,33 @@ mod tests {
     }
 
     #[test]
-    fn a_lone_short_word_is_noise_but_a_lone_number_is_not() {
+    fn an_article_or_a_spelled_out_sign_is_noise_but_a_missing_not_or_number_is_not() {
         let p = vec![seg(0, 3, "not on the Friday as it said")];
         let alt = vec![seg(0, 3, "not on Friday as it said")];
         assert!(
             reconcile(&p, &alt).disagreements.is_empty(),
             "\"the\" is noise"
         );
+
+        // Found by the end-to-end run: one engine writes the sign, the other the word.
+        let p = vec![seg(21, 28, "agreed to spend €4,250 on the new boiler")];
+        let alt = vec![seg(21, 28, "agreed to spend 4,250 euros on the new boiler")];
+        assert!(
+            reconcile(&p, &alt).disagreements.is_empty(),
+            "€ and euros say the same"
+        );
+
+        // The short words carry the most meaning per letter. A length rule would hide this.
+        let p = vec![seg(0, 3, "the pickup is not on Friday")];
+        let alt = vec![seg(0, 3, "the pickup is on Friday")];
+        let r = reconcile(&p, &alt);
+        assert_eq!(
+            r.disagreements.len(),
+            1,
+            "a missing \"not\" reverses the sentence"
+        );
+        assert_eq!(r.disagreements[0].primary, "not");
+        assert_eq!(r.disagreements[0].alternative, "");
 
         let p = vec![seg(0, 3, "picked up on the 14th")];
         let alt = vec![seg(0, 3, "picked up on the")];

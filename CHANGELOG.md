@@ -72,6 +72,14 @@ device captures and hands off, the bridge reads.
   - After the engine: known hallucinations over silence (music tags, subtitle credits) are
     dropped and COUNTED, and repetition loops are collapsed and MARKED in the text
     (`[repeated ×N, collapsed]`), never deleted silently.
+  - **The cancel poll is installed through whisper-rs's raw API, not its "safe" one.**
+    `set_abort_callback_safe` in 0.16.0 double-boxes the closure and then installs a
+    trampoline typed for the bare closure, so whisper.cpp's first abort poll segfaulted the
+    process. The end-to-end run on the Studio found it; no fake engine could have. The
+    replacement trampoline is typed for exactly the pointer it is handed. An `#[ignore]`d test,
+    `real_whisper_runs_and_honours_cancel`, now drives the real engine when a model path is
+    supplied (`JESSE_WHISPER_TEST_MODEL`), so the next binding upgrade can be checked the same
+    way.
 - **Conditioning** (`condition.rs`): high-pass 150 Hz, low-pass 3.8 kHz, spectral-gating
   denoise, loudness normalization. Hand-rolled — two biquads and a 512-point FFT — with no
   native code on the upload path. ADAPTIVE: it runs when speech is quiet (< -30 dBFS) or the
@@ -82,7 +90,11 @@ device captures and hands off, the bridge reads.
   - where they differ, the transcript keeps the PRIMARY reading and a disagreement list
     carries the alternative with its time range;
   - hunks one agreeing word apart merge ("Marta Esposito" / "Marvin Espino" is one entry);
-  - case and punctuation never count; a lone short word is noise, but a lone number is not.
+  - case and punctuation never count, and neither does a lone article, filler or spelled-out
+    sign ("€4,250" against "4,250 euros"). Every other one-sided word is listed, because
+    short words carry the most meaning per letter: a missing "not" or a missing "14th" is
+    exactly what the list is for. (The first cut filtered by length, which would have hidden
+    "not"; the end-to-end run's `'' vs 'euros'` is what made that visible.)
   - The comparison is shaped after `vision`'s helper comparison: every result is attributed.
 - **Progress.** Phases name the engine running: `queued`, `downloading_model`, `preparing`,
   `conditioning`, `transcribing`, `second_reading`, `reconciling`. A long run on a large model

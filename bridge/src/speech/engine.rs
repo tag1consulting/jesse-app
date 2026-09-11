@@ -208,8 +208,20 @@ impl SpeechEngine for WhisperEngine {
         params.set_progress_callback_safe(move |pct: i32| {
             progress(pct.clamp(0, 100) as f64 / 100.0);
         });
-        let cancelled = run.cancelled.clone();
-        params.set_abort_callback_safe(move || cancelled());
+        // THE CANCEL POLL, installed through the raw API on purpose. whisper-rs 0.16.0's
+        // `set_abort_callback_safe` boxes the closure twice and then installs a trampoline typed
+        // for the bare closure, so the first abort poll whisper.cpp makes reads a vtable pointer
+        // as a closure and the process segfaults — found by the end-to-end run on the Studio,
+        // which no fake engine could have shown. This trampoline is typed for exactly the
+        // pointer it is given: a `&CancelFn` on THIS stack frame, which outlives `state.full`
+        // because `full` returns before this function does. That is the whole safety argument.
+        let cancel_poll: *const CancelFn = &run.cancelled;
+        // SAFETY: see above — the pointee lives for the whole of `full`, and the trampoline
+        // only reads it.
+        unsafe {
+            params.set_abort_callback(Some(abort_trampoline));
+            params.set_abort_callback_user_data(cancel_poll as *mut std::ffi::c_void);
+        }
 
         let result = state.full(params, run.samples);
         if (run.cancelled)() {
@@ -230,6 +242,16 @@ impl SpeechEngine for WhisperEngine {
             })
             .collect())
     }
+}
+
+/// whisper.cpp's abort poll: `user_data` is the `*const CancelFn` installed in
+/// [`WhisperEngine::transcribe`], alive for the whole call that polls it.
+unsafe extern "C" fn abort_trampoline(user_data: *mut std::ffi::c_void) -> bool {
+    if user_data.is_null() {
+        return false;
+    }
+    let cancelled = &*(user_data as *const CancelFn);
+    cancelled()
 }
 
 // ---- After the engine ---------------------------------------------------------------
@@ -486,6 +508,83 @@ pub mod fakes {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// THE REAL ENGINE, where a model file is at hand — never in the default run, because no
+    /// test may need a model. On the Studio:
+    ///
+    /// ```text
+    /// JESSE_WHISPER_TEST_MODEL=~/.jesse-bridge/speech-models/ggml-large-v3-turbo.bin \
+    ///   cargo test --release real_whisper -- --ignored
+    /// ```
+    ///
+    /// It is the test that would have caught whisper-rs 0.16.0's abort trampoline before a
+    /// recording did: it runs a reading with the cancel poll installed, then a reading that is
+    /// cancelled from the first poll. `JESSE_WHISPER_TEST_WAV` optionally names a 16 kHz WAV of
+    /// real speech, which must come back as text.
+    #[test]
+    #[ignore]
+    fn real_whisper_runs_and_honours_cancel() {
+        let Some(model) = std::env::var_os("JESSE_WHISPER_TEST_MODEL") else {
+            eprintln!("skipped: set JESSE_WHISPER_TEST_MODEL to a ggml model file");
+            return;
+        };
+        let entry = CatalogEntry {
+            id: "under-test".to_string(),
+            label: "Model under test".to_string(),
+            file: String::new(),
+            url: String::new(),
+            sha256: String::new(),
+            bytes: 0,
+            tier: super::super::models::SpeechTier::Fast,
+            rank: 0,
+        };
+        let engine = WhisperEngine::load(&entry, Path::new(&model), 4).expect("the model loads");
+        let samples: Vec<f32> = match std::env::var_os("JESSE_WHISPER_TEST_WAV") {
+            Some(wav) => {
+                super::super::wav::read_wav(Path::new(&wav))
+                    .expect("a 16 kHz WAV")
+                    .samples
+            }
+            None => (0..16_000 * 5)
+                .map(|n| 0.1 * (2.0 * std::f32::consts::PI * 220.0 * n as f32 / 16_000.0).sin())
+                .collect(),
+        };
+        let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = polls.clone();
+        let never: CancelFn = Arc::new(move || {
+            counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            false
+        });
+        let progress: ProgressFn = Arc::new(|_| {});
+        let read = engine
+            .transcribe(EngineRun {
+                samples: &samples,
+                language: Some("en"),
+                progress: progress.clone(),
+                cancelled: never,
+            })
+            .expect("a reading with the cancel poll installed runs to the end");
+        assert!(
+            polls.load(std::sync::atomic::Ordering::Relaxed) > 0,
+            "whisper.cpp must actually poll the cancel callback"
+        );
+        if std::env::var_os("JESSE_WHISPER_TEST_WAV").is_some() {
+            assert!(
+                read.iter().any(|s| !s.text.trim().is_empty()),
+                "real speech comes back as text"
+            );
+        }
+        let always: CancelFn = Arc::new(|| true);
+        assert_eq!(
+            engine.transcribe(EngineRun {
+                samples: &samples,
+                language: Some("en"),
+                progress,
+                cancelled: always,
+            }),
+            Err(EngineError::Cancelled)
+        );
+    }
 
     /// THE PROFILE THAT SURVIVED HARD AUDIO. Changing any of these is a decision with a field
     /// failure behind it (see the module docs), so it has to be made here, in the open.
