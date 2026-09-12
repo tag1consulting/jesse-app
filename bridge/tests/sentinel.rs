@@ -29,8 +29,8 @@ use axum::{
 };
 use jesse_bridge::check_auth;
 use jesse_bridge::sentinel::{
-    sentinel_app, tick, Bins, Sentinel, SentinelConfig, ServiceSlot, DEFAULT_SENTINEL_PORT,
-    MAX_KICKSTARTS_PER_HOUR, SERVICE_SLOTS,
+    now_ms, probe_tailscale, sentinel_app, tick, Bins, ProbeState, Sentinel, SentinelConfig,
+    ServiceSlot, DEFAULT_SENTINEL_PORT, MAX_KICKSTARTS_PER_HOUR, SERVICE_SLOTS, TAILSCALE_DOWN_MS,
 };
 use serde_json::{json, Value};
 
@@ -345,6 +345,136 @@ async fn watchdog_leaves_a_healthy_bridge_alone() {
         recorded(&record)
     );
     assert_eq!(sen.state.lock().unwrap().bridge_misses, 0);
+}
+
+// ---- Tailscale ---------------------------------------------------------------------------
+
+const TS_ONLINE: &str = r#"{"Self":{"Online":true,"TailscaleIPs":["100.64.0.1"]}}"#;
+const TS_OFFLINE: &str = r#"{"Self":{"Online":false,"TailscaleIPs":[]}}"#;
+const TS_GUI_FAILURE: &str =
+    "The Tailscale GUI failed to start: The operation could not be completed. \
+     (Tailscale.CLIError error 3.)";
+
+/// A fake `tailscale` that records its argv, exits 0 to anything but `status`, and answers
+/// `status` with `status_stdout` and exit 0.
+///
+/// `app_bundle` makes it answer the way the Mac App Store bundle does when a launchd job runs
+/// it without a shell: the GUI-failure line, unless the probe's own `TERM_PROGRAM` reached it.
+/// It checks the exact value rather than "any `TERM`", so it cannot pass on a `TERM` the test
+/// runner inherited from its terminal.
+fn tailscale_shim(path: &Path, record: &Path, status_stdout: &str, app_bundle: bool) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let gate = if app_bundle {
+        format!(
+            "if [ \"$TERM_PROGRAM\" != 'jesse-sentinel' ]; then printf '%s\\n' '{TS_GUI_FAILURE}'; \
+             exit 0; fi\n"
+        )
+    } else {
+        String::new()
+    };
+    let body = format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n[ \"$1\" = status ] || exit 0\n{gate}\
+         printf '%s\\n' '{status_stdout}'\nexit 0\n",
+        record.display(),
+    );
+    std::fs::write(path, body).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path.to_path_buf()
+}
+
+/// The probe runs the app-bundle CLI in CLI mode: through the real spawn path, the fake only
+/// answers with status JSON when the probe's pinned environment reached it.
+#[tokio::test]
+async fn tailscale_probe_runs_the_app_bundle_cli_in_cli_mode() {
+    let sc = Scratch::new("ts-cli-mode");
+    let record = sc.path("tailscale.log");
+    let mut cfg = config(&sc, "http://127.0.0.1:1");
+    cfg.bins.tailscale = Some(tailscale_shim(
+        &sc.path("tailscale"),
+        &record,
+        TS_ONLINE,
+        true,
+    ));
+    let sen = Sentinel::new(cfg, None);
+    let p = probe_tailscale(&sen).await;
+    assert_eq!(p.state, ProbeState::Ok, "{:?}", p.error);
+    assert_eq!(p.detail["online"], json!(true));
+    assert_eq!(recorded(&record), vec!["status --json".to_string()]);
+}
+
+/// THE ARTIFACT NEVER ARMS THE WATCHDOG. When the CLI exits 0 with the GUI-failure line, the
+/// probe is `unknown` and quotes it, the outage clock does not start, and — even with a clock
+/// already past `TAILSCALE_DOWN_MS` — `tailscale up` is never run.
+#[tokio::test]
+async fn the_gui_failure_line_never_arms_tailscale_up() {
+    let sc = Scratch::new("ts-artifact");
+    let record = sc.path("tailscale.log");
+    let (url, _) = start_fake_bridge(json!({ "jobs": [] })).await;
+    let mut cfg = config(&sc, &url);
+    cfg.bins.tailscale = Some(tailscale_shim(
+        &sc.path("tailscale"),
+        &record,
+        TS_GUI_FAILURE,
+        false,
+    ));
+    let sen = Sentinel::new(cfg, None);
+
+    let p = probe_tailscale(&sen).await;
+    assert_eq!(p.state, ProbeState::Unknown, "{:?}", p.error);
+    let err = p.error.unwrap_or_default();
+    assert!(
+        err.contains("tailscale said: The Tailscale GUI failed to start:"),
+        "{err}"
+    );
+
+    tick(&sen).await;
+    assert!(
+        sen.state.lock().unwrap().tailscale_down_since_ms.is_none(),
+        "the GUI-failure line must not start the outage clock"
+    );
+
+    sen.state.lock().unwrap().tailscale_down_since_ms = Some(now_ms() - TAILSCALE_DOWN_MS - 60_000);
+    for _ in 0..3 {
+        tick(&sen).await;
+    }
+    let calls = recorded(&record);
+    assert!(
+        calls.iter().all(|c| c == "status --json"),
+        "only `status --json` may run: {calls:?}"
+    );
+    assert!(sen.state.lock().unwrap().tailscale_up_ms.is_none());
+}
+
+/// …and a REAL outage still acts: status JSON with `Self.Online` false, past
+/// `TAILSCALE_DOWN_MS`, runs `tailscale up` exactly once. This is also the control for the
+/// test above — the seeded clock is what makes `up` due.
+#[tokio::test]
+async fn an_offline_node_still_runs_tailscale_up_once() {
+    let sc = Scratch::new("ts-offline");
+    let record = sc.path("tailscale.log");
+    let (url, _) = start_fake_bridge(json!({ "jobs": [] })).await;
+    let mut cfg = config(&sc, &url);
+    cfg.bins.tailscale = Some(tailscale_shim(
+        &sc.path("tailscale"),
+        &record,
+        TS_OFFLINE,
+        false,
+    ));
+    let sen = Sentinel::new(cfg, None);
+
+    tick(&sen).await;
+    assert!(
+        sen.state.lock().unwrap().tailscale_down_since_ms.is_some(),
+        "an offline node starts the outage clock"
+    );
+
+    sen.state.lock().unwrap().tailscale_down_since_ms = Some(now_ms() - TAILSCALE_DOWN_MS - 60_000);
+    for _ in 0..3 {
+        tick(&sen).await;
+    }
+    let ups = recorded(&record).iter().filter(|c| *c == "up").count();
+    assert_eq!(ups, 1, "{:?}", recorded(&record));
+    assert!(sen.state.lock().unwrap().tailscale_up_ms.is_some());
 }
 
 /// THE TOKEN BOUNDARY, in both directions.

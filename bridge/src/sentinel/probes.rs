@@ -282,32 +282,56 @@ pub fn parse_tailscale_status(text: &str) -> Result<Value, String> {
     }))
 }
 
+/// The environment `tailscale` runs under: a `TERM_PROGRAM`, without which the Mac App Store
+/// build will not act as a command-line tool at all.
+///
+/// THAT CLI IS THE GUI APP. `/Applications/Tailscale.app/Contents/MacOS/Tailscale`, where
+/// `Bins::resolve` lands when no standalone `tailscale` is installed, decides from its
+/// environment whether a shell started it: it runs as the CLI only when `SHLVL`, `TERM` or
+/// `TERM_PROGRAM` is non-empty. A launchd job carries none of the three and `run_cmd` spawns
+/// without a shell, so unpinned it takes the app-launch path, cannot start a GUI that is
+/// already running, and prints "The Tailscale GUI failed to start: … (Tailscale.CLIError
+/// error 3.)" on STDOUT with exit 0 — a permanently red probe on a healthy tailnet. Measured
+/// on 1.98.5 from a launchd job: unpinned failed every run, pinned read `Self.Online` every
+/// run. `TERM_PROGRAM` rather than `TERM` because `TERM` changes how other programs format
+/// their output; a standalone CLI ignores it.
+pub const TAILSCALE_CLI_ENV: &[(&str, &str)] = &[("TERM_PROGRAM", "jesse-sentinel")];
+
 pub async fn probe_tailscale(sen: &Sentinel) -> Probe {
     let res = run_cmd(
         sen.cfg.bins.tailscale.as_ref(),
         &["status", "--json"],
-        &[],
+        TAILSCALE_CLI_ENV,
         PROBE_TIMEOUT,
     )
     .await;
-    // A tailscale we could not RUN is `unknown`, not offline. The watchdog acts on this
-    // probe — it runs `tailscale up` — and "the binary is not installed" or "the call hung"
-    // must never be read as an outage, because the action would then fire forever against a
-    // condition that does not exist.
-    if res.spawn_error.is_some() || res.timed_out {
+    classify_tailscale(&res)
+}
+
+/// What one `tailscale status --json` run says, as a probe.
+///
+/// `failed` is kept for the two shapes that ARE an outage: the CLI exiting non-zero, and
+/// status JSON whose `Self.Online` is false. The watchdog acts on `failed` — five minutes of
+/// it runs `tailscale up` — so every other shape is `unknown`, a statement about the probe
+/// rather than about the tailnet:
+///
+///   * A tailscale we could not RUN. "The binary is not installed" or "the call hung" must
+///     never be read as an outage, because the action would then fire forever against a
+///     condition that does not exist.
+///   * EXIT 0 WITH SOMETHING THAT IS NOT STATUS JSON. This is what the app-bundle CLI prints
+///     when it cannot reach the GUI (see [`TAILSCALE_CLI_ENV`]): "The Tailscale GUI failed to
+///     start: …" on STDOUT, exit zero, while the tailnet carries traffic the whole time. The
+///     error quotes that first line — "unparseable JSON at line 1" alone would send an
+///     operator hunting for a JSON bug that is not there.
+pub fn classify_tailscale(res: &CmdOut) -> Probe {
+    if res.unrunnable() {
         return Probe::unknown(res.summary());
     }
     if !res.ok() {
         return Probe::failed(Value::Null, res.summary());
     }
     match parse_tailscale_status(&res.stdout) {
-        // EXIT 0 IS NOT ENOUGH. The macOS CLI lives inside the app bundle and, when it cannot
-        // reach the GUI's state (a sandbox/HOME mismatch, the app not running), prints
-        // "The Tailscale GUI failed to start: …" on STDOUT and exits ZERO. So the parse is
-        // the real check, and its error carries what actually came back — "unparseable JSON
-        // at line 1" alone would send an operator hunting for a JSON bug that is not there.
-        Err(e) => Probe::failed(
-            Value::Null,
+        Err(e) => Probe::unknown(
             match res.stdout.lines().map(str::trim).find(|l| !l.is_empty()) {
                 Some(first) => format!(
                     "{e} — tailscale said: {}",
@@ -844,17 +868,101 @@ mod tests {
         assert!(parse_tailscale_status(r#"{"Peer":{}}"#).is_err());
     }
 
-    #[tokio::test]
-    async fn tailscale_exit_zero_with_prose_is_a_failure_that_quotes_it() {
-        // The shape measured on this host: the app-bundle CLI printed
-        // "The Tailscale GUI failed to start: …" on STDOUT and exited 0.
-        let out = "The Tailscale GUI failed to start: (Tailscale.CLIError error 3.)\n";
-        let err = parse_tailscale_status(out).unwrap_err();
+    /// What the app-bundle CLI printed on STDOUT, with exit 0, when a launchd job ran it
+    /// without [`TAILSCALE_CLI_ENV`].
+    const TAILSCALE_GUI_FAILURE: &str = "The Tailscale GUI failed to start: The operation \
+        couldn’t be completed. (Tailscale.CLIError error 3.)\n";
+
+    fn exited(code: i32, stdout: &str, stderr: &str) -> CmdOut {
+        CmdOut {
+            code: Some(code),
+            stdout: stdout.to_string(),
+            stderr: stderr.to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn tailscale_gui_failure_on_exit_zero_is_unknown_and_quotes_it() {
+        let err = parse_tailscale_status(TAILSCALE_GUI_FAILURE).unwrap_err();
         assert!(err.contains("unparseable JSON"), "{err}");
-        // …and the probe must carry the prose, not just "expected value at line 1 column 1",
+        let p = classify_tailscale(&exited(0, TAILSCALE_GUI_FAILURE, ""));
+        // UNKNOWN, NOT FAILED: the probe could not read the tailnet, which says nothing about
+        // whether the tailnet is up — and `failed` is what arms the watchdog's `tailscale up`.
+        assert_eq!(p.state, ProbeState::Unknown);
+        // The error carries what tailscale said, not just "expected value at line 1 column 1",
         // which would send someone hunting for a JSON bug that is not there.
-        let first = out.lines().next().unwrap();
-        assert!(first.contains("GUI failed to start"));
+        let err = p.error.clone().unwrap();
+        assert!(
+            err.contains("tailscale said: The Tailscale GUI failed to start:"),
+            "{err}"
+        );
+        assert!(err.contains("(Tailscale.CLIError error 3.)"), "{err}");
+        // The wire shape is the ordinary `unknown` one.
+        let j = p.to_json();
+        assert_eq!(j["ok"], Value::Null);
+        assert_eq!(j["state"], json!("unknown"));
+        assert_eq!(j["detail"], Value::Null);
+    }
+
+    #[test]
+    fn tailscale_exit_zero_without_status_json_is_never_an_outage() {
+        for out in ["", "\n  \n", "not json at all\n", r#"{"Peer":{}}"#] {
+            let p = classify_tailscale(&exited(0, out, ""));
+            assert_eq!(p.state, ProbeState::Unknown, "{out:?} → {:?}", p.error);
+        }
+        let silent = classify_tailscale(&exited(0, "", "")).error.unwrap();
+        assert!(silent.contains("printed nothing"), "{silent}");
+    }
+
+    #[test]
+    fn tailscale_real_outages_are_still_failed() {
+        // Status JSON saying this node is offline…
+        let off = classify_tailscale(&exited(
+            0,
+            r#"{"Self":{"Online":false,"TailscaleIPs":[]}}"#,
+            "",
+        ));
+        assert_eq!(off.state, ProbeState::Failed);
+        assert_eq!(off.detail["online"], json!(false));
+        // …and the CLI exiting non-zero, whatever it printed.
+        let down = classify_tailscale(&exited(1, "", "failed to connect to local Tailscale\n"));
+        assert_eq!(down.state, ProbeState::Failed);
+        assert_eq!(
+            down.error.as_deref(),
+            Some("exit 1: failed to connect to local Tailscale")
+        );
+        let gui_nonzero = classify_tailscale(&exited(1, TAILSCALE_GUI_FAILURE, ""));
+        assert_eq!(gui_nonzero.state, ProbeState::Failed);
+    }
+
+    #[test]
+    fn tailscale_online_is_ok_and_unrunnable_is_unknown() {
+        let on = classify_tailscale(&exited(
+            0,
+            r#"{"Self":{"Online":true,"TailscaleIPs":["100.64.0.1"]}}"#,
+            "",
+        ));
+        assert_eq!(on.state, ProbeState::Ok);
+        assert_eq!(on.detail["online"], json!(true));
+        let missing = CmdOut {
+            spawn_error: Some("binary not found on this host".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(classify_tailscale(&missing).state, ProbeState::Unknown);
+        let hung = CmdOut {
+            timed_out: true,
+            ..Default::default()
+        };
+        assert_eq!(classify_tailscale(&hung).state, ProbeState::Unknown);
+    }
+
+    #[test]
+    fn tailscale_cli_env_is_a_non_empty_term_program() {
+        // The bundle treats an EMPTY value as absent, so emptying this reintroduces the bug.
+        assert!(TAILSCALE_CLI_ENV
+            .iter()
+            .any(|(k, v)| *k == "TERM_PROGRAM" && !v.is_empty()));
     }
 
     #[test]
