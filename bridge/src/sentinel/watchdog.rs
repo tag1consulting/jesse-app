@@ -356,8 +356,9 @@ async fn check_tailscale(sen: &Arc<Sentinel>, now: u64) {
         st.last_push_ms.remove(AlertKind::Tailscale.key());
         return;
     }
-    // `unknown` (the probe timed out, or tailscale is not installed) is NOT an outage.
-    // Running `tailscale up` because a probe hung would be acting on nothing.
+    // `unknown` (the probe timed out, tailscale is not installed, or it exited 0 without
+    // status JSON) is NOT an outage. Running `tailscale up` because a probe hung would be
+    // acting on nothing.
     if probe.state == ProbeState::Unknown {
         return;
     }

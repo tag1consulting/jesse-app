@@ -14,6 +14,12 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [bridge 0.136.1] - 2026-09-12
+
+### Fixed
+- **Sentinel Tailscale probe read `failed` on a healthy tailnet:** the App Store `Tailscale` binary acts as a CLI only when `SHLVL`, `TERM` or `TERM_PROGRAM` is set, and a launchd job has none, so it printed "The Tailscale GUI failed to start" with exit 0.
+  The probe now pins `TERM_PROGRAM`, and exit-0 output that is not status JSON reads `unknown`, which never arms `tailscale up`.
+
 ## [bridge 0.136.0] - 2026-09-11
 
 **Phone replies lead with the answer and stop when it ends.** The formatting note appended

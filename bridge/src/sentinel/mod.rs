@@ -167,7 +167,8 @@ impl Bins {
         let bins = Bins {
             launchctl: resolve_bin("launchctl", &["/bin/launchctl"]),
             // Tailscale on a Mac ships inside the app bundle and is NOT on a launchd job's
-            // PATH; the CLI symlink is a thing the user may or may not have made.
+            // PATH; the CLI symlink is a thing the user may or may not have made. That binary
+            // is the GUI app too, and only acts as the CLI under `TAILSCALE_CLI_ENV`.
             tailscale: resolve_bin(
                 "tailscale",
                 &["/Applications/Tailscale.app/Contents/MacOS/Tailscale"],
