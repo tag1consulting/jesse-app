@@ -38,10 +38,17 @@ struct JesseApp: App {
 
         let box = IntentReplayerBox()
         _replayerBox = State(initialValue: box)
-        _coordinator = State(initialValue: RunCoordinator(
+        let coordinator = RunCoordinator(
             intentReplayer: box,
             onFirstSuccess: { PushManager.shared.noteSuccessfulTurn() }
-        ))
+        )
+        _coordinator = State(initialValue: coordinator)
+        // The automatic weigh-in and workout turns need the coordinator and the Health model
+        // from the first instant, because HealthKit relaunches the app straight into the
+        // BACKGROUND to deliver new data, and there no view is ever built. This initializer
+        // runs on every launch, that one included.
+        HealthAutoTrigger.shared.attach(coordinator: coordinator,
+                                        model: RootTabView.sharedHealthModel)
     }
 
     // Opened once at launch. `openFailure` is non-nil only when the on-disk store

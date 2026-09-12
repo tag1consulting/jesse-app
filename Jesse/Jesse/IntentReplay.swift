@@ -92,8 +92,15 @@ final class CoordinatorTellSender: IntentTellSending {
     /// replay must not send a day's second meal until the first has landed, because a log
     /// that arrives out of order reads as a different day's.
     func sendTell(_ text: String) async -> Bool {
+        await sendTell(text, origin: .phone)
+    }
+
+    /// The same, on a thread carrying `origin` — so a workout log or weigh-in the phone
+    /// fired by itself while offline is still found under Auto once it replays.
+    func sendTell(_ text: String, origin: ThreadOrigin) async -> Bool {
         guard let modelContext = context.modelContext else { return false }
         let thread = JesseThread(mode: .tell)
+        thread.origin = origin.rawValue
         modelContext.insert(thread)
         return await withCheckedContinuation { continuation in
             // `onAck` fires exactly once, on the `202` or on any pre-ACK failure, and it

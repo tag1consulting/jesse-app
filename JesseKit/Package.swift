@@ -232,7 +232,11 @@ let package = Package(
         ),
         .testTarget(
             name: "JesseTodayDisplayTests",
-            dependencies: ["JesseTodayDisplay", "JesseNetworking"],
+            // JesseDietDisplay is here for the replay tests that capture through the real
+            // `HealthDashboardModel` and replay through the real `IntentReplayer`: the
+            // automatic health turns' offline guarantees span both, and a fake of either
+            // half would assert the fake.
+            dependencies: ["JesseTodayDisplay", "JesseNetworking", "JesseDietDisplay"],
             swiftSettings: [
                 .swiftLanguageMode(.v6),
             ]
