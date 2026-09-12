@@ -101,7 +101,9 @@ public struct ModelMenuRow: Equatable, Sendable, Identifiable {
     public let isEnabled: Bool
     /// The resolved model: the one the next turn runs on. It carries the checkmark.
     public let isSelected: Bool
-    /// Harness and version, on the SELECTED row only — information, never a control.
+    /// The row's second line: harness and version on the SELECTED row, then the usage of the
+    /// account the model bills (`5h 23% · week 41%`, `$1.75 this month`) on EVERY row that has
+    /// one, joined by ` · `. Information, never a control. nil when there is neither.
     public let subtitle: String?
 }
 
@@ -128,8 +130,12 @@ public struct ModelMenuLayout: Equatable, Sendable {
     public let effort: ModelEffortControl?
     public let buttonLabel: String
 
+    /// `usage` is the shared `UsageStore`'s state and `now` the clock its `stale` rule reads.
+    /// Both default, and with no usage the menu is exactly what it was before quota existed:
+    /// a subtitle on the selected row only.
     public init(state: ModelSwitchState?, threadModelID: String?, deviceDefaultID: String?,
-                threadEffort: String?) {
+                threadEffort: String?, usage: UsageState? = nil, now: Date = Date()) {
+        let nowMs = QuotaPresentation.nowMs(now)
         let resolved = state?.resolvedModel(threadModelID: threadModelID,
                                             deviceDefaultID: deviceDefaultID)
         var order: [String] = []
@@ -145,11 +151,17 @@ public struct ModelMenuLayout: Equatable, Sendable {
                 header: models.count > 1 ? family : nil,
                 rows: models.map { model in
                     let selected = model.id == resolved?.id
+                    // The selected row's harness and version first, then the usage of the
+                    // account the model bills, on EVERY row that has one.
+                    let parts = [selected ? model.detailLine : nil,
+                                 QuotaPresentation.usageLine(for: usage?.scope(for: model),
+                                                             nowMs: nowMs)]
+                        .compactMap { $0 }
                     return ModelMenuRow(id: model.id,
                                         title: selected ? model.label : model.menuRowLabel,
                                         isEnabled: model.available,
                                         isSelected: selected,
-                                        subtitle: selected ? model.detailLine : nil)
+                                        subtitle: parts.isEmpty ? nil : parts.joined(separator: " · "))
                 })
         }
         effort = resolved.flatMap { $0.effortControl(threadEffort: threadEffort) }

@@ -62,6 +62,10 @@ pub struct AppState {
     // is never here (healthy by construction). Empty + inert for an opus-only deploy — the
     // prober (spawned in `main`) starts nothing then.
     pub health: Arc<HealthStore>,
+    // Per-ACCOUNT usage and quota (`GET /jesse/usage`): one snapshot per billing scope, filled
+    // passively by turns and on demand by that route, and never by a timer — the health
+    // prober above keeps skipping the subscription logins. See [`crate::quota`].
+    pub quota: Arc<QuotaStore>,
     // The registered APNs device token (single user). Always present so device
     // registration works even when push is off; persisted to the state dir.
     pub devices: Arc<DeviceStore>,
@@ -206,6 +210,8 @@ impl AppState {
             flags: Arc::new(FlagStore::new(flags_file)),
             models: Arc::new(ModelStore::new(model_file)),
             health,
+            // Empty until a turn reports or `GET /jesse/usage` asks. No task is spawned for it.
+            quota: Arc::new(QuotaStore::new()),
             deletions: Arc::new(DeletionStore::new(deletions_file, deletion_retention_ms)),
             devices: Arc::new(DeviceStore::new(device_file)),
             notify: Arc::new(NotifyFlags::new()),

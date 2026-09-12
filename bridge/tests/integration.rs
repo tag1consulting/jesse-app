@@ -4984,6 +4984,178 @@ async fn models_endpoint_requires_auth() {
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
+// ---- Live usage and quota: GET /jesse/usage -------------------------------------------
+
+fn usage_request(auth: Option<&str>, query: &str) -> Request<Body> {
+    let mut b = Request::builder().uri(format!("/jesse/usage{query}"));
+    if let Some(a) = auth {
+        b = b.header("authorization", a);
+    }
+    b.body(Body::empty()).unwrap()
+}
+
+/// A quota fetcher that answers from memory and counts, so the route runs with no network.
+#[derive(Default)]
+struct StubQuota {
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+impl QuotaFetcher for StubQuota {
+    fn fetch<'a>(
+        &'a self,
+        scope: QuotaScopeId,
+        _cfg: &'a Config,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<QuotaSnapshot, QuotaError>> + Send + 'a>,
+    > {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move {
+            let mut s = QuotaSnapshot::new(scope, 0, QuotaSource::Fetched);
+            s.windows.push(QuotaWindow {
+                id: "five_hour".into(),
+                label: "5 hours".into(),
+                used_percent: 23.0,
+                resets_at_ms: Some(1),
+                status: None,
+            });
+            s.plan = Some("max".into());
+            Ok(s)
+        })
+    }
+}
+
+/// opus on the subscription, a Codex model on the ChatGPT login (its URL is the deployed
+/// shape: a probe target on the local gateway), and GLM on Fireworks with a token that must
+/// never reach a client.
+fn cfg_with_three_accounts() -> Config {
+    let opus = ModelRegistry::opus_only().default_model().clone();
+    let mut codex = opus.clone();
+    codex.id = "codex".into();
+    codex.kind = ModelKind::Hosted;
+    codex.harness = CODEX_ID.to_string();
+    codex.backend = Some((
+        "http://127.0.0.1:9100".into(),
+        "cx-tok".into(),
+        "gpt".into(),
+    ));
+    let mut glm = opus.clone();
+    glm.id = "glm".into();
+    glm.kind = ModelKind::Hosted;
+    glm.backend = Some((
+        "https://api.fireworks.ai/inference".into(),
+        "fw-secret-token".into(),
+        "accounts/fireworks/models/glm-5p3".into(),
+    ));
+    Config {
+        model_registry: ModelRegistry {
+            models: vec![opus, codex, glm],
+        },
+        ..test_config()
+    }
+}
+
+#[tokio::test]
+async fn usage_endpoint_requires_auth() {
+    let resp = app(test_state())
+        .oneshot(usage_request(None, ""))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// The route's shape, its TTL cache and its force floor, with a counting fetcher: one entry per
+/// configured scope; the Fireworks scope, with no account id, says so and calls nothing; a
+/// second call inside the TTL calls nothing; a forced one inside the floor calls nothing.
+#[tokio::test]
+async fn usage_endpoint_reports_each_configured_account_and_caches_it() {
+    let mut st = AppState::new(cfg_with_three_accounts());
+    let stub = Arc::new(StubQuota::default());
+    st.quota = Arc::new(QuotaStore::with_fetcher(stub.clone()));
+    let before = quota_now_ms();
+
+    let resp = app(st.clone())
+        .oneshot(usage_request(Some("Bearer test-token"), ""))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = body_value(resp).await;
+    let scopes = v["scopes"].as_array().unwrap();
+    let ids: Vec<&str> = scopes.iter().map(|s| s["id"].as_str().unwrap()).collect();
+    assert_eq!(
+        ids,
+        vec!["claude-subscription", "codex-chatgpt", "fireworks"]
+    );
+
+    let claude = &scopes[0];
+    assert_eq!(claude["label"], "Claude subscription");
+    assert_eq!(claude["models"], serde_json::json!(["opus"]));
+    assert_eq!(claude["windows"][0]["used_percent"], 23.0);
+    assert_eq!(claude["plan"], "max");
+    assert_eq!(claude["source"], "fetched");
+    assert_eq!(claude["ttl_secs"], CLAUDE_QUOTA_TTL_SECS);
+    assert!(
+        claude["fetched_at_ms"].as_i64().unwrap() >= before,
+        "fetched just now"
+    );
+    assert!(claude["error"].is_null());
+    assert_eq!(scopes[1]["models"], serde_json::json!(["codex"]));
+
+    let fireworks = &scopes[2];
+    assert_eq!(fireworks["models"], serde_json::json!(["glm"]));
+    assert_eq!(fireworks["error"], FIREWORKS_SPEND_NOT_CONFIGURED);
+    assert_eq!(fireworks["windows"], serde_json::json!([]));
+    assert_eq!(
+        stub.calls.load(Ordering::SeqCst),
+        2,
+        "claude and codex fetched; fireworks, unconfigured, never asked"
+    );
+    let raw = v.to_string();
+    assert!(
+        !raw.contains("fw-secret-token") && !raw.contains("cx-tok"),
+        "{raw}"
+    );
+
+    // Inside the TTL: no provider call. Forced inside the 20 s floor: still none.
+    for query in ["", "?force=1"] {
+        let resp = app(st.clone())
+            .oneshot(usage_request(Some("Bearer test-token"), query))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+    assert_eq!(stub.calls.load(Ordering::SeqCst), 2);
+}
+
+/// `usage_scope` joins each model row to its account, and is null for one that bills nothing
+/// the bridge reads.
+#[tokio::test]
+async fn model_rows_name_the_account_each_model_bills() {
+    let mut cfg = cfg_with_three_accounts();
+    let mut local = ModelRegistry::opus_only().default_model().clone();
+    local.id = "local".into();
+    local.kind = ModelKind::Local;
+    local.backend = Some(("http://127.0.0.1:9100".into(), "t".into(), "m".into()));
+    cfg.model_registry.models.push(local);
+    let resp = app(AppState::new(cfg))
+        .oneshot(models_request(Some("Bearer test-token")))
+        .await
+        .unwrap();
+    let v = body_value(resp).await;
+    let scope_of = |id: &str| {
+        v["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["id"] == id)
+            .unwrap()["usage_scope"]
+            .clone()
+    };
+    assert_eq!(scope_of("opus"), "claude-subscription");
+    assert_eq!(scope_of("codex"), "codex-chatgpt");
+    assert_eq!(scope_of("glm"), "fireworks");
+    assert!(scope_of("local").is_null());
+}
+
 #[tokio::test]
 async fn models_endpoint_lists_the_registry_and_active_selection() {
     let dir = std::env::temp_dir().join(format!("jesse-model-it-{}", random_hex()));
@@ -5365,6 +5537,8 @@ async fn the_models_endpoint_entry_shape_is_pinned() {
             "level",
             "search_degraded",
             "streams_text",
+            // 0.137.0: the billing account the model spends, joined to `GET /jesse/usage`.
+            "usage_scope",
             "version",
             "vision",
             "wire",

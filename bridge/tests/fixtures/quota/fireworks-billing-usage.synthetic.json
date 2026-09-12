@@ -1,0 +1,33 @@
+{
+  "serverlessCosts": [
+    {
+      "group": { "model_name": "accounts/fireworks/models/glm-5p3" },
+      "modelName": "accounts/fireworks/models/glm-5p3",
+      "promptTokens": "1200000",
+      "completionTokens": "80000",
+      "cachedPromptTokens": "900000",
+      "uncachedPromptTokens": "300000",
+      "costNanoUsd": 1052000000,
+      "startTime": "2026-09-01T00:00:00Z",
+      "endTime": "2026-09-02T00:00:00Z",
+      "usageType": "SERVERLESS"
+    },
+    {
+      "group": { "model_name": "accounts/fireworks/models/kimi-k3" },
+      "promptTokens": "100000",
+      "completionTokens": "10000",
+      "cachedPromptTokens": "0",
+      "costNanoUsd": 0,
+      "usageType": "SERVERLESS"
+    },
+    {
+      "group": { "model_name": "accounts/fireworks/models/some-other-model" },
+      "promptTokens": "1000",
+      "completionTokens": "1000",
+      "costNanoUsd": 250000000,
+      "usageType": "SERVERLESS"
+    }
+  ],
+  "dedicatedCosts": [],
+  "trainingCosts": []
+}

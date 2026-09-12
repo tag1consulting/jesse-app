@@ -217,6 +217,13 @@ pub struct Provenance {
     /// field to mean "was it checked".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub style: Option<String>,
+    /// The quota of the account this turn's model bills to, when THIS TURN refreshed it (a
+    /// `rate_limit_event` or an `account/rateLimits/updated` seen while it ran), in exactly
+    /// the shape `GET /jesse/usage` returns per scope — so a client updates its usage display
+    /// without a call. Absent on every other turn, and on an older bridge. See
+    /// [`crate::quota`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota: Option<QuotaEntry>,
     /// The flags the badge (and the emergency warning) encode.
     pub flags: ProvenanceFlags,
 }
@@ -290,6 +297,9 @@ pub fn reply_provenance(
         cost_usd,
         badge,
         style: style.and_then(|v| v.label()),
+        // Attached by the turn handler, which alone knows whether this turn refreshed the
+        // account's quota; see `quota` on the struct.
+        quota: None,
         flags: ProvenanceFlags::from_source(source, citations_unverified),
     })
 }
@@ -852,6 +862,67 @@ mod tests {
         )
         .unwrap();
         assert_eq!(clean.style, None);
+    }
+
+    /// `quota` rides the provenance only when the handler attached it (a turn that refreshed
+    /// its account), in the `GET /jesse/usage` entry shape; otherwise the key is not on the
+    /// wire at all, so an older client and the shared fixture see exactly what they saw.
+    #[test]
+    fn provenance_carries_a_quota_entry_only_when_one_is_attached() {
+        let cfg = cfg_on();
+        let health = seeded_health(&cfg);
+        let mut p = reply_provenance(
+            &ok("Body."),
+            &cfg,
+            &health,
+            MetricsRoute::Hosted,
+            BadgeSource::Hosted,
+            Some("opus".into()),
+            &HostedBadge::opus(),
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(p.quota, None, "reply_provenance never invents one");
+        let without = provenance_to_value(Some(&p));
+        assert!(
+            without.get("quota").is_none(),
+            "absent, not null: {without}"
+        );
+
+        let mut snap = QuotaSnapshot::new(QuotaScopeId::ClaudeSubscription, 5, QuotaSource::Turn);
+        snap.apply(
+            QuotaPatch {
+                windows: vec![QuotaWindowPatch {
+                    id: "five_hour".into(),
+                    used_percent: Some(95.0),
+                    status: Some("allowed_warning".into()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            QuotaSource::Turn,
+            5,
+        );
+        p.quota = Some(QuotaEntry {
+            snapshot: snap,
+            label: QuotaScopeId::ClaudeSubscription.label().to_string(),
+            models: vec!["opus".into()],
+            ttl_secs: CLAUDE_QUOTA_TTL_SECS,
+        });
+        let with = provenance_to_value(Some(&p));
+        assert_eq!(with["quota"]["id"], "claude-subscription");
+        assert_eq!(with["quota"]["label"], "Claude subscription");
+        assert_eq!(with["quota"]["source"], "turn");
+        assert_eq!(with["quota"]["warning"], true, "95 percent");
+        assert_eq!(with["quota"]["windows"][0]["label"], "5 hours");
+        assert_eq!(with["quota"]["windows"][0]["used_percent"], 95.0);
+        assert_eq!(with["quota"]["models"], json!(["opus"]));
+        assert_eq!(with["quota"]["ttl_secs"], 120);
+        assert_eq!(with["badge"], without["badge"], "the badge is untouched");
+        // And a persisted job's provenance reads back with it.
+        let back: Provenance = serde_json::from_value(with).unwrap();
+        assert_eq!(back, p);
     }
 
     #[test]

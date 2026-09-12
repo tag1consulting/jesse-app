@@ -351,6 +351,14 @@ pub fn parse_stream_line(line: &str) -> StreamEvent {
             .filter(|s| !s.trim().is_empty())
             .map(|s| StreamEvent::SessionId(s.to_string()))
             .unwrap_or(StreamEvent::Ignore),
+        // The subscription login's standing (Claude Code 2.1.45 and later, subscription logins
+        // only). Carries no answer text and ends nothing; the driver folds it into the quota
+        // store as a sparse merge. One without a status is not one this parser can read.
+        Some("rate_limit_event") => v
+            .get("rate_limit_info")
+            .and_then(RateLimitEventInfo::from_value)
+            .map(StreamEvent::RateLimit)
+            .unwrap_or(StreamEvent::Ignore),
         // Token-level events (emitted under --include-partial-messages). The
         // visible answer streams as `text_delta`s inside a `text` content block;
         // tool use announces itself with a `tool_use` content-block start.
@@ -1864,8 +1872,10 @@ mod tests {
             StreamEvent::Ignore
         ));
         assert!(matches!(parse_stream_line("   "), StreamEvent::Ignore));
-        let rate = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed"}}"#;
-        assert!(matches!(parse_stream_line(rate), StreamEvent::Ignore));
+        // A rate limit event with no status is not one the parser can read.
+        let statusless =
+            r#"{"type":"rate_limit_event","rate_limit_info":{"rateLimitType":"five_hour"}}"#;
+        assert!(matches!(parse_stream_line(statusless), StreamEvent::Ignore));
         // A `system` event that is not `init` names no session.
         let status = r#"{"type":"system","subtype":"status","session_id":"s"}"#;
         assert!(matches!(parse_stream_line(status), StreamEvent::Ignore));
@@ -1888,6 +1898,101 @@ mod tests {
         assert!(matches!(parse_stream_line(no_id), StreamEvent::Ignore));
         let blank = r#"{"type":"system","subtype":"init","session_id":"  "}"#;
         assert!(matches!(parse_stream_line(blank), StreamEvent::Ignore));
+    }
+
+    /// Verification 2: the three `rate_limit_event` shapes, fed through the parser and into
+    /// the subscription scope. `allowed_warning` at 0.85 stores 85 percent; `rejected` stores
+    /// its status and reset; `allowed` alone changes no percentage.
+    #[test]
+    fn rate_limit_events_merge_sparsely_into_the_subscription_scope() {
+        let scope = QuotaScopeId::ClaudeSubscription;
+        // Merge only: this store's fetcher is never called here.
+        let store = QuotaStore::new();
+        let feed = |line: &str| match parse_stream_line(line) {
+            StreamEvent::RateLimit(info) => {
+                store.merge_sparse(scope, info.to_patch(), QuotaSource::Turn, 1)
+            }
+            other => panic!("expected RateLimit, got {other:?}"),
+        };
+
+        feed(
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","resetsAt":1789354800,"rateLimitType":"seven_day","utilization":0.85,"isUsingOverage":false},"session_id":"s"}"#,
+        );
+        let s = store.get(scope).expect("a snapshot");
+        let week = s.windows.iter().find(|w| w.id == "seven_day").unwrap();
+        assert_eq!(
+            week.used_percent, 85.0,
+            "a 0 to 1 fraction, as a percentage"
+        );
+        assert_eq!(week.label, "7 days");
+        assert_eq!(week.status.as_deref(), Some("allowed_warning"));
+        assert_eq!(week.resets_at_ms, Some(1_789_354_800_000));
+        assert!(!s.warning, "85 is under the warning line");
+
+        feed(
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":1789212600,"rateLimitType":"five_hour","utilization":1.0,"isUsingOverage":false,"overageStatus":"rejected","overageDisabledReason":"out_of_credits"}}"#,
+        );
+        let s = store.get(scope).unwrap();
+        let five = s.windows.iter().find(|w| w.id == "five_hour").unwrap();
+        assert_eq!(five.status.as_deref(), Some("rejected"));
+        assert_eq!(five.resets_at_ms, Some(1_789_212_600_000));
+        assert_eq!(five.used_percent, 100.0);
+        assert!(s.warning, "a rejected window is the warning state");
+
+        feed(
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","rateLimitType":"seven_day"}}"#,
+        );
+        let s = store.get(scope).unwrap();
+        let week = s.windows.iter().find(|w| w.id == "seven_day").unwrap();
+        assert_eq!(
+            week.used_percent, 85.0,
+            "allowed alone changes no percentage"
+        );
+        assert_eq!(week.status.as_deref(), Some("allowed"));
+        assert_eq!(s.source, QuotaSource::Turn);
+    }
+
+    /// The line claude 2.1.268 actually wrote on the Studio's subscription login on
+    /// 2026-09-12 (session id and uuid removed): an ordinary `allowed` turn, and yet it carried
+    /// EVERY window's fraction in `unifiedWindows` — the same 8 and 27 percent the usage
+    /// endpoint answered with that morning.
+    #[test]
+    fn the_rate_limit_event_claude_2_1_268_wrote_carries_every_window() {
+        let line = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","resetsAt":1789212600,"rateLimitType":"five_hour","overageStatus":"allowed","overageResetsAt":1790812800,"isUsingOverage":false,"unifiedWindows":{"five_hour":{"utilization":0.08,"resetsAt":1789212600},"seven_day":{"utilization":0.27,"resetsAt":1789354800}}}}"#;
+        let StreamEvent::RateLimit(info) = parse_stream_line(line) else {
+            panic!("a rate limit event");
+        };
+        assert_eq!(info.status, "allowed");
+        assert_eq!(info.rate_limit_type.as_deref(), Some("five_hour"));
+        assert_eq!(
+            info.utilization, None,
+            "no top-level utilization on an allowed turn"
+        );
+        assert_eq!(info.overage_status.as_deref(), Some("allowed"));
+        assert_eq!(info.is_using_overage, Some(false));
+        let got: Vec<_> = info
+            .to_patch()
+            .windows
+            .into_iter()
+            .map(|w| (w.id, w.used_percent, w.resets_at_ms, w.status))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (
+                    "five_hour".to_string(),
+                    Some(8.0),
+                    Some(1_789_212_600_000),
+                    Some("allowed".to_string())
+                ),
+                (
+                    "seven_day".to_string(),
+                    Some(27.0),
+                    Some(1_789_354_800_000),
+                    None
+                ),
+            ]
+        );
     }
 
     /// The per-turn parser is a thin wrapper: the same line yields the same event, and a

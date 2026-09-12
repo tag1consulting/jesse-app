@@ -548,6 +548,9 @@ final class MacCoordinator {
         let fields = Self.turnFields(from: reply, streamedText: streamedText)
         let jesseTurn = Turn(role: .jesse, text: fields.text)
         jesseTurn.provenanceJSON = fields.provenanceJSON
+        // The account quota this turn refreshed, into the one store the picker and Settings
+        // read. Mirrors the iOS `TurnWriter`.
+        UsageStore.shared.apply(reply.provenance?.quota)
         // Files this turn returned, as METADATA rows — the bytes are downloaded lazily on
         // first display and cached on disk, never held in the store. `sortIndex` keeps the
         // order the bridge swept them in, because the relationship is unordered and every

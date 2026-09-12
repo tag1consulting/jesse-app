@@ -59,34 +59,60 @@ final class ModelPickerMenuUITests: XCTestCase {
     /// looked for "claude-code · 5.3" and failed against a build where the screenshot
     /// plainly showed it.
     ///
-    /// What IS observable is that the row got taller: every model row holds one line of
-    /// similar length, and only the resolved one carries a subtitle, so the resolved row
-    /// being strictly taller than every other model row is exactly the second line. That
-    /// is the property the defect broke — the old `Label { Text; Text } icon:` form
-    /// rendered the resolved row at the same single-line height as its neighbours.
+    /// What IS observable is that the row got taller: a row with a subtitle stands taller than
+    /// a row of one line. That is the property the defect broke — the old
+    /// `Label { Text; Text } icon:` form rendered the resolved row at the same single-line
+    /// height as its neighbours.
+    ///
+    /// Since App 1.0 (134) every row whose model bills an account carries a usage line too,
+    /// so "taller than every other row" stopped being the test. The comparison is against
+    /// `Local Gemma`, the one row the stub gives neither an account nor the selection: a
+    /// single line by construction.
     func testTheResolvedRowRendersItsHarnessAndVersionAsASecondLine() throws {
         let app = try openTheModelMenu()
         attachScreenshot(app, "menu-with-glm-resolved")
 
         let rows = modelRowHeights(app)
-        guard let resolved = rows["GLM 5.3"] else {
-            return XCTFail("no GLM 5.3 row in the menu; menu held \(menuText(app))")
+        guard let resolved = rows["GLM 5.3"], let plain = rows["Local Gemma"] else {
+            return XCTFail("rows missing: heights \(rows); menu held \(menuText(app))")
         }
-        let others = rows.filter { $0.key != "GLM 5.3" }
-        XCTAssertFalse(others.isEmpty, "there are other model rows to compare against")
+        XCTAssertGreaterThan(
+            resolved, plain,
+            """
+            the resolved row carries a second line (its harness and version) and so stands \
+            taller than the one-line "Local Gemma". Resolved height \(resolved), plain height \
+            \(plain). Equal heights mean the subtitle was dropped: a second `Text` nested \
+            inside `Label`'s title builder does not become a menu item's subtitle — it must \
+            be a sibling of the Button's own label.
+            """
+        )
+    }
 
-        for (label, height) in others {
-            XCTAssertGreaterThan(
-                resolved, height,
-                """
-                the resolved row carries a second line (its harness and version) and so \
-                stands taller than "\(label)". Resolved height \(resolved), \(label) \
-                height \(height). Equal heights mean the subtitle was dropped: a second \
-                `Text` nested inside `Label`'s title builder does not become a menu \
-                item's subtitle — it must be a sibling of the Button's own label.
-                """
-            )
+    /// App 1.0 (134): a row that is NOT selected renders its account's usage as a second line.
+    ///
+    /// The regression this guards is the one above, in a new place: a dropped second `Text`
+    /// that no unit test can see (`ModelMenuTests` proves the layout PRODUCES the line; only a
+    /// presented menu proves it reaches the screen). `Claude Opus` is never the resolved model
+    /// here and its account has two windows, so it must stand taller than `Local Gemma`.
+    func testANonSelectedRowRendersItsUsageAsASecondLine() throws {
+        let app = try openTheModelMenu()
+        attachScreenshot(app, "menu-with-usage-on-every-row")
+        XCTAssertTrue(stub.requestPaths.contains { $0.contains("/jesse/usage") },
+                      "the picker loads usage once its models arrive: \(stub.requestPaths)")
+
+        let rows = modelRowHeights(app)
+        guard let opus = rows["Claude Opus"], let plain = rows["Local Gemma"] else {
+            return XCTFail("rows missing: heights \(rows); menu held \(menuText(app))")
         }
+        XCTAssertGreaterThan(
+            opus, plain,
+            """
+            the unselected "Claude Opus" row carries its account's usage (5h 23% · week 41%) \
+            as a second line and so stands taller than the one-line "Local Gemma". Opus \
+            height \(opus), plain height \(plain). Equal heights mean the unselected row's \
+            second `Text` was dropped.
+            """
+        )
     }
 
     func testTheEffortSectionRendersItsHeader() throws {
@@ -149,10 +175,23 @@ final class ModelPickerMenuUITests: XCTestCase {
         newConversation.tap()
 
         // GLM is now the resolved model, so the detail line and the three-value effort
-        // control are both properties of what this menu shows.
+        // control are both properties of what this menu shows. Let the picker's one shot
+        // usage load land first: the menu is built when it opens, so a menu opened before the
+        // answer arrived would be the rows without their usage lines.
+        waitForRequest("/jesse/usage", timeout: 15)
         openMenu(app)
         XCTAssertTrue(menuContains(app, "GLM 5.3"), "the stub's GLM row is in the menu")
         return app
+    }
+
+    /// Spin the run loop until the stub has served `path` or `timeout` passes, then give the
+    /// decoded answer one beat to reach the store and the picker.
+    private func waitForRequest(_ path: String, timeout: TimeInterval) {
+        let deadline = Date().addingTimeInterval(timeout)
+        while !stub.requestPaths.contains(where: { $0.contains(path) }), Date() < deadline {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.2))
+        }
+        RunLoop.current.run(until: Date().addingTimeInterval(0.5))
     }
 
     /// Tap the composer's model button: the one navigation-bar button in the CONVERSATION's
@@ -205,7 +244,7 @@ final class ModelPickerMenuUITests: XCTestCase {
     /// Height of each model row currently on screen, keyed by label. Scoped to the three
     /// the stub serves so the composer's own controls cannot be mistaken for menu rows.
     private func modelRowHeights(_ app: XCUIApplication) -> [String: CGFloat] {
-        let wanted = Set(["Claude Opus", "Claude Fable 5.1", "GLM 5.3"])
+        let wanted = Set(["Claude Opus", "Claude Fable 5.1", "GLM 5.3", "Local Gemma"])
         var out: [String: CGFloat] = [:]
         for el in app.buttons.allElementsBoundByIndex where wanted.contains(el.label) {
             let f = el.frame
@@ -277,10 +316,41 @@ final class StubBridge: @unchecked Sendable {
         {"id":"glm","label":"GLM 5.3","kind":"hosted","available":true,
          "configured":true,"healthy":true,"writes_allowed":true,"level":"write",
          "streams_text":true,"family":"GLM","harness":"claude-code","version":"5.3",
-         "effort":{"kind":"scale","values":["low","high","max"],"default":"high"}}
+         "usage_scope":"fireworks",
+         "effort":{"kind":"scale","values":["low","high","max"],"default":"high"}},
+        {"id":"local","label":"Local Gemma","kind":"local","available":true,
+         "configured":true,"healthy":true,"writes_allowed":true,"level":"write",
+         "streams_text":true,"family":"Local","usage_scope":null}
       ]
     }
     """
+    .replacingOccurrences(of: #""family":"Claude","harness":"claude-code","#,
+                          with: #""family":"Claude","harness":"claude-code","usage_scope":"claude-subscription","#)
+
+    /// The two accounts (App 1.0 (134)): Claude with two windows, so the UNSELECTED
+    /// `Claude Opus` row carries a usage line of its own, and Fireworks with a spend, which the
+    /// resolved `GLM 5.3` row shows after its harness and version. `Local Gemma` bills neither,
+    /// so it is the one row of a single line. `fetched_at_ms` is stamped at serve time, so
+    /// nothing reads `stale`.
+    static func usageJSON() -> String {
+        let now = Int64(Date().timeIntervalSince1970 * 1000)
+        return """
+        {"scopes": [
+          {"id":"claude-subscription","label":"Claude subscription","models":["opus","fable"],
+           "windows":[{"id":"five_hour","label":"5 hours","used_percent":23,
+                       "resets_at_ms":\(now + 7_800_000),"status":null},
+                      {"id":"seven_day","label":"7 days","used_percent":41,
+                       "resets_at_ms":\(now + 200_000_000),"status":null}],
+           "spend":null,"plan":"max","fetched_at_ms":\(now),"source":"fetched",
+           "error":null,"warning":false,"ttl_secs":120},
+          {"id":"fireworks","label":"Fireworks","models":["glm"],"windows":[],
+           "spend":{"month_to_date_usd":1.75,"by_model_usd":{"glm":1.75},
+                    "period_start_ms":0,"estimated":false},
+           "plan":null,"fetched_at_ms":\(now),"source":"fetched","error":null,
+           "warning":false,"ttl_secs":600}
+        ]}
+        """
+    }
 
     /// BSD sockets rather than `NWListener` on purpose: a Network.framework listener on
     /// iOS goes through the local-network privacy gate, which in a UI-test runner has no
@@ -349,9 +419,14 @@ final class StubBridge: @unchecked Sendable {
         paths.append(request.split(separator: "\r\n").first.map(String.init) ?? "?")
         lock.unlock()
 
-        let body = request.contains("/jesse/models")
-            ? Self.modelsJSON
-            : #"{"ok":true,"version":"0.132.0"}"#
+        let body: String
+        if request.contains("/jesse/models") {
+            body = Self.modelsJSON
+        } else if request.contains("/jesse/usage") {
+            body = Self.usageJSON()
+        } else {
+            body = #"{"ok":true,"version":"0.132.0"}"#
+        }
         let bytes = Array(body.utf8)
         let head = Array("""
         HTTP/1.1 200 OK\r

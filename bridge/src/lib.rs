@@ -122,6 +122,7 @@ mod probe;
 mod profile;
 mod prompt;
 mod queue;
+mod quota;
 mod ratelimit;
 mod routing;
 // THE SHARED INSTRUCTION BUNDLE, namespaced rather than flattened, for the reason the
@@ -219,6 +220,7 @@ pub use probe::*;
 pub use profile::*;
 pub use prompt::*;
 pub use queue::*;
+pub use quota::*;
 pub use ratelimit::*;
 pub use routing::*;
 pub use schedstate::*;
