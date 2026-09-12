@@ -14,6 +14,43 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [bridge 0.136.0] - 2026-09-11
+
+**Phone replies lead with the answer and stop when it ends.** The formatting note appended
+to every non-voice turn governed typography only: short paragraphs, bullets, narrow tables.
+It said nothing about where the answer goes, so a reply was free to open with context, put
+the conclusion in the third paragraph, run a ten item list, and close with an offer to do
+more. On a phone that is unreadable even when it is short.
+
+### Changed
+- `PHONE_FORMAT` now specifies SHAPE as well as typography, in nine rules: the first line is
+  the answer; more than one thing to do becomes a numbered list; any list caps at 5 items,
+  ranked; Markdown, short paragraphs, a table only when it is clearest; one bolded number,
+  name or path per paragraph; a failure is reported as what failed, the cause, the fix;
+  in-flight work says where it stands; a second issue is offered in one line rather than
+  folded in; and the reply ends when the answer ends, with no recap and no "let me know if".
+  An explain-or-compare request still runs as long as the topic needs, with headers.
+- The constant keeps its name, its type, and its place in `build_prompt_at`: appended last on
+  non-voice turns, never on voice turns, still mutually exclusive with `VOICE_SUFFIX`. Every
+  existing test references it by name and passes unchanged.
+- **The text is now plain ASCII.** The old one carried a literal en dash in "2-3 narrow
+  columns", which a reply is liable to mirror and a log or transcript is liable to mangle.
+- It also carries no owner pronoun. Unlike the preambles and floors, this const is pushed raw
+  and never rendered through `Persona`, so a gendered word in it would outlive a persona that
+  sets another.
+- Adapted from the ten rules of <https://github.com/ayghri/i-have-adhd> (MIT). Four were left
+  out on purpose: an unconditional "end with a next action" (padding on a factual lookup, so
+  it is conditional here), time estimates (most turns are lookups, and a standing estimate
+  rule invites an invented one), unconditional state restatement (narrowed to in-flight work,
+  since restating a one-shot answer is a recap), and the persistence toggle (every turn is a
+  fresh process, so there is no session to toggle; a per-turn opt out belongs in the app).
+
+### Added
+- `phone_format_is_plain_ascii_and_rides_every_non_voice_turn` asserts the three properties
+  the const's length and character set depend on rather than trusting them: ASCII only, no em
+  dash, en dash or double hyphen, under 250 words, present on a fresh and a follow-up turn in
+  both modes, absent by voice. It fails against the old constant, which was not ASCII.
+
 ## [bridge 0.135.0] - 2026-09-11
 
 **Recorded audio is transcribed on the Studio, by strong open models running inside the
