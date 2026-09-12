@@ -134,6 +134,14 @@ final class BackgroundRefreshCoordinator {
                          earliestBeginDate: now().addingTimeInterval(Self.interval))
     }
 
+    /// Ask for a refresh no earlier than `date`, sooner than the periodic interval, for work
+    /// that is waiting on a known moment — a workout burst waiting out its settle window. It
+    /// REPLACES the pending request rather than adding one (one identifier, one request), and
+    /// the run it produces re-arms the periodic request as every run does.
+    func schedule(at date: Date) {
+        scheduler.submit(identifier: Self.identifier, earliestBeginDate: max(date, now()))
+    }
+
     /// Run one task: re-arm FIRST, then do the work, then report.
     ///
     /// Re-arming first is deliberate. If the work throws, hangs, or the task is expired

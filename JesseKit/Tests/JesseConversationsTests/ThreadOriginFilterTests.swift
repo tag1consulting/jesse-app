@@ -61,6 +61,40 @@ final class ThreadOriginFilterTests: XCTestCase {
         XCTAssertTrue(threadMatchesOrigin(thread(origin: .watch), scope: .watch))
     }
 
+    // MARK: - The Auto scope
+
+    /// A thread the phone fired by itself on new health data is found under Auto, and
+    /// ONLY there: it is not a watch thread.
+    func testAnAutomaticThreadMatchesAutoAndNotWatch() {
+        let automatic = thread(origin: .automatic)
+        XCTAssertTrue(threadMatchesOrigin(automatic, scope: .automatic))
+        XCTAssertFalse(threadMatchesOrigin(automatic, scope: .watch))
+        XCTAssertTrue(threadMatchesOrigin(automatic, scope: .all))
+    }
+
+    /// The Start-new-day BUTTON leaves the origin alone, so its thread is a phone thread and
+    /// must not appear under Auto; nor may a watch thread.
+    func testAButtonCreatedThreadDoesNotMatchAuto() {
+        XCTAssertFalse(threadMatchesOrigin(thread(origin: .phone), scope: .automatic))
+        XCTAssertFalse(threadMatchesOrigin(thread(origin: .watch), scope: .automatic))
+    }
+
+    /// An origin string this build does not know reads as phone, so it is not Auto either.
+    func testAnUnknownOriginIsNotAuto() {
+        let t = thread(origin: .phone)
+        t.origin = "something-newer"
+        XCTAssertEqual(t.originValue, .phone)
+        XCTAssertFalse(threadMatchesOrigin(t, scope: .automatic))
+    }
+
+    func testAutoScopeLayoutShowsOnlyAutomaticThreads() {
+        let auto = thread(origin: .automatic, title: "auto one")
+        let phone = thread(origin: .phone, title: "phone one")
+        let watch = thread(origin: .watch, title: "watch one")
+        let shown = allThreads(layout([auto, phone, watch], origin: .automatic))
+        XCTAssertEqual(shown.map(\.title), ["auto one"])
+    }
+
     /// The guard that fails if the predicate ignores origin: a phone thread must
     /// NOT match the Watch scope.
     func testWatchScopeExcludesPhoneThread() {

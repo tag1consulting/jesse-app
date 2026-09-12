@@ -50,6 +50,15 @@ public nonisolated enum PendingIntentKind: String, Codable, CaseIterable, Sendab
     /// row is decoded by name, and a name the enum does not know would have to be
     /// silently dropped.
     case processUpdates
+    /// The automatic workout log (`HealthWorkoutLog.prompt`), held because new workouts
+    /// landed while the bridge was out of reach.
+    ///
+    /// Its replay rule is deliberately the OPPOSITE of `startNewDay`'s. A queued
+    /// start-new-day goes stale, because the day it meant to open may already have opened.
+    /// A queued workout log does not: the workout still happened, the prompt tells the
+    /// routine to diff against the CSV so a late replay is idempotent, and refusing it
+    /// would recreate exactly the late-logged row this intent exists to prevent.
+    case logWorkouts
 
     /// Whether replaying this intent writes to the DAY FILE (as opposed to opening a
     /// conversation). The two families have completely different replay rules — one
@@ -58,7 +67,7 @@ public nonisolated enum PendingIntentKind: String, Codable, CaseIterable, Sendab
     public var isDayFileWrite: Bool {
         switch self {
         case .check, .uncheck, .defer, .undefer, .move: return true
-        case .quickLog, .startNewDay, .processUpdates: return false
+        case .quickLog, .startNewDay, .processUpdates, .logWorkouts: return false
         }
     }
 
@@ -83,6 +92,7 @@ public nonisolated enum PendingIntentKind: String, Codable, CaseIterable, Sendab
         case .quickLog: return "Quick log"
         case .startNewDay: return "Start new day"
         case .processUpdates: return "Process updates"
+        case .logWorkouts: return "Log workouts"
         }
     }
 }
@@ -118,13 +128,19 @@ public nonisolated struct PendingIntentPayload: Codable, Equatable, Sendable {
     public var moveSection: String?
     /// The sentence a quick log will send.
     public var text: String?
+    /// The `ThreadOrigin` raw value the replayed turn's thread should carry, for a turn the
+    /// phone fired by itself (`automatic`). Absent means an ordinary `phone` thread, which
+    /// is what every row written before this field existed replays as.
+    public var origin: String?
 
     public init(evidence: String? = nil, moveOp: String? = nil,
-                moveSection: String? = nil, text: String? = nil) {
+                moveSection: String? = nil, text: String? = nil,
+                origin: String? = nil) {
         self.evidence = evidence
         self.moveOp = moveOp
         self.moveSection = moveSection
         self.text = text
+        self.origin = origin
     }
 
     /// Serialized for storage. An encode failure yields `"{}"` rather than throwing: a

@@ -308,7 +308,12 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
     /// The periodic backstop. Registered at launch (iOS insists on before-launch-finishes)
     /// and re-armed after every run.
     @MainActor private lazy var refresh = BackgroundRefreshCoordinator(
-        work: { await AppDelegate.delivery.periodicRefresh() })
+        work: {
+            // A workout burst that was still settling when its HealthKit wake ended fires
+            // here if nothing sooner has fired it.
+            await HealthAutoTrigger.shared.settleWorkouts()
+            return await AppDelegate.delivery.periodicRefresh()
+        })
 
     func application(_ application: UIApplication,
                     didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
@@ -325,6 +330,13 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
         MainActor.assumeIsolated {
             refresh.register()
             refresh.schedule()
+            // The body-mass and workout observers. HealthKit's rule, not a preference: an
+            // observer that should receive background delivery is set up HERE, before
+            // launch finishes, so it exists when HealthKit relaunches the app to deliver.
+            HealthAutoTrigger.shared.requestWake = { [weak self] date in
+                self?.refresh.schedule(at: date)
+            }
+            HealthAutoTrigger.shared.startIfEnabled()
         }
         return true
     }

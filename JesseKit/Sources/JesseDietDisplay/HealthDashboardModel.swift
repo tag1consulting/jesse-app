@@ -181,7 +181,7 @@ public final class HealthDashboardModel {
     /// Re-read the queue. Called after a capture and by the shell once a replay has run.
     public func refreshPending() {
         pendingIntents = (pending?.outstanding() ?? [])
-            .filter { $0.kind == .quickLog || $0.kind == .startNewDay }
+            .filter { $0.kind == .quickLog || $0.kind == .startNewDay || $0.kind == .logWorkouts }
     }
 
     /// **Hold a quick log.** Returns whether it was captured; `false` means the caller
@@ -208,10 +208,18 @@ public final class HealthDashboardModel {
     /// At most ONE is ever held. The routine is not additive — it audits yesterday and
     /// builds today — so two of them queued is one of them running against a day the
     /// other just created, and a second tap during an outage means "did that go?" rather
-    /// than "do it twice".
+    /// than "do it twice". The same holds when one of the two is the phone's own
+    /// automatic fire on a new weigh-in: that and a tap are one operation asked for twice.
+    ///
+    /// `dayDate` overrides `captureDay`, and the automatic path always passes it: the
+    /// weigh-in's own diet day, which is the day the replay guard must compare against. A
+    /// capture made from a cold background launch has only a cached snapshot to read
+    /// `captureDay` from, and that can still name yesterday. `origin` rides the payload so
+    /// the replayed turn's thread is findable under the same scope as a live one.
     @discardableResult
-    public func captureStartNewDay() -> Bool {
-        guard let pending, let day = captureDay else { return false }
+    public func captureStartNewDay(dayDate: String? = nil,
+                                   origin: ThreadOrigin = .phone) -> Bool {
+        guard let pending, let day = dayDate ?? captureDay else { return false }
         let alreadyHeld = pending.outstanding().contains {
             $0.kind == .startNewDay && $0.state != .refused
         }
@@ -219,8 +227,37 @@ public final class HealthDashboardModel {
             refreshPending()
             return true
         }
-        pending.append(PendingIntentRecord(kind: .startNewDay, dayDate: day,
-                                           createdAt: now(), tz: zone()))
+        pending.append(PendingIntentRecord(
+            kind: .startNewDay, dayDate: day,
+            payload: PendingIntentPayload(origin: origin == .phone ? nil : origin.rawValue),
+            createdAt: now(), tz: zone()))
+        refreshPending()
+        return true
+    }
+
+    /// **Hold the automatic workout log.** Returns whether it was captured.
+    ///
+    /// At most ONE is held, for a different reason from Start-new-day's: the workout log is
+    /// idempotent, not destructive. Its prompt tells the routine to log every workout the
+    /// health block carries that the CSV does not, so one replay covers every workout that
+    /// landed during the outage, and a second would only diff to nothing.
+    ///
+    /// `dayDate` is recorded for the pending row and nothing else — the replay of this kind
+    /// is never refused for a rolled day (see `PendingIntentKind.logWorkouts`).
+    @discardableResult
+    public func captureWorkoutLog(dayDate: String? = nil) -> Bool {
+        guard let pending, let day = dayDate ?? captureDay else { return false }
+        let alreadyHeld = pending.outstanding().contains {
+            $0.kind == .logWorkouts && $0.state != .refused
+        }
+        guard !alreadyHeld else {
+            refreshPending()
+            return true
+        }
+        pending.append(PendingIntentRecord(
+            kind: .logWorkouts, dayDate: day,
+            payload: PendingIntentPayload(origin: ThreadOrigin.automatic.rawValue),
+            createdAt: now(), tz: zone()))
         refreshPending()
         return true
     }

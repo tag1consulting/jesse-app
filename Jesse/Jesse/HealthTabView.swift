@@ -32,6 +32,9 @@ struct HealthTabView: View {
     @Environment(\.modelContext) private var context
     @State private var showQuickLog = false
     @State private var confirmNewDay = false
+    /// The last diet day this device ran the new-day refresh for, by this button or by the
+    /// automatic weigh-in trigger. Read to word the confirmation; written by `HealthTurn`.
+    @AppStorage(HealthNewDay.lastFiredDayKey) private var newDayLastFired = ""
 
     /// The one line about a log that was held (or could not be). Transient by design:
     /// it describes one action, not a state of the dashboard.
@@ -157,10 +160,17 @@ struct HealthTabView: View {
                     }
                 }
                 .confirmationDialog("Start new day", isPresented: $confirmNewDay) {
-                    Button("Start new day") { startNewDay() }
-                    Button("Cancel", role: .cancel) {}
+                    // Once today's refresh has run from this device — a tap, or a weigh-in
+                    // that fired it automatically — a second one is the same operation
+                    // asked for twice, so the dialog says so instead of offering it.
+                    if !ranNewDayToday {
+                        Button("Start new day") { startNewDay() }
+                    }
+                    Button(ranNewDayToday ? "OK" : "Cancel", role: .cancel) {}
                 } message: {
-                    Text("Audit yesterday, log your weigh-in, and refresh the dashboard?")
+                    Text(ranNewDayToday
+                         ? "Today's new-day refresh already ran from this device, so it won't be sent again."
+                         : "Audit yesterday, log your weigh-in, and refresh the dashboard?")
                 }
         }
         // Every askable card, row and chart on the dashboard AND ON ITS PUSHED SUB-PAGES
@@ -238,19 +248,28 @@ struct HealthTabView: View {
 
     /// Fire the fixed morning refresh on a fresh Tell thread, then return — the
     /// long-running routine runs in the background and the after-turn refresh above
-    /// repaints the dashboard when it lands. Mirrors the Quick log send path.
+    /// repaints the dashboard when it lands.
+    ///
+    /// Through `HealthTurn.startNewDay`, the SAME function the automatic weigh-in trigger
+    /// ends in, so the two cannot drift: offline it is held rather than fired (and a held
+    /// Start-new-day is refused on replay if the day has already rolled without it — see
+    /// `IntentReplayer`), and once this device has run the refresh for today's diet day, by
+    /// either path, pressing again runs nothing.
     private func startNewDay() {
-        if model.isReadOnly {
-            // Held rather than fired. A queued Start-new-day is refused on replay if the
-            // day has already rolled without it — see `IntentReplayer`.
-            if model.captureStartNewDay() { queuedNotice = HealthDashboardModel.queuedNotice }
-            else { queuedNotice = HealthDashboardModel.readOnlyNotice }
-            return
+        let outcome = HealthTurn.startNewDay(model: model, coordinator: coordinator,
+                                             context: context, origin: .phone,
+                                             dietDay: DietDay.stamp(for: .now))
+        switch outcome {
+        case .sent: break
+        case .queued: queuedNotice = HealthDashboardModel.queuedNotice
+        case .alreadyRan: queuedNotice = HealthNewDay.alreadyRanNotice
+        case .refused:
+            if model.isReadOnly { queuedNotice = HealthDashboardModel.readOnlyNotice }
         }
-        let thread = JesseThread(mode: .tell)
-        context.insert(thread)
-        coordinator.send(thread: thread, text: HealthNewDay.prompt, voice: false, context: context)
     }
+
+    /// Whether this device already ran the new-day refresh for today's diet day.
+    private var ranNewDayToday: Bool { newDayLastFired == DietDay.stamp(for: .now) }
 
     /// **Log something, or hold it.**
     ///

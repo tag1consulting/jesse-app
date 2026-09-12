@@ -27,14 +27,18 @@ public nonisolated enum TurnPhase: Equatable, Sendable {
 }
 
 /// Where a thread's first turn came from. `phone` is everything the app itself
-/// starts (typed composer, Siri); `watch` is a turn relayed through the phone
-/// from an Apple Watch. Modeled as a small String-backed enum so `JesseThread`
+/// starts at someone's touch (typed composer, Siri, the Health tab's buttons);
+/// `watch` is a turn relayed through the phone from an Apple Watch; `automatic` is
+/// a turn the iPhone fired by itself because new health data landed (a weigh-in or
+/// a workout). Modeled as a small String-backed enum so `JesseThread`
 /// can store a stable raw value that lightweight-migrates, mirroring how `mode`
 /// maps to `JesseMode`. An unknown/absent raw value reads as `.phone`, so an
-/// existing store with no `origin` column migrates without loss.
+/// existing store with no `origin` column migrates without loss — and a build that
+/// predates `automatic` reads such a thread as `.phone` rather than dropping it.
 public enum ThreadOrigin: String {
     case phone
     case watch
+    case automatic
 }
 
 /// Non-observed memo backing `JesseThread.orderedTurns`. A plain reference type so

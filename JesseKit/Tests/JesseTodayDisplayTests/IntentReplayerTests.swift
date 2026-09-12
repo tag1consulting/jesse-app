@@ -1,6 +1,7 @@
 import XCTest
 @testable import JesseTodayDisplay
 import JesseCore
+import JesseDietDisplay
 import JesseNetworking
 
 // **The offline capture queue, end to end**, driven through a scripted client and a
@@ -97,11 +98,33 @@ final class IntentReplayerTests: XCTestCase {
         nonisolated deinit {}
         var results: [Bool] = []
         private(set) var sent: [String] = []
+        /// The thread origin each send asked for, in the same order as `sent`.
+        private(set) var origins: [ThreadOrigin] = []
 
         func sendTell(_ text: String) async -> Bool {
+            await sendTell(text, origin: .phone)
+        }
+
+        func sendTell(_ text: String, origin: ThreadOrigin) async -> Bool {
             sent.append(text)
+            origins.append(origin)
             guard !results.isEmpty else { return true }
             return results[min(sent.count - 1, results.count - 1)]
+        }
+    }
+
+    /// A diet endpoint that always answers with one live day whose `dietDay` is given — enough
+    /// for a `HealthDashboardModel` to have a day to capture against.
+    struct OneDayDietClient: DietSnapshotProviding {
+        let dietDay: String
+
+        func fetchDietSnapshot(date: String?) async throws -> DietSnapshot {
+            try DietSnapshot.decode(from: Data("""
+            {"asOf":"\(dietDay)T07:00:00Z","dietDay":"\(dietDay)",
+             "today":{"date":"\(dietDay)","exercise":[],"meals":[],
+               "targets":{"calories":2100,"protein":190,"fat":65,"carbs":210}},
+             "availableDays":["\(dietDay)"],"historical":false,"errors":[]}
+            """.utf8))
         }
     }
 
@@ -521,6 +544,129 @@ final class IntentReplayerTests: XCTestCase {
         let outcomes = await makeReplayer(client, store, tell: tell).replayAll()
         XCTAssertEqual(outcomes, [.deferred])
         XCTAssertTrue(tell.sent.isEmpty)
+    }
+
+    /// A Start-new-day the phone held on its own (a weigh-in landed offline) replays onto an
+    /// automatic thread; a tapped one stays an ordinary phone thread.
+    func testAnAutomaticStartNewDayReplaysOntoAnAutomaticThread() async {
+        let tell = FakeTell()
+        let store = FakeStore([
+            captured(.startNewDay, id: nil, lead: nil,
+                     payload: PendingIntentPayload(origin: ThreadOrigin.automatic.rawValue)),
+        ])
+        let outcomes = await makeReplayer(ReplayClient(), store, tell: tell,
+                                          dietDay: "2026-03-03").replayAll()
+        XCTAssertEqual(outcomes, [.applied])
+        XCTAssertEqual(tell.origins, [.automatic])
+
+        let tapped = FakeTell()
+        _ = await makeReplayer(ReplayClient(), FakeStore([captured(.startNewDay, id: nil, lead: nil)]),
+                               tell: tapped, dietDay: "2026-03-03").replayAll()
+        XCTAssertEqual(tapped.origins, [.phone])
+    }
+
+    // MARK: - The automatic workout log
+
+    /// Amendment two, and the deliberate opposite of Start-new-day's rule: a queued workout log
+    /// replays and is ACCEPTED after the diet day has rolled. The workout still happened, and
+    /// the prompt's CSV diff makes a late replay idempotent.
+    func testAQueuedWorkoutLogReplaysAfterTheDietDayRolled() async {
+        let tell = FakeTell()
+        let store = FakeStore([captured(.logWorkouts, id: nil, lead: nil, day: "2026-03-03")])
+
+        let outcomes = await makeReplayer(ReplayClient(), store, tell: tell,
+                                          dietDay: "2026-03-04").replayAll()
+        XCTAssertEqual(outcomes, [.applied])
+        XCTAssertEqual(tell.sent, [HealthWorkoutLog.prompt])
+        XCTAssertEqual(tell.origins, [.automatic], "found under Auto like a live automatic turn")
+        XCTAssertEqual(store.all().first?.state, .applied)
+    }
+
+    /// An unknown diet day defers a Start-new-day; it does not hold up a workout log, which
+    /// never asks what day it is.
+    func testAQueuedWorkoutLogDoesNotNeedToKnowTheDietDay() async {
+        let tell = FakeTell()
+        let store = FakeStore([captured(.logWorkouts, id: nil, lead: nil)])
+        let outcomes = await makeReplayer(ReplayClient(), store, tell: tell).replayAll()
+        XCTAssertEqual(outcomes, [.applied])
+        XCTAssertEqual(tell.sent, [HealthWorkoutLog.prompt])
+    }
+
+    /// A send that does not land leaves it queued, like a quick log — nothing about it has
+    /// become untrue.
+    func testAWorkoutLogWhoseSendFailsStaysQueued() async {
+        let tell = FakeTell()
+        tell.results = [false]
+        let store = FakeStore([captured(.logWorkouts, id: nil, lead: nil)])
+        let outcomes = await makeReplayer(ReplayClient(), store, tell: tell).replayAll()
+        XCTAssertEqual(outcomes, [.deferred])
+        XCTAssertEqual(store.all().first?.state, .queued)
+    }
+
+    // MARK: - Automatic fires against the offline queue, end to end
+
+    /// A dashboard model that is offline and has a diet day on screen, sharing `store` — the
+    /// state the app is in when a weigh-in or a workout lands with the bridge unreachable.
+    private func offlineHealthModel(_ store: FakeStore) async -> HealthDashboardModel {
+        let model = HealthDashboardModel(
+            makeClient: { OneDayDietClient(dietDay: "2026-03-03") },
+            now: { Self.capturedAt }, pending: store, zone: { "Europe/London" })
+        await model.load()
+        model.isNetworkUnreachable = true
+        return model
+    }
+
+    /// Amendment two: an automatic fire while the bridge is unreachable queues EXACTLY ONCE —
+    /// body-mass notifications arrive in bursts — and the replay produces exactly one turn.
+    func testAnAutomaticWeighInOfflineQueuesOnceAndReplaysOnce() async {
+        let store = FakeStore()
+        let model = await offlineHealthModel(store)
+        XCTAssertTrue(model.isReadOnly)
+
+        XCTAssertTrue(model.captureStartNewDay(dayDate: "2026-03-03", origin: .automatic))
+        XCTAssertTrue(model.captureStartNewDay(dayDate: "2026-03-03", origin: .automatic))
+        XCTAssertEqual(store.all().count, 1, "a burst of notifications is one held run")
+
+        let tell = FakeTell()
+        let replayer = makeReplayer(ReplayClient(), store, tell: tell, dietDay: "2026-03-03")
+        _ = await replayer.replayAll()
+        _ = await replayer.replayAll()
+        XCTAssertEqual(tell.sent, [HealthNewDay.prompt], "one turn, and a second run sends nothing")
+        XCTAssertEqual(tell.origins, [.automatic])
+    }
+
+    /// Amendment two: an automatic fire followed by a manual press of Start new day on the same
+    /// day, both offline, is ONE turn — the button's capture finds the automatic one held.
+    func testAnAutomaticFireThenAManualPressOfflineIsOneTurn() async {
+        let store = FakeStore()
+        let model = await offlineHealthModel(store)
+
+        XCTAssertTrue(model.captureStartNewDay(dayDate: "2026-03-03", origin: .automatic))
+        XCTAssertTrue(model.captureStartNewDay(), "the button reports it held, not refused")
+        XCTAssertEqual(store.all().count, 1)
+
+        let tell = FakeTell()
+        _ = await makeReplayer(ReplayClient(), store, tell: tell, dietDay: "2026-03-03").replayAll()
+        XCTAssertEqual(tell.sent, [HealthNewDay.prompt])
+    }
+
+    /// A workout burst landing offline holds one log, whatever the number of notifications,
+    /// and it replays once — after the day rolled, too.
+    func testAnAutomaticWorkoutLogOfflineQueuesOnceAndReplaysOnce() async {
+        let store = FakeStore()
+        let model = await offlineHealthModel(store)
+
+        XCTAssertTrue(model.captureWorkoutLog(dayDate: "2026-03-03"))
+        XCTAssertTrue(model.captureWorkoutLog(dayDate: "2026-03-03"))
+        XCTAssertEqual(store.all().map(\.kind), [.logWorkouts])
+        XCTAssertEqual(model.pendingIntents.map(\.kind), [.logWorkouts],
+                       "the Health tab shows the held log")
+
+        let tell = FakeTell()
+        let replayer = makeReplayer(ReplayClient(), store, tell: tell, dietDay: "2026-03-04")
+        _ = await replayer.replayAll()
+        _ = await replayer.replayAll()
+        XCTAssertEqual(tell.sent, [HealthWorkoutLog.prompt])
     }
 
     // MARK: - The run itself

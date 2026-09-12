@@ -35,22 +35,38 @@ struct ThreadListView: View {
 
     // Which scope the list is showing, remembered across launches. All is the
     // default; Favorites narrows to starred threads; Watch narrows to threads
-    // relayed from an Apple Watch; Archived shows only conversations the user has
+    // relayed from an Apple Watch; Auto narrows to the turns this iPhone fired by
+    // itself when a weigh-in or workout landed in Apple Health; Archived shows only
+    // conversations the user has
     // hidden from the main list (and is the one place to restore them). Stored as the
     // raw string so it lightweight-adds over the old boolean-favorites default (an
     // unknown value reads as `.all`).
     enum ListScope: String, CaseIterable {
-        case all, favorites, watch, archived
+        case all, favorites, watch, auto, archived
         var label: String {
             switch self {
             case .all: return "All"
             case .favorites: return "Favorites"
             case .watch: return "Watch"
+            case .auto: return "Auto"
             case .archived: return "Archived"
+            }
+        }
+
+        /// The origin filter this scope maps to — one definition, so the view and the
+        /// tests that mirror its layout cannot disagree about it.
+        var originScope: ThreadOriginScope {
+            switch self {
+            case .watch: return .watch
+            case .auto: return .automatic
+            case .all, .favorites, .archived: return .all
             }
         }
     }
     @AppStorage("threadListScope") private var scopeRaw = ListScope.all.rawValue
+    // The last diet day the health new-day refresh ran from this device — written here only
+    // when the morning routine folds that refresh in. See `HealthNewDay.lastFiredDayKey`.
+    @AppStorage(HealthNewDay.lastFiredDayKey) private var healthNewDayLastFiredDay = ""
     private var scope: ListScope { ListScope(rawValue: scopeRaw) ?? .all }
 
     /// The orthogonal filters the current scope maps to, so the pure
@@ -59,7 +75,7 @@ struct ThreadListView: View {
     /// scope excludes archived threads (archiving is local-first, converged across
     /// devices by the bridge flags).
     private var favoritesOnly: Bool { scope == .favorites }
-    private var originScope: ThreadOriginScope { scope == .watch ? .watch : .all }
+    private var originScope: ThreadOriginScope { scope.originScope }
     private var archivedOnly: Bool { scope == .archived }
 
     /// Thread ids with at least one undelivered (`.failed`) outbox message — drives
@@ -304,6 +320,12 @@ struct ThreadListView: View {
                 } description: {
                     Text("Turns relayed from your Apple Watch will appear here.")
                 }
+            case .auto:
+                ContentUnavailableView {
+                    Label("No automatic conversations yet", systemImage: "bolt.heart")
+                } description: {
+                    Text("When a new weigh-in or workout lands in Apple Health, the turn that logs it will appear here.")
+                }
             case .archived:
                 ContentUnavailableView {
                     Label("No archived conversations", systemImage: "archivebox")
@@ -489,6 +511,10 @@ struct ThreadListView: View {
                          voice: false, context: context)
         path.append(thread)
         morningRoutineLastFiredDay = MorningRoutine.dayStamp(.now)
+        // Folding the health refresh in IS the Health tab's new-day refresh, so record it
+        // against the same diet day: a weigh-in landing after this must not roll the diet
+        // dashboard over a second time.
+        if includeHealth { healthNewDayLastFiredDay = DietDay.stamp(for: .now) }
     }
 
     private func newThread() {

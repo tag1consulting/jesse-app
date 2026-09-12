@@ -49,6 +49,16 @@ public protocol IntentTellSending: AnyObject {
     /// so a day's meals cannot arrive out of order, and a conformer that answered
     /// optimistically would break that ordering rather than merely mis-report.
     func sendTell(_ text: String) async -> Bool
+
+    /// The same, on a fresh thread carrying `origin`. The default forwards to
+    /// `sendTell(_:)`, which opens an ordinary `phone` thread.
+    func sendTell(_ text: String, origin: ThreadOrigin) async -> Bool
+}
+
+public extension IntentTellSending {
+    func sendTell(_ text: String, origin: ThreadOrigin) async -> Bool {
+        await sendTell(text)
+    }
 }
 
 /// The outcome of replaying one intent. Returned so a caller (and a test) can see what
@@ -145,6 +155,8 @@ public final class IntentReplayer {
             outcome = await replayQuickLog(intent)
         case .startNewDay:
             outcome = await replayStartNewDay(intent)
+        case .logWorkouts:
+            outcome = await replayWorkoutLog(intent)
         case .processUpdates:
             // Never captured (see `PendingIntentKind.processUpdates`); a row of this
             // kind can only have come from a build that did capture it, and running a
@@ -312,7 +324,29 @@ public final class IntentReplayer {
         // Not knowing the diet day is not evidence that it changed.
         guard let live = dietDay() else { return .deferred }
         guard live == intent.dayDate else { return .refused(Self.dayRolledNotice) }
-        return await tell.sendTell(HealthNewDay.prompt) ? .applied : .deferred
+        return await tell.sendTell(HealthNewDay.prompt, origin: Self.origin(intent))
+            ? .applied : .deferred
+    }
+
+    /// The automatic workout log replays ALWAYS — no day guard, and this is the deliberate
+    /// opposite of Start-new-day's rule directly above.
+    ///
+    /// A queued start-new-day goes stale because the morning it meant to open may already
+    /// have opened. A queued workout log does not: the workout still happened, the prompt
+    /// diffs the health block against `exercise-log.csv` so a late replay logs only what is
+    /// missing, and refusing it would recreate exactly the late-logged row the automatic
+    /// log exists to prevent. So a rolled diet day is not a reason, and neither is an
+    /// unknown one — the replay does not even ask.
+    private func replayWorkoutLog(_ intent: PendingIntentRecord) async -> IntentReplayOutcome {
+        guard let tell else { return .deferred }
+        return await tell.sendTell(HealthWorkoutLog.prompt, origin: .automatic)
+            ? .applied : .deferred
+    }
+
+    /// The thread origin a replayed Health turn should carry. A row with no recorded origin
+    /// (every row written before the field existed) is an ordinary phone thread.
+    private static func origin(_ intent: PendingIntentRecord) -> ThreadOrigin {
+        intent.payload.origin.flatMap(ThreadOrigin.init(rawValue:)) ?? .phone
     }
 
     // MARK: - Store bookkeeping
