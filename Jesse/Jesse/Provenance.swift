@@ -16,6 +16,12 @@ struct ProvenanceChip: View {
         HStack(spacing: 4) {
             Image(systemName: provenance.iconName)
                 .font(.caption2)
+            // The account this turn billed is near its limit, or at it. The ONE mark quota
+            // leaves on the chat surface; the numbers live in the picker and in Settings.
+            if provenance.isUsageWarning {
+                Image(systemName: "exclamationmark.triangle")
+                    .font(.caption2)
+            }
             Text(provenance.chipTitle)
                 .font(.caption2.weight(.medium))
             if let cost = provenance.costLabel {

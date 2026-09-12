@@ -561,6 +561,11 @@ struct JesseClient: JesseClientProtocol {
         try await bridge.fetchModels()
     }
 
+    /// The live quota of every account a model bills to (`GET /jesse/usage`).
+    func fetchUsage(force: Bool = false) async throws -> UsageState {
+        try await bridge.fetchUsage(force: force)
+    }
+
     /// Make `id` the active model (`POST /jesse/model`).
     func setActiveModel(_ id: String) async throws {
         try await bridge.setActiveModel(id)

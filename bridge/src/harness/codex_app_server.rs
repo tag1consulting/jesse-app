@@ -185,8 +185,14 @@ impl Connection {
     async fn request(&mut self, method: &str, params: Value) -> Step<i64> {
         self.next_id += 1;
         let id = self.next_id;
-        self.write(&json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}))
-            .await?;
+        // A method that takes no parameters gets NO `params` key, not a null one — see
+        // [`read_account_rate_limits`] for the method that needs it.
+        let msg = if params.is_null() {
+            json!({"jsonrpc": "2.0", "id": id, "method": method})
+        } else {
+            json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params})
+        };
+        self.write(&msg).await?;
         Ok(id)
     }
 
@@ -636,6 +642,24 @@ fn notification(
             None
         }
 
+        // THE ACCOUNT'S STANDING, for free: a turn on the ChatGPT login is told its rate limits
+        // as they move, in the shape `account/rateLimits/read` answers with. Sparse by the
+        // protocol's own contract ("nullable metadata missing from an update does not clear a
+        // previously observed value"), so it reaches the store as a patch, never a snapshot. A
+        // model on its own provider key does not spend the ChatGPT account, and its report is
+        // dropped.
+        "account/rateLimits/updated" => {
+            if let Some(rate_limits) = params.get("rateLimits").filter(|r| r.is_object()) {
+                if quota_scope_for_active(ctx.req.active) == Some(QuotaScopeId::CodexChatgpt) {
+                    ctx.sink.quota(
+                        QuotaScopeId::CodexChatgpt,
+                        codex_rate_limits_patch(rate_limits),
+                    );
+                }
+            }
+            None
+        }
+
         // NOT TERMINAL WHEN THE SERVER SAYS IT WILL RETRY, and the distinction is the same
         // one the `exec` parser drew from experience: Codex narrates its internal reconnects
         // as errors, and ending the turn on the first one abandons a child with attempts
@@ -852,6 +876,50 @@ async fn probe_await(conn: &mut Connection, id: i64) -> Step<Value> {
     }
 }
 
+// ---- The account's rate limits, and nothing else ---------------------------------
+
+/// Ask an App Server child for the ChatGPT account's rate limits — the whole exchange behind
+/// the `codex-chatgpt` quota scope (see [`crate::quota::fetch_codex`]).
+///
+/// `initialize`, `initialized`, `account/rateLimits/read`, and stop: no `thread/start`, no
+/// `turn/start`, no model call, so nothing here is a turn the containment record has to speak
+/// for. It shares [`Connection`], the handshake and — through [`probe_await`] —
+/// [`answer_server_request`], so a server request arriving mid-exchange is refused exactly as a
+/// turn refuses it.
+///
+/// **THE METHOD TAKES NO PARAMS ON THE PINNED BINARY.** Measured against codex-cli 0.153.4 on
+/// 2026-09-12: `{"excludeResetCreditDetails": true}` is answered with `-32600 Invalid request:
+/// invalid type: map, expected unit`, and a request with no `params` key is answered with the
+/// limits. So none is sent.
+///
+/// Returns the result object, or the server's error text for the caller to CLASSIFY — never to
+/// log, since it can carry account detail. Consumes the pipes: when this returns, the child's
+/// stdin is closed, which is its cue to exit.
+pub async fn read_account_rate_limits(
+    stdin: ChildStdin,
+    stdout: ChildStdout,
+) -> Result<Value, String> {
+    let mut conn = Connection::new(stdin, stdout);
+    rate_limits_exchange(&mut conn)
+        .await
+        .map_err(|stop| match stop {
+            Stop::Protocol(m) | Stop::Turn(m) => m,
+        })
+}
+
+async fn rate_limits_exchange(conn: &mut Connection) -> Step<Value> {
+    let id = conn
+        .request(
+            "initialize",
+            json!({"clientInfo": {"name": CLIENT_NAME, "version": env!("CARGO_PKG_VERSION")}}),
+        )
+        .await?;
+    probe_await(conn, id).await?;
+    conn.notify("initialized", json!({})).await?;
+    let id = conn.request("account/rateLimits/read", Value::Null).await?;
+    probe_await(conn, id).await
+}
+
 // ---- The write lock's hooks, trusted rather than bypassed -------------------------
 
 /// **GRANT TRUST TO THE HOOKS FILE THIS BRIDGE WROTE, AND TO NOTHING ELSE.**
@@ -984,6 +1052,7 @@ mod tests {
     struct Recorder {
         text: std::sync::Mutex<String>,
         activity: std::sync::Mutex<Vec<String>>,
+        quota: std::sync::Mutex<Vec<(QuotaScopeId, QuotaPatch)>>,
     }
 
     impl TurnSink for Recorder {
@@ -992,6 +1061,9 @@ mod tests {
         }
         fn tool_activity(&self, activity: ToolActivity) {
             self.activity.lock_ok().push(activity.name);
+        }
+        fn quota(&self, scope: QuotaScopeId, patch: QuotaPatch) {
+            self.quota.lock_ok().push((scope, patch));
         }
     }
 
@@ -1417,5 +1489,43 @@ mod tests {
                 json!({"turn": {"id": "someone-elses", "items": [], "status": "completed"}}),
             )
             .is_none());
+    }
+
+    /// `account/rateLimits/updated` reaches the sink as a SPARSE patch for the ChatGPT scope —
+    /// primary present, secondary null and therefore absent rather than zeroed — and ends
+    /// nothing. A model on its own provider key reports nothing: it does not spend that
+    /// account.
+    #[test]
+    fn a_rate_limits_notification_reaches_the_sink_as_a_chatgpt_patch() {
+        let params = json!({"rateLimits": {
+            "limitId": "codex",
+            "primary": {"usedPercent": 42, "windowDurationMins": 300, "resetsAt": 1789224359},
+            "secondary": null,
+            "planType": "pro"
+        }});
+        let mut f = Fixture::new();
+        assert!(
+            f.on("account/rateLimits/updated", params.clone()).is_none(),
+            "not a terminal"
+        );
+        let got = f.sink.quota.lock_ok().clone();
+        assert_eq!(got.len(), 1);
+        let (scope, patch) = &got[0];
+        assert_eq!(*scope, QuotaScopeId::CodexChatgpt);
+        assert_eq!(patch.plan.as_deref(), Some("pro"));
+        assert_eq!(
+            patch.windows.len(),
+            1,
+            "a null secondary is absent, not a zero"
+        );
+        assert_eq!(patch.windows[0].id, "primary");
+        assert_eq!(patch.windows[0].label.as_deref(), Some("5 hours"));
+        assert_eq!(patch.windows[0].used_percent, Some(42.0));
+        assert_eq!(patch.windows[0].resets_at_ms, Some(1_789_224_359_000));
+
+        let mut provider = Fixture::new();
+        provider.model.kind = ModelKind::OpenAi;
+        provider.on("account/rateLimits/updated", params);
+        assert!(provider.sink.quota.lock_ok().is_empty());
     }
 }

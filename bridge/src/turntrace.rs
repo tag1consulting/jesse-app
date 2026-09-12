@@ -173,6 +173,9 @@ struct TraceInner {
     /// The style checker's verdict, once the harness has one. `None` on every turn that ran
     /// no check, which is what makes the provenance field absent rather than zero.
     style: Option<StyleVerdict>,
+    /// The quota scopes this turn refreshed passively, in the order it first did. Read by the
+    /// handler to decide whether the reply's provenance carries a quota snapshot.
+    quota_scopes: Vec<QuotaScopeId>,
 }
 
 /// The per-turn observation point. Cheap, lock-per-event, and shared by the turn task and
@@ -182,6 +185,10 @@ pub struct TurnTrace {
     started_at: SystemTime,
     limits: PartialLimits,
     inner: Mutex<TraceInner>,
+    /// Where a passive quota report goes the moment it is seen. `None` on every trace the
+    /// turn handler did not build (tests, the containment battery), which makes
+    /// [`TurnTrace::note_quota`] a record-only no-op there.
+    quota: Option<Arc<QuotaStore>>,
 }
 
 impl TurnTrace {
@@ -191,11 +198,37 @@ impl TurnTrace {
             started_at: SystemTime::now(),
             limits,
             inner: Mutex::new(TraceInner::default()),
+            quota: None,
         }
     }
 
     pub fn from_cfg(cfg: &Config) -> Self {
         TurnTrace::new(PartialLimits::from_cfg(cfg))
+    }
+
+    /// Give this trace the quota store its turn's passive reports merge into.
+    pub fn with_quota(mut self, store: Arc<QuotaStore>) -> Self {
+        self.quota = Some(store);
+        self
+    }
+
+    /// A partial quota report seen during the turn — a Claude `rate_limit_event`, a Codex
+    /// `account/rateLimits/updated`. Merged into the store AT ONCE, sparse (see
+    /// [`QuotaStore::merge_sparse`]), so a usage screen open elsewhere sees it mid-turn; and
+    /// the scope is remembered so the reply's provenance can carry the result.
+    pub fn note_quota(&self, scope: QuotaScopeId, patch: QuotaPatch) {
+        if let Some(store) = &self.quota {
+            store.merge_sparse(scope, patch, QuotaSource::Turn, quota_now_ms());
+        }
+        let mut g = self.inner.lock_ok();
+        if !g.quota_scopes.contains(&scope) {
+            g.quota_scopes.push(scope);
+        }
+    }
+
+    /// Whether this turn refreshed `scope` passively.
+    pub fn quota_touched(&self, scope: QuotaScopeId) -> bool {
+        self.inner.lock_ok().quota_scopes.contains(&scope)
     }
 
     /// A chunk of visible answer text. Appends to the open block (opening one if the last

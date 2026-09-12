@@ -452,6 +452,32 @@ public struct JesseBridgeClient: BridgeClientProtocol {
         return state
     }
 
+    /// `GET /jesse/usage` — the live quota of every account a configured model bills to (bridge
+    /// 0.137.0). `force` asks the bridge to refetch anything older than its 20 second floor
+    /// rather than its TTL; it is for an explicit Refresh only. The bridge answers within 15
+    /// seconds even when a provider hangs. A bridge too old to expose the route returns 404 →
+    /// `badResponse`, which every caller treats as "no usage to show".
+    public func fetchUsage(force: Bool = false) async throws -> UsageState {
+        guard var req = authorized("/jesse/usage", method: "GET") else {
+            throw JesseError.notConfigured
+        }
+        if force, let url = req.url,
+           var comps = URLComponents(url: url, resolvingAgainstBaseURL: false) {
+            comps.queryItems = [URLQueryItem(name: "force", value: "1")]
+            req.url = comps.url
+        }
+        req.timeoutInterval = 20
+        let (data, resp) = try await perform(req)
+        guard let http = resp as? HTTPURLResponse else { throw JesseError.decoding }
+        guard (200..<300).contains(http.statusCode) else {
+            throw JesseError.badResponse(http.statusCode, String(data: data, encoding: .utf8) ?? "")
+        }
+        guard let usage = try? JSONDecoder().decode(UsageState.self, from: data) else {
+            throw JesseError.decoding
+        }
+        return usage
+    }
+
     /// `POST /jesse/model` — make `id` the active model. The bridge rejects an unknown (400)
     /// or unavailable (409) id; both surface as `badResponse` so the caller can show a clear
     /// message and re-fetch the authoritative state.

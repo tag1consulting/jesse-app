@@ -585,6 +585,47 @@ probing the chat path is deliberate and unchanged: the minimal probe body is val
 OpenAI contracts, so the chat path returns a real one-token completion and a green light means
 tokens were produced.) `GET /jesse/models` reports `wire` per model, beside `kind`.
 
+### Live usage and quota (`GET /jesse/usage`)
+
+Every row of `GET /jesse/models` also carries `usage_scope`: the billing ACCOUNT the model
+spends, or `null` for one the bridge cannot read (a `local` model, any other host). Quota
+belongs to the account, not the model, so there are three scopes:
+
+| `usage_scope` | models | source |
+| --- | --- | --- |
+| `claude-subscription` | `claude-code` models on the bridge's own login (`ambient`, `subscription`) | `GET https://api.anthropic.com/api/oauth/usage` with the login's OAuth token, plus the `rate_limit_event` a `claude` child writes during a turn |
+| `codex-chatgpt` | `codex` models on the ChatGPT login (any `kind` but `openai`) | `account/rateLimits/read` on a short-lived `codex app-server`, plus the `account/rateLimits/updated` notification a turn carries |
+| `fireworks` | any model whose backend host is `api.fireworks.ai` | `GET /v1/accounts/{id}/billingUsage`, month to date, once `[quota] fireworks_account_id` is set |
+
+`GET /jesse/usage` (bearer auth, like `/jesse/models`) answers `{"scopes": [...]}`, one entry
+per scope that a configured model maps to:
+
+```json
+{"id": "claude-subscription", "label": "Claude subscription", "models": ["opus", "fable"],
+ "windows": [{"id": "five_hour", "label": "5 hours", "used_percent": 8.0,
+              "resets_at_ms": 1789212600965, "status": null}],
+ "spend": null, "plan": "max", "fetched_at_ms": 1789205155000, "source": "fetched",
+ "error": null, "warning": false, "ttl_secs": 120}
+```
+
+**There is no timer.** A scope is fetched only inside this route, and only when its snapshot
+is older than its TTL: 120 s for both logins, 600 s for Fireworks, or one value for all from
+`JESSE_QUOTA_TTL_SECS`. `?force=1` lowers that to a 20 s floor. Concurrent callers share one
+fetch per scope; scopes fetch concurrently under their own timeouts (10 s, 15 s, 10 s); a 429
+holds a scope off for at least five minutes; a failure keeps the last snapshot and sets
+`error`. A turn that reports its account's standing merges it in while it runs, sparsely (a
+field the report leaves out never clears a stored one), and the reply's provenance carries the
+entry as `quota`, so the app refreshes without a call. `warning` is any window at 90 percent or
+more, or any window `rejected`.
+
+Logins are read, never written. The Claude token comes from the login keychain item
+`Claude Code-credentials` filed under the login user (through the `security` CLI), else
+`~/.claude/.credentials.json`; an expired one reports `login expired, refreshes on the next
+Claude turn` instead of being refreshed here. The Codex login is used only by the child spawned
+against `$CODEX_HOME` or `~/.codex`. Fireworks has no balance API, so that scope shows spend and
+never remaining credit; a billing bucket reported with no cost is estimated from its tokens and
+the model's price deck, and the spend is marked `estimated`.
+
 ### How `claude` is run
 
 The bridge runs the turn as:

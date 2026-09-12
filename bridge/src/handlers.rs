@@ -1264,7 +1264,9 @@ pub async fn start_turn(
         // stream events and answers two questions the bridge previously could not: what
         // had a killed turn already produced, and where did its time go. See
         // [`crate::turntrace`].
-        let trace = Arc::new(TurnTrace::from_cfg(&cfg));
+        // It also carries the quota store, so a rate-limit report the child writes mid-turn
+        // lands in `GET /jesse/usage` at once and can ride this reply's provenance.
+        let trace = Arc::new(TurnTrace::from_cfg(&cfg).with_quota(st.quota.clone()));
         // WRITES THE TIMING RECORD WHEN THE TURN ENDS — however it ends. A Drop guard for
         // the same reason `TurnLockRelease` is one: a CANCEL aborts this task outright, so
         // any code placed after `complete` below would simply never run for a cancelled
@@ -1785,7 +1787,17 @@ pub async fn start_turn(
             // and every harness that ran no check, which is what makes the provenance field
             // absent rather than a zero on every reply.
             trace.style(),
-        );
+        )
+        // THE ACCOUNT'S QUOTA, when THIS turn refreshed it: the child reported the login's
+        // standing while it ran, so the reply can hand the app the result and spare it a
+        // `GET /jesse/usage`. Absent on every other turn, and on a model that bills no
+        // account the bridge reads.
+        .map(|mut p| {
+            p.quota = quota_scope_for_active(&active)
+                .filter(|scope| trace.quota_touched(*scope))
+                .and_then(|scope| st.quota.entry(scope, &cfg));
+            p
+        });
         // Shadow comparison (JESSE_SHADOW_*): capture the eligible turn's inputs from
         // the PRE-BADGE outcome so a later mirror is judged on the same answer text the
         // model produced (the badge is bridge-added provenance the shadow answer never
@@ -2459,6 +2471,10 @@ fn model_row(
         // Which harness runs this model, by id. Information for the picker to show beside the
         // version, never a choice: a model is registered on exactly one harness.
         "harness": m.harness,
+        // The account this model bills to (`claude-subscription`, `codex-chatgpt`,
+        // `fireworks`), or null when it bills nothing the bridge can read. The key a client
+        // joins the row to its `GET /jesse/usage` entry by. See `quota::quota_scope_for`.
+        "usage_scope": quota_scope_for(m).map(QuotaScopeId::as_str),
         // The effort scale this model DECLARES (`kind`, `values`, `default`), or null when effort
         // does nothing measurable on it. The client renders an effort control from this and from
         // nothing else — it never infers one.
@@ -2507,6 +2523,46 @@ pub async fn jesse_models(
         "active": st.models.active(),
         "models": rows,
     })))
+}
+
+/// Query of `GET /jesse/usage`: `?force=1` refetches anything older than the force floor
+/// rather than the TTL.
+#[derive(Deserialize, Default)]
+pub struct UsageQuery {
+    force: Option<String>,
+}
+
+/// `GET /jesse/usage` — the live quota of every account a configured model bills to, one entry
+/// per scope ([`QuotaEntry`]): windows, spend, plan, when it was fetched, and any error. Same
+/// bearer auth as `/jesse/models`.
+///
+/// **THE ONLY PLACE A PROVIDER IS ASKED.** A scope refetches only when its snapshot is missing
+/// or older than its TTL (or, under `?force=1`, older than [`QUOTA_FORCE_FLOOR_SECS`]).
+/// Concurrent callers share one fetch per scope; different scopes fetch concurrently, each
+/// under its own timeout, so this answers within the slowest of those (15 s) and a failing
+/// provider never holds up another scope, the models route or a turn. A failure keeps the last
+/// snapshot and sets its `error`. Tokens never appear in the body.
+pub async fn jesse_usage(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<UsageQuery>,
+) -> Result<Json<Value>, ApiError> {
+    check_auth(&headers, &st.cfg.token)?;
+    let force = matches!(q.force.as_deref().map(str::trim), Some("1" | "true"));
+    let now = quota_now_ms();
+    let refreshes: Vec<_> = quota_scope_models(&st.cfg)
+        .into_keys()
+        .map(|scope| {
+            let (store, cfg) = (st.quota.clone(), st.cfg.clone());
+            // Spawned rather than awaited in place: a client that hangs up mid-fetch must not
+            // cancel a fetch another caller is waiting on through the single flight.
+            tokio::spawn(async move { store.ensure_fresh(scope, &cfg, force, now).await })
+        })
+        .collect();
+    for r in refreshes {
+        let _ = r.await;
+    }
+    Ok(Json(json!({ "scopes": st.quota.entries(&st.cfg) })))
 }
 
 /// `GET /jesse/persona` — what the assistant knows about how to talk to the owner.
@@ -2653,6 +2709,9 @@ pub fn app(state: AppState) -> Router {
         // The global model switch: read the selectable models + active selection, set the
         // active model, and set a model's write permission (Phase 2 wires the effect).
         .route("/jesse/models", get(jesse_models))
+        // LIVE USAGE AND QUOTA per billing account. Calls a provider only when a scope's
+        // snapshot is older than its TTL; there is no timer behind it. See `quota`.
+        .route("/jesse/usage", get(jesse_usage))
         .route("/jesse/persona", get(jesse_persona))
         .route("/jesse/model", post(jesse_set_model))
         // THE AWAY PROFILE: bridge state the phone can set and that expires by itself. It

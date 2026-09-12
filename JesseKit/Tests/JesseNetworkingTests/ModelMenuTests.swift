@@ -159,4 +159,64 @@ final class ModelMenuTests: XCTestCase {
         XCTAssertNil(bare.effort, "null is no scale")
         XCTAssertEqual(bare.family, "kimi", "an older bridge: every model is its own family")
     }
+
+    // MARK: - Usage on every row (App 1.0 (134))
+
+    private let now = Date(timeIntervalSince1970: 1_789_205_155)
+
+    private func usage(fetchedAtMs: Int64) -> UsageState {
+        UsageState(scopes: [
+            QuotaScope(id: "claude-subscription", label: "Claude subscription", models: ["opus"],
+                       windows: [QuotaWindow(id: "five_hour", label: "5 hours", usedPercent: 23),
+                                 QuotaWindow(id: "seven_day", label: "7 days", usedPercent: 41)],
+                       fetchedAtMs: fetchedAtMs, ttlSecs: 120),
+            QuotaScope(id: "fireworks", label: "Fireworks", models: ["glm"],
+                       spend: QuotaSpend(monthToDateUsd: 1.75), fetchedAtMs: fetchedAtMs,
+                       ttlSecs: 600),
+        ])
+    }
+
+    private func accounted(_ id: String, kind: String = "hosted", version: String? = nil,
+                           scope: String?) -> ModelInfo {
+        ModelInfo(id: id, label: id.capitalized, kind: kind, available: true, writesAllowed: true,
+                  harness: "claude-code", version: version, usageScope: scope)
+    }
+
+    func testEveryRowWithAnAccountCarriesItsUsageAndTheSelectedRowKeepsItsDetailFirst() {
+        let layout = ModelMenuLayout(
+            state: state([accounted("opus", kind: "ambient", scope: "claude-subscription"),
+                          accounted("glm", version: "5.3", scope: "fireworks"),
+                          accounted("local", kind: "local", scope: nil)]),
+            threadModelID: "glm", deviceDefaultID: nil, threadEffort: nil,
+            usage: usage(fetchedAtMs: QuotaPresentation.nowMs(now)), now: now)
+        let rows = Dictionary(uniqueKeysWithValues: layout.sections.flatMap(\.rows).map { ($0.id, $0) })
+        XCTAssertEqual(rows["opus"]?.subtitle, "5h 23% · week 41%",
+                       "a row that is NOT selected still shows its account's usage")
+        XCTAssertEqual(rows["glm"]?.subtitle, "claude-code · 5.3 · $1.75 this month",
+                       "the selected row keeps its harness and version first")
+        XCTAssertEqual(rows["glm"]?.isSelected, true)
+        XCTAssertNil(rows["local"]?.subtitle, "a model that bills no account says nothing")
+    }
+
+    func testWithoutUsageOnlyTheSelectedRowHasASubtitle() {
+        let layout = ModelMenuLayout(
+            state: state([accounted("opus", kind: "ambient", scope: "claude-subscription"),
+                          accounted("glm", version: "5.3", scope: "fireworks")]),
+            threadModelID: "glm", deviceDefaultID: nil, threadEffort: nil)
+        let rows = layout.sections.flatMap(\.rows)
+        XCTAssertNil(rows.first { $0.id == "opus" }?.subtitle, "an older bridge, or no load yet")
+        XCTAssertEqual(rows.first { $0.id == "glm" }?.subtitle, "claude-code · 5.3")
+    }
+
+    func testAStaleAccountSaysSoInTheMenuButNeverShowsACountdown() {
+        let old = QuotaPresentation.nowMs(now) - 361_000 // three 120 s TTLs, plus a second
+        let layout = ModelMenuLayout(
+            state: state([accounted("opus", kind: "ambient", scope: "claude-subscription"),
+                          accounted("glm", scope: "fireworks")]),
+            threadModelID: "glm", deviceDefaultID: nil, threadEffort: nil,
+            usage: usage(fetchedAtMs: old), now: now)
+        let opus = layout.sections.flatMap(\.rows).first { $0.id == "opus" }
+        XCTAssertEqual(opus?.subtitle, "5h 23% · week 41% · stale")
+        XCTAssertFalse(opus?.subtitle?.contains("resets") ?? true, "the countdown is Settings only")
+    }
 }

@@ -77,16 +77,41 @@ public func loadModelList(
     fetch: @MainActor () async -> ModelSwitchState?,
     sleep: @MainActor (TimeInterval) async -> Void
 ) async -> ModelSwitchState? {
+    let state = await boundedBurst(isConfigured: isConfigured, fetch: fetch, sleep: sleep)
+    if let state {
+        // The single funnel both clients load through, so it is where the models' shape is
+        // remembered for readers that have no list of their own — the transcript needs
+        // `streamsText` for a running turn's model and the picker owns the list.
+        NonStreamingModelStore.record(state)
+    }
+    return state
+}
+
+/// The picker's ONE SHOT usage load, made once its model list has arrived (App 1.0 (134)),
+/// through exactly the same bounded, backed-off burst — same cadence, same termination, same
+/// unpaired no-op. A bridge that cannot answer `GET /jesse/usage` (an older one answers 404)
+/// costs one short burst and leaves the rows without a usage line, which is the picker as it
+/// was before quota existed. The caller puts the result in `UsageStore`.
+@MainActor
+public func loadUsage(
+    isConfigured: Bool,
+    fetch: @MainActor () async -> UsageState?,
+    sleep: @MainActor (TimeInterval) async -> Void
+) async -> UsageState? {
+    await boundedBurst(isConfigured: isConfigured, fetch: fetch, sleep: sleep)
+}
+
+/// The burst both loads share: attempt, back off on `ModelListRetry`'s schedule, stop.
+@MainActor
+private func boundedBurst<T>(
+    isConfigured: Bool,
+    fetch: @MainActor () async -> T?,
+    sleep: @MainActor (TimeInterval) async -> Void
+) async -> T? {
     guard isConfigured else { return nil }
     var attempts = 0
     while !Task.isCancelled {
-        if let state = await fetch() {
-            // The single funnel both clients load through, so it is where the models' shape is
-            // remembered for readers that have no list of their own — the transcript needs
-            // `streamsText` for a running turn's model and the picker owns the list.
-            NonStreamingModelStore.record(state)
-            return state
-        }
+        if let value = await fetch() { return value }
         attempts += 1
         guard !Task.isCancelled, let wait = ModelListRetry.delay(afterAttempt: attempts) else {
             return nil

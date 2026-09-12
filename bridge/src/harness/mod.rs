@@ -908,6 +908,15 @@ pub trait TurnSink: Send + Sync {
     /// DEFAULTED TO A NO-OP, so a harness that runs no check and a sink that reports nowhere
     /// are both silent by writing nothing. See [`StyleVerdict`], which is two integers.
     fn style_verdict(&self, _verdict: StyleVerdict) {}
+
+    /// A partial quota report the harness read off its own stream (Codex's
+    /// `account/rateLimits/updated`) for the account `scope` names.
+    ///
+    /// Provenance-shaped like the style verdict, not a mid-turn event: nothing reaches the
+    /// client live, and the driver's sink folds it into the quota store through the trace.
+    /// DEFAULTED TO A NO-OP, so every sink that reports nowhere stays silent by writing
+    /// nothing. See [`crate::quota`].
+    fn quota(&self, _scope: QuotaScopeId, _patch: QuotaPatch) {}
 }
 
 /// What an in-process turn hands back when it succeeds: exactly what the driver needs to

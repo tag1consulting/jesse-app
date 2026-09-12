@@ -155,6 +155,33 @@ Answer the question I asked, not the one you wish I had asked.
 # offload_order = ["local", "glm"]
 
 # =============================================================================
+# [quota]: live usage and quota for the model picker and Settings
+# =============================================================================
+#
+# GET /jesse/usage reports, per BILLING ACCOUNT, what is left: the Claude subscription's 5 hour
+# and 7 day windows, the ChatGPT (Codex) subscription's primary and secondary windows, and the
+# month to date spend of the Fireworks account the open models bill to. Every model in the
+# [[models]] registry below maps to at most one of those by its kind, harness and host (GET
+# /jesse/models reports it as `usage_scope`); a `local` model maps to none.
+#
+# Nothing here polls. A provider is asked only when the app asks and that account's snapshot is
+# older than its TTL (Claude 120 s, Codex 120 s, Fireworks 600 s), or passively, when a turn has
+# already reported it. The Claude and Codex accounts need no configuration: they are read from
+# the logins the `claude` and `codex` children already use, read only, and never refreshed.
+#
+# fireworks_account_id: YOUR OWN Fireworks account slug, the account that owns the API key
+# (it is in the Fireworks dashboard URL). It is NOT the `accounts/fireworks/...` owner inside a
+# model slug. Without it the Fireworks card says "spend not configured" and nothing is called.
+# Fireworks has no balance API, so this shows spend, never remaining credit.
+# Env: JESSE_FIREWORKS_ACCOUNT_ID, which wins over this key.
+#
+# JESSE_QUOTA_TTL_SECS (env var, optional): one TTL for every account, replacing the defaults
+# above. Floored at 20 s, the same floor a forced refresh (`?force=1`) waits out.
+#
+# [quota]
+# fireworks_account_id = "my-account"
+
+# =============================================================================
 # [[models]] — the global model switch's registry (declarative, operator-configurable)
 # =============================================================================
 #

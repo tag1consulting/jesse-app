@@ -1453,7 +1453,8 @@ private struct ModelPickerMenu: View {
     /// Everything the menu renders, from the loaded list and this thread's selection.
     private var layout: ModelMenuLayout {
         ModelMenuLayout(state: modelState, threadModelID: thread.selectedModelID,
-                        deviceDefaultID: LastUsedModelStore.id, threadEffort: thread.selectedEffort)
+                        deviceDefaultID: LastUsedModelStore.id, threadEffort: thread.selectedEffort,
+                        usage: UsageStore.shared.state)
     }
 
     /// One family's rows. The resolved model carries the checkmark and, as secondary text, the
@@ -1475,6 +1476,11 @@ private struct ModelPickerMenu: View {
                     Text(row.title)
                     Text(subtitle)
                     Image(systemName: "checkmark")
+                } else if let subtitle = row.subtitle {
+                    // Every row whose model bills an account carries its usage line, not only
+                    // the resolved one — in the same flat sibling shape, for the same reason.
+                    Text(row.title)
+                    Text(subtitle)
                 } else if row.isSelected {
                     Label(row.title, systemImage: "checkmark")
                 } else {
@@ -1547,6 +1553,16 @@ private struct ModelPickerMenu: View {
                 thread.selectedEffort = kept
                 save("clearing a stale effort")
             }
+        }
+        // THE ONE SHOT USAGE LOAD, once the list is here: the same bounded burst, into the
+        // store every row's usage line reads. No poll in the thread view — each delivered
+        // turn's `provenance.quota` keeps its own account current from then on.
+        if modelState != nil,
+           let usage = await loadUsage(
+            isConfigured: cfg.isConfigured,
+            fetch: { try? await JesseClient(config: cfg).fetchUsage() },
+            sleep: { try? await Task.sleep(for: .seconds($0)) }) {
+            UsageStore.shared.replace(usage)
         }
     }
 

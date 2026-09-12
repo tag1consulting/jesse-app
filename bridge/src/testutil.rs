@@ -102,6 +102,9 @@ pub(crate) fn test_config() -> Config {
         // No `[direct]` table in the fixture: the direct harness is not registered here, so
         // every setting is inert and every existing turn assertion is unaffected.
         direct: DirectSettings::default(),
+        // No Fireworks account and the per-scope TTLs: the quota store is only ever read by
+        // tests that install their own fetcher.
+        quota: QuotaSettings::default(),
         // Speech transcription OFF in the fixture: no intake or models directory is ever
         // touched. The speech tests build their own service over a scratch root and fakes.
         speech: crate::speech::SpeechConfig::disabled(),

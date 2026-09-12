@@ -974,6 +974,10 @@ pub struct Config {
     /// It governs ONLY routed jobs. A main turn runs on the model the chip selected or it
     /// fails; see [`crate::routing`] for why that boundary matters and what erodes it.
     pub offload_order: Vec<String>,
+    /// Live usage and quota: the operator's Fireworks account id (`[quota]`,
+    /// `JESSE_FIREWORKS_ACCOUNT_ID`) and the snapshot TTL override (`JESSE_QUOTA_TTL_SECS`).
+    /// See [`crate::quota`].
+    pub quota: QuotaSettings,
     /// The per-turn run limit in seconds (`JESSE_TIMEOUT`, default
     /// [`DEFAULT_TIMEOUT_SECS`], clamped to `[1, HARD_TIMEOUT_CEILING]`).
     pub timeout_secs: u64,
@@ -3951,6 +3955,8 @@ impl Config {
             claude_bin: env_string("JESSE_CLAUDE_BIN").unwrap_or_else(|| "claude".to_string()),
             codex_bin: env_string("JESSE_CODEX_BIN").unwrap_or_else(|| "codex".to_string()),
             offload_order: load_offload_order(&home),
+            // Env over the `[quota]` table; the TTL override warns once on a bad value.
+            quota: QuotaSettings::from_env(load_quota_table(&home)),
             // 90m default; clamped to [1, HARD_TIMEOUT_CEILING].
             timeout_secs: clamp_timeout_secs(env_parse("JESSE_TIMEOUT", DEFAULT_TIMEOUT_SECS)),
             // The cut-off turn's partial-answer ring. Blocks are floored at 1 (a

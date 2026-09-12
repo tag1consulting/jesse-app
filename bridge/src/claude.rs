@@ -106,8 +106,13 @@ pub enum StreamEvent {
     /// The driver keeps the first one it sees, so a harness that repeats the id per line
     /// costs nothing.
     SessionId(String),
-    /// Anything else (rate-limit, message envelopes, thinking deltas, tool input
-    /// deltas, …) — carries nothing the bridge needs.
+    /// A `rate_limit_event`: the subscription login's standing, as the child reported it
+    /// mid-turn. Not a live event — nothing reaches the client — but folded into the quota
+    /// store as a sparse merge, which is how the picker's usage line refreshes for free. See
+    /// [`crate::quota`].
+    RateLimit(RateLimitEventInfo),
+    /// Anything else (message envelopes, thinking deltas, tool input deltas, …) — carries
+    /// nothing the bridge needs.
     Ignore,
 }
 
@@ -337,8 +342,11 @@ async fn run_stateless_oneshot(
                         }
                         // A one-shot child (title / diet / vault-QA) is not a conversation, so
                         // the session it names is nothing this path binds.
+                        // …and nor is the login standing it reports: a one-shot has no turn
+                        // trace to carry it, and the next conversation turn reports it again.
                         StreamEvent::SessionId(_)
                         | StreamEvent::ToolActivity(_)
+                        | StreamEvent::RateLimit(_)
                         | StreamEvent::Ignore => {}
                     }
                 }
@@ -891,6 +899,19 @@ async fn run_spawned_turn(
                             // The child named its session. Record it the moment it arrives, so
                             // a turn that dies after this line has still told us what it owns.
                             StreamEvent::SessionId(id) => spawned.record(&id),
+                            // The login's standing, for the account THIS model bills. A
+                            // `rate_limit_event` from a child pointed at another backend is
+                            // not the subscription's, whatever it says, so it is dropped.
+                            StreamEvent::RateLimit(info) => {
+                                if quota_scope_for_active(active)
+                                    == Some(QuotaScopeId::ClaudeSubscription)
+                                {
+                                    trace.note_quota(
+                                        QuotaScopeId::ClaudeSubscription,
+                                        info.to_patch(),
+                                    );
+                                }
+                            }
                             StreamEvent::Done(outcome) => {
                                 terminal = Some(outcome);
                                 break;
@@ -1126,6 +1147,12 @@ impl TurnSink for JobStoreSink<'_> {
     /// The handler reads it back off the trace when it builds the reply's provenance.
     fn style_verdict(&self, verdict: StyleVerdict) {
         self.trace.note_style(verdict);
+    }
+
+    /// Onto the trace too, which merges it into the quota store at once and remembers the
+    /// scope for the reply's provenance. Like the verdict, nothing is pushed onto the stream.
+    fn quota(&self, scope: QuotaScopeId, patch: QuotaPatch) {
+        self.trace.note_quota(scope, patch);
     }
 }
 
@@ -1380,7 +1407,10 @@ mod tests {
             match parser.on_line(line) {
                 StreamEvent::TextDelta(t) => streamed.push_str(&t),
                 StreamEvent::Done(o) => terminal = Some(o),
-                StreamEvent::SessionId(_) | StreamEvent::ToolActivity(_) | StreamEvent::Ignore => {}
+                StreamEvent::SessionId(_)
+                | StreamEvent::ToolActivity(_)
+                | StreamEvent::RateLimit(_)
+                | StreamEvent::Ignore => {}
             }
         }
         resolve_stream_outcome(ClaudeCode.id(), terminal, &streamed, stderr)

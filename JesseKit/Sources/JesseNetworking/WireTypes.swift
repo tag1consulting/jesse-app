@@ -1011,17 +1011,22 @@ public struct ModelInfo: Decodable, Equatable, Sendable, Identifiable {
     /// effort control at all. Decoded, never inferred: a client that guessed would offer a
     /// control that silently does nothing the first time a provider changed.
     public let effort: ModelEffortScale?
+    /// The billing account this model spends (`claude-subscription`, `codex-chatgpt`,
+    /// `fireworks`), the key its `GET /jesse/usage` entry is found by. nil for a model that
+    /// bills nothing the bridge can read (a local one) and against a bridge older than 0.137.0.
+    public let usageScope: String?
 
     public init(id: String, label: String, kind: String, available: Bool, writesAllowed: Bool,
                 level: String? = nil, streamsText: Bool? = nil,
                 configured: Bool? = nil, healthy: Bool? = nil,
                 lastCheckedMs: UInt64? = nil, latencyMs: UInt64? = nil,
                 family: String? = nil, harness: String? = nil, version: String? = nil,
-                effort: ModelEffortScale? = nil) {
+                effort: ModelEffortScale? = nil, usageScope: String? = nil) {
         self.family = family ?? id
         self.harness = harness
         self.version = version
         self.effort = effort
+        self.usageScope = usageScope
         self.id = id
         self.label = label
         self.kind = kind
@@ -1040,6 +1045,7 @@ public struct ModelInfo: Decodable, Equatable, Sendable, Identifiable {
     enum CodingKeys: String, CodingKey {
         case id, label, kind, available, configured, healthy, level
         case family, harness, version, effort
+        case usageScope = "usage_scope"
         case lastCheckedMs = "last_checked_ms"
         case latencyMs = "latency_ms"
         case writesAllowed = "writes_allowed"
@@ -1071,6 +1077,9 @@ public struct ModelInfo: Decodable, Equatable, Sendable, Identifiable {
         harness = try c.decodeIfPresent(String.self, forKey: .harness)
         version = try c.decodeIfPresent(String.self, forKey: .version)
         effort = try c.decodeIfPresent(ModelEffortScale.self, forKey: .effort)
+        // Additive again: a bridge before 0.137.0 omits it, and a model with no account
+        // sends null. Either way the row shows no usage line.
+        usageScope = try c.decodeIfPresent(String.self, forKey: .usageScope)
     }
 
     /// What this model may touch, for the switcher subtitle. `nil` for a Write model (the

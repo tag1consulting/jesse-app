@@ -28,18 +28,38 @@ public struct JesseProvenance: Decodable, Equatable, Sendable {
     /// end of the displayed message.
     public let badge: String
     public let flags: JesseProvenanceFlags
+    /// The quota of the account this turn's model bills to, when THIS turn refreshed it (bridge
+    /// 0.137.0 and later), in the `GET /jesse/usage` entry shape. The app folds it into
+    /// `UsageStore` so the picker and Settings update without a call, and the chip shows its one
+    /// warning glyph when `warning` is set. nil on every other turn and from an older bridge.
+    public let quota: QuotaScope?
 
-    public init(route: String, model: String?, costUsd: Double? = nil, badge: String, flags: JesseProvenanceFlags) {
+    public init(route: String, model: String?, costUsd: Double? = nil, badge: String,
+                flags: JesseProvenanceFlags, quota: QuotaScope? = nil) {
         self.route = route
         self.model = model
         self.costUsd = costUsd
         self.badge = badge
         self.flags = flags
+        self.quota = quota
     }
 
     enum CodingKeys: String, CodingKey {
-        case route, model, badge, flags
+        case route, model, badge, flags, quota
         case costUsd = "cost_usd"
+    }
+
+    /// Written out only so an unreadable `quota` costs the quota and never the chip: a newer
+    /// bridge's block this build cannot parse is dropped, and the reply's provenance still
+    /// decodes. Every other field decodes exactly as the synthesized decoder did.
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        route = try c.decode(String.self, forKey: .route)
+        model = try c.decodeIfPresent(String.self, forKey: .model)
+        costUsd = try c.decodeIfPresent(Double.self, forKey: .costUsd)
+        badge = try c.decode(String.self, forKey: .badge)
+        flags = try c.decode(JesseProvenanceFlags.self, forKey: .flags)
+        quota = (try? c.decodeIfPresent(QuotaScope.self, forKey: .quota)) ?? nil
     }
 }
 
@@ -178,12 +198,18 @@ extension JesseProvenance {
         return String(format: "$%.4f", costUsd)
     }
 
+    /// Whether the account this turn billed is near its limit: the one quota mark the chat
+    /// surface carries, an `exclamationmark.triangle` before the chip's text. Distinct from
+    /// `isWarning`, which is about citations and tints the whole chip.
+    public var isUsageWarning: Bool { quota?.warning == true }
+
     /// The full accessibility sentence (route + model + cost + any warning), for VoiceOver.
     public var accessibilityText: String {
         var parts = [label]
         if let model, !model.isEmpty { parts.append("model \(model)") }
         if let costLabel { parts.append("cost \(costLabel)") }
         if isWarning { parts.append("citations unverified") }
+        if isUsageWarning { parts.append("usage near limit") }
         return parts.joined(separator: ", ")
     }
 }

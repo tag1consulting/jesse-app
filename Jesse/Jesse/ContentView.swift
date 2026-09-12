@@ -405,6 +405,9 @@ struct SettingsView: View {
     @State private var loadingModels = false
     @State private var switchingModel = false
     @State private var modelsError: String?
+    // The Usage section's Refresh in flight. The usage itself lives in `UsageStore.shared`,
+    // which the thread picker reads too.
+    @State private var refreshingUsage = false
     // Phase 2: the model awaiting write-enable confirmation. Granting a non-default model
     // write access is gated behind an explicit confirm that names it and warns it can modify
     // the vault; revoking is immediate (it only ever reduces access).
@@ -896,6 +899,8 @@ struct SettingsView: View {
         // goes away (Settings dismissed), so polling backs off then — never a tight loop.
         .task { await pollModelsWhileVisible() }
 
+        usageSection
+
         writeAccessSection
     }
 
@@ -910,6 +915,9 @@ struct SettingsView: View {
         // Always load ONCE — the section is hidden until the list arrives, and frugal mode
         // is about spending less, never about showing less.
         if !switchingModel { await loadModels() }
+        // Usage rides the SAME visit and the same cadence: once on appear here, then inside
+        // the loop below, so Settings never runs a second timer for it.
+        await refreshUsage(force: false)
         // The repeat is what frugal mode drops: a round trip every 25 seconds, for the
         // duration of a settings visit, to catch a health change that almost never happens
         // while someone is looking at the screen.
@@ -917,6 +925,47 @@ struct SettingsView: View {
             try? await Task.sleep(for: Self.modelPollInterval)
             guard !Task.isCancelled else { return }
             if !switchingModel { await loadModels() }
+            await refreshUsage(force: false)
+        }
+    }
+
+    /// The Usage section: one card per account a model bills to, directly under the model
+    /// section it describes. Hidden until the first load answers (an older bridge has no
+    /// `/jesse/usage`), exactly like the model list above it. The card itself is shared with
+    /// the Mac (`UsageScopeCard`, JesseOps); only this wrapper and the Refresh button are here.
+    @ViewBuilder
+    private var usageSection: some View {
+        if let usage = UsageStore.shared.state, !usage.scopes.isEmpty {
+            Section {
+                ForEach(usage.scopes) { scope in
+                    UsageScopeCard(scope: scope,
+                                   modelLabels: QuotaPresentation.modelLabels(for: scope,
+                                                                              in: modelState))
+                }
+                Button {
+                    Task { await refreshUsage(force: true) }
+                } label: {
+                    Label("Refresh", systemImage: "arrow.clockwise")
+                }
+                .disabled(refreshingUsage)
+            } header: {
+                Text("Usage")
+            } footer: {
+                Text("What each account behind these models has left. Claude and ChatGPT show their plan windows; Fireworks shows this month's spend, because it has no balance to read. The bridge asks each provider at most every couple of minutes.")
+            }
+        }
+    }
+
+    /// Fetch `GET /jesse/usage` with the entered host and token into the shared store. A
+    /// failure (an older bridge, a blip) keeps whatever the store already shows. `force` is the
+    /// Refresh button's; the bridge still holds it to a 20 second floor.
+    private func refreshUsage(force: Bool) async {
+        let cfg = JesseConfig(host: host, port: Int(port) ?? JesseConfig.defaultPort, token: token)
+        guard cfg.isConfigured else { return }
+        refreshingUsage = true
+        defer { refreshingUsage = false }
+        if let usage = try? await JesseClient(config: cfg).fetchUsage(force: force) {
+            UsageStore.shared.replace(usage)
         }
     }
 

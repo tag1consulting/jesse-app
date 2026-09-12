@@ -428,7 +428,8 @@ private struct MacModelPickerMenu: View {
     /// Everything the menu renders — shared with the iPhone's picker.
     private var layout: ModelMenuLayout {
         ModelMenuLayout(state: store.state, threadModelID: thread.selectedModelID,
-                        deviceDefaultID: LastUsedModelStore.id, threadEffort: thread.selectedEffort)
+                        deviceDefaultID: LastUsedModelStore.id, threadEffort: thread.selectedEffort,
+                        usage: UsageStore.shared.state)
     }
 
     /// One family's rows: the checkmark and the harness/version detail on the resolved model, a
@@ -439,10 +440,15 @@ private struct MacModelPickerMenu: View {
             Button {
                 if let model = state.offered.first(where: { $0.id == row.id }) { select(model) }
             } label: {
+                // One line per row on the Mac, title and subtitle joined by ` · `: the form this
+                // menu has always rendered, now carried by every row whose model bills an
+                // account rather than by the resolved row alone.
                 if row.isSelected, let subtitle = row.subtitle {
-                    Label("\(row.title) — \(subtitle)", systemImage: "checkmark")
+                    Label("\(row.title) · \(subtitle)", systemImage: "checkmark")
                 } else if row.isSelected {
                     Label(row.title, systemImage: "checkmark")
+                } else if let subtitle = row.subtitle {
+                    Text("\(row.title) · \(subtitle)")
                 } else {
                     Text(row.title)
                 }
@@ -502,6 +508,14 @@ private struct MacModelPickerMenu: View {
                 thread.selectedEffort = kept
                 try? context.save()
             }
+        }
+        // The one shot usage load, once the list is here, exactly as the iPhone makes it.
+        if store.state != nil,
+           let usage = await loadUsage(
+            isConfigured: config.isConfigured,
+            fetch: { try? await JesseBridgeClient(config: config).fetchUsage() },
+            sleep: { try? await Task.sleep(for: .seconds($0)) }) {
+            UsageStore.shared.replace(usage)
         }
     }
 
@@ -634,6 +648,12 @@ struct ProvenanceChip: View {
         HStack(spacing: 4) {
             Image(systemName: provenance.iconName)
                 .font(.caption2)
+            // The account this turn billed is near its limit: the one quota mark on the chat
+            // surface. Mirrors iOS.
+            if provenance.isUsageWarning {
+                Image(systemName: "exclamationmark.triangle")
+                    .font(.caption2)
+            }
             Text(provenance.chipTitle)
                 .font(.caption2.weight(.medium))
             if let cost = provenance.costLabel {

@@ -92,6 +92,9 @@ struct TurnWriter {
         // chip on relaunch/scroll. `recordedText` above is already badge-stripped via
         // `reply.displayText`, so the bubble text and the chip never double-show it.
         turn.provenanceJSON = reply.provenance?.jsonString
+        // A turn that refreshed its account's quota hands the app the result: fold it into the
+        // one usage store the picker and Settings read, so neither needs a call to catch up.
+        UsageStore.shared.apply(reply.provenance?.quota)
         // Files this turn returned, as METADATA rows. The bytes are downloaded lazily on
         // first display and land in the on-device cache, never in the store — see
         // `TurnArtifact` and `ArtifactCache`. `sortIndex` preserves the order the bridge

@@ -41,6 +41,8 @@ struct MacSettingsView: View {
     @State private var loadingModels = false
     @State private var switchingModel = false
     @State private var modelsError: String?
+    // The Usage section's Refresh in flight; the usage itself lives in `UsageStore.shared`.
+    @State private var refreshingUsage = false
     // Phase 2: the model awaiting write-enable confirmation (granting writes is gated).
 
     var body: some View {
@@ -111,6 +113,7 @@ struct MacSettingsView: View {
                 }
 
                 modelSwitchSection
+                usageSection
                 writeAccessSection
             }
             .formStyle(.grouped)
@@ -202,7 +205,47 @@ struct MacSettingsView: View {
     private func pollModelsWhileVisible() async {
         while !Task.isCancelled {
             if !switchingModel { await loadModels() }
+            // Usage on the same cadence, inside the same loop: Settings runs no second timer.
+            await refreshUsage(force: false)
             try? await Task.sleep(for: Self.modelPollInterval)
+        }
+    }
+
+    /// The Usage section: one card per account a model bills to, directly under the model
+    /// section. Hidden until the first load answers (an older bridge has no `/jesse/usage`).
+    /// The card is shared with the iPhone (`UsageScopeCard`, JesseOps).
+    @ViewBuilder
+    private var usageSection: some View {
+        if let usage = UsageStore.shared.state, !usage.scopes.isEmpty {
+            Section {
+                ForEach(usage.scopes) { scope in
+                    UsageScopeCard(scope: scope,
+                                   modelLabels: QuotaPresentation.modelLabels(for: scope,
+                                                                              in: modelState))
+                }
+                Button {
+                    Task { await refreshUsage(force: true) }
+                } label: {
+                    Label("Refresh", systemImage: "arrow.clockwise")
+                }
+                .disabled(refreshingUsage)
+            } header: {
+                Text("Usage")
+            } footer: {
+                Text("What each account behind these models has left. Claude and ChatGPT show their plan windows; Fireworks shows this month's spend, because it has no balance to read. The bridge asks each provider at most every couple of minutes.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    /// Fetch `GET /jesse/usage` into the shared store, keeping what it shows on a failure.
+    private func refreshUsage(force: Bool) async {
+        let client = modelClient()
+        guard client.config.isConfigured else { return }
+        refreshingUsage = true
+        defer { refreshingUsage = false }
+        if let usage = try? await client.fetchUsage(force: force) {
+            UsageStore.shared.replace(usage)
         }
     }
 

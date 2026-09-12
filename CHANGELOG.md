@@ -14,6 +14,104 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [App 1.0 (134)] - 2026-09-12
+
+**Every row of the model picker now shows the live quota of the account that model bills.**
+A Claude model reads `5h 23% · week 41%`, a Fireworks model `$1.75 this month`, a local model
+nothing, and the selected row keeps its harness and version first. Settings gains a Usage
+section with one card per account.
+
+### Added
+- `ModelInfo.usageScope`, `UsageState`, `QuotaScope`, `QuotaWindow`, `QuotaSpend` and
+  `JesseBridgeClient.fetchUsage(force:)`, every field decoded with a default, so an older bridge
+  (no `usage_scope`, no `/jesse/usage`) leaves the picker exactly as it was.
+- `QuotaPresentation`, the pure rules both apps render from: windows as a short label and a
+  percentage joined by ` · `, a spend account as dollars this month (prefixed `about` when the
+  bridge estimated it), `stale` once a snapshot is older than three TTLs, and the error text only
+  when there is nothing else to show. The reset countdown (`resets in 2h 10m`) is on the Settings
+  card only, never in the menu.
+- `UsageStore`, the one in memory usage state the picker and Settings share. It is filled by the
+  picker's one shot load after its model list arrives (`loadUsage`, the same bounded retry the
+  list itself uses), by Settings on appear, inside its existing 25 second visible poll and on
+  Refresh, and by every delivered turn whose provenance carries `quota`. Never by background
+  refresh, the thread list, the watch or a widget, and the thread view does not poll.
+- The Usage section in Settings on both platforms, directly under the model section: per
+  account, its label and the models it covers, a bar per window with its percentage and reset
+  countdown, the spend line, when it was updated, and any error in secondary text. The card,
+  `UsageScopeCard`, lives in JesseOps so the iPhone and the Mac render the same one. The repeat
+  fetch rides the model poll, so it stays behind the same frugal gate.
+- The one change to the chat surface: a provenance chip whose account is near its limit shows an
+  `exclamationmark.triangle` before its text, and VoiceOver says `usage near limit`.
+
+### Changed
+- `ModelMenuRow.subtitle` now exists for every row whose model bills an account, not only the
+  selected one. The iPhone renders it as the flat `Text` pair UIKit maps to a menu subtitle; the
+  Mac keeps its one line form, now joined by ` · `.
+- `ModelPickerMenuUITests` measures against a row with no account (its stub bridge gains
+  `Local Gemma` and a `/jesse/usage` body), and a new test asserts that an unselected row's usage
+  line reaches the presented menu.
+
+### Known limits
+- The numbers are the bridge's (see bridge 0.137.0): its note on the Claude scale, Fireworks
+  showing spend and never a balance, and Codex needing the ChatGPT login all apply here.
+
+## [bridge 0.137.0] - 2026-09-12
+
+**Every model the app offers can now show the live quota of the account it bills.** Quota belongs
+to an account, not a model, so the bridge maps each registry model to at most one of three: the
+Claude subscription, the ChatGPT subscription behind Codex, and the Fireworks account the open
+models spend. `GET /jesse/usage` reports each one, and there is no timer behind it.
+
+### Added
+- `GET /jesse/usage` (bearer auth): one entry per account a configured model bills, with its
+  windows (`used_percent`, `resets_at_ms`, `status`), month to date `spend`, `plan`,
+  `fetched_at_ms`, `source` (`fetched` or `turn`), `error`, `warning` (any window at 90 percent
+  or more, or `rejected`) and `ttl_secs`. A provider is called only when an account's snapshot is
+  older than its TTL: 120 s for the Claude and ChatGPT logins, 600 s for Fireworks, or one value
+  for all from `JESSE_QUOTA_TTL_SECS`. `?force=1` lowers that to a 20 s floor. Concurrent callers
+  share one fetch per account, accounts fetch concurrently under their own timeouts (10 s, 15 s,
+  10 s), a 429 holds an account off for at least five minutes, and a failure keeps the last
+  snapshot beside its `error`.
+- The Claude subscription is read from the OAuth usage endpoint with the login's own token, taken
+  read only from the login keychain item Claude Code keeps it in, filed under the login user
+  (else `~/.claude/.credentials.json`). An expired token reports `login expired, refreshes on the
+  next Claude turn`; the bridge never refreshes it.
+- The ChatGPT subscription is read by `account/rateLimits/read` on a short lived Codex App Server
+  against the canonical Codex home: initialize, read, exit. No thread and no turn run, so no
+  containment record changes.
+- Fireworks spend is read from the billing usage endpoint for the current UTC month, serverless
+  only, grouped by model, once `[quota] fireworks_account_id` (or `JESSE_FIREWORKS_ACCOUNT_ID`)
+  names the operator's own account. Without it that account reads `spend not configured (set
+  fireworks_account_id)` and nothing is called.
+- Turns refresh their account for free. A `rate_limit_event` from a Claude Code child and an
+  `account/rateLimits/updated` notification from a Codex turn merge into the store as they
+  arrive, sparsely: a field the report leaves out never clears a stored one, so an `allowed` event
+  that says nothing else leaves a known 41 percent where it was. The reply's provenance carries
+  the refreshed account as `quota`, in the same shape as the route's entries.
+- `usage_scope` on every `GET /jesse/models` row, naming the account the model bills, or null for
+  a local model or any other host.
+
+### Changed
+- The Claude Code stream parser reads `rate_limit_event`, which it used to ignore, including the
+  `unifiedWindows` map Claude Code 2.1.268 writes on an ordinary subscription turn.
+- An App Server request with no parameters now goes out without a `params` key, which
+  `account/rateLimits/read` requires.
+
+### Known limits
+- The Claude usage endpoint's `utilization` is a 0 to 100 percentage, observed live on
+  12 September 2026 (`8.0` and `27.0`, matching the same body's `limits[].percent`), while a
+  turn's `rate_limit_event` reports the same windows as 0 to 1 fractions (`0.08` and `0.27`).
+  Each parser converts from the scale observed; an upstream change would show as a wrong
+  percentage, not an error.
+- Fireworks has no balance API, so that account shows spend and never remaining credit. Its
+  billing API documents `costNanoUsd` as 0 wherever the provider stamps no cost, so such a bucket
+  is estimated from its tokens and the model's price deck and the spend is marked `estimated`.
+  The Fireworks call was not made live: this host has no account id configured.
+- Codex quota needs the ChatGPT login in `~/.codex` (or `$CODEX_HOME`). A model on its own
+  provider key bills its host's account instead, and an API key login reads `not logged in`.
+- The pinned Codex CLI (0.153.4) rejects any parameters on `account/rateLimits/read`, so the
+  reset credit details the newer protocol can exclude are simply not requested.
+
 ## [bridge 0.136.1] - 2026-09-12
 
 ### Fixed

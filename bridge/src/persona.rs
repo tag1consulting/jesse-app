@@ -520,6 +520,10 @@ struct LocalConfig {
     /// [`crate::schedule::ProfileToml`].
     #[serde(default)]
     profile: Option<ProfileToml>,
+    /// The optional top-level `[quota]` table — today just `fireworks_account_id`, the
+    /// operator's own Fireworks account slug for month to date spend. See [`crate::quota`].
+    #[serde(default)]
+    quota: Option<QuotaToml>,
 }
 
 /// Resolve the local overlay file, first existing wins:
@@ -753,6 +757,13 @@ pub fn load_schedule(home: &str) -> Vec<ScheduleToml> {
 /// has not asked for one.
 pub fn load_profile_table(home: &str) -> Option<ProfileToml> {
     load_local_config(home).and_then(|c| c.profile)
+}
+
+/// Read the optional top-level `[quota]` table from the same overlay file (same search order,
+/// same soft-fail). Absent → `None` → no Fireworks account id, and the Fireworks scope reports
+/// that spend is not configured without calling anything.
+pub fn load_quota_table(home: &str) -> Option<QuotaToml> {
+    load_local_config(home).and_then(|c| c.quota)
 }
 
 /// The overlay file the bridge actually loaded, or `None` when there is none.
