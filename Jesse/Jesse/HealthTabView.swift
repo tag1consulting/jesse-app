@@ -160,16 +160,14 @@ struct HealthTabView: View {
                     }
                 }
                 .confirmationDialog("Start new day", isPresented: $confirmNewDay) {
-                    // Once today's refresh has run from this device — a tap, or a weigh-in
-                    // that fired it automatically — a second one is the same operation
-                    // asked for twice, so the dialog says so instead of offering it.
-                    if !ranNewDayToday {
-                        Button("Start new day") { startNewDay() }
-                    }
-                    Button(ranNewDayToday ? "OK" : "Cancel", role: .cancel) {}
+                    // A deliberate tap always runs it, even when today's refresh already ran
+                    // from this device (a tap, or a weigh-in that fired it automatically).
+                    // The message only says so, so a second run is a choice, not an accident.
+                    Button(ranNewDayToday ? "Run again" : "Start new day") { startNewDay() }
+                    Button("Cancel", role: .cancel) {}
                 } message: {
                     Text(ranNewDayToday
-                         ? "Today's new-day refresh already ran from this device, so it won't be sent again."
+                         ? "Today's new-day refresh already ran from this device. Run it again?"
                          : "Audit yesterday, log your weigh-in, and refresh the dashboard?")
                 }
         }
@@ -253,16 +251,17 @@ struct HealthTabView: View {
     /// Through `HealthTurn.startNewDay`, the SAME function the automatic weigh-in trigger
     /// ends in, so the two cannot drift: offline it is held rather than fired (and a held
     /// Start-new-day is refused on replay if the day has already rolled without it — see
-    /// `IntentReplayer`), and once this device has run the refresh for today's diet day, by
-    /// either path, pressing again runs nothing.
+    /// `IntentReplayer`). It is never `oncePerDay`: the automatic weigh-in runs the refresh at
+    /// most once a diet day, but a tap is deliberate and always sends. The day it records is
+    /// what stops a later weigh-in from firing a second one.
     private func startNewDay() {
         let outcome = HealthTurn.startNewDay(model: model, coordinator: coordinator,
                                              context: context, origin: .phone,
-                                             dietDay: DietDay.stamp(for: .now))
+                                             dietDay: DietDay.stamp(for: .now), oncePerDay: false)
         switch outcome {
-        case .sent: break
+        // `.alreadyRan` needs `oncePerDay`, so the button never sees it.
+        case .sent, .alreadyRan: break
         case .queued: queuedNotice = HealthDashboardModel.queuedNotice
-        case .alreadyRan: queuedNotice = HealthNewDay.alreadyRanNotice
         case .refused:
             if model.isReadOnly { queuedNotice = HealthDashboardModel.readOnlyNotice }
         }

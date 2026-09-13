@@ -37,7 +37,7 @@ own ordinary thread, found under a new **Auto** scope in Chats.
     two-minute settle from its first workout and goes out as ONE turn. A backfilled workout
     still fires, and the fired set is bounded (14 days, 256 entries).
   - `HealthTurnRoute`: send, hold offline, or "already ran", one decision for the button and
-    both observers.
+    both observers. Only the weigh-in observer asks it with the day guard on.
 - `HealthWorkoutLog.prompt`: the workout turn. It names its own scope, keeps `log`, `exercise`,
   `workout` and `health` for the classifier, and tells the routine to diff against
   `exercise-log.csv` and never estimate an unmeasured field.
@@ -54,9 +54,11 @@ own ordinary thread, found under a new **Auto** scope in Chats.
 ### Changed
 - The Start-new-day button and the automatic weigh-in end in the same function,
   `HealthTurn.startNewDay`, and send byte-identical text. Both record the diet day in
-  `HealthNewDay.lastFiredDayKey`. Once today's refresh has run from this device, by either
-  path, the button's confirmation says so and sends nothing. The Good morning routine's
-  "Include health and diet first" records the same day. The Mac's button is unchanged.
+  `HealthNewDay.lastFiredDayKey`. That day stops only the automatic weigh-in: once today's
+  refresh has run from this device, by either path, a later weigh-in fires nothing. A tap
+  always sends. When today's refresh already ran, the confirmation says so and offers
+  **Run again**. The Good morning routine's "Include health and diet first" records the same
+  day. The Mac's button is unchanged.
 - The one Health dashboard model is now process-wide (`RootTabView.sharedHealthModel`), so an
   automatic turn fired from a background launch is held offline by the same capture path as the
   button's. Before firing, it fetches the diet snapshot once, which is what says whether the

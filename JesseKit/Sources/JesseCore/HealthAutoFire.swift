@@ -56,8 +56,9 @@ public nonisolated enum HealthAutoFire {
     /// most: a phone syncing last week's readings from a scale, or a 00:30 reading that
     /// belongs to the evening before, must not roll anything.
     ///
-    /// `lastFiredDay` is written by BOTH the automatic path and the Start-new-day button, so
-    /// the two are one operation requested twice rather than two operations.
+    /// `lastFiredDay` is written by BOTH the automatic path and the Start-new-day button, so a
+    /// weigh-in after a tap fires nothing. The reverse does not hold: a tap after an automatic
+    /// fire is deliberate, and sends.
     public static func shouldFireMorningRefresh(newestSampleDate: Date,
                                                 lastFiredDay: String?,
                                                 now: Date,
@@ -228,10 +229,11 @@ public nonisolated enum HealthTurnRoute: Equatable, Sendable {
     /// This device already ran it for this diet day. Nothing is sent and nothing is held.
     case alreadyRan
 
-    /// `alreadyRanToday` wins over everything, including being offline: a Start-new-day
-    /// already sent or already held is the same operation, and asking again means "did that
-    /// go?", not "do it twice". The workout log passes `false` — it guards by workout
-    /// identity instead, before it ever asks.
+    /// `alreadyRanToday` wins over everything, including being offline: for the automatic
+    /// weigh-in, a Start-new-day already sent or already held means the next reading is not
+    /// news. Two callers pass `false`. The button does, because a tap is a deliberate request
+    /// to run it again. The workout log does, because it guards by workout identity instead,
+    /// before it ever asks.
     public static func decide(alreadyRanToday: Bool, isReadOnly: Bool) -> HealthTurnRoute {
         if alreadyRanToday { return .alreadyRan }
         return isReadOnly ? .capture : .send

@@ -45,23 +45,28 @@ enum HealthTurn {
         case queued
         /// Neither: nothing to capture it with, or the staging save failed.
         case refused
-        /// This device already ran the new-day refresh for this diet day. Nothing happened.
+        /// This device already ran the new-day refresh for this diet day and `oncePerDay` was
+        /// asked for. Nothing happened. Only the automatic path can get this.
         case alreadyRan
     }
 
     /// **Start-new-day.** The button's path and the automatic weigh-in's, in one function.
     ///
     /// `dietDay` is the diet day this run is FOR, and it is what `HealthNewDay.lastFiredDayKey`
-    /// records once the run is sent or held, so a second request for the same day — by either
-    /// path — is `.alreadyRan` rather than a second rollover. `capturedDay` is the day a HELD
-    /// run is dated against: the automatic path passes the weigh-in's own day, and the button
-    /// passes nil and keeps the bridge's `captureDay`, as it always has.
+    /// records once the run is sent or held, by either path. `oncePerDay` is the automatic
+    /// weigh-in's guard: with it, a day already recorded is `.alreadyRan` rather than a second
+    /// rollover. The button passes false, because a deliberate tap is a request to run it
+    /// again; it still records the day, so a weigh-in later that morning fires nothing.
+    /// `capturedDay` is the day a HELD run is dated against: the automatic path passes the
+    /// weigh-in's own day, and the button passes nil and keeps the bridge's `captureDay`, as
+    /// it always has.
     @discardableResult
     static func startNewDay(model: HealthDashboardModel, coordinator: RunCoordinator,
                             context: ModelContext, origin: ThreadOrigin, dietDay: String,
-                            capturedDay: String? = nil,
+                            oncePerDay: Bool, capturedDay: String? = nil,
                             defaults: UserDefaults = .standard) -> Outcome {
-        let ranToday = defaults.string(forKey: HealthNewDay.lastFiredDayKey) == dietDay
+        let ranToday = oncePerDay
+            && defaults.string(forKey: HealthNewDay.lastFiredDayKey) == dietDay
         let outcome: Outcome
         switch HealthTurnRoute.decide(alreadyRanToday: ranToday, isReadOnly: model.isReadOnly) {
         case .alreadyRan:
@@ -221,7 +226,8 @@ final class HealthAutoTrigger {
         let outcome = HealthTurn.startNewDay(
             model: model, coordinator: coordinator,
             context: AppModelContainer.shared.container.mainContext,
-            origin: .automatic, dietDay: day, capturedDay: day, defaults: defaults)
+            origin: .automatic, dietDay: day, oncePerDay: true, capturedDay: day,
+            defaults: defaults)
         Log.health.notice("automatic new-day refresh for \(day): \(String(describing: outcome))")
     }
 

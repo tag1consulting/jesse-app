@@ -249,9 +249,9 @@ final class HealthAutoFireTests: XCTestCase {
 
     // MARK: - Send, hold, or say it already ran
 
-    /// Amendment two's online half: an automatic fire followed by a manual press on the same
-    /// diet day is one turn, not two — and the same holds offline.
-    func testAnAutomaticFireFollowedByAManualPressIsOneTurn() {
+    /// A day that already ran stops the automatic weigh-in whether or not the bridge is
+    /// reachable. The button never asks with `true`; `HealthTurnTests` pins that it sends.
+    func testADayThatAlreadyRanWinsOnlineAndOffline() {
         XCTAssertEqual(HealthTurnRoute.decide(alreadyRanToday: false, isReadOnly: false), .send)
         XCTAssertEqual(HealthTurnRoute.decide(alreadyRanToday: true, isReadOnly: false), .alreadyRan)
         XCTAssertEqual(HealthTurnRoute.decide(alreadyRanToday: true, isReadOnly: true), .alreadyRan)
