@@ -68,6 +68,7 @@ struct RootTabView: View {
 
     /// The app-scoped coordinator, read here only to build the replayer's Tell sender.
     @Environment(RunCoordinator.self) private var coordinator
+    @Environment(\.scenePhase) private var scenePhase
 
     /// The Today screen's model lives HERE, not in `TodayTabView`, because the tab
     /// item's badge and the screen must read the same number. Injected through the
@@ -105,7 +106,13 @@ struct RootTabView: View {
     /// The Health tab's model. It lives HERE rather than in `HealthTabView` for the one
     /// reason the day model does: the replayer needs it (to read the live diet day) and
     /// the replayer must outlive whichever tab happens to be on screen.
-    @State private var healthModel = HealthDashboardModel(
+    @State private var healthModel = RootTabView.sharedHealthModel
+
+    /// **The one Health model, per process.** Static for the reason `pendingStore` is: it is
+    /// also driven with no view hierarchy at all — HealthKit relaunches the app into the
+    /// background to deliver a new weigh-in or workout, and `HealthAutoTrigger` must send
+    /// that turn through the same model (and so the same offline capture) the button uses.
+    @MainActor static let sharedHealthModel = HealthDashboardModel(
         makeClient: { JesseClient(config: ConfigStore.load(), snapshotCache: SnapshotCache.shared) },
         cache: SnapshotCache.shared,
         pending: RootTabView.pendingStore)
@@ -152,6 +159,12 @@ struct RootTabView: View {
             buildTheReplayer()
             todayModel.refreshPending()
             healthModel.refreshPending()
+        }
+        // A workout burst whose settle window ran out while the app was suspended fires
+        // the moment the app is back, rather than waiting for a background wake.
+        .onChange(of: scenePhase) { _, phase in
+            guard phase == .active else { return }
+            Task { await HealthAutoTrigger.shared.settleWorkouts() }
         }
         // EVERY successful fetch and every mutation lands a new server snapshot, and
         // each one is pushed. Not gated on the Today tab being selected: the wrist's

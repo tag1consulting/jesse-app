@@ -18,5 +18,13 @@
 	<true/>
 	<key>com.apple.developer.healthkit.access</key>
 	<array/>
+	<!--
+	  Lets the body-mass and workout observer queries wake the app when new health data
+	  lands (iOS 15+). Without it enableBackgroundDelivery fails with
+	  errorAuthorizationDenied. It must ALSO be enabled on the provisioning profile, which
+	  cannot be done from a build environment.
+	-->
+	<key>com.apple.developer.healthkit.background-delivery</key>
+	<true/>
 </dict>
 </plist>

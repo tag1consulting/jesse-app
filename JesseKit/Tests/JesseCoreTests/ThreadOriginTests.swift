@@ -32,6 +32,31 @@ final class ThreadOriginTests: XCTestCase {
         XCTAssertEqual(thread.originValue, .phone)
     }
 
+    /// A thread the phone fired by itself when new health data landed.
+    func testAutomaticRawValueDecodes() {
+        let thread = JesseThread(mode: .tell)
+        thread.origin = ThreadOrigin.automatic.rawValue
+        XCTAssertEqual(thread.origin, "automatic")
+        XCTAssertEqual(thread.originValue, .automatic)
+    }
+
+    /// `automatic` is a stored raw string like `watch`, so it survives a real store.
+    func testAutomaticOriginPersistsThroughStore() throws {
+        let container = try ModelContainer(
+            for: JesseThread.self, Turn.self,
+            configurations: ModelConfiguration(isStoredInMemoryOnly: true))
+        let context = ModelContext(container)
+        let thread = JesseThread(mode: .tell)
+        thread.origin = ThreadOrigin.automatic.rawValue
+        let id = thread.id
+        context.insert(thread)
+        try context.save()
+
+        var descriptor = FetchDescriptor<JesseThread>(predicate: #Predicate { $0.id == id })
+        descriptor.fetchLimit = 1
+        XCTAssertEqual(try XCTUnwrap(context.fetch(descriptor).first).originValue, .automatic)
+    }
+
     /// Persisting and re-fetching a `.watch` thread through a real (in-memory)
     /// SwiftData store keeps the origin — proving it's a stored property, not just
     /// an in-memory flag.

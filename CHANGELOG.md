@@ -14,6 +14,71 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [App 1.0 (135)] - 2026-09-12
+
+**New health data now logs itself.** When the first body-mass reading of a diet day lands in
+Apple Health, the iPhone sends the Start-new-day refresh on its own; when new workouts land, it
+sends a workout log turn. No tap, no foreground, no fixed time. Every automatic turn opens its
+own ordinary thread, found under a new **Auto** scope in Chats.
+
+### Added
+- `HealthDataObserver`: `HKObserverQuery` on body mass and on workouts, with background delivery
+  (`.immediate` requested), registered once from `application(_:didFinishLaunchingWithOptions:)`
+  when "Attach health context" is on, and stopped when it is turned off. Each notification runs
+  an anchored query (anchor persisted per type) and ALWAYS calls the observer's completion
+  handler. The first query per type is a baseline: what was already in Health fires nothing.
+- `HealthAutoTrigger`: the decision layer, running without any view (HealthKit relaunches the
+  app into the background to deliver). The rules are pure and live in JesseCore
+  (`HealthAutoFire.swift`):
+  - `DietDay.stamp`: the bridge 0.92.0 diet day, local time minus four hours, always Gregorian.
+  - `HealthAutoFire.shouldFireMorningRefresh`: fire only for a reading in TODAY's diet day and
+    only once per diet day. A synced old reading, or a 00:30 reading, fires nothing.
+  - `WorkoutAutoLog.workoutsToFire`: dedupe by workout UUID, never by day. A burst waits a
+    two-minute settle from its first workout and goes out as ONE turn. A backfilled workout
+    still fires, and the fired set is bounded (14 days, 256 entries).
+  - `HealthTurnRoute`: send, hold offline, or "already ran", one decision for the button and
+    both observers. Only the weigh-in observer asks it with the day guard on.
+- `HealthWorkoutLog.prompt`: the workout turn. It names its own scope, keeps `log`, `exercise`,
+  `workout` and `health` for the classifier, and tells the routine to diff against
+  `exercise-log.csv` and never estimate an unmeasured field.
+- `ThreadOrigin.automatic`, `ThreadOriginScope.automatic` and the **Auto** list scope beside
+  Watch. `automatic` is a raw string like `watch`, so it is a lightweight add, and an older build
+  reads it as `phone`.
+- `PendingIntentKind.logWorkouts` and `HealthDashboardModel.captureWorkoutLog`: a workout log
+  that lands offline is held, at most one, and shown on the Health tab. Its replay is never
+  refused for a rolled day, the deliberate opposite of Start-new-day, because the CSV diff
+  makes a late replay idempotent. `PendingIntentPayload.origin` carries `automatic` so a
+  replayed turn is found under Auto too.
+- The `com.apple.developer.healthkit.background-delivery` entitlement.
+
+### Changed
+- The Start-new-day button and the automatic weigh-in end in the same function,
+  `HealthTurn.startNewDay`, and send byte-identical text. Both record the diet day in
+  `HealthNewDay.lastFiredDayKey`. That day stops only the automatic weigh-in: once today's
+  refresh has run from this device, by either path, a later weigh-in fires nothing. A tap
+  always sends. When today's refresh already ran, the confirmation says so and offers
+  **Run again**. The Good morning routine's "Include health and diet first" records the same
+  day. The Mac's button is unchanged.
+- The one Health dashboard model is now process-wide (`RootTabView.sharedHealthModel`), so an
+  automatic turn fired from a background launch is held offline by the same capture path as the
+  button's. Before firing, it fetches the diet snapshot once, which is what says whether the
+  bridge is reachable.
+- The periodic background refresh can be requested sooner (`schedule(at:)`) for a settling
+  workout burst.
+
+### Known limits
+- **The provisioning profile must have HealthKit Background Delivery enabled.** That cannot be
+  done from a build environment. Without it, `enableBackgroundDelivery` fails and the observers
+  fire only while the app is running.
+- HealthKit background delivery does not run on the Simulator (Apple's documentation), so the
+  wake-from-background path is unverified until it runs on a device.
+- A background wake is short. A burst still settling when it ends fires on the next foreground,
+  background refresh or HealthKit wake, whichever comes first, rather than at exactly two minutes.
+- The health block carries workouts from the last 48 hours, so a workout backfilled later than
+  that fires a turn that cannot see it. The morning export reconcile still catches it.
+- A workout deleted or edited in Health after its row was written is not corrected from the app.
+  That is left to the morning reconcile.
+
 ## [App 1.0 (134)] - 2026-09-12
 
 **Every row of the model picker now shows the live quota of the account that model bills.**
