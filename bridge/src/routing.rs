@@ -429,6 +429,8 @@ mod tests {
                 checked_at_ms: 1,
                 latency_ms: None,
                 last_error_class: Some("connect".to_string()),
+                tolerated_4xx_streak: 0,
+                ever_passed: false,
             },
         );
     }
