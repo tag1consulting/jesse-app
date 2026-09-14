@@ -180,7 +180,7 @@ final class MacOfflineRecoveryTests: XCTestCase {
         nonisolated var config: JesseConfig { JesseConfig(host: "studio", port: 8765, token: "tok") }
 
         nonisolated func setFlags(conversationId: String, favorite: FlagWrite?,
-                                  archived: FlagWrite?) async throws {
+                                  archived: FlagWrite?, read: ReadWrite?) async throws {
             let seen = UserDefaults.standard.string(forKey: key)
             lock.withLock { _observed = seen }
         }

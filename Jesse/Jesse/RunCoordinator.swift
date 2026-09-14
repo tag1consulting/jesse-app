@@ -1089,11 +1089,17 @@ final class RunCoordinator {
             }
             thread.aiTitle = c.title
             thread.updatedAt = stamp
+            // When this conversation last replied, on the BRIDGE's clock. An adopted stub
+            // carries it so a conversation answered on the Mac shows its dot here without
+            // waiting to be opened and hydrated.
+            thread.noteReply(atUnixMillis: Int(c.lastReplyMs))
             context.insert(thread)
             await FlagReconciler.reconcile(
                 thread: thread,
                 serverFavorite: c.favorite, serverFavoriteUpdatedMs: Int(c.favoriteUpdatedMs),
                 serverArchived: c.archived, serverArchivedUpdatedMs: Int(c.archivedUpdatedMs),
+                serverReadThroughMs: Int(c.readThroughMs),
+                serverReadUpdatedMs: Int(c.readUpdatedMs),
                 client: client)
             changed = true
         }
@@ -1116,10 +1122,17 @@ final class RunCoordinator {
                 thread.updatedAt = stamp
                 changed = true
             }
+            // A reply that landed while this device was away (or on the other device)
+            // shows its dot from the list pull alone, without opening the thread. `max`,
+            // never assignment: a list built a moment before a reply the app has already
+            // delivered locally must not pull the stamp backwards.
+            if thread.noteReply(atUnixMillis: Int(c.lastReplyMs)) { changed = true }
             let didChange = await FlagReconciler.reconcile(
                 thread: thread,
                 serverFavorite: c.favorite, serverFavoriteUpdatedMs: Int(c.favoriteUpdatedMs),
                 serverArchived: c.archived, serverArchivedUpdatedMs: Int(c.archivedUpdatedMs),
+                serverReadThroughMs: Int(c.readThroughMs),
+                serverReadUpdatedMs: Int(c.readUpdatedMs),
                 client: client)
             changed = changed || didChange
         }
@@ -1209,6 +1222,14 @@ final class RunCoordinator {
                 if loser.archivedUpdatedMs > winner.archivedUpdatedMs {
                     winner.applyArchivedFromSync(loser.isArchived, updatedMs: loser.archivedUpdatedMs)
                 }
+                // The read mark resolves the same way, on its own clock — otherwise a merge
+                // could revive a dot the user cleared on the copy that is not the oldest.
+                // The reply stamp takes the max instead: both copies describe the same
+                // conversation, so the later reply is simply the one that happened.
+                if loser.readUpdatedMs > winner.readUpdatedMs {
+                    winner.applyReadFromSync(loser.readThroughMs, updatedMs: loser.readUpdatedMs)
+                }
+                winner.noteReply(atUnixMillis: loser.lastReplyMs)
                 if (winner.aiTitle ?? "").isEmpty, let title = loser.aiTitle, !title.isEmpty {
                     winner.aiTitle = title
                 }
@@ -1303,6 +1324,14 @@ final class RunCoordinator {
                     Self.attach(t.artifacts, to: turn)
                     turn.thread = thread
                     context.insert(turn)
+                    // A JESSE turn this device never saw — sent from the Mac, or landed
+                    // while the app was closed. It is a reply arriving, so it moves the
+                    // unread stamp, dated by the TURN's own timestamp rather than now:
+                    // hydration can carry history that is hours old, and `noteReply`'s max
+                    // rule keeps an older one from pulling the stamp backwards.
+                    if turn.roleValue == .jesse {
+                        thread.noteReply(atUnixMillis: JesseThread.unixMillis(turn.createdAt))
+                    }
                     inserted += 1
                 }
             }
@@ -1390,7 +1419,7 @@ final class RunCoordinator {
         guard let cid = thread.conversationId, !cid.isEmpty else { return }
         let write = FlagWrite(value: thread.isFavorite, updatedMs: thread.favoriteUpdatedMs)
         let client = makeClient(configProvider())
-        Task { try? await client.setFlags(conversationId: cid, favorite: write, archived: nil) }
+        Task { try? await client.setFlags(conversationId: cid, favorite: write, archived: nil, read: nil) }
     }
 
     /// Optimistic best-effort push of a just-toggled ARCHIVE up to the bridge. Mirror of
@@ -1399,7 +1428,22 @@ final class RunCoordinator {
         guard let cid = thread.conversationId, !cid.isEmpty else { return }
         let write = FlagWrite(value: thread.isArchived, updatedMs: thread.archivedUpdatedMs)
         let client = makeClient(configProvider())
-        Task { try? await client.setFlags(conversationId: cid, favorite: nil, archived: write) }
+        Task { try? await client.setFlags(conversationId: cid, favorite: nil, archived: write, read: nil) }
+    }
+
+    /// Optimistic best-effort push of a just-changed READ MARK up to the bridge, so the
+    /// other device's dot clears (or comes back) on its next sync. Mirror of
+    /// `pushFavoriteChange`; same self-healing best-effort semantics — the local
+    /// `readUpdatedMs` stayed newer than the server's, so a failed push is simply
+    /// re-decided as `pushLocal` on the next reconcile.
+    ///
+    /// Call it only when `markRead`/`markUnread` actually returned true: a no-op mark
+    /// must not cost a request, and this runs on every appear and every foreground.
+    func pushReadChange(for thread: JesseThread) {
+        guard let cid = thread.conversationId, !cid.isEmpty else { return }
+        let write = ReadWrite(throughMs: thread.readThroughMs, updatedMs: thread.readUpdatedMs)
+        let client = makeClient(configProvider())
+        Task { try? await client.setFlags(conversationId: cid, favorite: nil, archived: nil, read: write) }
     }
 
     /// Manually retry a `.failed` outbox message — NEVER automatic. Re-runs the

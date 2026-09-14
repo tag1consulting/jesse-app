@@ -15,7 +15,12 @@ final class SessionFlagSyncTests: XCTestCase {
     /// scripted session list. Only the methods the flag-sync path touches do real work; the
     /// turn-running methods are inert stubs.
     private final class FlagRecorder: @unchecked Sendable {
-        struct Call: Equatable { let conversationId: String; let favorite: FlagWrite?; let archived: FlagWrite? }
+        struct Call: Equatable {
+            let conversationId: String
+            let favorite: FlagWrite?
+            let archived: FlagWrite?
+            var read: ReadWrite?
+        }
         private let lock = NSLock()
         private var _calls: [Call] = []
         func record(_ c: Call) { lock.withLock { _calls.append(c) } }
@@ -29,8 +34,10 @@ final class SessionFlagSyncTests: XCTestCase {
         init(conversations: ConversationsResult = .notModified) { self.conversations = conversations }
 
         func listConversations(etag: String?) async throws -> ConversationsResult { conversations }
-        nonisolated func setFlags(conversationId: String, favorite: FlagWrite?, archived: FlagWrite?) async throws {
-            recorder.record(.init(conversationId: conversationId, favorite: favorite, archived: archived))
+        nonisolated func setFlags(conversationId: String, favorite: FlagWrite?, archived: FlagWrite?,
+                                  read: ReadWrite?) async throws {
+            recorder.record(.init(conversationId: conversationId, favorite: favorite,
+                                  archived: archived, read: read))
         }
 
         // Inert turn-running surface — never exercised by the flag-sync path.

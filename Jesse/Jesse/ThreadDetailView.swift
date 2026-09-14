@@ -87,6 +87,16 @@ struct ThreadDetailView: View {
 
     @Environment(\.scenePhase) private var scenePhase
 
+    /// Whether this transcript is actually on screen: set on appear, cleared on disappear.
+    ///
+    /// That pair is exactly the "top of the stack, or the split view's detail column"
+    /// condition, without this view needing to know which shell built it: the iPhone pops
+    /// it, the iPad's detail column carries `.id(thread.id)` and replaces it, and a tab
+    /// switch fires `onDisappear` too (see THE DEPARTURES below) — so all three cases that
+    /// mean "you are no longer reading this" clear it. Paired with `scenePhase` through the
+    /// pure `jesseShouldMarkRead`.
+    @State private var isOnScreen = false
+
     /// The frugal decision this composer is drawing: the live path plus the Settings
     /// toggle.
     ///
@@ -197,7 +207,14 @@ struct ThreadDetailView: View {
             // has to hold the user's unsent text again the instant this view exists.
             restoreDraft()
             if attachedContext != nil && turns.isEmpty { inputFocused = true }
+            isOnScreen = true
+            markReadIfOnScreen()
         }
+        // THE THREE MOMENTS A TRANSCRIPT IS READ, and there are only three: it came on
+        // screen (above), the app came back to the foreground with it still there, and a
+        // reply landed while it was being watched. Each one runs through the same gate, so
+        // a reply that arrives while the app is in a pocket stays unread.
+        .onChange(of: thread.lastReplyMs) { _, _ in markReadIfOnScreen() }
         // ── THE DEPARTURES ────────────────────────────────────────────────────────────
         // Three of the four (the fourth is `send`). Between them they cover every way this
         // composer stops being reachable: the iPhone popping it, the iPad detail column
@@ -211,9 +228,15 @@ struct ThreadDetailView: View {
         // LEAVING, not just a departure: after this the composer is gone, so it stops
         // exempting its conversation from the list's reaper — which runs again right after,
         // because on a pop the list may have appeared before this fired. See `leaveComposer`.
-        .onDisappear { leaveComposer() }
+        .onDisappear {
+            leaveComposer()
+            isOnScreen = false
+        }
         .onChange(of: scenePhase) { _, phase in
             if phase != .active { captureDraft() }
+            // Coming BACK to a conversation left on screen reads it, including whatever
+            // landed while the phone was away. Going away never marks anything.
+            markReadIfOnScreen()
         }
         // Backgrounding covers almost every real exit on the phone; this covers the rest.
         .onReceive(NotificationCenter.default.publisher(
@@ -1013,6 +1036,26 @@ struct ThreadDetailView: View {
     private func leaveComposer() {
         guard didRestoreDraft else { return }
         ComposerDrafts.leave(composerState, for: thread, in: context)
+    }
+
+    // MARK: - Unread
+
+    /// Mark this conversation read, if a person is actually looking at it.
+    ///
+    /// Called from the three moments in `body`: appearing, the scene becoming active, and
+    /// a reply landing. Cheap enough to call from all three because `markRead` is a no-op
+    /// when the conversation is already read — no value written, so no save and no push.
+    private func markReadIfOnScreen() {
+        guard jesseShouldMarkRead(isVisible: isOnScreen, isActive: scenePhase == .active) else { return }
+        guard thread.markRead(nowMs: JesseThread.unixMillis(.now)) else { return }
+        do {
+            try context.save()
+        } catch {
+            Log.run.error("mark-read save failed: \(error.localizedDescription)")
+        }
+        // Best-effort mirror so the Mac's dot clears too; self-healing if it fails, exactly
+        // like the favorite push (see RunCoordinator.pushReadChange).
+        coordinator.pushReadChange(for: thread)
     }
 
     private func send() {

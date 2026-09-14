@@ -128,6 +128,15 @@ final class AppModelContainerMigrationTests: XCTestCase {
         for thread in try ctx.fetch(FetchDescriptor<JesseThread>()) {
             XCTAssertFalse(thread.isArchived, "isArchived defaults to false on a pre-archive row")
             XCTAssertNil(thread.archivedAt, "archivedAt defaults to nil on a pre-archive row")
+            // THE UPGRADE MARKS NOTHING UNREAD. The three unread columns are additive
+            // defaulted Ints, so every row written before they existed opens with all
+            // three at 0 — and 0 > 0 is false, so the whole store reads as READ. Anything
+            // else would greet an existing install with a list full of dots and a home
+            // screen badge counting its entire history.
+            XCTAssertEqual(thread.lastReplyMs, 0, "lastReplyMs defaults to 0 on a pre-unread row")
+            XCTAssertEqual(thread.readThroughMs, 0, "readThroughMs defaults to 0")
+            XCTAssertEqual(thread.readUpdatedMs, 0, "readUpdatedMs defaults to 0")
+            XCTAssertFalse(thread.hasUnreadReply, "which reads as READ")
         }
 
         // The relationship + a Turn's provenance + the attachment's bytes all survive.
@@ -158,6 +167,10 @@ final class AppModelContainerMigrationTests: XCTestCase {
         // defaults).
         let archivedAt = Date(timeIntervalSince1970: 1_800_000_000)
         fav.setArchived(true, now: archivedAt)
+        // And a reply + read mark in the same save, so the unread columns round-trip
+        // through the reopen rather than only proving they default.
+        fav.noteReply(atUnixMillis: 1_750_000_000_000)
+        XCTAssertTrue(fav.markRead(nowMs: 1_750_000_001_000))
         try ctx.save()
         let reopened = AppModelContainer.load(url: url)
         let ctx2 = ModelContext(reopened.container)
@@ -174,6 +187,11 @@ final class AppModelContainerMigrationTests: XCTestCase {
         XCTAssertEqual(archived.first?.archivedAt, archivedAt, "archivedAt persists")
         XCTAssertEqual(archived.first?.archivedUpdatedMs, JesseThread.unixMillis(archivedAt),
                        "the archive LWW-sync clock persists")
+        XCTAssertEqual(archived.first?.lastReplyMs, 1_750_000_000_000, "lastReplyMs persists")
+        XCTAssertEqual(archived.first?.readThroughMs, 1_750_000_000_000, "the read mark persists")
+        XCTAssertEqual(archived.first?.readUpdatedMs, 1_750_000_001_000,
+                       "the read LWW-sync clock persists")
+        XCTAssertEqual(archived.first?.hasUnreadReply, false, "and it is still read")
         XCTAssertEqual(item.orderedAttachments.first?.data, originalBytes,
                        "the ORIGINAL full-resolution bytes round-trip through OutboxAttachment")
     }
@@ -229,6 +247,11 @@ final class AppModelContainerMigrationTests: XCTestCase {
         // reconciler treats as "unset" (equal to an unflagged server session's 0).
         XCTAssertEqual(t.favoriteUpdatedMs, 0, "the added favoriteUpdatedMs column defaults to 0")
         XCTAssertEqual(t.archivedUpdatedMs, 0, "the added archivedUpdatedMs column defaults to 0")
+        // The unread columns are the same kind of addition and open the same way.
+        XCTAssertEqual(t.lastReplyMs, 0, "the added lastReplyMs column defaults to 0")
+        XCTAssertEqual(t.readThroughMs, 0, "the added readThroughMs column defaults to 0")
+        XCTAssertEqual(t.readUpdatedMs, 0, "the added readUpdatedMs column defaults to 0")
+        XCTAssertFalse(t.hasUnreadReply, "a pre-unread row opens READ")
     }
 
     func testFailedOpenIsFlaggedAndLeavesTheOnDiskFileIntact() throws {

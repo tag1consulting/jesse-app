@@ -414,7 +414,8 @@ public struct JesseBridgeClient: BridgeClientProtocol {
     /// count as success, so degrading against an older bridge is a clean no-op. Only a
     /// genuine transport/auth/5xx failure throws, and the caller (`FlagReconciler`) swallows
     /// even that, because the local clock stays newer and the next reconcile re-pushes.
-    public func setFlags(conversationId: String, favorite: FlagWrite?, archived: FlagWrite?) async throws {
+    public func setFlags(conversationId: String, favorite: FlagWrite?, archived: FlagWrite?,
+                         read: ReadWrite?) async throws {
         guard var req = authorized("/jesse/conversation/\(conversationId)/flags", method: "POST") else {
             throw JesseError.notConfigured
         }
@@ -422,7 +423,9 @@ public struct JesseBridgeClient: BridgeClientProtocol {
             favorite: favorite?.value,
             favoriteUpdatedMs: favorite.map { UInt64(max(0, $0.updatedMs)) },
             archived: archived?.value,
-            archivedUpdatedMs: archived.map { UInt64(max(0, $0.updatedMs)) })
+            archivedUpdatedMs: archived.map { UInt64(max(0, $0.updatedMs)) },
+            readThroughMs: read.map { UInt64(max(0, $0.throughMs)) },
+            readUpdatedMs: read.map { UInt64(max(0, $0.updatedMs)) })
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.httpBody = try Self.encodeBody(body)
         let (data, resp) = try await perform(req)
@@ -864,7 +867,8 @@ public struct JesseBridgeClient: BridgeClientProtocol {
             guard let text = obj.response else { throw JesseError.decoding }
             return .done(JesseReply(text: text, sessionId: obj.sessionId,
                                     directives: obj.directives, provenance: obj.provenance,
-                                    artifacts: obj.artifacts ?? []))
+                                    artifacts: obj.artifacts ?? [],
+                                    lastReplyMs: obj.lastReplyMs ?? 0))
         case "failed":
             return .failed(obj.error ?? "Jesse couldn't complete that.")
         case "cancelled":

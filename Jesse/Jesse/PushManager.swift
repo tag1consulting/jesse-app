@@ -204,10 +204,18 @@ final class PushManager {
     func noteSuccessfulTurn() {
         guard configProvider().isConfigured, !hasRequestedAuth else { return }
         hasRequestedAuth = true
-        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { granted, _ in
-            guard granted else { return }
-            Task { @MainActor in UIApplication.shared.registerForRemoteNotifications() }
-        }
+        // `.badge` rides the SAME single prompt the alert and sound do — iOS asks once per
+        // install, for whatever set is requested, so adding it here costs no second prompt
+        // and no second interruption. An install that was already authorized for
+        // alert+sound is not re-prompted either: `requestAuthorization` returns the
+        // existing status without showing anything. What such an install may not have is
+        // the badge PERMISSION, which is why every write checks `badgeSetting` first and
+        // degrades silently (see `RootTabView.applyIconBadge`).
+        UNUserNotificationCenter.current()
+            .requestAuthorization(options: [.alert, .sound, .badge]) { granted, _ in
+                guard granted else { return }
+                Task { @MainActor in UIApplication.shared.registerForRemoteNotifications() }
+            }
     }
 
     /// Called on foreground: if authorization is already granted, re-register for

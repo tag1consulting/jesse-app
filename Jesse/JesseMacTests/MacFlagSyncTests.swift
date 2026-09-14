@@ -16,7 +16,12 @@ final class MacFlagSyncTests: XCTestCase {
     /// two flag-sync methods do real work; the rest are inert stubs the sync path never
     /// calls.
     private final class FakeBridgeClient: BridgeClientProtocol, @unchecked Sendable {
-        struct Call: Equatable { let conversationId: String; let favorite: FlagWrite?; let archived: FlagWrite? }
+        struct Call: Equatable {
+            let conversationId: String
+            let favorite: FlagWrite?
+            let archived: FlagWrite?
+            var read: ReadWrite?
+        }
         private let lock = NSLock()
         private var _calls: [Call] = []
         var calls: [Call] { lock.withLock { _calls } }
@@ -29,8 +34,12 @@ final class MacFlagSyncTests: XCTestCase {
         nonisolated func listConversations(since: UInt64?, etag: String?) async throws -> ConversationsResult {
             scriptedConversations
         }
-        nonisolated func setFlags(conversationId: String, favorite: FlagWrite?, archived: FlagWrite?) async throws {
-            lock.withLock { _calls.append(Call(conversationId: conversationId, favorite: favorite, archived: archived)) }
+        nonisolated func setFlags(conversationId: String, favorite: FlagWrite?, archived: FlagWrite?,
+                                  read: ReadWrite?) async throws {
+            lock.withLock {
+                _calls.append(Call(conversationId: conversationId, favorite: favorite,
+                                   archived: archived, read: read))
+            }
         }
 
         // Inert turn-running / hydrate surface — never exercised by the flag-sync path.

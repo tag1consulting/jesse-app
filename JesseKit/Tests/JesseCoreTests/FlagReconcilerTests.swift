@@ -19,6 +19,7 @@ private final class RecordingFlagClient: FlagSyncing, @unchecked Sendable {
         let conversationId: String
         let favorite: FlagWrite?
         let archived: FlagWrite?
+        let read: ReadWrite?
     }
     private let lock = NSLock()
     private var _calls: [Call] = []
@@ -27,9 +28,11 @@ private final class RecordingFlagClient: FlagSyncing, @unchecked Sendable {
 
     init(shouldThrow: Bool = false) { self.shouldThrow = shouldThrow }
 
-    func setFlags(conversationId: String, favorite: FlagWrite?, archived: FlagWrite?) async throws {
+    func setFlags(conversationId: String, favorite: FlagWrite?, archived: FlagWrite?,
+                  read: ReadWrite?) async throws {
         lock.withLock {
-            _calls.append(Call(conversationId: conversationId, favorite: favorite, archived: archived))
+            _calls.append(Call(conversationId: conversationId, favorite: favorite,
+                               archived: archived, read: read))
         }
         if shouldThrow { throw NSError(domain: "test", code: 1) }
     }
@@ -181,5 +184,81 @@ final class FlagReconcilerTests: XCTestCase {
         XCTAssertTrue(changed)
         XCTAssertTrue(t.isArchived, "the server-newer archived value is still adopted")
         XCTAssertEqual(client.calls.count, 1, "the push was attempted (and its throw swallowed)")
+    }
+
+    // MARK: - The read register
+
+    /// The pure decision, same clock rule as the boolean flags.
+    func testDecideReadFollowsTheSameClockRule() {
+        XCTAssertEqual(
+            FlagReconciler.decideRead(localThroughMs: 10, localMs: 100,
+                                      serverThroughMs: 20, serverMs: 200),
+            .adoptServer(throughMs: 20, updatedMs: 200))
+        XCTAssertEqual(
+            FlagReconciler.decideRead(localThroughMs: 10, localMs: 300,
+                                      serverThroughMs: 20, serverMs: 200),
+            .pushLocal(ReadWrite(throughMs: 10, updatedMs: 300)))
+        XCTAssertEqual(
+            FlagReconciler.decideRead(localThroughMs: 10, localMs: 200,
+                                      serverThroughMs: 20, serverMs: 200),
+            .noChange, "equal clocks never flip, matching the bridge's apply_read")
+    }
+
+    /// THE PROPERTY THE BOOLEAN FLAGS DO NOT HAVE. "Mark as Unread" moves the VALUE
+    /// backwards to 0; only the clock orders the writes. A max-wins rule on the value
+    /// would swallow the unread mark and the dot would never come back on the other device.
+    func testANewerMarkUnreadIsAdoptedEvenThoughItsValueIsLower() async {
+        let t = makeThread(conversationId: "c1")
+        t.noteReply(atUnixMillis: 5_000)
+        t.markRead(nowMs: 100)                       // local: through 5_000 at clock 100
+        let client = RecordingFlagClient()
+        let changed = await FlagReconciler.reconcile(
+            thread: t,
+            serverFavorite: false, serverFavoriteUpdatedMs: 0,
+            serverArchived: false, serverArchivedUpdatedMs: 0,
+            serverReadThroughMs: 0, serverReadUpdatedMs: 200,   // the Mac marked it unread
+            client: client)
+        XCTAssertTrue(changed)
+        XCTAssertEqual(t.readThroughMs, 0, "the newer mark-unread wins despite the lower value")
+        XCTAssertEqual(t.readUpdatedMs, 200, "adopts the server clock exactly")
+        XCTAssertTrue(t.hasUnreadReply, "the dot is back on this device")
+        XCTAssertTrue(client.calls.isEmpty, "adopting pushes nothing")
+    }
+
+    /// A local read mark newer than the server's is pushed, and ONLY it — the favorite and
+    /// archive registers are left out of the body so the server's are untouched.
+    func testALocalNewerReadMarkIsPushedAlone() async {
+        let t = makeThread(conversationId: "c1")
+        t.noteReply(atUnixMillis: 5_000)
+        t.markRead(nowMs: 400)
+        let client = RecordingFlagClient()
+        let changed = await FlagReconciler.reconcile(
+            thread: t,
+            serverFavorite: false, serverFavoriteUpdatedMs: 0,
+            serverArchived: false, serverArchivedUpdatedMs: 0,
+            serverReadThroughMs: 0, serverReadUpdatedMs: 300,
+            client: client)
+        XCTAssertFalse(changed, "local wins → no local mutation")
+        XCTAssertEqual(client.calls.count, 1)
+        XCTAssertEqual(client.calls.first?.read, ReadWrite(throughMs: 5_000, updatedMs: 400))
+        XCTAssertNil(client.calls.first?.favorite, "only the changed register is pushed")
+        XCTAssertNil(client.calls.first?.archived)
+    }
+
+    /// AN OLDER BRIDGE sends neither read field, so both default to 0 — and a thread that
+    /// has never been marked has a 0 clock too, which is a tie and therefore a no-op. The
+    /// new app against the old bridge simply behaves as it did before.
+    func testAnOlderBridgeLeavesTheReadRegisterAlone() async {
+        let t = makeThread(conversationId: "c1")
+        t.noteReply(atUnixMillis: 5_000)
+        let client = RecordingFlagClient()
+        let changed = await FlagReconciler.reconcile(
+            thread: t,
+            serverFavorite: false, serverFavoriteUpdatedMs: 0,
+            serverArchived: false, serverArchivedUpdatedMs: 0,
+            client: client)   // the read arguments default to 0/0
+        XCTAssertFalse(changed)
+        XCTAssertTrue(client.calls.isEmpty, "nothing to push, nothing to adopt")
+        XCTAssertEqual(t.readThroughMs, 0)
     }
 }

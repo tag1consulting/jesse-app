@@ -182,4 +182,40 @@ final class MacSessionSyncTests: XCTestCase {
         XCTAssertEqual(held.sessionId, "sess-new", "the fork moved the current session")
         XCTAssertEqual(held.updatedAt.timeIntervalSince1970, 1_700_000_000, accuracy: 1)
     }
+
+    // MARK: - Unread replies across the sync
+
+    /// A conversation answered on the PHONE shows its dot here from the list pull alone, and
+    /// a read mark made there clears it here — the Mac half of the phone's own sync tests,
+    /// so the two shells cannot drift on which fields the UPDATE branch carries.
+    func testTheListPullCarriesTheReplyStampAndTheReadMark() async throws {
+        let context = try makeContext()
+        let cid = "conv-unread"
+        let held = JesseThread(mode: .ask)
+        held.conversationId = cid
+        context.insert(held); try context.save()
+
+        // A reply landed on the phone: unread here.
+        let replied = FakeBridgeClient(conversations: .conversations(
+            [ConversationSummary(conversationId: cid, sessionId: "sess-1", sessionIds: ["sess-1"],
+                                 lastModified: 1_700_000_000, firstMessage: "hi", title: nil,
+                                 lastReplyMs: 5_000)],
+            deleted: [], etag: "e1"))
+        await makeCoordinator(replied, deletion: scratchDeletionStore())
+            .refreshSessions(context: context)
+        XCTAssertEqual(held.lastReplyMs, 5_000)
+        XCTAssertTrue(held.hasUnreadReply)
+
+        // Then it was read on the phone: the mark converges and the dot clears here.
+        let read = FakeBridgeClient(conversations: .conversations(
+            [ConversationSummary(conversationId: cid, sessionId: "sess-1", sessionIds: ["sess-1"],
+                                 lastModified: 1_700_000_000, firstMessage: "hi", title: nil,
+                                 lastReplyMs: 5_000,
+                                 readThroughMs: 5_000, readUpdatedMs: 900)],
+            deleted: [], etag: "e2"))
+        await makeCoordinator(read, deletion: scratchDeletionStore())
+            .refreshSessions(context: context)
+        XCTAssertEqual(held.readUpdatedMs, 900, "the server's clock, adopted exactly")
+        XCTAssertFalse(held.hasUnreadReply, "read on the phone, read here")
+    }
 }

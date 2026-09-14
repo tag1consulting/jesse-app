@@ -52,6 +52,20 @@ pub struct ConversationRecord {
     /// nothing branches on it, it exists so an operator reading the file can tell.
     #[serde(default)]
     pub origin: Option<String>,
+    /// When this conversation last produced a REPLY, in unix millis on the BRIDGE's
+    /// clock. Stamped at the single point a job's reply is finalized for delivery (the
+    /// same seam the model badge is appended at), and nowhere else — a user's own turn
+    /// never moves it, which is the whole difference between this and `registered_ms` or
+    /// a transcript mtime.
+    ///
+    /// It is the reply half of the unread rule (`last_reply_ms > read_through_ms`, see
+    /// [`crate::SessionFlags`]). ONE clock owns it, deliberately: were each device to
+    /// stamp its own arrival time, skew between phone, Mac and bridge could either hide a
+    /// new reply or revive a read one. `0` for a conversation that has never replied, and
+    /// for every record written before this field existed — which read as "no reply yet",
+    /// and therefore as READ, so the upgrade marks nothing unread.
+    #[serde(default)]
+    pub last_reply_ms: u64,
 }
 
 impl ConversationRecord {
@@ -267,6 +281,8 @@ impl ConversationStore {
                 created_ms: now_ms,
                 registered_ms: now_ms,
                 origin: origin.map(str::to_string),
+                // No reply yet, which reads as READ against a zero `read_through_ms`.
+                last_reply_ms: 0,
             };
             inner.map.insert(conversation_id.to_string(), rec.clone());
             rec
@@ -365,6 +381,41 @@ impl ConversationStore {
         self.inner.lock_ok().map.values().cloned().collect()
     }
 
+    /// Stamp that this conversation just produced a reply, at `now_ms` on the BRIDGE's
+    /// clock. Called from the one seam where a turn's reply is finalized for delivery, so
+    /// "a reply arrived" has exactly one definition and exactly one clock (see
+    /// [`ConversationRecord::last_reply_ms`]).
+    ///
+    /// MONOTONIC: a stamp older than the one already stored is ignored, so a clock that
+    /// steps backwards (NTP, a suspend/resume) cannot make a conversation the user has
+    /// already read go unread again. Returns the resulting `last_reply_ms` — the value the
+    /// reply itself carries to the app — so the caller never has to read it back, and
+    /// persists only on a real change. A conversation with no record (a turn that never
+    /// registered one) is a no-op returning `0`, which the app reads as "no bridge value"
+    /// and falls back on.
+    pub fn note_reply(&self, conversation_id: &str, now_ms: u64) -> u64 {
+        let conversation_id = conversation_id.trim();
+        if conversation_id.is_empty() {
+            return 0;
+        }
+        let (value, changed) = {
+            let mut inner = self.inner.lock_ok();
+            let Some(rec) = inner.map.get_mut(conversation_id) else {
+                return 0;
+            };
+            if now_ms > rec.last_reply_ms {
+                rec.last_reply_ms = now_ms;
+                (now_ms, true)
+            } else {
+                (rec.last_reply_ms, false)
+            }
+        };
+        if changed {
+            self.persist();
+        }
+        value
+    }
+
     /// Adopt a transcript found on disk with no record: mint the DETERMINISTIC v5 id
     /// for that session and bind it. Idempotent: adopting the same stem twice yields
     /// the identical id and one record. Returns the conversation id.
@@ -405,6 +456,10 @@ impl ConversationStore {
                         created_ms: now_ms,
                         registered_ms: now_ms,
                         origin: Some("cli".to_string()),
+                        // An ADOPTED transcript is history, not news: it is stamped
+                        // with no reply time, so adopting a directory full of old
+                        // sessions cannot light up the badge.
+                        last_reply_ms: 0,
                     });
                 if !rec.session_ids.iter().any(|s| s == sid) {
                     rec.session_ids.push(sid.to_string());
@@ -1130,5 +1185,70 @@ mod tests {
             store.migration_done(),
             "the caller marks it, and `AppState` skips the whole pass when it is set"
         );
+    }
+
+    // ---- The reply clock --------------------------------------------------
+
+    #[test]
+    fn note_reply_is_monotonic_and_a_missing_record_is_a_noop() {
+        let store = ConversationStore::new(None);
+        let cid = store.mint(Some("phone"), 1_000).conversation_id;
+        assert_eq!(store.get(&cid).unwrap().last_reply_ms, 0, "no reply yet");
+
+        assert_eq!(
+            store.note_reply(&cid, 5_000),
+            5_000,
+            "the stamp is returned"
+        );
+        assert_eq!(store.get(&cid).unwrap().last_reply_ms, 5_000);
+
+        // A clock that stepped BACKWARDS (NTP, a suspend/resume) must not un-read a
+        // conversation the user has already read: the older stamp is ignored and the
+        // stored value is returned instead.
+        assert_eq!(store.note_reply(&cid, 4_000), 5_000, "older stamp ignored");
+        assert_eq!(store.get(&cid).unwrap().last_reply_ms, 5_000);
+
+        // Forward still moves.
+        assert_eq!(store.note_reply(&cid, 6_000), 6_000);
+
+        // A turn with no registered conversation stamps nothing and reports 0, which the
+        // app reads as "no bridge value".
+        assert_eq!(
+            store.note_reply("00000000-0000-0000-0000-000000000000", 9),
+            0
+        );
+        assert_eq!(store.note_reply("", 9), 0);
+    }
+
+    #[test]
+    fn a_conversations_file_without_last_reply_ms_loads_with_it_defaulted() {
+        // THE UPGRADE MARKS NOTHING UNREAD: every record written before this field
+        // existed loads with `last_reply_ms == 0`, which against a zero read mark is READ.
+        let path = temp_conversations_path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let cid = "11111111-2222-3333-4444-555555555555";
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"v":1,"conversations":{{"{cid}":{{"conversation_id":"{cid}",
+                   "session_ids":["sess-a"],"created_ms":7,"registered_ms":7,
+                   "origin":"phone"}}}}}}"#
+            ),
+        )
+        .unwrap();
+        let store = ConversationStore::new(Some(path.clone()));
+        let rec = store.get(cid).expect("a pre-field record still loads");
+        assert_eq!(
+            rec.session_ids,
+            vec!["sess-a".to_string()],
+            "the record is intact"
+        );
+        assert_eq!(rec.registered_ms, 7);
+        assert_eq!(rec.last_reply_ms, 0, "the added field defaults to 0");
+        // And it is usable: a reply stamps it and survives a reload.
+        store.note_reply(cid, 8_000);
+        let reloaded = ConversationStore::new(Some(path.clone()));
+        assert_eq!(reloaded.get(cid).unwrap().last_reply_ms, 8_000);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }

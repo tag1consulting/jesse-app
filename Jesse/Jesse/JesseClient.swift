@@ -524,8 +524,10 @@ struct JesseClient: JesseClientProtocol {
         -> (turns: [HydratedTurn], nextCursor: String) {
         try await bridge.hydrate(conversationId: conversationId, after: cursor)
     }
-    func setFlags(conversationId: String, favorite: FlagWrite?, archived: FlagWrite?) async throws {
-        try await bridge.setFlags(conversationId: conversationId, favorite: favorite, archived: archived)
+    func setFlags(conversationId: String, favorite: FlagWrite?, archived: FlagWrite?,
+                  read: ReadWrite?) async throws {
+        try await bridge.setFlags(conversationId: conversationId, favorite: favorite,
+                                  archived: archived, read: read)
     }
 
     func registerDevice(token: String) async throws {

@@ -111,7 +111,8 @@ final class MacFakeBridgeClient: BridgeClientProtocol, @unchecked Sendable {
     nonisolated func listConversations(since: UInt64?, etag: String?) async throws -> ConversationsResult {
         lock.withLock { conversations }
     }
-    nonisolated func setFlags(conversationId: String, favorite: FlagWrite?, archived: FlagWrite?) async throws {}
+    nonisolated func setFlags(conversationId: String, favorite: FlagWrite?, archived: FlagWrite?,
+                              read: ReadWrite?) async throws {}
     nonisolated func deleteConversation(_ conversationId: String) async throws {
         lock.withLock { _deleted.append(conversationId) }
     }

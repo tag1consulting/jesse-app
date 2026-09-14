@@ -1934,7 +1934,10 @@ pub async fn push_schedule_outcome(
         prefetch,
         reply,
     );
-    match apns.push_payload(&token, payload).await {
+    // Every push the bridge sends to the phone carries the unread count, so a scheduled
+    // run's alert leaves the icon showing the same number the Chats tab does.
+    let badge = Some(unread_conversation_count(&st.conversations, &st.flags));
+    match apns.push_payload(&token, payload, badge).await {
         PushOutcome::Sent => eprintln!(
             "jesse-bridge: schedule PUSH id={schedule_id} outcome={} sent",
             outcome.label()
@@ -1993,7 +1996,9 @@ async fn push_alert(st: &AppState, schedule_id: &str, payload: Vec<u8>, what: &s
         );
         return;
     };
-    match apns.push_payload(&token, payload).await {
+    // Same rule as the outcome push: every push to the phone restates the unread count.
+    let badge = Some(unread_conversation_count(&st.conversations, &st.flags));
+    match apns.push_payload(&token, payload, badge).await {
         PushOutcome::Sent => {
             eprintln!("jesse-bridge: schedule PUSH id={schedule_id} {what} sent")
         }

@@ -1,13 +1,13 @@
 import Foundation
 
-// Cross-device convergence for a thread's favorite / archived flags. The local
+// Cross-device convergence for a thread's favorite / archived / read flags. The local
 // SwiftData store stays the render source (cache-first, offline-tolerant); the bridge
 // is the sync source. The two are reconciled per flag by last-writer-wins on a
-// never-cleared unix-millis clock (`favoriteUpdatedMs` / `archivedUpdatedMs`), the
-// exact rule the bridge's flagstore applies server-side (strictly-newer wins, a tie is
-// a no-op). This file is view-free and unit-testable without a view host or a server:
-// the pure `decide` is a value-in / value-out function, and `reconcile` drives a real
-// `JesseThread` plus a fake `FlagSyncing` client.
+// never-cleared unix-millis clock (`favoriteUpdatedMs` / `archivedUpdatedMs` /
+// `readUpdatedMs`), the exact rule the bridge's flagstore applies server-side
+// (strictly-newer wins, a tie is a no-op). This file is view-free and unit-testable
+// without a view host or a server: the pure `decide` is a value-in / value-out function,
+// and `reconcile` drives a real `JesseThread` plus a fake `FlagSyncing` client.
 
 /// One flag's value plus its unix-millis change clock, the payload pushed to the bridge
 /// when the local change is the newer writer.
@@ -20,6 +20,22 @@ public nonisolated struct FlagWrite: Sendable, Equatable {
     public let updatedMs: Int
     public init(value: Bool, updatedMs: Int) {
         self.value = value
+        self.updatedMs = updatedMs
+    }
+}
+
+/// The READ register's payload: how far the conversation has been read (a `lastReplyMs`
+/// value, or 0 for "Mark as Unread") plus the unix-millis clock of that change.
+///
+/// A separate type from `FlagWrite` because the value is a timestamp, not a boolean — and
+/// deliberately NOT collapsed into "the newer value wins", because the value moves
+/// BACKWARDS when a conversation is marked unread. The clock orders the writes; the value
+/// is free to go either way. Mirrors the bridge's `apply_read`.
+public nonisolated struct ReadWrite: Sendable, Equatable {
+    public let throughMs: Int
+    public let updatedMs: Int
+    public init(throughMs: Int, updatedMs: Int) {
+        self.throughMs = throughMs
         self.updatedMs = updatedMs
     }
 }
@@ -37,11 +53,13 @@ public protocol FlagSyncing: Sendable {
     // `nonisolated`: the witness is the nonisolated networking client (and test fakes),
     // called from the MainActor reconciler across an await. Marking it here keeps the
     // requirement isolation-agnostic so any Sendable conformer satisfies it.
-    nonisolated func setFlags(conversationId: String, favorite: FlagWrite?, archived: FlagWrite?) async throws
+    nonisolated func setFlags(conversationId: String, favorite: FlagWrite?, archived: FlagWrite?,
+                              read: ReadWrite?) async throws
 }
 
 public extension FlagSyncing {
-    nonisolated func setFlags(conversationId: String, favorite: FlagWrite?, archived: FlagWrite?) async throws {}
+    nonisolated func setFlags(conversationId: String, favorite: FlagWrite?, archived: FlagWrite?,
+                              read: ReadWrite?) async throws {}
 }
 
 /// The per-flag last-writer-wins outcome.
@@ -52,6 +70,14 @@ public nonisolated enum FlagDecision: Equatable, Sendable {
     case adoptServer(value: Bool, updatedMs: Int)
     /// The local clock is strictly newer: push this value + clock up.
     case pushLocal(FlagWrite)
+}
+
+/// The READ register's last-writer-wins outcome. Same three cases as `FlagDecision`,
+/// carrying a timestamp value instead of a boolean.
+public nonisolated enum ReadDecision: Equatable, Sendable {
+    case noChange
+    case adoptServer(throughMs: Int, updatedMs: Int)
+    case pushLocal(ReadWrite)
 }
 
 /// The cross-device flag reconciler. Pure decision + a thin async apply/push.
@@ -68,7 +94,22 @@ public enum FlagReconciler {
         return .noChange
     }
 
-    /// Reconcile one thread's favorite + archived flags against the server summary,
+    /// Pure last-writer-wins for the READ register. Identical clock rule to `decide`; the
+    /// value it carries is a `lastReplyMs` timestamp rather than a boolean, so a
+    /// mark-unread (which moves the value DOWN to 0) is carried correctly instead of being
+    /// swallowed by a max comparison.
+    public nonisolated static func decideRead(localThroughMs: Int, localMs: Int,
+                                              serverThroughMs: Int, serverMs: Int) -> ReadDecision {
+        if serverMs > localMs {
+            return .adoptServer(throughMs: serverThroughMs, updatedMs: serverMs)
+        }
+        if localMs > serverMs {
+            return .pushLocal(ReadWrite(throughMs: localThroughMs, updatedMs: localMs))
+        }
+        return .noChange
+    }
+
+    /// Reconcile one thread's favorite + archived + read flags against the server summary,
     /// last-writer-wins per flag. Adopts a strictly-newer server value into the local
     /// thread (the caller saves the context), pushes a strictly-newer local value up via
     /// `client`, and leaves a tie alone. Returns whether the local thread was mutated so
@@ -90,6 +131,7 @@ public enum FlagReconciler {
     public static func reconcile(thread: JesseThread,
                                  serverFavorite: Bool, serverFavoriteUpdatedMs: Int,
                                  serverArchived: Bool, serverArchivedUpdatedMs: Int,
+                                 serverReadThroughMs: Int = 0, serverReadUpdatedMs: Int = 0,
                                  client: any FlagSyncing) async -> Bool {
         guard let cid = thread.conversationId, !cid.isEmpty else { return false }
 
@@ -97,10 +139,13 @@ public enum FlagReconciler {
                               serverValue: serverFavorite, serverMs: serverFavoriteUpdatedMs)
         let archived = decide(localValue: thread.isArchived, localMs: thread.archivedUpdatedMs,
                               serverValue: serverArchived, serverMs: serverArchivedUpdatedMs)
+        let read = decideRead(localThroughMs: thread.readThroughMs, localMs: thread.readUpdatedMs,
+                              serverThroughMs: serverReadThroughMs, serverMs: serverReadUpdatedMs)
 
         var localChanged = false
         var favoritePush: FlagWrite?
         var archivedPush: FlagWrite?
+        var readPush: ReadWrite?
 
         switch favorite {
         case let .adoptServer(value, ms):
@@ -121,8 +166,19 @@ public enum FlagReconciler {
             break
         }
 
-        if favoritePush != nil || archivedPush != nil {
-            try? await client.setFlags(conversationId: cid, favorite: favoritePush, archived: archivedPush)
+        switch read {
+        case let .adoptServer(throughMs, ms):
+            thread.applyReadFromSync(throughMs, updatedMs: ms)
+            localChanged = true
+        case let .pushLocal(write):
+            readPush = write
+        case .noChange:
+            break
+        }
+
+        if favoritePush != nil || archivedPush != nil || readPush != nil {
+            try? await client.setFlags(conversationId: cid, favorite: favoritePush,
+                                       archived: archivedPush, read: readPush)
         }
         return localChanged
     }

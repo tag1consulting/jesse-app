@@ -37,6 +37,63 @@ public enum ThreadOrigin: String {
     case watch
 }
 
+/// THE UNREAD RULE, in one place: a conversation holds a reply nobody has seen when its
+/// last reply is strictly newer than how far it has been read.
+///
+/// Both timestamps are unix millis on the BRIDGE's clock (see `JesseThread.lastReplyMs`),
+/// so this is a comparison of two values from one clock, never of a device time against a
+/// server time. It is the same rule the bridge's `has_unread_reply` applies when counting
+/// the app-icon badge — the number on the icon and the dots in the list are one claim, and
+/// two copies of a comparison is how they would come to disagree.
+///
+/// Zero-against-zero (no reply yet, and every row written before these fields existed) is
+/// READ, which is why the upgrade marks nothing unread.
+///
+/// `nonisolated` and free-standing so the pure rule is unit-testable with two integers,
+/// without a store or a model.
+public nonisolated func jesseHasUnreadReply(lastReplyMs: Int, readThroughMs: Int) -> Bool {
+    lastReplyMs > readThroughMs
+}
+
+/// How many of these conversations hold a reply nobody has seen — the number on the Chats
+/// tab, the app icon and the Dock tile.
+///
+/// ARCHIVED CONVERSATIONS ARE EXCLUDED, matching the bridge's own count: an archived thread
+/// keeps its dot inside the Archived view, but archiving is the gesture for "stop showing
+/// me this", so it must not put a number on the home screen. Deleted threads are simply not
+/// in the array.
+///
+/// It reads only the three defaulted Int columns and `isArchived`, and NEVER a thread's
+/// `turns`. That is load-bearing rather than incidental: this is recomputed whenever any
+/// thread row changes, and faulting every conversation's turns to paint a badge would pull
+/// the whole history into memory on launch.
+///
+/// One function for three badges (and the same rule the bridge counts by), so the number on
+/// the icon can never disagree with the dots in the list behind it.
+public func jesseUnreadCount(_ threads: [JesseThread]) -> Int {
+    threads.reduce(0) { $0 + (!$1.isArchived && $1.hasUnreadReply ? 1 : 0) }
+}
+
+/// THE GATE on marking a conversation read: only a transcript ACTUALLY ON SCREEN counts.
+///
+/// Both conditions are needed and neither is sufficient:
+///
+///  * `isVisible` — this conversation's transcript is the one being shown (top of the
+///    iPhone's stack or the split view's detail column; the selected conversation in a key
+///    window on the Mac). A conversation merely open in another tab is not being read.
+///  * `isActive` — the app itself is frontmost. A reply that lands while the phone is in a
+///    pocket, with this thread still nominally "on screen" under a lock screen, has not
+///    been seen by anyone, and marking it read there is exactly how a reply gets missed.
+///
+/// Siri, the watch relay and the share sheet reach none of this, which is the point: they
+/// deliver into a conversation nobody is looking at.
+///
+/// Pure, so the rule is unit-tested against two booleans without standing up a view host —
+/// the same shape as `shouldShowOfflineBanner`.
+public nonisolated func jesseShouldMarkRead(isVisible: Bool, isActive: Bool) -> Bool {
+    isVisible && isActive
+}
+
 /// Non-observed memo backing `JesseThread.orderedTurns`. A plain reference type so
 /// the (read-only-looking) getter can cache the sorted array without writing any
 /// *observed* property of the model: the model holds this box in a `@Transient`
@@ -172,6 +229,40 @@ public final class JesseThread {
     // unarchive's timestamp survives to beat a stale server `archived:true`. Additive
     // defaulted property → lightweight migration; a pre-sync row reads 0.
     public var archivedUpdatedMs: Int = 0
+
+    // ── UNREAD REPLIES: two timestamps and one comparison ───────────────────────────
+    //
+    // `updatedAt` above cannot answer "has a reply arrived that I have not seen": it is
+    // bumped on EVERY turn, the user's own included, so a thread the user has just posted
+    // to looks exactly like one Jesse has just answered. These two fields separate the
+    // question, and a thread is unread when `lastReplyMs > readThroughMs`.
+    //
+    // When this conversation last REPLIED, in unix millis ON THE BRIDGE'S CLOCK. It comes
+    // off the wire (`last_reply_ms`, stamped where the bridge finalizes a reply) and is
+    // stored verbatim; the device clock is used only as a fallback against a bridge too
+    // old to send it.
+    //
+    // ONE CLOCK, deliberately. Were the phone to stamp its own arrival time here while the
+    // Mac stamped its own, a device running a minute fast could mark a reply read "in the
+    // future" and hide the next one, or mark it read in the past and revive one already
+    // read. Both sides of the comparison come off the same clock instead.
+    //
+    // Additive defaulted property → SwiftData lightweight-migrates existing stores with no
+    // migration code (matching `favoriteUpdatedMs`/`archivedUpdatedMs`). A pre-upgrade row
+    // reads 0, which against a `readThroughMs` of 0 is READ — so the upgrade marks nothing
+    // unread, and nobody opens the app to a screen full of dots.
+    public var lastReplyMs: Int = 0
+    // How far this conversation has been read: the `lastReplyMs` value that was current
+    // when a device last had the transcript actually on screen. NEVER the device's "now" —
+    // `markRead` copies `lastReplyMs` across, for the reason above.
+    public var readThroughMs: Int = 0
+    // The never-cleared last-writer-wins clock for `readThroughMs`, the device's change
+    // time, exactly like `favoriteUpdatedMs`. It is separate from the value because the
+    // VALUE moves backwards on "Mark as Unread", so the value cannot also be the clock:
+    // a max-wins rule would silently discard the unread mark. Reconciled by
+    // `FlagReconciler` alongside favorite and archived (bridge's `read_through_ms` /
+    // `read_updated_ms` registers).
+    public var readUpdatedMs: Int = 0
 
     // The Health tab's "Ask about this" scope this conversation was opened for — a
     // stable key over (area, scope, time range, subject), e.g.
@@ -346,6 +437,73 @@ public final class JesseThread {
         isArchived = value
         archivedAt = value ? Self.date(fromUnixMillis: updatedMs) : nil
         archivedUpdatedMs = updatedMs
+    }
+
+    // MARK: - Unread replies
+
+    /// Whether this conversation holds a reply nobody has seen. The one definition, shared
+    /// with the bridge's badge count (`has_unread_reply`), so the number on the app icon
+    /// and the dots in the list can never disagree.
+    public var hasUnreadReply: Bool {
+        jesseHasUnreadReply(lastReplyMs: lastReplyMs, readThroughMs: readThroughMs)
+    }
+
+    /// Note that a reply landed at `ms` on the BRIDGE's clock, never moving the stamp
+    /// backwards. Returns whether it changed.
+    ///
+    /// Every write point funnels through this — the live turn writer, the Mac's reply
+    /// append, hydration's insert of a `jesse` turn, and the conversation sync — so the
+    /// "max, never backwards" rule has one home. Without it a hydrate of older history, or
+    /// a sync carrying a list built before the newest reply, could pull the stamp back and
+    /// make an unread thread look read.
+    @discardableResult
+    public func noteReply(atUnixMillis ms: Int) -> Bool {
+        guard ms > lastReplyMs else { return false }
+        lastReplyMs = ms
+        return true
+    }
+
+    /// Mark this conversation read: copy `lastReplyMs` into `readThroughMs`, stamping the
+    /// last-writer-wins clock with `nowMs`. Returns whether anything changed.
+    ///
+    /// It copies the REPLY time and never `nowMs`, which is the whole point of rule 2: both
+    /// sides of the unread comparison then come off the bridge's clock, and skew between
+    /// this device and the bridge can neither hide a newer reply nor revive a read one.
+    ///
+    /// A NO-OP WHEN ALREADY READ — no value written, no clock moved, `false` returned — so
+    /// opening a thread that is already read costs nothing: no save, and no flag push.
+    /// That matters because this is called on appear, on every foreground, and on every
+    /// reply.
+    @discardableResult
+    public func markRead(nowMs: Int) -> Bool {
+        guard readThroughMs != lastReplyMs else { return false }
+        readThroughMs = lastReplyMs
+        readUpdatedMs = nowMs
+        return true
+    }
+
+    /// Mark this conversation unread: reset `readThroughMs` to 0, so any reply at all
+    /// reads as unseen. Returns whether anything changed (a no-op when already 0), and
+    /// stamps `readUpdatedMs` only then.
+    ///
+    /// Zero rather than "one millisecond before the last reply" because the user's
+    /// statement is about the conversation, not about one message in it: they want the dot
+    /// back, and every reply behind it is fair game to re-read.
+    @discardableResult
+    public func markUnread(nowMs: Int) -> Bool {
+        guard readThroughMs != 0 else { return false }
+        readThroughMs = 0
+        readUpdatedMs = nowMs
+        return true
+    }
+
+    /// Adopt a read mark that WON last-writer-wins against the local one, carrying the
+    /// SERVER's change clock (not `now`) so the local clock matches the server exactly and
+    /// the next reconcile is a no-op. Mirrors `applyFavoriteFromSync`; called only by
+    /// `FlagReconciler`.
+    public func applyReadFromSync(_ value: Int, updatedMs: Int) {
+        readThroughMs = value
+        readUpdatedMs = updatedMs
     }
 
     /// Unix milliseconds of a date, the unit the bridge's LWW flag clocks use. Rounded

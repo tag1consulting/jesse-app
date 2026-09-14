@@ -410,6 +410,15 @@ struct ThreadListView: View {
                           systemImage: thread.isArchived ? "tray.and.arrow.up" : "archivebox")
                 }
                 .tint(.indigo)
+                // DECLARED LAST, deliberately. A FULL swipe fires the FIRST leading
+                // action, and that has been Favorite since this list existed — putting
+                // read/unread ahead of it would silently retrain a gesture people use
+                // every day. Adding it at the end leaves the full swipe exactly as it was.
+                Button { toggleRead(thread) } label: {
+                    Label(thread.hasUnreadReply ? "Mark as Read" : "Mark as Unread",
+                          systemImage: thread.hasUnreadReply ? "envelope.open" : "envelope.badge")
+                }
+                .tint(.blue)
             }
             .contextMenu {
                 Button { toggleFavorite(thread) } label: {
@@ -419,6 +428,10 @@ struct ThreadListView: View {
                 Button { toggleArchived(thread) } label: {
                     Label(thread.isArchived ? "Unarchive" : "Archive",
                           systemImage: thread.isArchived ? "tray.and.arrow.up" : "archivebox")
+                }
+                Button { toggleRead(thread) } label: {
+                    Label(thread.hasUnreadReply ? "Mark as Read" : "Mark as Unread",
+                          systemImage: thread.hasUnreadReply ? "envelope.open" : "envelope.badge")
                 }
             }
         }
@@ -468,6 +481,26 @@ struct ThreadListView: View {
             Log.run.error("archive toggle save failed: \(error.localizedDescription)")
         }
         coordinator.pushArchivedChange(for: thread)
+    }
+
+    /// Flip this conversation's read state by hand: an unread one is marked read, a read
+    /// one is marked unread (`readThroughMs` back to 0, so any reply at all shows a dot
+    /// again). Local-first, then best-effort mirrored so the Mac converges.
+    ///
+    /// This is the ONE place a conversation is read without being on screen, and that is
+    /// the point: it is an explicit instruction, not an inference from where the user is
+    /// looking.
+    private func toggleRead(_ thread: JesseThread) {
+        let nowMs = JesseThread.unixMillis(.now)
+        let changed = thread.hasUnreadReply ? thread.markRead(nowMs: nowMs)
+                                            : thread.markUnread(nowMs: nowMs)
+        guard changed else { return }
+        do {
+            try context.save()
+        } catch {
+            Log.run.error("read toggle save failed: \(error.localizedDescription)")
+        }
+        coordinator.pushReadChange(for: thread)
     }
 
     /// Fire the morning routine and OPEN the conversation it runs in.
@@ -633,8 +666,35 @@ struct ThreadRow: View {
         searchSnippet(for: thread, queries: searchQueries)
     }
 
+    /// The width the unread dot's slot always occupies, whether or not a dot is in it.
+    /// A fixed slot rather than a conditional view, so titles line up down the list
+    /// instead of shifting sideways as threads are read.
+    static let unreadSlotWidth: CGFloat = 12
+    /// The dot's diameter. Small enough to read as punctuation next to the title rather
+    /// than as a control.
+    static let unreadDotSize: CGFloat = 8
+
     var body: some View {
         HStack(spacing: 10) {
+            // NEVER COLOUR ALONE. The dot says "unread" in the accent colour, and the
+            // title goes semibold to say the same thing again in weight — so the row is
+            // still legible to someone who cannot separate the accent from the background,
+            // and the accessibility label below says it a third time in words.
+            ZStack {
+                if thread.hasUnreadReply {
+                    Circle()
+                        .fill(Color.accentColor)
+                        .frame(width: Self.unreadDotSize, height: Self.unreadDotSize)
+                }
+            }
+            .frame(width: Self.unreadSlotWidth)
+            // Said a third time, in words. It is the row's LEADING element, so VoiceOver
+            // announces "Unread reply" before the title and the timestamp and a swipe
+            // through the list surfaces the unread ones without waiting each row out.
+            // Labelling this slot rather than combining the whole row keeps the star, the
+            // relative date and the undelivered badge as their own announcements.
+            .accessibilityHidden(!thread.hasUnreadReply)
+            .accessibilityLabel("Unread reply")
             VStack(alignment: .leading, spacing: 3) {
                 HStack(spacing: 5) {
                     if thread.isFavorite {
@@ -644,6 +704,7 @@ struct ThreadRow: View {
                             .accessibilityLabel("Favorite")
                     }
                     Text(displayTitle(for: thread))
+                        .fontWeight(thread.hasUnreadReply ? .semibold : .regular)
                         .lineLimit(1)
                 }
                 if let snippet {

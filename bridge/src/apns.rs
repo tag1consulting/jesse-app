@@ -307,19 +307,33 @@ impl ApnsClient {
         conversation_id: Option<&str>,
         artifacts: &[Artifact],
         summary: PushSummary<'_>,
+        badge: Option<u64>,
     ) -> PushOutcome {
         self.push_payload(
             device_token,
             build_apns_payload(job_id, conversation_id, artifacts, summary),
+            badge,
         )
         .await
     }
 
-    /// Send an already-built payload. The seam [`push`](Self::push) is written in terms
-    /// of, so the scheduler's alert — which must NAME the job and its outcome, and may
-    /// have no turn to deep-link to at all (a skipped run) — travels the identical
-    /// client, JWT cache, topic and status interpretation rather than a second push path.
-    pub async fn push_payload(&self, device_token: &str, payload: Vec<u8>) -> PushOutcome {
+    /// Send an already-built payload, stamped with the app-icon badge count. The seam
+    /// [`push`](Self::push) is written in terms of, so the scheduler's alert — which must
+    /// NAME the job and its outcome, and may have no turn to deep-link to at all (a
+    /// skipped run) — travels the identical client, JWT cache, topic and status
+    /// interpretation rather than a second push path.
+    ///
+    /// THE BADGE IS STAMPED HERE, at the one point every push goes through, rather than
+    /// in each of the four payload builders. A push that forgot it would leave the home
+    /// screen showing a number from some earlier push forever, and there is no way to
+    /// forget it from here. See [`with_badge`].
+    pub async fn push_payload(
+        &self,
+        device_token: &str,
+        payload: Vec<u8>,
+        badge: Option<u64>,
+    ) -> PushOutcome {
+        let payload = with_badge(payload, badge);
         let jwt = match self.jwt() {
             Ok(j) => j,
             Err(e) => return PushOutcome::Failed(format!("apns jwt: {e}")),
@@ -447,6 +461,32 @@ pub fn build_apns_payload(
         payload["conversation_id"] = json!(cid);
     }
     payload.to_string().into_bytes()
+}
+
+/// Stamp `aps.badge` into an already-built APNs payload — the number iOS paints on the
+/// app icon, which is how many conversations hold a reply nobody has seen.
+///
+/// `aps.badge` is absolute, not a delta: every push restates the whole count, so a push
+/// the phone missed cannot leave the icon permanently wrong. `0` clears the badge, which
+/// is exactly what should happen when the last unread conversation is read on the Mac.
+///
+/// `None` means "this sender cannot know the count" — the sentinel watchdog is a separate
+/// process with no conversation registry to count — and leaves the icon's current badge
+/// alone rather than wrongly clearing it to zero.
+///
+/// Best-effort in the same spirit as the rest of push: a payload that somehow does not
+/// parse is sent UNCHANGED rather than dropped — a notification without a badge beats no
+/// notification.
+pub fn with_badge(payload: Vec<u8>, badge: Option<u64>) -> Vec<u8> {
+    let Some(badge) = badge else { return payload };
+    let Ok(mut value) = serde_json::from_slice::<Value>(&payload) else {
+        return payload;
+    };
+    if !value.get("aps").map(Value::is_object).unwrap_or(false) {
+        return payload;
+    }
+    value["aps"]["badge"] = json!(badge);
+    value.to_string().into_bytes()
 }
 
 /// What a completion push has to say about the turn it is reporting on: the reply the
@@ -795,6 +835,8 @@ pub async fn notify_if_complete(
     notify: &NotifyFlags,
     jobs: &JobStore,
     job_id: &str,
+    conversations: &ConversationStore,
+    flags: &FlagStore,
 ) {
     let Some(apns) = apns else { return };
     // WHAT THE TURN SAID, and the files it returned. Both read from the same terminal
@@ -830,6 +872,10 @@ pub async fn notify_if_complete(
         eprintln!("push: job {job_id} flagged but no device registered — skipping");
         return;
     };
+    // Counted HERE rather than passed in, and counted AFTER the reply landed in the
+    // store, so the number on the icon describes the state the user is being told about
+    // — including this very reply.
+    let badge = Some(unread_conversation_count(conversations, flags));
     match apns
         .push(
             &token,
@@ -837,6 +883,7 @@ pub async fn notify_if_complete(
             conversation_id.as_deref(),
             &artifacts,
             summary,
+            badge,
         )
         .await
     {
@@ -1385,6 +1432,52 @@ mod tests {
         }
     }
 
+    /// THE APP-ICON BADGE, stamped at the one point every push goes through, so no push
+    /// path can forget it and leave the icon showing an old number forever.
+    #[test]
+    fn the_badge_is_stamped_into_every_kind_of_payload() {
+        let payloads = [
+            build_apns_payload("j", None, &[], PushSummary::Reply("done")),
+            build_apns_payload("j", None, &[], PushSummary::Failure("boom")),
+            build_scheduled_payload("nightly", "ok", "", Some("j"), None, false, None),
+            build_escalation_payload("nightly", 3, "timed out"),
+            build_reload_failure_payload("bad toml"),
+        ];
+        for payload in payloads {
+            let v: Value = serde_json::from_slice(&with_badge(payload.clone(), Some(3))).unwrap();
+            assert_eq!(v["aps"]["badge"], 3, "aps.badge must be inside aps: {v}");
+            // Everything else about the payload is untouched.
+            assert_eq!(v["aps"]["content-available"], 1);
+            assert!(v["aps"]["alert"]["body"].is_string());
+
+            // ZERO IS A REAL VALUE: it CLEARS the icon, which is what has to happen when
+            // the last unread conversation is read on the other device.
+            let zeroed: Value =
+                serde_json::from_slice(&with_badge(payload.clone(), Some(0))).unwrap();
+            assert_eq!(zeroed["aps"]["badge"], 0);
+
+            // `None` (the sentinel, which cannot know the count) leaves the icon alone:
+            // no key at all, and the bytes are handed back untouched.
+            let untouched = with_badge(payload.clone(), None);
+            assert_eq!(
+                untouched, payload,
+                "a None badge sends the payload verbatim"
+            );
+            let v: Value = serde_json::from_slice(&untouched).unwrap();
+            assert!(v["aps"]["badge"].is_null(), "no badge key: {v}");
+        }
+    }
+
+    /// Never drop a notification over a badge. A payload that somehow does not parse (or
+    /// carries no `aps`) is sent exactly as built rather than swallowed.
+    #[test]
+    fn an_unparseable_payload_is_sent_verbatim_rather_than_dropped() {
+        let garbage = b"not json at all {".to_vec();
+        assert_eq!(with_badge(garbage.clone(), Some(2)), garbage);
+        let no_aps = br#"{"job_id":"j"}"#.to_vec();
+        assert_eq!(with_badge(no_aps.clone(), Some(2)), no_aps);
+    }
+
     /// The prefetch hint: present, top-level, and exactly the two documents — only for a
     /// job the operator listed.
     #[test]
@@ -1543,6 +1636,7 @@ mod tests {
             directives: None,
             provenance: None,
             artifacts: Vec::new(),
+            last_reply_ms: 0,
         }));
         assert!(job_state_is_pushable(&JobState::Failed {
             error: "x".into(),
@@ -1565,7 +1659,16 @@ mod tests {
         );
         st.notify.insert(&id);
 
-        notify_if_complete(st.apns.as_deref(), &st.devices, &st.notify, &st.jobs, &id).await;
+        notify_if_complete(
+            st.apns.as_deref(),
+            &st.devices,
+            &st.notify,
+            &st.jobs,
+            &id,
+            &st.conversations,
+            &st.flags,
+        )
+        .await;
 
         let calls = mock.calls.lock_ok();
         assert_eq!(calls.len(), 1, "a flagged, completed turn pushes once");
@@ -1606,7 +1709,16 @@ mod tests {
             .complete(&id, Ok(("the answer".to_string(), None, None)));
         st.notify.insert(&id);
 
-        notify_if_complete(st.apns.as_deref(), &st.devices, &st.notify, &st.jobs, &id).await;
+        notify_if_complete(
+            st.apns.as_deref(),
+            &st.devices,
+            &st.notify,
+            &st.jobs,
+            &id,
+            &st.conversations,
+            &st.flags,
+        )
+        .await;
 
         {
             let calls = mock.calls.lock_ok();
@@ -1620,7 +1732,16 @@ mod tests {
         st.jobs
             .complete(&bare, Ok(("no conversation".to_string(), None, None)));
         st.notify.insert(&bare);
-        notify_if_complete(st.apns.as_deref(), &st.devices, &st.notify, &st.jobs, &bare).await;
+        notify_if_complete(
+            st.apns.as_deref(),
+            &st.devices,
+            &st.notify,
+            &st.jobs,
+            &bare,
+            &st.conversations,
+            &st.flags,
+        )
+        .await;
         let calls = mock.calls.lock_ok();
         let v: Value = serde_json::from_slice(&calls[1].payload).unwrap();
         assert!(v.get("conversation_id").is_none());
@@ -1645,7 +1766,16 @@ mod tests {
         );
         st.notify.insert(&id);
 
-        notify_if_complete(st.apns.as_deref(), &st.devices, &st.notify, &st.jobs, &id).await;
+        notify_if_complete(
+            st.apns.as_deref(),
+            &st.devices,
+            &st.notify,
+            &st.jobs,
+            &id,
+            &st.conversations,
+            &st.flags,
+        )
+        .await;
 
         let calls = mock.calls.lock_ok();
         assert_eq!(calls.len(), 1);
@@ -1666,7 +1796,16 @@ mod tests {
             .complete(&id, Ok(("the answer".to_string(), None, None)));
         // No notify.insert — the turn finished in the foreground.
 
-        notify_if_complete(st.apns.as_deref(), &st.devices, &st.notify, &st.jobs, &id).await;
+        notify_if_complete(
+            st.apns.as_deref(),
+            &st.devices,
+            &st.notify,
+            &st.jobs,
+            &id,
+            &st.conversations,
+            &st.flags,
+        )
+        .await;
         assert_eq!(mock.calls.lock_ok().len(), 0, "unflagged turn never pushes");
     }
     #[tokio::test]
@@ -1678,7 +1817,16 @@ mod tests {
         let id = st.jobs.create();
         st.jobs.complete(&id, Ok(("a".to_string(), None, None)));
         st.notify.insert(&id);
-        notify_if_complete(st.apns.as_deref(), &st.devices, &st.notify, &st.jobs, &id).await;
+        notify_if_complete(
+            st.apns.as_deref(),
+            &st.devices,
+            &st.notify,
+            &st.jobs,
+            &id,
+            &st.conversations,
+            &st.flags,
+        )
+        .await;
         assert_eq!(mock.calls.lock_ok().len(), 0, "no token → no push");
     }
     #[tokio::test]
@@ -1691,7 +1839,16 @@ mod tests {
         st.jobs.stream_register(&id);
         assert!(matches!(st.jobs.cancel(&id), CancelOutcome::Cancelled));
         st.notify.insert(&id);
-        notify_if_complete(st.apns.as_deref(), &st.devices, &st.notify, &st.jobs, &id).await;
+        notify_if_complete(
+            st.apns.as_deref(),
+            &st.devices,
+            &st.notify,
+            &st.jobs,
+            &id,
+            &st.conversations,
+            &st.flags,
+        )
+        .await;
         assert_eq!(
             mock.calls.lock_ok().len(),
             0,
@@ -1721,7 +1878,16 @@ mod tests {
         );
         st.notify.insert(&id);
 
-        notify_if_complete(st.apns.as_deref(), &st.devices, &st.notify, &st.jobs, &id).await;
+        notify_if_complete(
+            st.apns.as_deref(),
+            &st.devices,
+            &st.notify,
+            &st.jobs,
+            &id,
+            &st.conversations,
+            &st.flags,
+        )
+        .await;
 
         assert_eq!(mock.calls.lock_ok().len(), 1, "the send was attempted");
         match st.jobs.get(&id) {
@@ -1750,7 +1916,16 @@ mod tests {
         st.jobs.complete(&id, Ok(("a".to_string(), None, None)));
         st.notify.insert(&id);
         // Just must not panic; there's no transport to record against.
-        notify_if_complete(st.apns.as_deref(), &st.devices, &st.notify, &st.jobs, &id).await;
+        notify_if_complete(
+            st.apns.as_deref(),
+            &st.devices,
+            &st.notify,
+            &st.jobs,
+            &id,
+            &st.conversations,
+            &st.flags,
+        )
+        .await;
         // The flag is left intact (nothing consumed it) — harmless.
         assert!(st.notify.take(&id));
     }
@@ -1765,7 +1940,16 @@ mod tests {
 
         let id = st.jobs.create(); // Running
         st.notify.insert(&id);
-        notify_if_complete(st.apns.as_deref(), &st.devices, &st.notify, &st.jobs, &id).await;
+        notify_if_complete(
+            st.apns.as_deref(),
+            &st.devices,
+            &st.notify,
+            &st.jobs,
+            &id,
+            &st.conversations,
+            &st.flags,
+        )
+        .await;
         assert_eq!(
             mock.calls.lock_ok().len(),
             0,
@@ -1774,7 +1958,16 @@ mod tests {
 
         st.jobs
             .complete(&id, Ok(("done now".to_string(), None, None)));
-        notify_if_complete(st.apns.as_deref(), &st.devices, &st.notify, &st.jobs, &id).await;
+        notify_if_complete(
+            st.apns.as_deref(),
+            &st.devices,
+            &st.notify,
+            &st.jobs,
+            &id,
+            &st.conversations,
+            &st.flags,
+        )
+        .await;
         assert_eq!(
             mock.calls.lock_ok().len(),
             1,
@@ -1807,7 +2000,16 @@ mod tests {
         let id = st.jobs.create();
         st.jobs.complete(&id, Ok(("x".into(), None, None)));
         st.notify.insert(&id);
-        notify_if_complete(st.apns.as_deref(), &st.devices, &st.notify, &st.jobs, &id).await;
+        notify_if_complete(
+            st.apns.as_deref(),
+            &st.devices,
+            &st.notify,
+            &st.jobs,
+            &id,
+            &st.conversations,
+            &st.flags,
+        )
+        .await;
 
         assert_eq!(mock.calls.lock_ok().len(), 1, "the push was attempted");
         assert!(
@@ -1828,7 +2030,16 @@ mod tests {
         let id = st.jobs.create();
         st.jobs.complete(&id, Ok(("x".into(), None, None)));
         st.notify.insert(&id);
-        notify_if_complete(st.apns.as_deref(), &st.devices, &st.notify, &st.jobs, &id).await;
+        notify_if_complete(
+            st.apns.as_deref(),
+            &st.devices,
+            &st.notify,
+            &st.jobs,
+            &id,
+            &st.conversations,
+            &st.flags,
+        )
+        .await;
 
         assert_eq!(
             st.devices.get().as_deref(),
