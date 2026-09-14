@@ -65,7 +65,8 @@ public struct SSEParser: Sendable {
             // and "this bridge has no artifact channel". They mean the same thing here.
             return .done(JesseReply(text: obj?.response ?? "", sessionId: obj?.sessionId,
                                     directives: obj?.directives, provenance: obj?.provenance,
-                                    artifacts: obj?.artifacts ?? []))
+                                    artifacts: obj?.artifacts ?? [],
+                                    lastReplyMs: obj?.lastReplyMs ?? 0))
         case "error": return .failed(obj?.error ?? "Jesse couldn't complete that.")
         case "cancelled": return .cancelled
         default: return nil

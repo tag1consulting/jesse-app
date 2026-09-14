@@ -1947,6 +1947,25 @@ pub async fn start_turn(
             err => err,
         };
 
+        // THE REPLY CLOCK. A turn that produced an answer stamps its conversation with
+        // the time that answer was finalized, on the BRIDGE's clock, at this same seam —
+        // one point, one clock, whatever route produced the text and whatever device is
+        // listening. It is what the apps compare against `read_through_ms` to decide the
+        // conversation has a reply nobody has seen, and it deliberately does NOT move for
+        // a user's own turn (that is `last_modified`'s job).
+        //
+        // Only the Ok branch: a failed or cancelled turn delivered no reply, so nothing to
+        // mark unread. The stamp is monotonic (see `note_reply`) and returns the resulting
+        // value, which rides the reply itself so the app stores the bridge's number rather
+        // than its own arrival time. A scheduled job reaches this seam through exactly the
+        // same turn path, so it stamps here too.
+        let last_reply_ms = if outcome.is_ok() {
+            st.conversations
+                .note_reply(&cid, system_time_to_ms(SystemTime::now()))
+        } else {
+            0
+        };
+
         // `trace.partial()` is `Some` ONLY when the run limit cut this turn off, and the
         // store attaches it only to a FAILURE — so a hosted turn that timed out and was
         // then served by the emergency fallback delivers its answer with nothing extra,
@@ -1958,6 +1977,7 @@ pub async fn start_turn(
             provenance,
             trace.partial(),
             artifacts.artifacts,
+            last_reply_ms,
         );
         // Close the live stream with the frame matching the state that actually
         // landed. `complete` is write-once, so a cancel that won the race already
@@ -1987,7 +2007,16 @@ pub async fn start_turn(
         // a push problem can't disturb it. Awaited (not detached) so the push
         // can't outlive the runtime on shutdown; it adds only ~one HTTP round-trip
         // to a turn that already finished.
-        notify_if_complete(apns.as_deref(), &devices, &notify, &jobs, &jid).await;
+        notify_if_complete(
+            apns.as_deref(),
+            &devices,
+            &notify,
+            &jobs,
+            &jid,
+            &st.conversations,
+            &st.flags,
+        )
+        .await;
 
         // Shadow comparison (JESSE_SHADOW_*): mirror this delivered ask on a DETACHED,
         // permit-free task — the LAST thing the turn does. Drop the production permit
@@ -2066,6 +2095,7 @@ pub async fn jesse_result(
             directives,
             provenance,
             artifacts,
+            last_reply_ms,
         }) => Ok(Json(json!({
             "status": "done",
             "response": response,
@@ -2076,6 +2106,11 @@ pub async fn jesse_result(
             // none, so this response is byte-for-byte what it was for every turn that
             // returns nothing. The bytes come from `GET /jesse/artifact/{id}`.
             "artifacts": artifacts_to_value(&artifacts),
+            // When this reply was finalized, on the bridge's clock. The app stores this
+            // rather than its own arrival time, so clock skew between phone, Mac and
+            // bridge can neither hide a new reply nor revive a read one. `0` for a turn
+            // with no conversation record; an older app ignores the key.
+            "last_reply_ms": last_reply_ms,
             "timing": timing,
             "usage": usage,
         }))),
@@ -2253,6 +2288,8 @@ pub async fn jesse_notify(
         &st.notify,
         &st.jobs,
         &job_id,
+        &st.conversations,
+        &st.flags,
     )
     .await;
     Ok(StatusCode::NO_CONTENT)

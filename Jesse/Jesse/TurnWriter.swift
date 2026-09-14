@@ -45,8 +45,11 @@ struct TurnWriter {
     /// `thread` reference the send path holds; falls back to a by-id fetch on the
     /// resume/recheck path (`thread == nil`). Idempotent on `jobId`: a re-entry for a
     /// job already delivered retries only the save. Never records an empty reply.
+    ///
+    /// `now` is injectable so a test can pin the device-clock FALLBACK below without
+    /// reading the real clock.
     func write(threadID: UUID, thread: JesseThread?, reply: JesseReply,
-               jobId: String?, context: ModelContext) -> Outcome {
+               jobId: String?, context: ModelContext, now: Date = Date()) -> Outcome {
         // (1) Resolve the destination. Prefer the held reference; fall back to a
         // by-id fetch only when there isn't one (resume/recheck).
         guard let target = thread ?? fetchThread(threadID, context: context) else {
@@ -108,6 +111,19 @@ struct TurnWriter {
         target.turns.append(turn)
         target.sessionId = reply.sessionId ?? target.sessionId
         target.updatedAt = Date()
+        // A REPLY ARRIVED — the one thing `updatedAt` above cannot say, because it is
+        // bumped by the user's own turns too. Only on this path: step (2) above returns
+        // early for a job already delivered, so a Re-check that re-polls a completed job
+        // cannot move the stamp and cannot make a conversation the user has already read
+        // go unread again.
+        //
+        // The bridge's own finalize time is preferred over this device's clock, so both
+        // sides of the unread comparison come off one clock (see `JesseThread.lastReplyMs`).
+        // `0` means the bridge is too old to send it; the device clock then stands in,
+        // which is worse only by the skew between the two.
+        target.noteReply(atUnixMillis: reply.lastReplyMs > 0
+                         ? Int(reply.lastReplyMs)
+                         : JesseThread.unixMillis(now))
         if let jobId { target.lastDeliveredJobId = jobId }
 
         // (4) Real error handling, not `try?`. The in-memory append above already

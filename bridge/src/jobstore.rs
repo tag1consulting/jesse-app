@@ -53,6 +53,17 @@ pub enum JobState {
         // plain `Vec` rather than an `Option`: empty and absent mean the same thing and
         // there is nothing for a reader to distinguish.
         artifacts: Vec<Artifact>,
+        // When this reply was finalized for delivery, in unix millis on the BRIDGE's
+        // clock — the value the conversation record was stamped with at the same seam
+        // (see `ConversationRecord::last_reply_ms`). Carried here for the same reason
+        // `provenance` is: BOTH the poll result and the SSE `done` frame must surface
+        // the identical value, or the same reply would be timed differently depending on
+        // whether the app was streaming or polling when it landed.
+        //
+        // `0` for a turn with no conversation record and for any job file persisted
+        // before this field existed; the app reads that as "no bridge value" and falls
+        // back to its own clock.
+        last_reply_ms: u64,
     },
     Failed {
         error: String,
@@ -204,46 +215,59 @@ pub fn ms_to_system_time(ms: u64) -> SystemTime {
 /// and timing metadata; never any secret.
 pub fn job_to_value(id: &str, job: &Job) -> Option<Value> {
     let completed_at = job.completed_at?;
-    let (status, response, session_id, directives, provenance, artifacts, error, partial) =
-        match &job.state {
-            JobState::Done {
-                response,
-                session_id,
-                directives,
-                provenance,
-                artifacts,
-            } => (
-                "done",
-                Some(response.clone()),
-                session_id.clone(),
-                directives_to_value(directives.as_deref()),
-                provenance_to_value(provenance.as_deref()),
-                artifacts_to_value(artifacts),
-                None,
-                Value::Null,
-            ),
-            JobState::Failed { error, partial } => (
-                "failed",
-                None,
-                None,
-                Value::Null,
-                Value::Null,
-                Value::Null,
-                Some(error.clone()),
-                partial_to_value(partial.as_deref()),
-            ),
-            JobState::Cancelled => (
-                "cancelled",
-                None,
-                None,
-                Value::Null,
-                Value::Null,
-                Value::Null,
-                None,
-                Value::Null,
-            ),
-            JobState::Running => return None,
-        };
+    let (
+        status,
+        response,
+        session_id,
+        directives,
+        provenance,
+        artifacts,
+        error,
+        partial,
+        last_reply_ms,
+    ) = match &job.state {
+        JobState::Done {
+            response,
+            session_id,
+            directives,
+            provenance,
+            artifacts,
+            last_reply_ms,
+        } => (
+            "done",
+            Some(response.clone()),
+            session_id.clone(),
+            directives_to_value(directives.as_deref()),
+            provenance_to_value(provenance.as_deref()),
+            artifacts_to_value(artifacts),
+            None,
+            Value::Null,
+            *last_reply_ms,
+        ),
+        JobState::Failed { error, partial } => (
+            "failed",
+            None,
+            None,
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Some(error.clone()),
+            partial_to_value(partial.as_deref()),
+            0,
+        ),
+        JobState::Cancelled => (
+            "cancelled",
+            None,
+            None,
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            None,
+            Value::Null,
+            0,
+        ),
+        JobState::Running => return None,
+    };
     Some(json!({
         "v": 1,
         "job_id": id,
@@ -271,6 +295,11 @@ pub fn job_to_value(id: &str, job: &Job) -> Option<Value> {
         // after a restart. Null on a job created outside a turn and on any file written
         // before this field existed — read back the same additive way as `request_id`.
         "conversation_id": job.conversation_id,
+        // When the reply was finalized, on the bridge's clock, so a restart still serves
+        // the reply with the time the app compares against its read mark. `0` on every
+        // other state and on any file written before this field existed, which the app
+        // reads as "no bridge value".
+        "last_reply_ms": last_reply_ms,
     }))
 }
 
@@ -308,6 +337,10 @@ pub fn value_to_job(v: &Value) -> Option<(String, Job)> {
             // file written before this field existed loads: the reply is served exactly
             // as it always was, with no artifact chips. See `artifacts_from_value`.
             artifacts: artifacts_from_value(v.get("artifacts")),
+            // Absent/null → 0, which is how every job file written before this field
+            // existed loads: the app reads it as "no bridge value" and falls back to its
+            // own clock, exactly as it does against an older bridge.
+            last_reply_ms: v.get("last_reply_ms").and_then(|m| m.as_u64()).unwrap_or(0),
         },
         "failed" => JobState::Failed {
             error: v
@@ -699,7 +732,9 @@ impl JobStore {
         outcome: Result<(String, Option<String>, Option<Directives>), ApiError>,
         provenance: Option<Provenance>,
     ) {
-        self.complete_full(id, outcome, provenance, None, Vec::new());
+        // No conversation stamp: the wrappers exist for callers outside the turn path
+        // (and for tests), and a `0` reply time reads as "no bridge value" client-side.
+        self.complete_full(id, outcome, provenance, None, Vec::new(), 0);
     }
 
     /// Land the outcome, its provenance, AND — for a turn the run limit cut off — how far
@@ -710,6 +745,10 @@ impl JobStore {
     /// answer, whatever its trace also retained (a hosted turn can time out and still be
     /// served by the emergency fallback, and that turn did not get cut off from the
     /// client's point of view). `None` for every ordinary failure.
+    /// `last_reply_ms` is when the reply was finalized for delivery, on the bridge's
+    /// clock — the same value the conversation record was stamped with at that seam. It
+    /// rides the terminal state so the poll result and the SSE `done` frame carry the
+    /// identical number; `0` from a caller with no conversation to stamp.
     pub fn complete_full(
         &self,
         id: &str,
@@ -717,6 +756,7 @@ impl JobStore {
         provenance: Option<Provenance>,
         partial: Option<PartialTurn>,
         artifacts: Vec<Artifact>,
+        last_reply_ms: u64,
     ) {
         // The turn is over — drop its abort handle so the map can't leak. Done in
         // its own statement so the `aborts` lock is released before taking `jobs`.
@@ -734,6 +774,7 @@ impl JobStore {
                 // Box on store — keeps the terminal variant small (see the field docs).
                 provenance: provenance.map(Box::new),
                 artifacts,
+                last_reply_ms,
             },
             Err((_code, error)) => JobState::Failed {
                 error,
@@ -840,6 +881,7 @@ impl JobStore {
                 directives,
                 provenance,
                 artifacts,
+                last_reply_ms,
             }) => self.stream_finish(
                 id,
                 StreamFrame::Done {
@@ -848,6 +890,7 @@ impl JobStore {
                     directives,
                     provenance,
                     artifacts,
+                    last_reply_ms,
                 },
             ),
             Some(JobState::Failed { error, .. }) => {
@@ -1382,6 +1425,7 @@ mod tests {
                     directives: None,
                     provenance: None,
                     artifacts: Vec::new(),
+                    last_reply_ms: 0,
                 },
                 completed_at: Some(SystemTime::now()),
                 first_retrieved_at: None,
@@ -1624,6 +1668,7 @@ mod tests {
                 directives: None,
                 provenance: None,
                 artifacts: Vec::new(),
+                last_reply_ms: 0,
             },
             completed_at: Some(SystemTime::now()),
             first_retrieved_at: None,
@@ -1660,6 +1705,7 @@ mod tests {
                 directives: None,
                 provenance: None,
                 artifacts: Vec::new(),
+                last_reply_ms: 0,
             },
             completed_at: Some(SystemTime::now()),
             first_retrieved_at: None,

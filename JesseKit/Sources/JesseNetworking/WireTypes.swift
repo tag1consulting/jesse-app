@@ -74,15 +74,26 @@ public struct JesseReply: Equatable, Sendable {
     // overwhelming majority of turns, and empty against any bridge that predates the
     // field, which is the same thing: there is nothing for a reader to distinguish.
     public var artifacts: [JesseArtifact]
+    // When the bridge FINALIZED this reply, in unix millis on ITS clock (`last_reply_ms`).
+    // The thread stores this rather than the device's arrival time, so the unread
+    // comparison has one clock on both sides and skew between phone, Mac and bridge can
+    // neither hide a new reply nor revive a read one.
+    //
+    // `0` against a bridge too old to send it (and on a turn with no conversation record),
+    // which the write points read as "no bridge value" and replace with the device clock —
+    // the degradation being that two devices' unread marks can then disagree by their
+    // skew, which is strictly better than not marking anything at all.
+    public var lastReplyMs: UInt64
 
     public init(text: String, sessionId: String?,
                 directives: JesseDirectives? = nil, provenance: JesseProvenance? = nil,
-                artifacts: [JesseArtifact] = []) {
+                artifacts: [JesseArtifact] = [], lastReplyMs: UInt64 = 0) {
         self.text = text
         self.sessionId = sessionId
         self.directives = directives
         self.provenance = provenance
         self.artifacts = artifacts
+        self.lastReplyMs = lastReplyMs
     }
 
     private static let marker = "SPOKEN:"
@@ -470,12 +481,24 @@ public struct ConversationSummary: Decodable, Sendable, Equatable {
     public let favoriteUpdatedMs: UInt64
     public let archived: Bool
     public let archivedUpdatedMs: UInt64
+    /// When this conversation last REPLIED, on the BRIDGE's clock (unix millis). Distinct
+    /// from `lastModified`, which moves for the user's own turns too and is in seconds.
+    /// With `readThroughMs` below it is the whole unread rule, so a device that has been
+    /// away decides what is unread from this list alone. `0` against a bridge that
+    /// predates the field, which reads as "no reply" and therefore as READ.
+    public let lastReplyMs: UInt64
+    /// How far the conversation has been read, and the last-writer-wins clock of that
+    /// mark. Both `0` against an older bridge, which reconciles as a no-op against a
+    /// local thread whose own clock is 0.
+    public let readThroughMs: UInt64
+    public let readUpdatedMs: UInt64
     public let registeredMs: UInt64
 
     public init(conversationId: String, sessionId: String? = nil, sessionIds: [String] = [],
                 lastModified: UInt64 = 0, firstMessage: String? = nil, title: String? = nil,
                 favorite: Bool = false, favoriteUpdatedMs: UInt64 = 0,
                 archived: Bool = false, archivedUpdatedMs: UInt64 = 0,
+                lastReplyMs: UInt64 = 0, readThroughMs: UInt64 = 0, readUpdatedMs: UInt64 = 0,
                 registeredMs: UInt64 = 0) {
         self.conversationId = conversationId
         self.sessionId = sessionId
@@ -487,6 +510,9 @@ public struct ConversationSummary: Decodable, Sendable, Equatable {
         self.favoriteUpdatedMs = favoriteUpdatedMs
         self.archived = archived
         self.archivedUpdatedMs = archivedUpdatedMs
+        self.lastReplyMs = lastReplyMs
+        self.readThroughMs = readThroughMs
+        self.readUpdatedMs = readUpdatedMs
         self.registeredMs = registeredMs
     }
 
@@ -500,6 +526,9 @@ public struct ConversationSummary: Decodable, Sendable, Equatable {
         case favoriteUpdatedMs = "favorite_updated_ms"
         case archived
         case archivedUpdatedMs = "archived_updated_ms"
+        case lastReplyMs = "last_reply_ms"
+        case readThroughMs = "read_through_ms"
+        case readUpdatedMs = "read_updated_ms"
         case registeredMs = "registered_ms"
     }
 
@@ -517,6 +546,9 @@ public struct ConversationSummary: Decodable, Sendable, Equatable {
         favoriteUpdatedMs = try c.decodeIfPresent(UInt64.self, forKey: .favoriteUpdatedMs) ?? 0
         archived = try c.decodeIfPresent(Bool.self, forKey: .archived) ?? false
         archivedUpdatedMs = try c.decodeIfPresent(UInt64.self, forKey: .archivedUpdatedMs) ?? 0
+        lastReplyMs = try c.decodeIfPresent(UInt64.self, forKey: .lastReplyMs) ?? 0
+        readThroughMs = try c.decodeIfPresent(UInt64.self, forKey: .readThroughMs) ?? 0
+        readUpdatedMs = try c.decodeIfPresent(UInt64.self, forKey: .readUpdatedMs) ?? 0
         registeredMs = try c.decodeIfPresent(UInt64.self, forKey: .registeredMs) ?? 0
     }
 }
@@ -744,11 +776,15 @@ public struct JesseResultResponse: Decodable {
     /// Absent or `null` against a bridge with no artifact channel, and on every turn that
     /// returned no file — both decode to nil and are read as "none".
     public let artifacts: [JesseArtifact]?
+    /// When the bridge finalized this reply, on its own clock. Absent against a bridge
+    /// that predates the field, which decodes to nil and is read as "no bridge value".
+    public let lastReplyMs: UInt64?
     public let error: String?
     enum CodingKeys: String, CodingKey {
         case status, response
         case sessionId = "session_id"
         case directives, provenance, artifacts, error
+        case lastReplyMs = "last_reply_ms"
     }
 }
 
@@ -933,11 +969,16 @@ public struct JesseStreamFrameData: Decodable {
     /// Present only on a `done` frame for a turn that returned a file; `null` otherwise
     /// and absent from any bridge that predates the field.
     public let artifacts: [JesseArtifact]?
+    /// On a `done` frame: when the bridge finalized this reply, on its own clock. The
+    /// identical value the poll result carries, so a streaming client and a polling one
+    /// time the reply the same way. Absent from a bridge that predates the field.
+    public let lastReplyMs: UInt64?
     public let error: String?
     enum CodingKeys: String, CodingKey {
         case text, name, refused, response
         case sessionId = "session_id"
         case directives, provenance, artifacts, error
+        case lastReplyMs = "last_reply_ms"
     }
 }
 
@@ -1166,18 +1207,29 @@ public struct JesseFlagsRequest: Encodable, Equatable {
     public let favoriteUpdatedMs: UInt64?
     public let archived: Bool?
     public let archivedUpdatedMs: UInt64?
+    /// The READ register: how far the conversation has been read (a `last_reply_ms` value,
+    /// or 0 for "Mark as Unread") and the unix-millis clock of that change. Both nil on a
+    /// favorite- or archive-only change, so its keys drop out and the server's read
+    /// register is left untouched.
+    public let readThroughMs: UInt64?
+    public let readUpdatedMs: UInt64?
     public init(favorite: Bool? = nil, favoriteUpdatedMs: UInt64? = nil,
-                archived: Bool? = nil, archivedUpdatedMs: UInt64? = nil) {
+                archived: Bool? = nil, archivedUpdatedMs: UInt64? = nil,
+                readThroughMs: UInt64? = nil, readUpdatedMs: UInt64? = nil) {
         self.favorite = favorite
         self.favoriteUpdatedMs = favoriteUpdatedMs
         self.archived = archived
         self.archivedUpdatedMs = archivedUpdatedMs
+        self.readThroughMs = readThroughMs
+        self.readUpdatedMs = readUpdatedMs
     }
     enum CodingKeys: String, CodingKey {
         case favorite
         case favoriteUpdatedMs = "favorite_updated_ms"
         case archived
         case archivedUpdatedMs = "archived_updated_ms"
+        case readThroughMs = "read_through_ms"
+        case readUpdatedMs = "read_updated_ms"
     }
 }
 

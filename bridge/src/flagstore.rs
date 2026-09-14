@@ -17,10 +17,10 @@ use crate::*;
 // converge to the same result. Only the two booleans and their timestamps are
 // ever written; never a secret and never conversation content.
 
-/// The favorite / archived state for one session. Each flag carries the unix-millis
-/// client change time it was last set at, so a write applies last-writer-wins.
-/// Defaults to `false` / `0` for a session with no row, and every field is
-/// `#[serde(default)]` so a missing or future field loads without error (an added
+/// The favorite / archived / read state for one session. Each flag carries the
+/// unix-millis client change time it was last set at, so a write applies
+/// last-writer-wins. Defaults to `false` / `0` for a session with no row, and every field
+/// is `#[serde(default)]` so a missing or future field loads without error (an added
 /// flag is a purely additive change).
 #[derive(serde::Serialize, serde::Deserialize, Clone, Default, PartialEq, Debug)]
 pub struct SessionFlags {
@@ -32,6 +32,25 @@ pub struct SessionFlags {
     pub archived: bool,
     #[serde(default)]
     pub archived_updated_ms: u64,
+    /// How far this conversation has been READ: the `last_reply_ms` value that was
+    /// current when a device last had the transcript on screen. A conversation is unread
+    /// when its [`ConversationRecord::last_reply_ms`](crate::ConversationRecord) is
+    /// strictly greater than this.
+    ///
+    /// It holds a REPLY time, never a device's "now": marking read copies the
+    /// conversation's own `last_reply_ms` across, so both sides of the comparison come
+    /// off the bridge's clock and skew between devices can neither hide a new reply nor
+    /// revive a read one. `0` means "never read", which against a `last_reply_ms` of `0`
+    /// (no reply yet, and every record written before either field existed) reads as
+    /// READ — so the upgrade marks nothing unread.
+    #[serde(default)]
+    pub read_through_ms: u64,
+    /// The never-cleared last-writer-wins clock for `read_through_ms` — the DEVICE's
+    /// change time, exactly like `favorite_updated_ms`. Separate from the value because
+    /// the value moves backwards on "Mark as Unread", and a register whose own clock
+    /// could go back would lose that write.
+    #[serde(default)]
+    pub read_updated_ms: u64,
 }
 
 impl SessionFlags {
@@ -61,10 +80,27 @@ impl SessionFlags {
             false
         }
     }
+
+    /// Apply a read-through write with client change time `ts_ms` (unix millis), LWW:
+    /// the same strictly-newer rule as [`apply_favorite`](Self::apply_favorite), on the
+    /// read register. Returns whether anything changed.
+    ///
+    /// Deliberately last-writer-wins and NOT max-wins on the value: "Mark as Unread"
+    /// moves `read_through_ms` BACKWARDS (to 0), and a max rule would silently discard
+    /// it. The clock is what orders the writes; the value is free to go either way.
+    fn apply_read(&mut self, value: u64, ts_ms: u64) -> bool {
+        if ts_ms > self.read_updated_ms {
+            self.read_through_ms = value;
+            self.read_updated_ms = ts_ms;
+            true
+        } else {
+            false
+        }
+    }
 }
 
-/// A write to the flags endpoint: any subset of the four fields. A flag is applied
-/// only when its boolean value is present; its timestamp defaults to 0 when absent
+/// A write to the flags endpoint: any subset of the six fields. A flag is applied
+/// only when its value is present; its timestamp defaults to 0 when absent
 /// (which, being not strictly greater than any real prior timestamp, is a no-op),
 /// so a well-formed client always sends the value and its unix-millis change time
 /// together.
@@ -78,6 +114,13 @@ pub struct FlagUpdate {
     pub archived: Option<bool>,
     #[serde(default)]
     pub archived_updated_ms: Option<u64>,
+    /// The read-through value: the conversation's `last_reply_ms` as the marking device
+    /// saw it, or `0` for "Mark as Unread". Not a boolean like the other two, which is
+    /// why the register has its own `apply_read`.
+    #[serde(default)]
+    pub read_through_ms: Option<u64>,
+    #[serde(default)]
+    pub read_updated_ms: Option<u64>,
 }
 
 /// The conversation_id -> flags map. Cheaply shared behind an `Arc` in `AppState`.
@@ -143,6 +186,9 @@ impl FlagStore {
             if let Some(value) = update.archived {
                 changed |= entry.apply_archived(value, update.archived_updated_ms.unwrap_or(0));
             }
+            if let Some(value) = update.read_through_ms {
+                changed |= entry.apply_read(value, update.read_updated_ms.unwrap_or(0));
+            }
             (entry.clone(), changed)
         };
         // Persist only when a flag actually changed.
@@ -192,6 +238,37 @@ impl FlagStore {
     pub fn is_empty(&self) -> bool {
         self.map.lock_ok().is_empty()
     }
+}
+
+/// THE UNREAD RULE, in one place: a conversation has a reply nobody has seen when its
+/// last reply is strictly newer than how far it has been read.
+///
+/// Pure, and shared with both apps' `JesseThread.hasUnreadReply` — the badge the bridge
+/// puts on a push and the dot the app draws on a row have to be the same claim, or the
+/// number on the icon disagrees with the list behind it.
+pub fn has_unread_reply(last_reply_ms: u64, read_through_ms: u64) -> bool {
+    last_reply_ms > read_through_ms
+}
+
+/// How many conversations have a reply nobody has seen — the number the app icon badges.
+///
+/// ARCHIVED CONVERSATIONS ARE EXCLUDED, and deleted ones are already gone from the
+/// registry (a delete `forget`s the record), so this counts exactly what the phone's
+/// Chats list counts. An archived thread keeps its dot inside the Archived view; what it
+/// does not do is drive a number on the home screen, because archiving is precisely the
+/// gesture for "stop showing me this".
+pub fn unread_conversation_count(conversations: &ConversationStore, flags: &FlagStore) -> u64 {
+    let rows = flags.snapshot();
+    conversations
+        .all()
+        .iter()
+        .filter(|rec| {
+            let f = rows.get(&rec.conversation_id);
+            let archived = f.is_some_and(|f| f.archived);
+            let read_through = f.map(|f| f.read_through_ms).unwrap_or(0);
+            !archived && has_unread_reply(rec.last_reply_ms, read_through)
+        })
+        .count() as u64
 }
 
 /// Load the flags map from disk, tolerating any corruption by returning what's
@@ -365,6 +442,8 @@ mod tests {
                 favorite_updated_ms: 111,
                 archived: true,
                 archived_updated_ms: 222,
+                read_through_ms: 0,
+                read_updated_ms: 0,
             }
         );
 
@@ -443,5 +522,143 @@ mod tests {
             "missing fields default"
         );
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    // ---- The read register ------------------------------------------------
+
+    /// An update that marks read through `value` at client change time `ts`.
+    fn read(value: u64, ts: u64) -> FlagUpdate {
+        FlagUpdate {
+            read_through_ms: Some(value),
+            read_updated_ms: Some(ts),
+            ..FlagUpdate::default()
+        }
+    }
+
+    #[test]
+    fn read_through_is_lww_and_a_newer_mark_unread_moves_it_backwards() {
+        // The property the boolean flags do not have: the VALUE goes backwards on
+        // "Mark as Unread", and only the CLOCK orders the writes. A max-wins rule on
+        // the value would silently discard the unread mark.
+        let store = FlagStore::new(None);
+
+        // Read through a reply at 5_000, marked at client time 100.
+        let r = store.apply("s", &read(5_000, 100));
+        assert_eq!((r.read_through_ms, r.read_updated_ms), (5_000, 100));
+
+        // A NEWER mark-unread (value 0, clock 200) wins even though the value drops.
+        let r = store.apply("s", &read(0, 200));
+        assert_eq!(
+            (r.read_through_ms, r.read_updated_ms),
+            (0, 200),
+            "a newer mark-unread moves read_through_ms backwards"
+        );
+
+        // An OLDER write is ignored, value and clock both.
+        let r = store.apply("s", &read(9_000, 150));
+        assert_eq!(
+            (r.read_through_ms, r.read_updated_ms),
+            (0, 200),
+            "older ignored"
+        );
+
+        // An EQUAL clock is ignored too (strictly-newer only), matching the other flags.
+        let r = store.apply("s", &read(9_000, 200));
+        assert_eq!(
+            (r.read_through_ms, r.read_updated_ms),
+            (0, 200),
+            "equal ignored"
+        );
+    }
+
+    #[test]
+    fn read_is_independent_of_favorite_and_archived() {
+        let store = FlagStore::new(None);
+        store.apply("s", &fav(true, 100));
+        store.apply("s", &arch(true, 100));
+        let r = store.apply("s", &read(7, 1));
+        assert!(r.favorite && r.archived, "the boolean flags are untouched");
+        assert_eq!(r.read_through_ms, 7);
+        // And a stale read write leaves the others alone in turn.
+        let r = store.apply("s", &fav(false, 200));
+        assert_eq!(
+            r.read_through_ms, 7,
+            "read_through_ms untouched by a favorite write"
+        );
+        assert!(!r.favorite);
+    }
+
+    #[test]
+    fn a_flags_file_without_the_read_fields_loads_with_them_defaulted() {
+        // THE UPGRADE MARKS NOTHING UNREAD. A flags.json written by a bridge that
+        // predates the read register must load with `read_through_ms == 0` — which,
+        // against a conversation whose `last_reply_ms` is also 0 (no field either),
+        // reads as READ.
+        let path = temp_flags_path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            r#"{"v":1,"flags":{"s":{"favorite":true,"favorite_updated_ms":9,"archived":false,"archived_updated_ms":0}}}"#,
+        )
+        .unwrap();
+        let store = FlagStore::new(Some(path.clone()));
+        let f = store.get("s");
+        assert!(f.favorite, "the pre-existing flag survives");
+        assert_eq!(f.read_through_ms, 0, "read_through_ms defaults to 0");
+        assert_eq!(f.read_updated_ms, 0, "read_updated_ms defaults to 0");
+        assert!(
+            !has_unread_reply(0, f.read_through_ms),
+            "which reads as READ"
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn the_unread_rule_is_strictly_greater() {
+        assert!(!has_unread_reply(0, 0), "no reply yet is read");
+        assert!(has_unread_reply(1, 0), "a reply nobody marked is unread");
+        assert!(
+            !has_unread_reply(5, 5),
+            "read exactly through the last reply"
+        );
+        assert!(has_unread_reply(6, 5), "a newer reply than the mark");
+        assert!(
+            !has_unread_reply(5, 6),
+            "a mark past the last reply stays read"
+        );
+    }
+
+    #[test]
+    fn the_count_skips_archived_and_read_conversations() {
+        let convs = ConversationStore::new(None);
+        let flags = FlagStore::new(None);
+        let mk = |origin: &str| convs.mint(Some(origin), 1_000).conversation_id;
+
+        let unread = mk("phone");
+        let read_one = mk("phone");
+        let archived_unread = mk("phone");
+        let never_replied = mk("phone");
+
+        // Each of the first three got a reply at bridge time 5_000.
+        for cid in [&unread, &read_one, &archived_unread] {
+            convs.note_reply(cid, 5_000);
+        }
+        // One was read through that reply; one was archived (and stays unread inside the
+        // Archived view, but must not drive the icon badge).
+        flags.apply(&read_one, &read(5_000, 1));
+        flags.apply(&archived_unread, &arch(true, 1));
+
+        assert_eq!(unread_conversation_count(&convs, &flags), 1);
+
+        // Marking the remaining one read empties the badge.
+        flags.apply(&unread, &read(5_000, 1));
+        assert_eq!(unread_conversation_count(&convs, &flags), 0);
+
+        // And a conversation that never replied never counted.
+        assert_eq!(convs.get(&never_replied).unwrap().last_reply_ms, 0);
+
+        // A NEW reply on the read conversation makes it unread again.
+        convs.note_reply(&read_one, 6_000);
+        assert_eq!(unread_conversation_count(&convs, &flags), 1);
     }
 }

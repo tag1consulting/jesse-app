@@ -84,7 +84,8 @@ final class SessionSyncTests: XCTestCase {
             pollStaysRunning ? .running : .done(JesseReply(text: "", sessionId: nil))
         }
         func cancelJob(jobId: String) async throws {}
-        nonisolated func setFlags(conversationId: String, favorite: FlagWrite?, archived: FlagWrite?) async throws {}
+        nonisolated func setFlags(conversationId: String, favorite: FlagWrite?, archived: FlagWrite?,
+                                  read: ReadWrite?) async throws {}
         func stream(jobId: String) -> AsyncThrowingStream<JesseStreamEvent, Error> {
             AsyncThrowingStream { $0.finish() }
         }
@@ -120,12 +121,16 @@ final class SessionSyncTests: XCTestCase {
 
     private func summary(_ id: String, title: String? = nil, sessionId: String? = nil,
                         sessionIds: [String] = [], lastModified: UInt64 = 1_700_000_000,
-                        favorite: Bool = false, favoriteUpdatedMs: UInt64 = 0)
+                        favorite: Bool = false, favoriteUpdatedMs: UInt64 = 0,
+                        lastReplyMs: UInt64 = 0,
+                        readThroughMs: UInt64 = 0, readUpdatedMs: UInt64 = 0)
         -> ConversationSummary {
         ConversationSummary(conversationId: id, sessionId: sessionId,
                             sessionIds: sessionIds.isEmpty ? [sessionId].compactMap { $0 } : sessionIds,
                             lastModified: lastModified, firstMessage: "hello \(id)", title: title,
-                            favorite: favorite, favoriteUpdatedMs: favoriteUpdatedMs)
+                            favorite: favorite, favoriteUpdatedMs: favoriteUpdatedMs,
+                            lastReplyMs: lastReplyMs,
+                            readThroughMs: readThroughMs, readUpdatedMs: readUpdatedMs)
     }
 
     private func turn(_ role: String, _ text: String, _ key: String = "") -> HydratedTurn {
@@ -278,6 +283,86 @@ final class SessionSyncTests: XCTestCase {
         XCTAssertEqual(threadCount(context), 2, "only the unknown id was adopted")
         XCTAssertEqual(thread(heldId, in: context)?.aiTitle, "Held")
         XCTAssertEqual(thread(Self.cid(0x99), in: context)?.aiTitle, "Fresh")
+    }
+
+    // MARK: - Unread replies across the sync
+
+    /// A conversation answered on the MAC shows its dot here from the list pull alone,
+    /// without being opened and hydrated first — both when it is adopted as a new stub and
+    /// when it is an existing thread being refreshed.
+    func testTheListPullCarriesTheReplyStampOnAdoptAndUpdate() async throws {
+        let context = try makeContext()
+        let fake = FakeSyncClient()
+        let held = JesseThread(mode: .ask)
+        let heldId = try XCTUnwrap(held.conversationId)
+        context.insert(held)
+        try context.save()
+
+        let freshId = Self.cid(0xA1)
+        fake.scriptedConversations = .conversations(
+            [summary(heldId, title: "Held", lastReplyMs: 5_000),
+             summary(freshId, title: "Fresh", lastReplyMs: 7_000)],
+            deleted: [], etag: "e1")
+        let coordinator = makeCoordinator(fake, cursor: scratchCursorStore(),
+                                          deletion: scratchDeletionStore())
+        await coordinator.refreshSessions(context: context)
+
+        let updated = try XCTUnwrap(thread(heldId, in: context))
+        XCTAssertEqual(updated.lastReplyMs, 5_000, "UPDATE carries the bridge's reply stamp")
+        XCTAssertTrue(updated.hasUnreadReply)
+        let adopted = try XCTUnwrap(thread(freshId, in: context))
+        XCTAssertEqual(adopted.lastReplyMs, 7_000, "ADOPT carries it too")
+        XCTAssertTrue(adopted.hasUnreadReply)
+    }
+
+    /// The bridge's read mark converges: this device adopts a mark made on the Mac and its
+    /// dot clears, with no local clock involved.
+    func testAServerNewerReadMarkClearsTheDotHere() async throws {
+        let context = try makeContext()
+        let fake = FakeSyncClient()
+        let held = JesseThread(mode: .ask)
+        let heldId = try XCTUnwrap(held.conversationId)
+        held.noteReply(atUnixMillis: 5_000)
+        context.insert(held)
+        try context.save()
+        XCTAssertTrue(held.hasUnreadReply, "unread before the sync")
+
+        fake.scriptedConversations = .conversations(
+            [summary(heldId, lastReplyMs: 5_000,
+                     readThroughMs: 5_000, readUpdatedMs: 900)],
+            deleted: [], etag: "e1")
+        let coordinator = makeCoordinator(fake, cursor: scratchCursorStore(),
+                                          deletion: scratchDeletionStore())
+        await coordinator.refreshSessions(context: context)
+
+        let after = try XCTUnwrap(thread(heldId, in: context))
+        XCTAssertEqual(after.readThroughMs, 5_000)
+        XCTAssertEqual(after.readUpdatedMs, 900, "the server's clock, adopted exactly")
+        XCTAssertFalse(after.hasUnreadReply, "read on the other device, read here")
+    }
+
+    /// A LIST BUILT BEFORE A REPLY THIS DEVICE ALREADY DELIVERED must not pull the stamp
+    /// backwards — which would make a conversation the user has just read go unread again
+    /// on every poll.
+    func testAStaleListDoesNotPullTheReplyStampBackwards() async throws {
+        let context = try makeContext()
+        let fake = FakeSyncClient()
+        let held = JesseThread(mode: .ask)
+        let heldId = try XCTUnwrap(held.conversationId)
+        held.noteReply(atUnixMillis: 9_000)
+        held.markRead(nowMs: 9_500)
+        context.insert(held)
+        try context.save()
+
+        fake.scriptedConversations = .conversations(
+            [summary(heldId, lastReplyMs: 5_000)], deleted: [], etag: "e1")
+        let coordinator = makeCoordinator(fake, cursor: scratchCursorStore(),
+                                          deletion: scratchDeletionStore())
+        await coordinator.refreshSessions(context: context)
+
+        let after = try XCTUnwrap(thread(heldId, in: context))
+        XCTAssertEqual(after.lastReplyMs, 9_000, "the older stamp was ignored")
+        XCTAssertFalse(after.hasUnreadReply, "and it stayed read")
     }
 
     func testLegacyThreadWithSessionIdBindsToRemoteConversationIdAndIsNotReAdopted() async throws {

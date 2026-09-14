@@ -107,8 +107,11 @@ pub async fn push_alert(sen: &Sentinel, kind: AlertKind, window_ms: u64, body: &
         );
         return false;
     };
+    // NO BADGE. The sentinel is a separate process watching the bridge from outside; it
+    // has no conversation registry to count, and stamping a made-up number here would
+    // overwrite whatever the bridge's own last push put on the icon. `None` leaves it.
     match apns
-        .push_payload(&token, build_sentinel_payload(kind, body))
+        .push_payload(&token, build_sentinel_payload(kind, body), None)
         .await
     {
         PushOutcome::Sent => {

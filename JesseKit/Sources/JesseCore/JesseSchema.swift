@@ -36,6 +36,12 @@ import SwiftData
 //   • `JesseThread.isArchived` (Bool = false), `archivedAt` (Date?)  ← the archive fields
 //   • `JesseThread.favoriteUpdatedMs` (Int = 0), `archivedUpdatedMs` (Int = 0)  ← the
 //     never-cleared last-writer-wins clocks for cross-device favorite/archive sync
+//   • `JesseThread.lastReplyMs` (Int = 0), `readThroughMs` (Int = 0),
+//     `readUpdatedMs` (Int = 0)  ← UNREAD REPLIES: when this conversation last replied
+//     (on the BRIDGE's clock), how far it has been read, and the never-cleared
+//     last-writer-wins clock for that read mark. Three additive defaulted Ints, the same
+//     shape as the favorite/archive clocks above. All three default to 0, and 0 > 0 is
+//     false, so every existing thread opens READ — the upgrade marks nothing unread
 //   • `Turn.provenanceJSON` (String?)
 //   • `Turn.attachments` → `TurnAttachment` (to-many, cascade, empty default)
 //   • the `WrittenMeal` entity, then its `contentHash` / `tombstoned` fields
@@ -80,9 +86,10 @@ import SwiftData
 // The `VersionedSchema` enums below remain purely as the canonical, single-source
 // model list (and as lineage documentation); they are not wired into a staged plan.
 //
-// Note: favorite and archive state are local-first (the store is the render source)
+// Note: favorite, archive and read state are local-first (the store is the render source)
 // and reconciled across devices through the bridge flags, last-writer-wins on the
-// `favoriteUpdatedMs` / `archivedUpdatedMs` clocks (bridge 0.25.0; see `FlagReconciler`).
+// `favoriteUpdatedMs` / `archivedUpdatedMs` / `readUpdatedMs` clocks (bridge 0.25.0 for
+// the first two, 0.138.0 for the read register; see `FlagReconciler`).
 
 /// The original entity set (through the whole additive property lineage above, all
 /// lightweight-compatible). Kept for lineage documentation.

@@ -57,6 +57,17 @@ struct MacThreadDetailView: View {
 
     @Environment(\.scenePhase) private var scenePhase
 
+    /// Whether this transcript is actually on screen. The detail column carries
+    /// `.id(thread.id)`, so selecting another conversation destroys this view and builds a
+    /// new one — which makes appear/disappear exactly "this is the selected conversation",
+    /// with no need to read the selection binding from here.
+    @State private var isOnScreen = false
+    /// Whether this view's window is KEY. A Mac can have this conversation showing in a
+    /// background window while the person works in another one, and that is not reading it.
+    /// `controlActiveState` is `.key` only for the frontmost window of the active app, so
+    /// it carries both halves of the Mac's gate.
+    @Environment(\.controlActiveState) private var controlActiveState
+
     private var running: Bool { coordinator.isRunning(thread.id) }
 
     var body: some View {
@@ -70,7 +81,14 @@ struct MacThreadDetailView: View {
         .onAppear {
             mode = thread.modeValue
             restoreDraft()
+            isOnScreen = true
+            markReadIfOnScreen()
         }
+        // The three moments a transcript is read, the same three as the phone's: it came on
+        // screen (above), its window became key again, and a reply landed while it was
+        // being watched.
+        .onChange(of: controlActiveState) { _, _ in markReadIfOnScreen() }
+        .onChange(of: thread.lastReplyMs) { _, _ in markReadIfOnScreen() }
         // ── THE DEPARTURES ────────────────────────────────────────────────────────────
         // Three of the four (the fourth is `send`): the detail column replacing this view
         // on `.id(thread.id)`, the app losing the foreground, and a quit. Cmd-Q with the
@@ -79,6 +97,7 @@ struct MacThreadDetailView: View {
         // LEAVING: the detail column is replacing this composer, so it stops exempting its
         // conversation from the reapers. See `ComposerDrafts.leave`.
         .onDisappear {
+            isOnScreen = false
             guard didRestoreDraft else { return }
             ComposerDrafts.leave(composerState, for: thread, in: context)
         }
@@ -92,6 +111,26 @@ struct MacThreadDetailView: View {
         .task(id: thread.id) {
             await coordinator.hydrate(thread: thread, context: context)
         }
+    }
+
+    // MARK: - Unread
+
+    /// Mark this conversation read, if someone is actually looking at it: it is the
+    /// selected conversation (`isOnScreen`) AND its window is key in the active app
+    /// (`controlActiveState == .key`). Both halves go through the same pure
+    /// `jesseShouldMarkRead` the phone uses, so the two shells cannot drift on what
+    /// "being read" means.
+    ///
+    /// Cheap to call from all three moments because `markRead` is a no-op when the
+    /// conversation is already read — no save, no push.
+    private func markReadIfOnScreen() {
+        guard jesseShouldMarkRead(isVisible: isOnScreen,
+                                  isActive: controlActiveState == .key) else { return }
+        guard thread.markRead(nowMs: JesseThread.unixMillis(.now)) else { return }
+        try? context.save()
+        // Best-effort mirror so the phone's dot and icon badge clear too; self-healing if
+        // it fails (see MacCoordinator.pushReadChange).
+        coordinator.pushReadChange(for: thread)
     }
 
     // MARK: - The durable draft

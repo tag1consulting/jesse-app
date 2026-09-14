@@ -85,4 +85,73 @@ final class TurnWriterTests: XCTestCase {
         XCTAssertEqual(jesseTurns(thread).map(\.text), ["shown"],
                        "the in-memory append still shows despite the save failure")
     }
+
+    // MARK: - The reply clock (unread replies)
+
+    /// A delivered reply stores the BRIDGE's finalize time, not this device's clock, so
+    /// both sides of the unread comparison come off one clock.
+    func testDeliveredReplyStoresTheBridgeClock() throws {
+        let ctx = try makeContext()
+        let thread = JesseThread(mode: .ask); ctx.insert(thread)
+        let deviceNow = Date(timeIntervalSince1970: 9_999)
+        _ = TurnWriter().write(threadID: thread.id, thread: thread,
+                               reply: JesseReply(text: "hi", sessionId: "s1", lastReplyMs: 1_234),
+                               jobId: "job-1", context: ctx, now: deviceNow)
+        XCTAssertEqual(thread.lastReplyMs, 1_234, "the bridge's stamp, not the device's")
+        XCTAssertTrue(thread.hasUnreadReply)
+    }
+
+    /// Against a bridge too old to send `last_reply_ms` the device clock stands in, so the
+    /// dot still appears rather than the feature silently doing nothing.
+    func testAnOlderBridgeFallsBackToTheDeviceClock() throws {
+        let ctx = try makeContext()
+        let thread = JesseThread(mode: .ask); ctx.insert(thread)
+        let deviceNow = Date(timeIntervalSince1970: 9.999)  // ms 9_999
+        _ = TurnWriter().write(threadID: thread.id, thread: thread,
+                               reply: JesseReply(text: "hi", sessionId: "s1"),  // lastReplyMs: 0
+                               jobId: "job-1", context: ctx, now: deviceNow)
+        XCTAssertEqual(thread.lastReplyMs, JesseThread.unixMillis(deviceNow))
+        XCTAssertTrue(thread.hasUnreadReply)
+    }
+
+    /// RE-DELIVERY MUST NOT MOVE THE STAMP. A Re-check (or a resume re-polling a completed
+    /// job) runs `write` again for a job already delivered; if that bumped `lastReplyMs`, a
+    /// conversation the user had already read would silently go unread again — and would do
+    /// so every time the app re-polled.
+    func testRedeliveryOfTheSameJobDoesNotMoveTheReplyStamp() throws {
+        let ctx = try makeContext()
+        let thread = JesseThread(mode: .ask); ctx.insert(thread)
+        let writer = TurnWriter()
+        _ = writer.write(threadID: thread.id, thread: thread,
+                         reply: JesseReply(text: "first", sessionId: "s", lastReplyMs: 1_000),
+                         jobId: "job-x", context: ctx)
+        XCTAssertTrue(thread.markRead(nowMs: 1), "the user read it")
+        XCTAssertFalse(thread.hasUnreadReply)
+
+        // The same job, re-polled, carrying a LATER bridge stamp (a fresh finalize time on
+        // the same job) and a later device clock. Neither may move anything.
+        let outcome = writer.write(threadID: thread.id, thread: thread,
+                                   reply: JesseReply(text: "first", sessionId: "s", lastReplyMs: 9_000),
+                                   jobId: "job-x", context: ctx,
+                                   now: Date(timeIntervalSince1970: 90))
+        XCTAssertEqual(outcome, .alreadyDelivered(saved: true))
+        XCTAssertEqual(thread.lastReplyMs, 1_000, "the stamp did not move")
+        XCTAssertFalse(thread.hasUnreadReply, "and the conversation stayed read")
+    }
+
+    /// A genuinely NEW reply on a conversation already read makes it unread again.
+    func testANewReplyAfterReadingMakesItUnreadAgain() throws {
+        let ctx = try makeContext()
+        let thread = JesseThread(mode: .ask); ctx.insert(thread)
+        let writer = TurnWriter()
+        _ = writer.write(threadID: thread.id, thread: thread,
+                         reply: JesseReply(text: "one", sessionId: "s", lastReplyMs: 1_000),
+                         jobId: "job-1", context: ctx)
+        thread.markRead(nowMs: 1)
+        _ = writer.write(threadID: thread.id, thread: thread,
+                         reply: JesseReply(text: "two", sessionId: "s", lastReplyMs: 2_000),
+                         jobId: "job-2", context: ctx)
+        XCTAssertEqual(thread.lastReplyMs, 2_000)
+        XCTAssertTrue(thread.hasUnreadReply)
+    }
 }

@@ -169,7 +169,17 @@ struct MacRootView: View {
         .onReconnect {
             Task { await coordinator.refreshSessions(context: context) }
         }
+        // THE DOCK TILE FOLLOWS THE LIST, the Mac's half of the phone's icon badge, from
+        // the same count. `nil` at zero, because `"0"` on a Dock tile is a badge saying
+        // there is nothing to see.
+        .onChange(of: unreadCount, initial: true) { _, count in
+            NSApp.dockTile.badgeLabel = count > 0 ? String(count) : nil
+        }
     }
+
+    /// Conversations holding a reply nobody has seen — the Dock tile's number, from the
+    /// same shared rule the phone's badges use (archived excluded, no `turns` faulted).
+    private var unreadCount: Int { jesseUnreadCount(threads) }
 
     /// Delete never-used empty threads: no turns, never sent (no session), no unsent draft,
     /// and not the one currently running. Deliberately narrow, so it can never take a thread
@@ -374,6 +384,13 @@ struct MacRootView: View {
                     Label(thread.isArchived ? "Unarchive" : "Archive",
                           systemImage: thread.isArchived ? "tray.and.arrow.up" : "archivebox")
                 }
+                // IN THIS MENU, not a second `.contextMenu` on the row: two context menus
+                // on one List row produce an arbitrary winner, and the loser's items
+                // silently vanish.
+                Button { toggleRead(thread) } label: {
+                    Label(thread.hasUnreadReply ? "Mark as Read" : "Mark as Unread",
+                          systemImage: thread.hasUnreadReply ? "envelope.open" : "envelope.badge")
+                }
                 Divider()
                 Button(role: .destructive) { delete(thread) } label: {
                     Label("Delete", systemImage: "trash")
@@ -453,6 +470,19 @@ struct MacRootView: View {
         coordinator.pushArchivedChange(for: thread)
     }
 
+    /// Flip this conversation's read state by hand — the Mac's half of the phone's
+    /// context-menu item, with the same rule: an unread one is marked read, a read one is
+    /// marked unread (`readThroughMs` back to 0). Local-first, then best-effort mirrored
+    /// so the phone converges.
+    private func toggleRead(_ thread: JesseThread) {
+        let nowMs = JesseThread.unixMillis(.now)
+        let changed = thread.hasUnreadReply ? thread.markRead(nowMs: nowMs)
+                                            : thread.markUnread(nowMs: nowMs)
+        guard changed else { return }
+        try? context.save()
+        coordinator.pushReadChange(for: thread)
+    }
+
     /// The ⌘⇧A action: archive / restore whatever thread is selected in the sidebar.
     /// No-op with no selection (the toolbar button is disabled then).
     private func archiveSelected() {
@@ -494,11 +524,31 @@ struct MacThreadRow: View {
     /// Star / unstar this conversation (the parent persists the context).
     let onToggleFavorite: () -> Void
 
+    /// The fixed-width slot the unread dot lives in, occupied whether or not a dot is in
+    /// it, so titles stay aligned as threads are read. Matches the phone's row.
+    static let unreadSlotWidth: CGFloat = 12
+    static let unreadDotSize: CGFloat = 8
+
     var body: some View {
         HStack(spacing: 6) {
+            // NEVER COLOUR ALONE: the dot and the semibold title say the same thing twice,
+            // and the slot below says it a third time in words. Same rule as the phone's row.
+            ZStack {
+                if thread.hasUnreadReply {
+                    Circle()
+                        .fill(Color.accentColor)
+                        .frame(width: Self.unreadDotSize, height: Self.unreadDotSize)
+                }
+            }
+            .frame(width: Self.unreadSlotWidth)
+            .accessibilityHidden(!thread.hasUnreadReply)
+            .accessibilityLabel("Unread reply")
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 6) {
-                    Text(displayTitle(for: thread)).font(.body).lineLimit(1)
+                    Text(displayTitle(for: thread))
+                        .font(.body)
+                        .fontWeight(thread.hasUnreadReply ? .semibold : .regular)
+                        .lineLimit(1)
                     if running {
                         ProgressView().controlSize(.small)
                     }

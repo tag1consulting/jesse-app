@@ -1,5 +1,6 @@
 import SwiftUI
 import SwiftData
+import UserNotifications
 import JesseCore
 import JesseDietDisplay
 import JesseNetworking
@@ -9,9 +10,14 @@ import JesseTodayDisplay
 // UI (`ContentView`) exactly as before — every Siri/push/voice entry point it owns
 // keeps working, because the whole view (and its scene-phase + onChange handlers)
 // lives inside the tab, which TabView keeps mounted. "Today" is the vault's day file,
-// one tap away and carrying the only badge on the bar. "Health" is the native diet
-// dashboard. Wrapping (rather than restructuring) `ContentView` is the non-invasive
-// path: nothing about the old root's behavior changes.
+// one tap away. "Health" is the native diet dashboard. Wrapping (rather than
+// restructuring) `ContentView` is the non-invasive path: nothing about the old root's
+// behavior changes.
+//
+// TWO tabs carry a badge, and they count different things: Today's is open Do Now work
+// plus unseen briefing rows, Chats' is conversations holding a reply nobody has seen.
+// Chats' number is also the one that reaches the app icon (see `applyIconBadge`), because
+// it is the one that is true whether or not the app is open.
 struct RootTabView: View {
     /// The tabs, as data. A `CaseIterable` enum the body ITERATES rather than a
     /// hand-written list of three `.tabItem`s: the set of tabs, their order, and
@@ -65,6 +71,9 @@ struct RootTabView: View {
     static let defaultTab: Tab = .chats
 
     @State private var selection: Tab = RootTabView.defaultTab
+
+    /// Read only to repaint the icon badge on the way to the background.
+    @Environment(\.scenePhase) private var scenePhase
 
     /// The app-scoped coordinator, read here only to build the replayer's Tell sender.
     @Environment(RunCoordinator.self) private var coordinator
@@ -157,6 +166,14 @@ struct RootTabView: View {
         // each one is pushed. Not gated on the Today tab being selected: the wrist's
         // list has to be right whichever tab the phone happens to be showing, and a
         // context push is a dictionary written to a mailbox, not a network call.
+        // THE ICON FOLLOWS THE LIST. Repainted whenever the count changes — a reply
+        // landing, a thread being read here or converging from the Mac — and again on the
+        // way to the background, which is the last chance to leave the home screen
+        // truthful before the app stops running.
+        .onChange(of: unreadCount, initial: true) { _, count in applyIconBadge(count) }
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .background { applyIconBadge(unreadCount) }
+        }
         .onChange(of: todayModel.serverSnapshot) { _, _ in
             watchLink?.pushCurrent()
             // A fetch that produced a document is the strongest evidence there is that
@@ -232,10 +249,38 @@ struct RootTabView: View {
         }
     }
 
-    /// Only Today carries a number, and the number is the semantics' — open Do Now
-    /// work plus unseen briefing rows. `0` renders as no badge at all.
+    /// The number on each tab. `0` renders as no badge at all.
     private func badge(for tab: Tab) -> Int {
-        tab == .today ? todayModel.tabBadgeCount : 0
+        switch tab {
+        case .today: return todayModel.tabBadgeCount
+        case .chats: return unreadCount
+        case .health: return 0
+        }
+    }
+
+    /// Conversations holding a reply nobody has seen — the Chats badge, and the number the
+    /// app icon carries. The shared rule (archived excluded, no `turns` faulted); see
+    /// `jesseUnreadCount`.
+    private var unreadCount: Int { jesseUnreadCount(threads) }
+
+    /// Every conversation row, for the badge alone. `@Query` keeps it live, so reading a
+    /// thread updates both the tab badge and the icon without anything having to tell them.
+    @Query private var threads: [JesseThread]
+
+    /// Paint (or clear) the app-icon badge.
+    ///
+    /// THREE THINGS IT WILL NOT DO. It never asks for permission — that is
+    /// `PushManager.noteSuccessfulTurn`'s single prompt, at the moment the app has earned
+    /// one. It checks `badgeSetting` first and returns silently when badges are off, so a
+    /// user who has turned them off in Settings is not fought with. And a failure is
+    /// swallowed: a badge is not worth an error banner.
+    private func applyIconBadge(_ count: Int) {
+        UNUserNotificationCenter.current().getNotificationSettings { settings in
+            guard settings.badgeSetting == .enabled else { return }
+            Task { @MainActor in
+                try? await UNUserNotificationCenter.current().setBadgeCount(count)
+            }
+        }
     }
 }
 

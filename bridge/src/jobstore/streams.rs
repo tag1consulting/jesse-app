@@ -35,6 +35,10 @@ pub enum StreamFrame {
         // `JobState::Done`'s field so a streamed terminal frame and a polled result
         // carry the identical value; empty on nearly every turn.
         artifacts: Vec<Artifact>,
+        // When the reply was finalized, on the bridge's clock. Mirrors
+        // `JobState::Done`'s field for the same reason every other sidecar here does:
+        // a streamed reply and a polled one must carry the identical value.
+        last_reply_ms: u64,
     },
     /// Terminal: the turn failed. Carries the human-readable cause.
     Error(String),

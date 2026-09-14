@@ -64,6 +64,7 @@ pub fn frame_to_event(frame: &StreamFrame) -> Event {
             directives,
             provenance,
             artifacts,
+            last_reply_ms,
         } => sse_event(
             "done",
             json!({
@@ -75,6 +76,11 @@ pub fn frame_to_event(frame: &StreamFrame) -> Event {
                 // no-artifact turn emits is byte-for-byte the frame it emitted before
                 // this field existed and an older client is unaffected.
                 "artifacts": artifacts_to_value(artifacts),
+                // When the reply was finalized, on the bridge's clock — the same value
+                // the poll result carries, so a streaming client and a polling one time
+                // the reply identically. `0` for a turn with no conversation record; an
+                // older client simply ignores the key.
+                "last_reply_ms": last_reply_ms,
             }),
         ),
         StreamFrame::Error(error) => sse_event("error", json!({ "error": error })),
@@ -177,6 +183,7 @@ pub async fn jesse_stream(
                 directives,
                 provenance,
                 artifacts,
+                last_reply_ms,
             }) => {
                 let _ = tx.try_send(Ok(sse_reset(&response)));
                 let _ = tx.try_send(Ok(frame_to_event(&StreamFrame::Done {
@@ -185,6 +192,7 @@ pub async fn jesse_stream(
                     directives,
                     provenance,
                     artifacts,
+                    last_reply_ms,
                 })));
             }
             Some(JobState::Failed { error, .. }) => {
@@ -251,6 +259,7 @@ mod tests {
                 directives: None,
                 provenance: None,
                 artifacts: Vec::new(),
+                last_reply_ms: 0,
             },
         );
 

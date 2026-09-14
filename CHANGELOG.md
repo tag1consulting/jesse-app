@@ -14,6 +14,68 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [Bridge 0.138.0, App 1.0 (135)] - 2026-09-14
+
+**A conversation with a reply you have not read is now marked, on the phone and the Mac,
+and reading it on one clears it on the other.** A dot in the accent colour and a semibold
+title on the list row, a number on the Chats tab, on the app icon and on the Dock tile;
+"Mark as Read" / "Mark as Unread" in the row's context menu when you disagree.
+
+A thread is unread when `lastReplyMs > readThroughMs`, and **both numbers come off the
+bridge's clock**. The bridge stamps `last_reply_ms` at the single point it finalizes a
+reply, the apps store that value rather than their own arrival time, and marking read
+copies the thread's own `lastReplyMs` across instead of writing "now". That is what stops
+clock skew between phone, Mac and bridge from either hiding a new reply or reviving a read
+one. A device falls back to its own clock only against a bridge too old to send the field.
+
+**Only a transcript actually on screen marks anything read**: the conversation's detail
+view visible and the app active on iOS, the selected conversation in a key window of the
+active app on macOS. A reply that lands while the app is in a pocket stays unread, and
+Siri, the watch and the share sheet never mark anything.
+
+**The upgrade marks nothing unread.** Every existing thread and conversation defaults to
+`0`/`0`, and `0 > 0` is false.
+
+### Added
+- `ConversationRecord.last_reply_ms` (bridge), stamped at the reply-finalization seam
+  beside the model badge and monotonic, so a clock that steps backwards cannot un-read a
+  conversation. Scheduled jobs reach that seam through the same turn path and stamp too.
+- `SessionFlags.read_through_ms` / `read_updated_ms` and `apply_read` — a third
+  last-writer-wins register beside favorite and archived, on the same strictly-newer clock
+  rule. Deliberately LWW and not max-wins on the value: "Mark as Unread" moves
+  `read_through_ms` backwards, and a max rule would swallow it.
+- `last_reply_ms` on the poll result, the SSE `done` frame, the persisted job file and
+  every entry of `GET /jesse/conversations`; `read_through_ms` / `read_updated_ms` on the
+  conversation list and on the flags endpoint, which now accepts them.
+- `unread_conversation_count` and `aps.badge` on every push the bridge sends to the phone,
+  stamped at `push_payload` — the one point every push goes through, so no push path can
+  forget it and leave the icon showing an old number. The sentinel watchdog, which cannot
+  know the count, sends `None` and leaves the icon alone.
+- `JesseThread.lastReplyMs` / `readThroughMs` / `readUpdatedMs`, `hasUnreadReply`,
+  `noteReply(atUnixMillis:)`, `markRead(nowMs:)`, `markUnread(nowMs:)` and
+  `applyReadFromSync`. `markRead` and `markUnread` return whether anything changed and are
+  no-ops when already in that state, so opening a read thread costs no save and no push.
+- The shared pure rules in JesseCore, one definition each for both apps and matching the
+  bridge's: `jesseHasUnreadReply`, `jesseUnreadCount` (archived excluded, and it never
+  faults a thread's turns) and `jesseShouldMarkRead(isVisible:isActive:)`.
+- `ReadWrite`, `ReadDecision`, `FlagReconciler.decideRead` and the read register in
+  `FlagReconciler.reconcile` and `FlagSyncing.setFlags`; `pushReadChange` on both
+  coordinators, best-effort and self-healing exactly like the favorite push.
+- The unread dot and semibold title on `ThreadRow` and `MacThreadRow` (never colour alone:
+  dot plus weight, plus an "Unread reply" announcement leading the row), "Mark as
+  Read"/"Mark as Unread" in both context menus, and an iOS leading swipe action declared
+  AFTER Favorite and Archive so a full swipe still favorites.
+- `.badge` in `PushManager`'s authorization options — the same single prompt, no second
+  interruption — and app-icon / Dock-tile badges that check `badgeSetting` first and skip
+  silently when badges are off.
+
+### Changed
+- Three additive defaulted `Int` columns on `JesseThread`, listed in `JesseSchema.swift`'s
+  migration header. No new `VersionedSchema` and no `SchemaMigrationPlan`.
+- Compatible both directions: a new app against an old bridge shows everything as read (and
+  falls back to its own clock for replies it delivers itself); an old app against a new
+  bridge ignores the new fields.
+
 ## [App 1.0 (134)] - 2026-09-12
 
 **Every row of the model picker now shows the live quota of the account that model bills.**

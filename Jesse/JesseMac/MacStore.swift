@@ -563,6 +563,14 @@ final class MacCoordinator {
         jesseTurn.thread = thread
         context.insert(jesseTurn)
         thread.updatedAt = Date()
+        // A REPLY ARRIVED, which `updatedAt` above cannot say on its own (the user's own
+        // turns bump it too). The bridge's finalize time is preferred over this Mac's
+        // clock so both sides of the unread comparison come off one clock; `0` means a
+        // bridge too old to send it and the device clock stands in. Mirrors the iOS
+        // `TurnWriter`, deliberately — the two must not drift on when a reply "arrived".
+        thread.noteReply(atUnixMillis: reply.lastReplyMs > 0
+                         ? Int(reply.lastReplyMs)
+                         : JesseThread.unixMillis(Date()))
         try? context.save()
 
         onTurnFinished?(thread, fields.text)
@@ -642,6 +650,14 @@ final class MacCoordinator {
                     turn.thread = thread
                     context.insert(turn)
                     thread.updatedAt = Date()
+                    // A JESSE turn this Mac never saw — sent from the phone, or landed
+                    // while this app was closed. It is a reply arriving, so it moves the
+                    // unread stamp, dated by the TURN's own timestamp rather than now:
+                    // hydration can carry history that is hours old, and `noteReply`'s
+                    // max rule keeps an older one from pulling the stamp backwards.
+                    if turn.roleValue == .jesse {
+                        thread.noteReply(atUnixMillis: JesseThread.unixMillis(turn.createdAt))
+                    }
                     changed = true
                 }
             }
@@ -751,11 +767,16 @@ final class MacCoordinator {
             }
             t.aiTitle = c.title
             t.updatedAt = stamp
+            // When this conversation last replied, on the BRIDGE's clock, so a stub
+            // adopted from the phone shows its dot without waiting to be opened.
+            t.noteReply(atUnixMillis: Int(c.lastReplyMs))
             context.insert(t)
             await FlagReconciler.reconcile(
                 thread: t,
                 serverFavorite: c.favorite, serverFavoriteUpdatedMs: Int(c.favoriteUpdatedMs),
                 serverArchived: c.archived, serverArchivedUpdatedMs: Int(c.archivedUpdatedMs),
+                serverReadThroughMs: Int(c.readThroughMs),
+                serverReadUpdatedMs: Int(c.readUpdatedMs),
                 client: cli)
         }
 
@@ -769,10 +790,15 @@ final class MacCoordinator {
             }
             if let sid = c.sessionId, !sid.isEmpty, t.sessionId != sid { t.sessionId = sid }
             if stamp > t.updatedAt { t.updatedAt = stamp }
+            // A reply that landed on the phone shows its dot here from the list pull
+            // alone. `max`, never assignment — see the phone's half.
+            t.noteReply(atUnixMillis: Int(c.lastReplyMs))
             await FlagReconciler.reconcile(
                 thread: t,
                 serverFavorite: c.favorite, serverFavoriteUpdatedMs: Int(c.favoriteUpdatedMs),
                 serverArchived: c.archived, serverArchivedUpdatedMs: Int(c.archivedUpdatedMs),
+                serverReadThroughMs: Int(c.readThroughMs),
+                serverReadUpdatedMs: Int(c.readUpdatedMs),
                 client: cli)
         }
 
@@ -841,6 +867,14 @@ final class MacCoordinator {
                 if loser.archivedUpdatedMs > winner.archivedUpdatedMs {
                     winner.applyArchivedFromSync(loser.isArchived, updatedMs: loser.archivedUpdatedMs)
                 }
+                // The read mark resolves the same way, on its own clock — otherwise a merge
+                // could revive a dot the user cleared on the copy that is not the oldest.
+                // The reply stamp takes the max instead: both copies describe the same
+                // conversation, so the later reply is simply the one that happened.
+                if loser.readUpdatedMs > winner.readUpdatedMs {
+                    winner.applyReadFromSync(loser.readThroughMs, updatedMs: loser.readUpdatedMs)
+                }
+                winner.noteReply(atUnixMillis: loser.lastReplyMs)
                 if (winner.aiTitle ?? "").isEmpty, let title = loser.aiTitle, !title.isEmpty {
                     winner.aiTitle = title
                 }
@@ -897,7 +931,7 @@ final class MacCoordinator {
         guard let cid = thread.conversationId, !cid.isEmpty else { return }
         let write = FlagWrite(value: thread.isFavorite, updatedMs: thread.favoriteUpdatedMs)
         let cli = makeClient(configStore.config)
-        Task { try? await cli.setFlags(conversationId: cid, favorite: write, archived: nil) }
+        Task { try? await cli.setFlags(conversationId: cid, favorite: write, archived: nil, read: nil) }
     }
 
     /// Optimistic best-effort push of a just-toggled ARCHIVE up. Mirror of
@@ -906,7 +940,18 @@ final class MacCoordinator {
         guard let cid = thread.conversationId, !cid.isEmpty else { return }
         let write = FlagWrite(value: thread.isArchived, updatedMs: thread.archivedUpdatedMs)
         let cli = makeClient(configStore.config)
-        Task { try? await cli.setFlags(conversationId: cid, favorite: nil, archived: write) }
+        Task { try? await cli.setFlags(conversationId: cid, favorite: nil, archived: write, read: nil) }
+    }
+
+    /// Optimistic best-effort push of a just-changed READ MARK up, so the phone's dot
+    /// clears (or comes back) on its next sync. Mirror of `pushFavoriteChange`; same
+    /// self-healing best-effort semantics. Call it only when the mark actually changed —
+    /// this runs on every selection and every activation.
+    func pushReadChange(for thread: JesseThread) {
+        guard let cid = thread.conversationId, !cid.isEmpty else { return }
+        let write = ReadWrite(throughMs: thread.readThroughMs, updatedMs: thread.readUpdatedMs)
+        let cli = makeClient(configStore.config)
+        Task { try? await cli.setFlags(conversationId: cid, favorite: nil, archived: nil, read: write) }
     }
 
     // MARK: Helpers

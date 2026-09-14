@@ -650,7 +650,7 @@ pub fn resolve_conversation_resume(
 ///
 /// `session_id` is the CURRENT bound session (`null` for a conversation registered but
 /// not yet run) and `session_ids` the full ordered alias list. The client needs the
-/// latter to bind its pre-upgrade threads to a conversation exactly once. The four flag
+/// latter to bind its pre-upgrade threads to a conversation exactly once. The flag
 /// fields default to false/0 for a conversation with no flags row.
 #[derive(serde::Serialize, PartialEq, Debug)]
 pub struct ConversationSummary {
@@ -664,6 +664,13 @@ pub struct ConversationSummary {
     pub favorite_updated_ms: u64,
     pub archived: bool,
     pub archived_updated_ms: u64,
+    /// When this conversation last REPLIED, on the bridge's clock (unix millis). Distinct
+    /// from `last_modified`, which moves for the user's own turns too and is in seconds.
+    /// Paired with `read_through_ms` below it is the whole unread rule, so a device that
+    /// has been away decides what is unread from this list alone.
+    pub last_reply_ms: u64,
+    pub read_through_ms: u64,
+    pub read_updated_ms: u64,
     pub registered_ms: u64,
 }
 
@@ -738,6 +745,9 @@ pub fn list_conversations_in(
             favorite_updated_ms: f.favorite_updated_ms,
             archived: f.archived,
             archived_updated_ms: f.archived_updated_ms,
+            last_reply_ms: rec.last_reply_ms,
+            read_through_ms: f.read_through_ms,
+            read_updated_ms: f.read_updated_ms,
             registered_ms: rec.registered_ms,
             conversation_id: rec.conversation_id,
         });
@@ -1389,15 +1399,16 @@ pub async fn jesse_conversation_delete(
 }
 
 /// `POST /jesse/conversation/{conversation_id}/flags` sets this conversation's
-/// favorite / archived flags, so the bridge (not one device) is the source of truth and
-/// every device converges. Same bearer auth and rate limiter as the other routes.
+/// favorite / archived / read flags, so the bridge (not one device) is the source of
+/// truth and every device converges. Same bearer auth and rate limiter as the other
+/// routes.
 ///
 /// The body carries any subset of `{ favorite, favorite_updated_ms, archived,
-/// archived_updated_ms }`; each provided flag is applied **last-writer-wins** by its
-/// client-supplied change timestamp (unix millis): a strictly newer timestamp wins,
-/// an equal or older write is ignored, so out-of-order writes from different devices
-/// converge deterministically. A partial body (one flag only) leaves the other flag
-/// untouched. The resulting `SessionFlags` is returned.
+/// archived_updated_ms, read_through_ms, read_updated_ms }`; each provided flag is
+/// applied **last-writer-wins** by its client-supplied change timestamp (unix millis): a
+/// strictly newer timestamp wins, an equal or older write is ignored, so out-of-order
+/// writes from different devices converge deterministically. A partial body (one flag
+/// only) leaves the other flags untouched. The resulting `SessionFlags` is returned.
 ///
 /// - **`400`** for a malformed conversation id.
 /// - **`404`** for an unknown conversation.
@@ -1426,6 +1437,8 @@ pub async fn jesse_conversation_flags(
         "favorite_updated_ms": result.favorite_updated_ms,
         "archived": result.archived,
         "archived_updated_ms": result.archived_updated_ms,
+        "read_through_ms": result.read_through_ms,
+        "read_updated_ms": result.read_updated_ms,
     })))
 }
 
@@ -1751,6 +1764,7 @@ mod tests {
                 favorite_updated_ms: Some(1_700),
                 archived: Some(true),
                 archived_updated_ms: Some(1_800),
+                ..FlagUpdate::default()
             },
         );
 
