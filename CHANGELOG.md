@@ -14,6 +14,15 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [Bridge 0.139.1] - 2026-09-15
+
+**Clear RUSTSEC-2026-0285 so `main` can deploy again.** The `bridge` CI job's dependency audit
+started failing on 2026-09-14, when the advisory was published: `rustls` 0.23.41 accepts TLS 1.3
+handshake messages across encryption-level boundaries (severity 5.3, fixed in 0.23.45). The
+sentinel refuses to deploy a commit whose `bridge` job is not green, so this also held back
+0.139.0. `rustls` goes to 0.23.45 (and `rustls-webpki` to 0.103.15) in `bridge/Cargo.lock`, and
+the root lockfile moves `rustls` 0.23.43 → 0.23.45. Lockfiles only; no source change.
+
 ## [Bridge 0.139.0] - 2026-09-14
 
 **A model whose health probe has never once passed no longer shows a green light just
