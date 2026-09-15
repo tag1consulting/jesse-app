@@ -5223,6 +5223,8 @@ async fn set_model_on_an_unhealthy_configured_model_is_409_and_does_not_switch()
             checked_at_ms: 123,
             latency_ms: Some(3000),
             last_error_class: Some("timeout".into()),
+            tolerated_4xx_streak: 0,
+            ever_passed: false,
         },
     );
     // The row now reports it configured-but-unhealthy → not available.
@@ -5272,6 +5274,8 @@ async fn set_model_accepts_a_healthy_configured_model() {
             checked_at_ms: 1,
             latency_ms: Some(40),
             last_error_class: None,
+            tolerated_4xx_streak: 0,
+            ever_passed: false,
         },
     );
     let resp = app(st.clone())
@@ -5844,6 +5848,8 @@ async fn per_turn_unhealthy_model_is_409_and_spawns_nothing() {
             checked_at_ms: 5,
             latency_ms: Some(3000),
             last_error_class: Some("timeout".into()),
+            tolerated_4xx_streak: 0,
+            ever_passed: false,
         },
     );
 

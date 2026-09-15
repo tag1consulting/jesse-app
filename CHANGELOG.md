@@ -14,7 +14,29 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
-## [Bridge 0.138.0, App 1.0 (135)] - 2026-09-14
+## [Bridge 0.139.0] - 2026-09-14
+
+**A model whose health probe has never once passed no longer shows a green light just
+because the refusal was a tolerated 4xx.** From 2026-09-13 16:18 the `qwen-local` probe was
+answered `400` on every one of 187 attempts over fifteen hours, and the model read healthy
+the entire time: `classify_probe_status` tolerates any 4xx other than 401/403/404, and the
+health store kept no memory of how many it had tolerated.
+
+The store now counts consecutive tolerated 4xx and remembers whether any probe has ever
+passed since startup. A model that reaches `TOLERATED_4XX_DEGRADE_AFTER` (3) tolerated 4xx in a
+row **with no pass ever** reads unhealthy with the class `degraded-4xx`. It recovers on its
+first real pass. A model that HAS passed keeps the full old tolerance however long a throttle
+lasts, so a proven model is never blanked out by a 429.
+
+The 400 itself was not the bridge's: the local gateway forwarded the probe's lowercase
+`content-length` alongside its own `Content-Length` after rewriting the body, and uvicorn
+rejected the duplicate as `Invalid HTTP request received.` The gateway fix lives with the
+gateway. **Deploy it before this bridge**, or `qwen-local` turns unselectable fifteen minutes
+after startup, for a reason this change correctly reports.
+
+### Changed
+- `HealthStatus` gains `tolerated_4xx_streak` and `ever_passed`; `ProbeOutcome` gains
+  `tolerated_4xx`. Three new prober tests cover demotion, the kept tolerance, and recovery.
 
 **A conversation with a reply you have not read is now marked, on the phone and the Mac,
 and reading it on one clears it on the other.** A dot in the accent colour and a semibold

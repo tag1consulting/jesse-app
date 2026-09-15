@@ -123,9 +123,13 @@ pub struct HealthStatus {
     pub checked_at_ms: u64,
     /// Round-trip latency of the last probe, absent for the optimistic seed.
     pub latency_ms: Option<u64>,
-    /// Coarse class of the last failure (`timeout` / `connect` / `transport` / `http-5xx`),
-    /// or `None` on a passing probe. NEVER the token, URL, or body.
+    /// Coarse class of the last failure (`timeout` / `connect` / `transport` / `http-5xx` /
+    /// `degraded-4xx`), or `None` on a passing probe. NEVER the token, URL, or body.
     pub last_error_class: Option<String>,
+    /// Consecutive probes answered with a TOLERATED 4xx. Reset to 0 by any other outcome.
+    pub tolerated_4xx_streak: u32,
+    /// Whether a probe of this model has ever passed outright (`< 400`) since startup. Sticky.
+    pub ever_passed: bool,
 }
 
 impl HealthStatus {
@@ -136,6 +140,8 @@ impl HealthStatus {
             checked_at_ms: 0,
             latency_ms: None,
             last_error_class: None,
+            tolerated_4xx_streak: 0,
+            ever_passed: false,
         }
     }
 }
@@ -357,6 +363,9 @@ pub struct ProbeOutcome {
     pub ok: bool,
     pub latency_ms: u64,
     pub error_class: Option<String>,
+    /// The response was a TOLERATED 4xx: `ok` is true, but the probe itself was refused.
+    /// [`probe_and_record`] counts these; see [`TOLERATED_4XX_DEGRADE_AFTER`].
+    pub tolerated_4xx: bool,
 }
 
 /// The mockable network seam (exactly the [`ApnsTransport`] shape): the real impl is
@@ -385,6 +394,24 @@ pub const TIMEOUT_CONFIRM_SECS: u64 = 45;
 const _: () = assert!(TIMEOUT_CONFIRM_SECS > REASONING_HEALTH_TIMEOUT_SECS);
 const _: () = assert!(TIMEOUT_CONFIRM_SECS <= MAX_HEALTH_TIMEOUT_SECS);
 
+/// How many CONSECUTIVE tolerated-4xx probes a model that has NEVER passed a probe may collect
+/// before it reads unhealthy, with the class `degraded-4xx`.
+///
+/// A tolerated 4xx (400/422/429/…) reads healthy on purpose — see [`classify_probe_status`] —
+/// because one such answer usually means a gateway quirk or a throttle on a model that works.
+/// But the tolerance had no memory: from 2026-09-13 16:18 the `qwen-local` probe got a 400 on
+/// every one of 187 attempts over fifteen hours, never passed once, and the light stayed green
+/// throughout. (The 400 was the local gateway forwarding the probe's lowercase
+/// `content-length` next to its own `Content-Length` after rewriting the body; uvicorn
+/// rejected the duplicate. Real turns, which capitalize the header, were unaffected.)
+///
+/// So the tolerance now expires for a model with no evidence it has ever served: once the
+/// streak reaches this many and no probe has passed since startup, the model is demoted. A
+/// model that HAS passed keeps the old tolerance for as long as it runs, so a throttle on a
+/// proven model still never blanks it out. Three is fifteen minutes at the 300 s cadence the
+/// deploy uses, three at the 60 s default.
+pub const TOLERATED_4XX_DEGRADE_AFTER: u32 = 3;
+
 /// Run ONE probe of a target and record its status under `now_ms`. This is the whole prober
 /// body per tick — factored out so the tests drive it directly with a mock probe and an
 /// injected clock (the spawned loop just calls it on each interval tick). Never blocks a
@@ -402,13 +429,32 @@ pub async fn probe_and_record(
         patient.health.timeout_secs = target.health.timeout_secs.max(TIMEOUT_CONFIRM_SECS);
         outcome = probe.probe(&patient).await;
     }
+    let prev = store.get(&target.id);
+    let ever_passed =
+        prev.as_ref().is_some_and(|s| s.ever_passed) || (outcome.ok && !outcome.tolerated_4xx);
+    let tolerated_4xx_streak = if outcome.tolerated_4xx {
+        prev.as_ref()
+            .map_or(0, |s| s.tolerated_4xx_streak)
+            .saturating_add(1)
+    } else {
+        0
+    };
+    let degraded = outcome.tolerated_4xx
+        && !ever_passed
+        && tolerated_4xx_streak >= TOLERATED_4XX_DEGRADE_AFTER;
     store.set(
         &target.id,
         HealthStatus {
-            healthy: outcome.ok,
+            healthy: outcome.ok && !degraded,
             checked_at_ms: now_ms,
             latency_ms: Some(outcome.latency_ms),
-            last_error_class: outcome.error_class,
+            last_error_class: if degraded {
+                Some("degraded-4xx".to_string())
+            } else {
+                outcome.error_class
+            },
+            tolerated_4xx_streak,
+            ever_passed,
         },
     );
 }
@@ -513,21 +559,23 @@ pub fn spawn_health_prober(
 ///   * `< 400`            → healthy
 ///   * `401` / `403`      → unhealthy, `unauthorized`
 ///   * `404`              → unhealthy, `unknown-model`
-///   * any other `4xx`    → healthy (reachable + authed, tolerated)
+///   * any other `4xx`    → healthy (reachable + authed, tolerated) — but a model that has
+///     NEVER passed is demoted after [`TOLERATED_4XX_DEGRADE_AFTER`] of these in a row
 ///   * `>= 500`           → unhealthy, `http-5xx`
 pub fn classify_probe_status(status: u16) -> ProbeOutcome {
-    let (ok, error_class): (bool, Option<&str>) = match status {
-        s if s < 400 => (true, None),
-        401 | 403 => (false, Some("unauthorized")),
-        404 => (false, Some("unknown-model")),
-        s if s >= 500 => (false, Some("http-5xx")),
-        // Any other 4xx (400, 422, 429, …): reachable and authed — tolerate as today.
-        _ => (true, None),
+    let (ok, error_class, tolerated_4xx): (bool, Option<&str>, bool) = match status {
+        s if s < 400 => (true, None, false),
+        401 | 403 => (false, Some("unauthorized"), false),
+        404 => (false, Some("unknown-model"), false),
+        s if s >= 500 => (false, Some("http-5xx"), false),
+        // Any other 4xx (400, 422, 429, …): reachable and authed — tolerated, and counted.
+        _ => (true, None, true),
     };
     ProbeOutcome {
         ok,
         latency_ms: 0, // filled in by the caller
         error_class: error_class.map(str::to_string),
+        tolerated_4xx,
     }
 }
 
@@ -599,6 +647,7 @@ impl HealthProbe for ReqwestProbe {
                         ok: false,
                         latency_ms,
                         error_class: Some(class.to_string()),
+                        tolerated_4xx: false,
                     }
                 }
             }
@@ -625,6 +674,7 @@ mod tests {
                     ok,
                     latency_ms,
                     error_class: error_class.map(str::to_string),
+                    tolerated_4xx: false,
                 },
                 calls: AtomicUsize::new(0),
             }
@@ -715,6 +765,11 @@ mod tests {
             let o = classify_probe_status(s);
             assert!(o.ok, "status {s} should be healthy");
             assert_eq!(o.error_class, None, "status {s} carries no error class");
+            assert_eq!(
+                o.tolerated_4xx,
+                s >= 400,
+                "only the 4xx are counted as tolerated"
+            );
         }
         // A bad/expired token: 401 and 403 read unhealthy so the switcher hides the model.
         for s in [401u16, 403] {
@@ -906,6 +961,8 @@ mod tests {
                 checked_at_ms: 5,
                 latency_ms: Some(3000),
                 last_error_class: Some("timeout".into()),
+                tolerated_4xx_streak: 0,
+                ever_passed: false,
             },
         );
         let h = model_health(&glm, &store);
@@ -990,6 +1047,7 @@ mod tests {
             ok,
             latency_ms,
             error_class: error_class.map(str::to_string),
+            tolerated_4xx: false,
         }
     }
 
@@ -1079,5 +1137,62 @@ mod tests {
         ]);
         probe_and_record(&t, &probe, &store, 1_000).await;
         assert_eq!(probe.timeouts(), vec![55, 55]);
+    }
+
+    /// THE REGRESSION (2026-09-13): a model whose probe is refused with a tolerated 4xx on
+    /// every attempt, and has never passed, used to read healthy forever (187 probes, 15 h).
+    /// Now the tolerance runs out after TOLERATED_4XX_DEGRADE_AFTER in a row.
+    #[tokio::test]
+    async fn a_tolerated_4xx_streak_that_never_passed_reads_degraded() {
+        let store = HealthStore::new();
+        let n = TOLERATED_4XX_DEGRADE_AFTER as usize;
+        let probe = ScriptedProbe::new(vec![classify_probe_status(400); n + 1]);
+        for i in 1..n {
+            probe_and_record(&target("qwen-local"), &probe, &store, i as u64).await;
+            let s = store.get("qwen-local").expect("status recorded");
+            assert!(s.healthy, "probe {i} of {n}: still inside the tolerance");
+            assert_eq!(s.tolerated_4xx_streak, i as u32);
+        }
+        probe_and_record(&target("qwen-local"), &probe, &store, n as u64).await;
+        let s = store.get("qwen-local").expect("status recorded");
+        assert!(!s.healthy, "the streak reached the limit with no pass ever");
+        assert_eq!(s.last_error_class.as_deref(), Some("degraded-4xx"));
+        assert!(!s.ever_passed);
+        // One more tolerated 4xx keeps it degraded; it does not flap back.
+        probe_and_record(&target("qwen-local"), &probe, &store, 99).await;
+        assert!(!store.get("qwen-local").expect("status recorded").healthy);
+    }
+
+    /// A model that has passed once keeps the full tolerance: a throttle on a proven model
+    /// never blanks it out, however long it lasts.
+    #[tokio::test]
+    async fn a_model_that_has_passed_keeps_tolerating_4xx() {
+        let store = HealthStore::new();
+        let mut script = vec![outcome(true, 40, None)];
+        script.extend(vec![classify_probe_status(429); 10]);
+        let probe = ScriptedProbe::new(script);
+        for t in 0..11 {
+            probe_and_record(&target("glm"), &probe, &store, t).await;
+        }
+        let s = store.get("glm").expect("status recorded");
+        assert!(s.healthy && s.ever_passed);
+        assert_eq!(s.tolerated_4xx_streak, 10);
+        assert_eq!(s.last_error_class, None);
+    }
+
+    /// A degraded model recovers on its first real pass, and the streak resets.
+    #[tokio::test]
+    async fn a_degraded_model_recovers_on_its_first_pass() {
+        let store = HealthStore::new();
+        let n = TOLERATED_4XX_DEGRADE_AFTER as usize;
+        let mut script = vec![classify_probe_status(400); n];
+        script.push(outcome(true, 30, None));
+        let probe = ScriptedProbe::new(script);
+        for t in 0..=n as u64 {
+            probe_and_record(&target("qwen-local"), &probe, &store, t).await;
+        }
+        let s = store.get("qwen-local").expect("status recorded");
+        assert!(s.healthy && s.ever_passed);
+        assert_eq!((s.tolerated_4xx_streak, s.last_error_class), (0, None));
     }
 }
