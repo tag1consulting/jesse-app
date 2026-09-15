@@ -416,13 +416,18 @@ pub fn expected_nutrient_count() -> usize {
 // ---- Canonical CSV headers (single source of truth) -----------------------
 //
 // These headers are the ONE definition of each log's column contract. BOTH the
-// append path (the row builders below target exactly these columns, in order) AND
-// the extract prompt (which inlines them verbatim) consume them, so the prompt can
-// never describe a schema the writer doesn't produce. `prompt_contract_matches_
-// append_schema` is the drift guard that enforces this (the parity mitigation).
+// append path (the row builders below name exactly these columns) AND the extract
+// prompt (which inlines them verbatim) consume them, so the prompt can never describe
+// a schema the writer doesn't produce. `prompt_contract_matches_append_schema` is the
+// drift guard that enforces this (the parity mitigation).
 //
-// The food header's nutrient tail is DERIVED from [`NUTRIENT_COLUMNS`]; only the 14
-// core columns are spelled out here.
+// Canonical order is: core columns, nutrient columns (food only), `TZ`, then the
+// structured tail. A file on disk need not match it byte for byte: rows are placed by
+// column NAME under the file's own header ([`LogRow::render`]), and the append only
+// ever ADDS missing names to a header ([`plan_log_header`]).
+//
+// The food header's nutrient block is DERIVED from [`NUTRIENT_COLUMNS`]; only the 14
+// core columns and the tail are spelled out here.
 
 /// The 14 core `food-log.csv` columns, in order, ahead of the nutrient tail.
 const FOOD_LOG_CORE_COLUMNS: &[&str] = &[
@@ -442,14 +447,68 @@ const FOOD_LOG_CORE_COLUMNS: &[&str] = &[
     "Meal_Type",
 ];
 
-/// The zone column every log gained with the diet day. It is LAST in every header —
-/// appended rather than inserted — so a reader that addresses columns by NAME sees one
-/// new column and a reader that predates it sees the file it always saw.
+/// The zone column every log gained with the diet day. It was appended rather than
+/// inserted, so a reader that addresses columns by NAME saw one new column and a reader
+/// that predates it saw the file it always saw. The structured tail follows it.
 ///
 /// A blank cell is not a defect on a historical row: it means "written before the column
 /// existed", which [`parse_row_zone`] reads as the process zone, because that is in fact
 /// the zone those rows were written in.
 pub const TZ_COLUMN: &str = "TZ";
+
+/// The structured `food-log.csv` columns, in order, AFTER [`TZ_COLUMN`]. `Alcohol_g` is
+/// here and deliberately NOT in [`NUTRIENT_COLUMNS`], whose block sits before `TZ`.
+pub const FOOD_LOG_TAIL_COLUMNS: &[&str] =
+    &["Alcohol_g", "Category", "Source", "Basis", "Time_Source"];
+/// The structured `exercise-log.csv` columns, in order, after [`TZ_COLUMN`].
+pub const EXERCISE_LOG_TAIL_COLUMNS: &[&str] = &["Treadmill", "Source"];
+/// The structured `weight-log.csv` columns, in order, after [`TZ_COLUMN`].
+pub const WEIGHT_LOG_TAIL_COLUMNS: &[&str] = &["Hydration_Artifact"];
+
+// The structured tail's vocabularies. On a HISTORICAL row a blank cell means unknown;
+// every row the bridge writes fills the cell, with `unknown` rather than a guess.
+
+/// `Category` — what the row IS. Beer, wine, spirits, cider and cocktails are
+/// `alcoholic_drink`; a hot chocolate with a whisky measure in it is a `soft_drink` whose
+/// `Alcohol_g` is not zero.
+pub const FOOD_CATEGORIES: &[&str] = &[
+    "food",
+    "alcoholic_drink",
+    "soft_drink",
+    "supplement",
+    "water",
+];
+/// Food `Source` — `shop` is bought ready to eat or eaten as packaged; `other_home` is
+/// someone else's kitchen.
+pub const FOOD_SOURCES: &[&str] = &["home", "restaurant", "shop", "other_home", "unknown"];
+/// `Basis` — how the numbers were obtained: this product's own label; a weighed portion
+/// with reference nutrients; a standard reference portion, not weighed; an assumed
+/// portion or composition; a portion judged from a photo.
+pub const BASIS_VALUES: &[&str] = &[
+    "label",
+    "weighed",
+    "reference",
+    "estimate",
+    "photo",
+    "unknown",
+];
+/// `Time_Source` — whether `Time` is when it was eaten, when it was reported, or a
+/// reconstruction.
+pub const TIME_SOURCES: &[&str] = &["actual", "report", "estimated", "unknown"];
+/// Exercise `Source`.
+pub const EXERCISE_SOURCES: &[&str] = &["watch", "self_reported", "unknown"];
+/// Exercise `Type`. Anything else is mapped onto it on write ([`exercise_type`]).
+pub const EXERCISE_TYPES: &[&str] = &[
+    "Run",
+    "Walk",
+    "Swim",
+    "Bike",
+    "Strength",
+    "Yard_Work",
+    "Other",
+];
+/// The cell a bridge-written row carries when it does not know.
+pub const UNKNOWN_CELL: &str = "unknown";
 
 /// Build the food header for an arbitrary nutrient table (the parameterized form the
 /// synthetic-ninth-nutrient test drives; production calls [`food_log_header`]).
@@ -459,6 +518,7 @@ fn build_food_log_header(cols: &[NutrientCol]) -> String {
         .copied()
         .chain(cols.iter().map(|c| c.csv))
         .chain(std::iter::once(TZ_COLUMN))
+        .chain(FOOD_LOG_TAIL_COLUMNS.iter().copied())
         .collect::<Vec<_>>()
         .join(",")
 }
@@ -466,19 +526,19 @@ fn build_food_log_header(cols: &[NutrientCol]) -> String {
 static FOOD_LOG_HEADER_CELL: LazyLock<String> =
     LazyLock::new(|| build_food_log_header(NUTRIENT_COLUMNS));
 
-/// The canonical `food-log.csv` header line: the 14 core columns plus one column per
-/// [`NUTRIENT_COLUMNS`] entry, in table order.
+/// The canonical `food-log.csv` header line: the 14 core columns, one column per
+/// [`NUTRIENT_COLUMNS`] entry in table order, `TZ`, then [`FOOD_LOG_TAIL_COLUMNS`].
 pub fn food_log_header() -> &'static str {
     &FOOD_LOG_HEADER_CELL
 }
 
 pub const EXERCISE_LOG_HEADER: &str =
-    "Date,Type,Description,Distance_km,Duration,Pace_min_per_km,Elevation_m,Avg_HR,Cadence,Calories,Plan_Source,Notes,Start_Time,TZ";
+    "Date,Type,Description,Distance_km,Duration,Pace_min_per_km,Elevation_m,Avg_HR,Cadence,Calories,Plan_Source,Notes,Start_Time,TZ,Treadmill,Source";
 pub const WEIGHT_LOG_HEADER: &str =
-    "Date,Weight_lbs,Weight_kg,Phase,BodyFat_pct,MuscleMass_lbs,Notes,TZ";
+    "Date,Weight_lbs,Weight_kg,Phase,BodyFat_pct,MuscleMass_lbs,Notes,TZ,Hydration_Artifact";
 
 /// The canonical header for one log file name, or `None` for a name this module does not
-/// own. The header-repair path ([`repair_log_header`]) is driven entirely by this.
+/// own. The header plan ([`plan_log_header`]) is driven entirely by this.
 pub fn canonical_header(file_name: &str) -> Option<&'static str> {
     match file_name {
         "food-log.csv" => Some(food_log_header()),
@@ -486,6 +546,31 @@ pub fn canonical_header(file_name: &str) -> Option<&'static str> {
         "weight-log.csv" => Some(WEIGHT_LOG_HEADER),
         _ => None,
     }
+}
+
+/// Normalise a free-form value onto one word of `vocab`: case-insensitive, with spaces
+/// and hyphens read as underscores. `None` when it names nothing in the list.
+pub fn vocab_word(raw: &str, vocab: &[&'static str]) -> Option<&'static str> {
+    let norm: String = raw
+        .trim()
+        .chars()
+        .map(|c| if c == ' ' || c == '-' { '_' } else { c })
+        .collect();
+    vocab
+        .iter()
+        .copied()
+        .find(|w| w.eq_ignore_ascii_case(&norm))
+}
+
+/// A structured-tail cell: the value's vocabulary word, or [`UNKNOWN_CELL`].
+fn vocab_cell(v: Option<&str>, vocab: &[&'static str]) -> String {
+    v.and_then(|s| vocab_word(s, vocab))
+        .unwrap_or(UNKNOWN_CELL)
+        .to_string()
+}
+
+fn bool_cell(b: bool) -> String {
+    if b { "true" } else { "false" }.to_string()
 }
 
 // ---- Extracted entry schema -----------------------------------------------
@@ -565,6 +650,31 @@ pub struct FoodEntry {
     /// across the upgrade.
     #[serde(default)]
     pub unknowable_composite: bool,
+    /// The structured tail of the row (`Alcohol_g`, `Category`, `Source`, `Basis`,
+    /// `Time_Source`). `#[serde(default)]` keeps a queue entry written by an older bridge
+    /// readable.
+    #[serde(default)]
+    pub tags: FoodTags,
+}
+
+/// A food row's structured tail, as the extract (and, for `basis`, the verify
+/// completion) reported it. Every field is optional: `None` is "nobody said", and the
+/// row builder then writes `unknown` (or, for alcohol, the rule in [`alcohol_grams`])
+/// rather than a guess. The strings are already vocabulary words when they are `Some`.
+///
+/// Never mirrored: none of these reach the `JESSE_MEAL_LOG` wire.
+#[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
+pub struct FoodTags {
+    /// Grams of ethanol, when the extract stated it.
+    pub alcohol_g: Option<f64>,
+    /// A [`FOOD_CATEGORIES`] word.
+    pub category: Option<String>,
+    /// A [`FOOD_SOURCES`] word.
+    pub source: Option<String>,
+    /// A [`BASIS_VALUES`] word.
+    pub basis: Option<String>,
+    /// A [`TIME_SOURCES`] word.
+    pub time_source: Option<String>,
 }
 
 /// One extracted exercise session.
@@ -588,6 +698,13 @@ pub struct ExerciseEntry {
     pub avg_hr: Option<f64>,
     pub calories: Option<f64>,
     pub notes: Option<String>,
+    /// The session was on a treadmill. An activity NAMED "Treadmill run" says so too
+    /// ([`exercise_type`]), whatever this carries.
+    #[serde(default)]
+    pub treadmill: bool,
+    /// An [`EXERCISE_SOURCES`] word, when the extract stated one.
+    #[serde(default)]
+    pub source: Option<String>,
 }
 
 /// One extracted weigh-in reading.
@@ -864,6 +981,11 @@ const FOOD_CORE_KEYS: &[&str] = &[
     "fat_g",
     "unknowable_composite",
     "notes",
+    "alcohol_g",
+    "category",
+    "source",
+    "basis",
+    "time_source",
 ];
 
 /// Whether `k` is a key the food schema accepts: a core key or a nutrient key from
@@ -881,6 +1003,20 @@ fn opt_bool_field(m: &serde_json::Map<String, Value>, key: &str) -> Result<bool,
         Some(Value::Bool(b)) => Ok(*b),
         Some(_) => Err(format!("`{key}` is not a boolean")),
     }
+}
+
+/// An optional vocabulary field, TOLERANT the way `eaten_at` is: absent, `null`, a
+/// non-string, or a word outside `vocab` all read as `None`, which the row builder
+/// writes as `unknown`. A strict check here would send a whole meal to rung 2 over a
+/// label nobody downstream needs to be exact.
+fn opt_vocab_field(
+    m: &serde_json::Map<String, Value>,
+    key: &str,
+    vocab: &[&'static str],
+) -> Option<String> {
+    opt_str_field(m, key)
+        .and_then(|s| vocab_word(&s, vocab))
+        .map(str::to_string)
 }
 
 fn parse_food(m: &serde_json::Map<String, Value>) -> Result<FoodEntry, String> {
@@ -925,6 +1061,13 @@ fn parse_food(m: &serde_json::Map<String, Value>) -> Result<FoodEntry, String> {
         vitamin_d_ug: None,
         notes: opt_str_field(m, "notes"),
         unknowable_composite: opt_bool_field(m, "unknowable_composite")?,
+        tags: FoodTags {
+            alcohol_g: opt_extract_num_field(m, "alcohol_g")?,
+            category: opt_vocab_field(m, "category", FOOD_CATEGORIES),
+            source: opt_vocab_field(m, "source", FOOD_SOURCES),
+            basis: opt_vocab_field(m, "basis", BASIS_VALUES),
+            time_source: opt_vocab_field(m, "time_source", TIME_SOURCES),
+        },
     };
     for c in NUTRIENT_COLUMNS {
         c.set(&mut f, opt_extract_num_field(m, c.key)?);
@@ -934,6 +1077,9 @@ fn parse_food(m: &serde_json::Map<String, Value>) -> Result<FoodEntry, String> {
 
 const EXERCISE_KEYS: &[&str] = &[
     "kind",
+    "type",
+    // The schema's old name for `type`, still accepted so an extract that keeps using
+    // it is not a rung-2 rejection.
     "activity",
     "eaten_at",
     "time",
@@ -944,6 +1090,8 @@ const EXERCISE_KEYS: &[&str] = &[
     "avg_hr",
     "calories",
     "notes",
+    "treadmill",
+    "source",
 ];
 
 fn parse_exercise(m: &serde_json::Map<String, Value>) -> Result<ExerciseEntry, String> {
@@ -952,8 +1100,16 @@ fn parse_exercise(m: &serde_json::Map<String, Value>) -> Result<ExerciseEntry, S
             return Err(format!("unknown exercise field {k:?}"));
         }
     }
+    // `type` is the schema's name; the entry keeps the field it always had (`activity`)
+    // so a queued entry round-trips, and the row builder maps it onto the vocabulary.
+    let activity = match req_str(m, "type") {
+        Ok(t) => t,
+        Err(_) => req_str(m, "activity").map_err(|_| "entry missing string `type`")?,
+    };
     Ok(ExerciseEntry {
-        activity: req_str(m, "activity")?,
+        treadmill: opt_bool_field(m, "treadmill")?,
+        source: opt_vocab_field(m, "source", EXERCISE_SOURCES),
+        activity,
         eaten_at: opt_instant_field(m, "eaten_at"),
         time: opt_str_field(m, "time"),
         description: opt_str_field(m, "description"),
@@ -1106,10 +1262,10 @@ fn parse_completion(m: &serde_json::Map<String, Value>) -> MicroCompletion {
     out
 }
 
-/// Squeeze a reference-basis string into ONE safe CSV note: collapse every run of
-/// whitespace (including the CR/LF that a bare newline in a CSV cell would smuggle
-/// in) to a single space, trim, and cap the length. The Notes cell is still
-/// RFC-4180-quoted by [`csv_field`]; this keeps the cell one readable line.
+/// Squeeze a reference-basis string into ONE line: collapse every run of whitespace
+/// (including the CR/LF that a bare newline in a CSV cell would smuggle in) to a single
+/// space, trim, and cap the length. The line itself never reaches the CSV — the merge
+/// maps it onto the `Basis` vocabulary ([`basis_from_reference`]).
 fn sanitize_basis(s: &str) -> String {
     const MAX_BASIS_CHARS: usize = 180;
     let one_line = s.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -1237,12 +1393,13 @@ fn resolve_food_verdict(f: &FoodEntry, v: &EntryVerdict) -> Option<DietEntry> {
 ///     completed — a blank there is the correct state for most foods — so a value
 ///     the verifier volunteers for it is ignored.
 ///   * **Composites are skipped whole.** An `unknowable_composite` row is left
-///     untouched, including its Notes.
-///   * **Notes only when empty.** The reference basis is written to Notes ONLY when
-///     Notes is empty AND at least one cell was actually filled; existing note text
-///     is never overwritten and nothing is appended to an uncompleted row.
-///   * **Nothing else moves.** Only nutrient fields and (conditionally) Notes are
-///     touched here: name, meal, time, amount, unit and the core macros are not
+///     untouched, including its Basis.
+///   * **Basis only when unset.** The reference basis is mapped onto the `Basis`
+///     vocabulary ([`basis_from_reference`]) and written ONLY when the row has no basis
+///     of its own (or `unknown`) AND at least one cell was actually filled. A basis the
+///     extract stated (`label`, say) always wins, and Notes is never touched.
+///   * **Nothing else moves.** Only nutrient fields and (conditionally) Basis are
+///     touched here: name, meal, time, amount, unit, Notes and the core macros are not
 ///     reachable from this function. A changed macro is the verify CORRECTION path
 ///     ([`resolve_verdict`]), which has already run by the time this does.
 pub fn complete_food_micros(f: &mut FoodEntry, c: &MicroCompletion) -> usize {
@@ -1267,29 +1424,40 @@ pub fn complete_food_micros(f: &mut FoodEntry, c: &MicroCompletion) -> usize {
             _ => {}
         }
     }
-    // The basis rides in Notes only when this row was actually completed and its
-    // Notes cell is empty.
+    // The basis lands in `Basis` only when this row was actually completed and carries
+    // no basis of its own. It is a vocabulary word by the time it is stored, so no free
+    // text from the verifier reaches the CSV.
     if filled > 0 {
-        let notes_empty = f
-            .notes
-            .as_deref()
-            .map(|n| n.trim().is_empty())
-            .unwrap_or(true);
-        if notes_empty {
-            // Sanitized HERE as well as at parse time: the merge is the trusted layer,
-            // and a bare CR/newline in a CSV cell is exactly the defect that once broke
-            // the food log's own header line.
-            let basis = c
-                .basis
-                .as_deref()
-                .map(sanitize_basis)
-                .filter(|b| !b.is_empty());
-            if let Some(basis) = basis {
-                f.notes = Some(basis);
+        let unset = f.tags.basis.as_deref().is_none_or(|b| b == UNKNOWN_CELL);
+        if unset {
+            if let Some(basis) = c.basis.as_deref().filter(|b| !b.trim().is_empty()) {
+                f.tags.basis = Some(basis_from_reference(basis).to_string());
             }
         }
     }
     filled
+}
+
+/// Map the verifier's one-line `reference_basis` onto the [`BASIS_VALUES`] vocabulary.
+/// The line names the food-composition source the verifier scaled from, so it is
+/// `reference` unless it says otherwise: a vocabulary word on its own, or a line that
+/// names a label, a weighed portion, a photo, or an estimate.
+pub fn basis_from_reference(line: &str) -> &'static str {
+    if let Some(w) = vocab_word(line, BASIS_VALUES) {
+        return w;
+    }
+    let l = line.to_lowercase();
+    if l.contains("label") {
+        "label"
+    } else if l.contains("weigh") {
+        "weighed"
+    } else if l.contains("photo") {
+        "photo"
+    } else if l.contains("estimat") || l.contains("assum") {
+        "estimate"
+    } else {
+        "reference"
+    }
 }
 
 /// The EXPECTED nutrient columns still blank on this row, by CSV column name — what
@@ -1394,75 +1562,262 @@ fn num_cell(n: Option<f64>) -> String {
     }
 }
 
+/// One log row as NAMED cells, each already CSV-quoted. A row has no width of its own:
+/// the append renders it under the target file's ACTUAL header ([`LogRow::render`]), so
+/// every cell lands under its own column name whatever order the file keeps its columns
+/// in, and a column the builder does not know gets an empty cell.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct LogRow {
+    cells: Vec<(&'static str, String)>,
+}
+
+impl LogRow {
+    fn push(&mut self, name: &'static str, cell: String) {
+        self.cells.push((name, cell));
+    }
+
+    /// The (CSV-quoted) cell for column `name`, if the builder set one.
+    pub fn cell(&self, name: &str) -> Option<&str> {
+        self.cells
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, c)| c.as_str())
+    }
+
+    fn set(&mut self, name: &'static str, cell: String) {
+        match self.cells.iter_mut().find(|(n, _)| *n == name) {
+            Some(slot) => slot.1 = cell,
+            None => self.push(name, cell),
+        }
+    }
+
+    /// The row as one CSV line under `header`: exactly one cell per header column, in the
+    /// header's order, empty for any column this row does not name.
+    pub fn render<S: AsRef<str>>(&self, header: &[S]) -> String {
+        header
+            .iter()
+            .map(|h| self.cell(h.as_ref()).unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+}
+
+/// Grams of ethanol for the `Alcohol_g` cell. The extract's own figure wins (it can
+/// work from ml and ABV: ml × ABV/100 × 0.789). An `alcoholic_drink` that arrived
+/// without one gets the macro remainder, (Calories − 4 × Protein − 4 × Carbs − 9 × Fat)
+/// / 7, floored at 0, from the VERIFIED macros (a blank macro counts as 0). Anything
+/// else is 0: the extract is told to state alcohol on any row that has it.
+pub fn alcohol_grams(e: &FoodEntry) -> f64 {
+    if let Some(g) = e.tags.alcohol_g {
+        return g;
+    }
+    if e.tags.category.as_deref() != Some("alcoholic_drink") {
+        return 0.0;
+    }
+    let m = |v: Option<f64>| v.unwrap_or(0.0);
+    let grams = (m(e.kcal) - 4.0 * m(e.protein_g) - 4.0 * m(e.carbs_g) - 9.0 * m(e.fat_g)) / 7.0;
+    (grams.max(0.0) * 10.0).round() / 10.0
+}
+
+/// Map an activity name onto the [`EXERCISE_TYPES`] vocabulary, and say whether the
+/// name itself means a treadmill. Case-insensitive. A vocabulary word maps to itself;
+/// Swimming is Swim; Treadmill run is Run on a treadmill; Marathon is Run; Gardening,
+/// Garden work, Yard work and Manual labor are Yard_Work; Strength/Weights is Strength;
+/// anything else is Other.
+pub fn exercise_type(activity: &str) -> (&'static str, bool) {
+    let a = activity
+        .trim()
+        .to_lowercase()
+        .replace(['_', '-'], " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mapped = match a.as_str() {
+        "treadmill run" => return ("Run", true),
+        "marathon" => "Run",
+        "swimming" => "Swim",
+        "gardening" | "garden work" | "yard work" | "manual labor" => "Yard_Work",
+        "strength/weights" | "strength / weights" | "weights" => "Strength",
+        _ => "",
+    };
+    if !mapped.is_empty() {
+        return (mapped, false);
+    }
+    let word = EXERCISE_TYPES
+        .iter()
+        .copied()
+        .find(|t| t.replace('_', " ").eq_ignore_ascii_case(&a))
+        .unwrap_or("Other");
+    (word, false)
+}
+
+/// The `Description` cell: the extract's description, with the ORIGINAL activity
+/// wording kept in front of it whenever [`exercise_type`] changed that wording (and the
+/// description does not already carry it).
+fn exercise_description(activity: &str, mapped: &str, description: Option<&str>) -> String {
+    let original = activity.trim();
+    let reworded = !original
+        .replace(['_', '-', ' '], "")
+        .eq_ignore_ascii_case(&mapped.replace('_', ""));
+    let desc = description.map(str::trim).filter(|d| !d.is_empty());
+    match (reworded, desc) {
+        (false, d) => d.unwrap_or("").to_string(),
+        (true, Some(d)) if d.to_lowercase().contains(&original.to_lowercase()) => d.to_string(),
+        (true, Some(d)) => format!("{original}: {d}"),
+        (true, None) => original.to_string(),
+    }
+}
+
+/// Whether a weigh-in on diet day `date` is a hydration artifact: a Run (by
+/// [`exercise_type`], so a historical "Marathon" row counts) with `Distance_km` over 20
+/// logged on that date or either of the two dates before it. Reads `exercise_csv` by
+/// header NAME, tolerant of short and ragged rows; an unreadable file has no runs.
+pub fn hydration_artifact(exercise_csv: &str, date: &str) -> bool {
+    let Ok(day) = chrono::NaiveDate::parse_from_str(date.trim(), "%Y-%m-%d") else {
+        return false;
+    };
+    let window: Vec<String> = (0..3)
+        .filter_map(|back| day.checked_sub_days(chrono::Days::new(back)))
+        .map(|d| d.format("%Y-%m-%d").to_string())
+        .collect();
+    let mut rdr = csv::ReaderBuilder::new()
+        .has_headers(true)
+        .flexible(true)
+        .from_reader(exercise_csv.as_bytes());
+    let idx: HashMap<String, usize> = match rdr.headers() {
+        Ok(h) => h
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (s.trim().to_string(), i))
+            .collect(),
+        Err(_) => return false,
+    };
+    let cell = |rec: &csv::StringRecord, name: &str| -> String {
+        idx.get(name)
+            .and_then(|&j| rec.get(j))
+            .unwrap_or("")
+            .trim()
+            .to_string()
+    };
+    rdr.records().flatten().any(|rec| {
+        window.contains(&cell(&rec, "Date"))
+            && exercise_type(&cell(&rec, "Type")).0 == "Run"
+            && cell(&rec, "Distance_km")
+                .parse::<f64>()
+                .is_ok_and(|km| km > 20.0)
+    })
+}
+
 /// Build one `food-log.csv` row for a verified food item on the DIET DAY `date`, whose
 /// wall clock was read in `tz`. Follows the vault fill convention: `Unit` defaults to
 /// `serving`, `Cal_per_100g`/`Grams` are left BLANK, and the absolute macros go into
-/// `Calories,Protein_g,Fat_g,Carbs_g` (+ `Fiber_g`). `Meal_Type` mirrors `Meal`.
+/// `Calories,Protein_g,Fat_g,Carbs_g` (+ `Fiber_g`). `Meal_Type` mirrors `Meal`. Every
+/// nutrient cell is blank when unknown, never 0. The structured tail is always filled:
+/// `unknown` for a word nobody stated, [`alcohol_grams`] for `Alcohol_g`.
 ///
 /// `date`, `e.time` and `tz` are three renderings of the entry's one `eaten_at`
 /// ([`stamp_entry_clocks`] derives all three), never three independent claims.
-pub fn food_row(e: &FoodEntry, date: &str, tz: &str) -> String {
-    // The 14 core cells, then one nutrient cell per NUTRIENT_COLUMNS entry IN TABLE
-    // ORDER — the same order `food_log_header()` names them, so the two cannot drift.
-    // Every nutrient cell is blank when unknown, never 0.
-    let mut cols = vec![
-        date.to_string(),
-        csv_field(&e.meal),
-        csv_field(&e.name),
-        csv_field(e.amount.as_deref().unwrap_or("")),
-        csv_field(e.unit.as_deref().unwrap_or("serving")),
-        String::new(), // Cal_per_100g — blank by convention
-        String::new(), // Grams — blank by convention
-        num_cell(e.kcal),
-        num_cell(e.protein_g),
-        num_cell(e.fat_g),
-        num_cell(e.carbs_g),
-        csv_field(e.notes.as_deref().unwrap_or("")),
-        csv_field(e.time.as_deref().unwrap_or("")),
-        csv_field(&e.meal), // Meal_Type mirrors Meal
-    ];
-    cols.extend(NUTRIENT_COLUMNS.iter().map(|c| num_cell(c.get(e))));
-    cols.push(csv_field(tz)); // TZ — last, matching `food_log_header()`
-    cols.join(",")
+pub fn food_cells(e: &FoodEntry, date: &str, tz: &str) -> LogRow {
+    let mut r = LogRow::default();
+    r.push("Date", date.to_string());
+    r.push("Meal", csv_field(&e.meal));
+    r.push("Item", csv_field(&e.name));
+    r.push("Amount", csv_field(e.amount.as_deref().unwrap_or("")));
+    r.push("Unit", csv_field(e.unit.as_deref().unwrap_or("serving")));
+    // `Cal_per_100g` and `Grams` stay blank by convention (a header column the row does
+    // not name renders empty).
+    r.push("Calories", num_cell(e.kcal));
+    r.push("Protein_g", num_cell(e.protein_g));
+    r.push("Fat_g", num_cell(e.fat_g));
+    r.push("Carbs_g", num_cell(e.carbs_g));
+    r.push("Notes", csv_field(e.notes.as_deref().unwrap_or("")));
+    r.push("Time", csv_field(e.time.as_deref().unwrap_or("")));
+    r.push("Meal_Type", csv_field(&e.meal));
+    for c in NUTRIENT_COLUMNS {
+        r.push(c.csv, num_cell(c.get(e)));
+    }
+    r.push(TZ_COLUMN, csv_field(tz));
+    r.push("Alcohol_g", num_cell(Some(alcohol_grams(e))));
+    r.push(
+        "Category",
+        vocab_cell(e.tags.category.as_deref(), FOOD_CATEGORIES),
+    );
+    r.push("Source", vocab_cell(e.tags.source.as_deref(), FOOD_SOURCES));
+    r.push("Basis", vocab_cell(e.tags.basis.as_deref(), BASIS_VALUES));
+    r.push(
+        "Time_Source",
+        vocab_cell(e.tags.time_source.as_deref(), TIME_SOURCES),
+    );
+    r
 }
 
 /// Build one `exercise-log.csv` row for a verified exercise session on the diet day
-/// `date`, whose `Start_Time` was read in `tz`.
-pub fn exercise_row(e: &ExerciseEntry, date: &str, tz: &str) -> String {
-    let cols = [
-        date.to_string(),
-        csv_field(&e.activity),
-        csv_field(e.description.as_deref().unwrap_or("")),
-        num_cell(e.distance_km),
-        csv_field(e.duration.as_deref().unwrap_or("")),
+/// `date`, whose `Start_Time` was read in `tz`. `Type` is mapped onto the vocabulary
+/// ([`exercise_type`]) with the original wording kept in `Description`.
+pub fn exercise_cells(e: &ExerciseEntry, date: &str, tz: &str) -> LogRow {
+    let (kind, named_treadmill) = exercise_type(&e.activity);
+    let description = exercise_description(&e.activity, kind, e.description.as_deref());
+    let mut r = LogRow::default();
+    r.push("Date", date.to_string());
+    r.push("Type", kind.to_string());
+    r.push("Description", csv_field(&description));
+    r.push("Distance_km", num_cell(e.distance_km));
+    r.push("Duration", csv_field(e.duration.as_deref().unwrap_or("")));
+    r.push(
+        "Pace_min_per_km",
         csv_field(e.pace.as_deref().unwrap_or("")),
-        String::new(), // Elevation_m
-        num_cell(e.avg_hr),
-        String::new(), // Cadence
-        num_cell(e.calories),
-        String::new(), // Plan_Source
-        csv_field(e.notes.as_deref().unwrap_or("")),
-        csv_field(e.time.as_deref().unwrap_or("")),
-        csv_field(tz),
-    ];
-    cols.join(",")
+    );
+    r.push("Avg_HR", num_cell(e.avg_hr));
+    r.push("Calories", num_cell(e.calories));
+    r.push("Notes", csv_field(e.notes.as_deref().unwrap_or("")));
+    r.push("Start_Time", csv_field(e.time.as_deref().unwrap_or("")));
+    r.push(TZ_COLUMN, csv_field(tz));
+    r.push("Treadmill", bool_cell(e.treadmill || named_treadmill));
+    r.push("Source", vocab_cell(e.source.as_deref(), EXERCISE_SOURCES));
+    r
 }
 
 /// Build one `weight-log.csv` row for a verified weigh-in at `date`. `Phase` is left
 /// blank (the pipeline doesn't infer it); `BodyFat_pct`/`MuscleMass_lbs` blank when
 /// unmeasured (the honest "not measured" signal, never `0`).
+///
+/// `Hydration_Artifact` is NOT set here: it depends on `exercise-log.csv` as it stands
+/// at the moment of the write, including a run logged in the same turn, so the weight
+/// writer in [`append_rows_atomic`] fills it through [`hydration_artifact`].
+pub fn weight_cells(e: &WeightEntry, date: &str, tz: &str) -> LogRow {
+    let mut r = LogRow::default();
+    r.push("Date", date.to_string());
+    r.push("Weight_lbs", num_cell(Some(e.weight_lbs)));
+    r.push("Weight_kg", num_cell(e.weight_kg));
+    r.push("BodyFat_pct", num_cell(e.body_fat_pct));
+    r.push("MuscleMass_lbs", num_cell(e.muscle_mass_lbs));
+    r.push("Notes", csv_field(e.notes.as_deref().unwrap_or("")));
+    r.push(TZ_COLUMN, csv_field(tz));
+    r
+}
+
+/// A row rendered under its log's CANONICAL header — what a fresh file receives. Tests
+/// read cells back by position from this; production renders under the file's own
+/// header at append.
+#[cfg(test)]
+fn canonical_line(row: &LogRow, file_name: &str) -> String {
+    let header = canonical_header(file_name).expect("a log this module owns");
+    row.render(&header.split(',').collect::<Vec<_>>())
+}
+
+#[cfg(test)]
+pub fn food_row(e: &FoodEntry, date: &str, tz: &str) -> String {
+    canonical_line(&food_cells(e, date, tz), "food-log.csv")
+}
+
+#[cfg(test)]
+pub fn exercise_row(e: &ExerciseEntry, date: &str, tz: &str) -> String {
+    canonical_line(&exercise_cells(e, date, tz), "exercise-log.csv")
+}
+
+#[cfg(test)]
 pub fn weight_row(e: &WeightEntry, date: &str, tz: &str) -> String {
-    let cols = [
-        date.to_string(),
-        num_cell(Some(e.weight_lbs)),
-        num_cell(e.weight_kg),
-        String::new(), // Phase
-        num_cell(e.body_fat_pct),
-        num_cell(e.muscle_mass_lbs),
-        csv_field(e.notes.as_deref().unwrap_or("")),
-        csv_field(tz),
-    ];
-    cols.join(",")
+    canonical_line(&weight_cells(e, date, tz), "weight-log.csv")
 }
 
 // ---- Mirror: appended food rows → JESSE_MEAL_LOG directive ------------------
@@ -2072,53 +2427,92 @@ impl AppendSnapshot {
     }
 }
 
-/// A STRICT check of one log's header line against its canonical form, returning the
-/// repaired content when it fails and `None` when it already passes.
+/// The columns an append renders rows under, decided from a log's existing header line
+/// (its terminator's `\r` already removed) against the canonical header.
 ///
-/// The check is on the header's CONTENT: the bytes before the first line terminator, with
-/// the terminator's own `\r` (a CRLF file — `food-log.csv` is one throughout, and that is
-/// RFC 4180's own line ending, not a defect) removed. Anything else that differs — a
-/// STRAY carriage return inside the header, a renamed column, or a header written before
-/// the `TZ` column existed — is a header this writer will not append under, so it is
-/// rewritten.
+/// The rule is NON-DESTRUCTIVE: a column is never removed, renamed or reordered.
 ///
-/// **Rows are never touched.** Only the bytes before the first terminator change, and the
-/// terminator itself is preserved, so a CRLF file stays a CRLF file and every row keeps
-/// the exact bytes it was committed with. That restraint is the whole point: the header is
-/// a schema declaration the writer owns, the rows are the owner's data and are not this
-/// code's to normalise.
-pub fn repair_log_header(content: &str, canonical: &str) -> Option<String> {
+///   * The canonical header, or the canonical header plus columns this bridge does not
+///     know: the file's own columns, unknown ones kept (rows give them an empty cell).
+///   * A LEGACY header — a prefix of the canonical one, as every file written before a
+///     column was added is — gets the missing canonical names appended.
+///   * Both at once (a legacy prefix with unknown columns after it) is handled the same
+///     way: the unknown columns stay where they are and the missing names go last.
+///
+/// Anything else is an `Err` naming what is wrong and the append does not happen: a first
+/// column that is not the canonical first, a blank or duplicated name, or canonical
+/// columns out of canonical order or with one missing from the middle (a rename reads as
+/// exactly that). Writing under such a header would put cells under the wrong names.
+///
+/// Column names are trimmed, so a STRAY carriage return inside the header is read as the
+/// name it decorates; the header is then rewritten without it.
+pub fn plan_log_header(found: &str, canonical: &str) -> Result<Vec<String>, String> {
+    let names: Vec<String> = found.split(',').map(|n| n.trim().to_string()).collect();
+    let canon: Vec<&str> = canonical.split(',').collect();
+    if let Some(i) = names.iter().position(|n| n.is_empty()) {
+        return Err(format!("column {} has a blank name", i + 1));
+    }
+    if let Some(dup) = names
+        .iter()
+        .enumerate()
+        .find(|(i, n)| names[..*i].contains(n))
+        .map(|(_, n)| n)
+    {
+        return Err(format!("column {dup:?} appears twice"));
+    }
+    if names[0] != canon[0] {
+        return Err(format!(
+            "the first column is {:?}, not {:?}",
+            names[0], canon[0]
+        ));
+    }
+    let known: Vec<&str> = names
+        .iter()
+        .map(String::as_str)
+        .filter(|n| canon.contains(n))
+        .collect();
+    if let Some(i) = known.iter().zip(&canon).position(|(k, c)| k != c) {
+        return Err(format!(
+            "column {:?} sits where {:?} belongs — a canonical column is renamed, missing \
+             or out of order",
+            known[i], canon[i]
+        ));
+    }
+    let missing = &canon[known.len()..];
+    let mut columns = names;
+    columns.extend(missing.iter().map(|s| s.to_string()));
+    Ok(columns)
+}
+
+/// Prepare one log's content for an append: the content to append to and the columns
+/// rows are rendered under.
+///
+/// A missing or blank file starts with the canonical header. Otherwise the header is
+/// planned ([`plan_log_header`]) and, when the plan differs from the header's bytes (a
+/// legacy header extended, a stray carriage return dropped), ONLY the header line is
+/// rewritten. **Rows are never touched**: the bytes after the first terminator are kept
+/// exactly, and the terminator's own `\r` survives, so a CRLF file stays a CRLF file
+/// (`food-log.csv` is one throughout, and that is RFC 4180's own line ending).
+pub fn prepare_log_content(
+    content: &str,
+    canonical: &str,
+) -> Result<(String, Vec<String>), String> {
+    if content.trim().is_empty() {
+        let columns = canonical.split(',').map(str::to_string).collect();
+        return Ok((format!("{canonical}\n"), columns));
+    }
     let (first_line, rest) = match content.find('\n') {
         Some(nl) => (&content[..nl], &content[nl..]),
         None => (content, ""),
     };
-    let terminated_crlf = first_line.ends_with('\r');
+    let terminator = if first_line.ends_with('\r') { "\r" } else { "" };
     let found = first_line.strip_suffix('\r').unwrap_or(first_line);
-    if found == canonical {
-        return None;
+    let columns = plan_log_header(found, canonical)?;
+    let header = columns.join(",");
+    if header == found {
+        return Ok((content.to_string(), columns));
     }
-    let terminator = if terminated_crlf { "\r" } else { "" };
-    Some(format!("{canonical}{terminator}{rest}"))
-}
-
-/// Rewrite `path`'s header when it fails [`repair_log_header`], logging what changed.
-/// A missing or empty file is left alone — the append below creates it with the canonical
-/// header. Returns the file's content as it now stands, so the caller reads the disk once.
-fn ensure_log_header(path: &Path, canonical: &str, original: Option<String>) -> Option<String> {
-    let content = original?;
-    if content.trim().is_empty() {
-        return Some(content);
-    }
-    let repaired = repair_log_header(&content, canonical)?;
-    let found = content.lines().next().unwrap_or("");
-    eprintln!(
-        "jesse-bridge: rewrote the header of {} — it read {:?} and the canonical header is \
-         {:?}. Rows were not touched.",
-        path.display(),
-        truncate_chars(found, 400),
-        truncate_chars(canonical, 400),
-    );
-    Some(repaired)
+    Ok((format!("{header}{terminator}{rest}"), columns))
 }
 
 /// Append one file's rows, preserving the single-trailing-newline convention.
@@ -2138,20 +2532,35 @@ fn appended_content(original: &str, rows: &[String]) -> String {
 /// target's prior content into the returned snapshot BEFORE writing, so any failure
 /// mid-way (or a later hook failure) can roll the whole turn back with no partial
 /// rows left behind. Returns the snapshot on success (for rung-4 rollback or normal
-/// completion), or `Err` (already rolled back) on the first write failure.
+/// completion), or `Err` (already rolled back) on the first failure.
+///
+/// Each file's rows are rendered under THAT FILE'S header as [`prepare_log_content`]
+/// plans it, so a cell always lands under its own column name and every row is exactly
+/// as wide as the header. A header the plan refuses fails the whole append, logged, with
+/// nothing written: the live pipeline then falls through to the hosted turn and a queue
+/// replay re-queues the meal, exactly as for any other append failure.
+///
+/// The files are written food, exercise, weight, in that order, because the weight
+/// writer fills `Hydration_Artifact` ([`hydration_artifact`]) from `exercise-log.csv` as
+/// it stands AFTER this turn's own exercise rows.
 pub fn append_rows_atomic(
     logs_dir: &Path,
-    food: &[String],
-    exercise: &[String],
-    weight: &[String],
+    food: &[LogRow],
+    exercise: &[LogRow],
+    weight: &[LogRow],
 ) -> Result<AppendSnapshot, String> {
-    let targets: [(&str, &[String]); 3] = [
+    let targets: [(&str, &[LogRow]); 3] = [
         ("food-log.csv", food),
         ("exercise-log.csv", exercise),
         ("weight-log.csv", weight),
     ];
     let mut snapshot = AppendSnapshot {
         restores: Vec::new(),
+    };
+    let fail = |snapshot: &AppendSnapshot, msg: String| {
+        snapshot.rollback();
+        eprintln!("jesse-bridge: diet append refused: {msg}");
+        msg
     };
     for (name, rows) in targets {
         if rows.is_empty() {
@@ -2162,26 +2571,66 @@ pub fn append_rows_atomic(
             Ok(c) => Some(c),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => {
-                snapshot.rollback();
-                return Err(format!("cannot read {}: {e}", path.display()));
+                return Err(fail(
+                    &snapshot,
+                    format!("cannot read {}: {e}", path.display()),
+                ))
             }
         };
-        // HEADER FIRST, and only ever the header. The rows about to be appended carry a
-        // `TZ` cell, so a file still declaring the pre-`TZ` header would describe a schema
-        // it no longer holds; the same check catches a stray carriage return or a renamed
-        // column. The repair rides inside the SAME snapshot as the append, so a later hook
-        // failure rolls the header back with the rows.
-        let canonical = canonical_header(name);
-        let base = match canonical.and_then(|c| ensure_log_header(&path, c, original.clone())) {
-            Some(repaired) => repaired,
-            None => original.clone().unwrap_or_default(),
-        };
-        let new_content = appended_content(&base, rows);
+        let canonical = canonical_header(name).expect("every append target is a log we own");
+        // HEADER FIRST, and only ever the header. The plan rides inside the SAME snapshot
+        // as the append, so a later hook failure rolls an extended header back with the
+        // rows.
+        let (base, columns) =
+            match prepare_log_content(original.as_deref().unwrap_or(""), canonical) {
+                Ok(planned) => planned,
+                Err(why) => {
+                    let found = original
+                        .as_deref()
+                        .and_then(|c| c.lines().next())
+                        .unwrap_or("");
+                    return Err(fail(
+                        &snapshot,
+                        format!(
+                            "{} has a header this bridge will not write under ({why}); the \
+                             file was not changed. Header: {:?}",
+                            path.display(),
+                            truncate_chars(found, 400)
+                        ),
+                    ));
+                }
+            };
+        let mut rows = rows.to_vec();
+        if name == "weight-log.csv" {
+            let exercise_csv =
+                std::fs::read_to_string(logs_dir.join("exercise-log.csv")).unwrap_or_default();
+            for row in rows.iter_mut() {
+                let date = row.cell("Date").unwrap_or("").to_string();
+                row.set(
+                    "Hydration_Artifact",
+                    bool_cell(hydration_artifact(&exercise_csv, &date)),
+                );
+            }
+        }
+        let lines: Vec<String> = rows.iter().map(|r| r.render(&columns)).collect();
+        if original
+            .as_deref()
+            .is_some_and(|o| !o.trim().is_empty() && o != base)
+        {
+            eprintln!(
+                "jesse-bridge: extended the header of {} to {} columns. Rows were not touched.",
+                path.display(),
+                columns.len()
+            );
+        }
+        let new_content = appended_content(&base, &lines);
         // Snapshot BEFORE writing so a rollback restores this file too.
         snapshot.restores.push((path.clone(), original));
         if let Err(e) = std::fs::write(&path, new_content) {
-            snapshot.rollback();
-            return Err(format!("cannot write {}: {e}", path.display()));
+            return Err(fail(
+                &snapshot,
+                format!("cannot write {}: {e}", path.display()),
+            ));
         }
     }
     Ok(snapshot)
@@ -2600,6 +3049,24 @@ pub fn stamp_entry_clocks(entries: &mut [DietEntry], reference: &str, zone: &Sch
     }
 }
 
+/// Mark `Time_Source = report` on every food entry that arrived with no time of its own
+/// (no usable `eaten_at`, no `time`) when the utterance carried no `(eaten at …)` stamp.
+/// Such an entry is about to be dated to the moment the message was sent — the bridge's
+/// own fallback, not a claim the model made — so `report` is a fact, and it overrides
+/// whatever the extract said. Runs BEFORE [`stamp_entry_clocks`], which fills both.
+pub fn mark_reported_times(entries: &mut [DietEntry], stamped: bool) {
+    if stamped {
+        return;
+    }
+    for e in entries.iter_mut() {
+        if let DietEntry::Food(f) = e {
+            if f.eaten_at.is_none() && f.time.as_deref().and_then(parse_hhmm).is_none() {
+                f.tags.time_source = Some("report".to_string());
+            }
+        }
+    }
+}
+
 /// One entry's diet day, from its stamped `eaten_at`. `fallback` covers an entry that
 /// somehow reached here unstamped (a queue item written by an older bridge) — never a
 /// silent guess at the host's calendar.
@@ -2735,8 +3202,8 @@ fn build_extract_schema(cols: &[NutrientCol]) -> String {
         r#"{{
   "no_loggable_content": <boolean: true if the message logs nothing NEW to eat/drink, no workout, no weight — OR if it AMENDS/corrects/moves/deletes something already logged instead of reporting new consumption; in either case return an empty entries array>,
   "entries": [
-    {{ "kind": "food", "name": "<ONE food item, never a combined meal>", "meal": "Breakfast|Lunch|Dinner|Snack", "eaten_at": "<RFC3339 with offset, ONLY if the message says when — else null/omit>", "time": "<HH:MM, same rule; omit when you set eaten_at>", "amount": "<e.g. 1 medium (~118g)>", "unit": "serving", "kcal": <number>, "protein_g": <number>, "carbs_g": <number>, "fat_g": <number>, {nutrients}, "unknowable_composite": <boolean, optional, default false: true ONLY for a composite you cannot identify>, "notes": "<optional>" }},
-    {{ "kind": "exercise", "activity": "Run|Walk|Swim|Strength/Weights|...", "eaten_at": "<RFC3339 with offset, ONLY if stated — else null/omit>", "time": "<HH:MM, same rule>", "description": "<optional>", "distance_km": <number>, "duration": "<e.g. 56:58>", "pace": "<e.g. 7:07>", "avg_hr": <number>, "calories": <number>, "notes": "<optional>" }},
+    {{ "kind": "food", "name": "<ONE food item, never a combined meal>", "meal": "Breakfast|Lunch|Dinner|Snack", "eaten_at": "<RFC3339 with offset, ONLY if the message says when — else null/omit>", "time": "<HH:MM, same rule; omit when you set eaten_at>", "amount": "<e.g. 1 medium (~118g)>", "unit": "serving", "kcal": <number>, "protein_g": <number>, "carbs_g": <number>, "fat_g": <number>, {nutrients}, "alcohol_g": <number, g of ethanol; 0 or omit when there is none>, "category": "food|alcoholic_drink|soft_drink|supplement|water", "source": "home|restaurant|shop|other_home|unknown", "basis": "label|weighed|reference|estimate|photo|unknown", "time_source": "actual|report|estimated|unknown", "unknowable_composite": <boolean, optional, default false: true ONLY for a composite you cannot identify>, "notes": "<optional>" }},
+    {{ "kind": "exercise", "type": "Run|Walk|Swim|Bike|Strength|Yard_Work|Other", "eaten_at": "<RFC3339 with offset, ONLY if stated — else null/omit>", "time": "<HH:MM, same rule>", "description": "<the activity in the message's own words>", "distance_km": <number>, "duration": "<e.g. 56:58>", "pace": "<e.g. 7:07>", "avg_hr": <number>, "calories": <number>, "treadmill": <boolean>, "source": "watch|self_reported|unknown", "notes": "<optional>" }},
     {{ "kind": "weight", "eaten_at": "<RFC3339 with offset, ONLY if stated — else null/omit>", "weight_lbs": <number>, "weight_kg": <number>, "body_fat_pct": <number>, "muscle_mass_lbs": <number>, "notes": "<optional>" }}
   ]
 }}"#
@@ -2849,6 +3316,32 @@ pub fn diet_nutrient_rules() -> &'static str {
     &NUTRIENT_RULES_CELL
 }
 
+/// The extract prompt's rules for the structured tail. Every field has an `unknown` (or
+/// an omission) the model is told to prefer over a guess; the bridge writes `unknown`
+/// for anything missing or off-vocabulary.
+const DIET_STRUCTURED_RULES: &str = "\
+- `category` is what the item IS: `food`, `alcoholic_drink` (beer, wine, spirits, cider, \
+cocktails), `soft_drink`, `supplement`, or `water`. A hot chocolate with a whisky measure \
+in it is a `soft_drink` with a non-zero `alcohol_g`.\n\
+- `alcohol_g` is grams of ethanol: ml × ABV/100 × 0.789 when the volume and ABV are known \
+(a 500 ml beer at 5% is 19.7). Write 0 for anything without alcohol. Alcohol used in \
+cooking counts as 0. Omit it for a drink whose amount you cannot tell; the bridge then \
+works it out from the macros.\n\
+- `source` is where the item came from: `home`, `restaurant`, `shop` (bought ready to eat \
+or eaten as packaged), `other_home` (someone else's kitchen), or `unknown`.\n\
+- `basis` is how you got the numbers: `label` (this product's own label), `weighed` (a \
+weighed portion with reference nutrients), `reference` (a standard reference portion, not \
+weighed), `estimate` (an assumed portion or composition), `photo` (a portion judged from a \
+photo), or `unknown`.\n\
+- `time_source` says what the time is: `actual` (the message says when it was eaten), \
+`report` (it is when the message was sent), `estimated` (you reconstructed it from a \
+phrase like \"this morning\"), or `unknown`.\n\
+- Exercise `type` is ONE of Run, Walk, Swim, Bike, Strength, Yard_Work, Other. A treadmill \
+run is `Run` with `\"treadmill\": true`; a marathon is `Run`; gardening or manual labour is \
+`Yard_Work`; weights are `Strength`. Put the activity in the message's own words in \
+`description`. Exercise `source` is `watch`, `self_reported`, or `unknown`.\n\
+- When you cannot tell a value, write `unknown`. NEVER guess.\n";
+
 /// Build the stateless EXTRACT prompt: the CSV/macro contract (inlined from the same
 /// header consts the append path targets — the parity source of truth), the per-item
 /// anti-aggregation rule, the schema, and the JSON-only instruction. The raw
@@ -2857,6 +3350,7 @@ pub fn build_diet_extract_prompt(utterance: &str, owner: &str, sent_at: &str) ->
     let food_header = food_log_header();
     let nutrient_rules = diet_nutrient_rules();
     let schema = diet_extract_schema();
+    let structured_rules = DIET_STRUCTURED_RULES;
     format!(
         "You extract structured diet-log entries from a short message {owner} sent from \
 their phone. Return ONLY a single JSON object — no prose, no markdown, no code fence.\n\
@@ -2883,6 +3377,7 @@ entry, and ignore `NOW:` for those entries.\n\
 `eaten_at`; when you set `eaten_at`, omit `time`.\n\
 - `meal` is the meal slot that fits the stated hour, or your best slot from the wording \
 when no time is given.\n\
+{structured_rules}\
 \n\
 PER-ITEM RULE (the 2026-07-13 schema decision — enforce it):\n\
 - Emit ONE food entry PER DISTINCT FOOD, each with its OWN per-item macros. NEVER a \
@@ -2940,7 +3435,8 @@ mean \"unknown\"; send 0 only for a real measured zero (plain meat has 0 fiber).
 packaged food whose label the message quoted, or for a dish you cannot identify.\n\
 - `reference_basis`: ONE line naming the food-composition basis and the scaling you \
 used, e.g. \"USDA SR Legacy banana raw, 89 kcal/100 g, scaled to 118 g edible\". It is \
-written to the row's empty Notes cell.\n\
+mapped onto the row's `Basis` column (label, weighed, reference, estimate, photo) when the \
+row has none of its own.\n\
 - Completion is SEPARATE from the verdict. It never changes the item, the meal, the \
 time, the amount or any macro; correcting a macro is the `correct` verdict above.\n",
                 expected = NUTRIENT_COLUMNS
@@ -3199,7 +3695,11 @@ pub async fn run_diet_pipeline(
     // the message (`sent_at`), or — for a client too old to say — now. Every relative
     // phrase the extract child resolves, and every entry the child said nothing about,
     // resolves against this one value. The model never supplies it.
-    let reference = eaten_at_stamp(utterance).unwrap_or_else(|| turn_sent_at.to_string());
+    let stamp = eaten_at_stamp(utterance);
+    // With no stamp, an entry that arrives without a time of its own is dated to the
+    // moment the message was sent, and its `Time_Source` says so ([`mark_reported_times`]).
+    let stamped = stamp.is_some();
+    let reference = stamp.unwrap_or_else(|| turn_sent_at.to_string());
     // The last-resort day, used only for an entry whose instant is somehow unrecoverable.
     let fallback_day = diet_day_of(&reference, zone).unwrap_or_else(|| local_today_in(zone));
     let tz = tz_label(zone);
@@ -3345,6 +3845,7 @@ pub async fn run_diet_pipeline(
                 // back. That is the whole difference between a queue that preserves a log
                 // and one that quietly moves it to the next morning.
                 let mut queued = extract.entries;
+                mark_reported_times(&mut queued, stamped);
                 stamp_entry_clocks(&mut queued, &reference, zone);
                 return DietPipelineOutcome::VerifyUnavailable {
                     err: e,
@@ -3425,6 +3926,7 @@ pub async fn run_diet_pipeline(
     // Stage 3 — append + hooks + commit (atomic per turn). Resolve every entry's
     // `eaten_at` and DERIVE its `Time` cell from it BEFORE building rows, so the row's
     // `Date`, `Time` and `TZ` are three renderings of one instant.
+    mark_reported_times(&mut verified, stamped);
     stamp_entry_clocks(&mut verified, &reference, zone);
     // Only the food rows are needed as a collection here (the mirror and the day's
     // completeness figure read them); the CSV rows themselves are built per entry below,
@@ -3445,9 +3947,9 @@ pub async fn run_diet_pipeline(
     for (i, e) in verified.iter().enumerate() {
         let day = row_day(i);
         match e {
-            DietEntry::Food(f) => food_rows.push(food_row(f, &day, &tz)),
-            DietEntry::Exercise(x) => ex_rows.push(exercise_row(x, &day, &tz)),
-            DietEntry::Weight(w) => wt_rows.push(weight_row(w, &day, &tz)),
+            DietEntry::Food(f) => food_rows.push(food_cells(f, &day, &tz)),
+            DietEntry::Exercise(x) => ex_rows.push(exercise_cells(x, &day, &tz)),
+            DietEntry::Weight(w) => wt_rows.push(weight_cells(w, &day, &tz)),
         }
     }
     days.sort();
@@ -3994,83 +4496,198 @@ mod tests {
         assert!(p.contains("eaten_at"), "the schema names the field");
     }
 
-    // ---- Header migration + repair -----------------------------------------
+    // ---- Header plan: non-destructive, rows placed by name -------------------
 
-    /// The pre-`TZ` header is not a broken file — it is the file every row before this
-    /// change was written under — so the readers keep working and the WRITER migrates it.
+    /// The food header a bridge before the structured tail wrote: canonical through `TZ`.
+    fn pre_tail_food_header() -> &'static str {
+        food_log_header()
+            .strip_suffix(",Alcohol_g,Category,Source,Basis,Time_Source")
+            .expect("the structured tail follows TZ")
+    }
+
+    /// Parse a whole CSV (tolerant of ragged rows) into its header and rows.
+    fn read_csv(csv: &str) -> (Vec<String>, Vec<Vec<String>>) {
+        let mut rdr = csv::ReaderBuilder::new()
+            .has_headers(true)
+            .flexible(true)
+            .from_reader(csv.as_bytes());
+        let header = rdr.headers().unwrap().iter().map(str::to_string).collect();
+        let rows = rdr
+            .records()
+            .map(|r| r.unwrap().iter().map(str::to_string).collect())
+            .collect();
+        (header, rows)
+    }
+
+    /// The cell under column `name`.
+    fn at<'a>(header: &[String], row: &'a [String], name: &str) -> &'a str {
+        let i = header
+            .iter()
+            .position(|h| h == name)
+            .unwrap_or_else(|| panic!("no column {name}"));
+        &row[i]
+    }
+
+    /// A CSV-quoted cell read back as its value.
+    fn unquote(cell: &str) -> String {
+        csv::ReaderBuilder::new()
+            .has_headers(false)
+            .from_reader(cell.as_bytes())
+            .records()
+            .next()
+            .map(|r| r.unwrap()[0].to_string())
+            .unwrap_or_default()
+    }
+
+    fn run_entry(activity: &str, km: f64) -> ExerciseEntry {
+        ExerciseEntry {
+            eaten_at: None,
+            activity: activity.into(),
+            time: Some("07:00".into()),
+            description: None,
+            distance_km: Some(km),
+            duration: None,
+            pace: None,
+            avg_hr: None,
+            calories: None,
+            notes: None,
+            treadmill: false,
+            source: None,
+        }
+    }
+
+    fn weigh_in(lbs: f64) -> WeightEntry {
+        WeightEntry {
+            eaten_at: None,
+            weight_lbs: lbs,
+            weight_kg: None,
+            body_fat_pct: None,
+            muscle_mass_lbs: None,
+            notes: None,
+        }
+    }
+
+    /// A legacy header — a prefix of the canonical one, as every file written before a
+    /// column existed is — gains the missing names, and its rows are left alone.
     #[test]
-    fn the_writer_migrates_a_pre_tz_header_and_leaves_rows_alone() {
-        let old_header = food_log_header()
-            .strip_suffix(",TZ")
-            .expect("the canonical header ends with TZ");
-        let content = format!("{old_header}\n2026-09-01,Snack,Banana,,serving\n");
-        let repaired = repair_log_header(&content, food_log_header()).expect("a migration");
+    fn a_legacy_header_is_extended_and_its_rows_are_left_alone() {
+        let pre_tz = food_log_header()
+            .strip_suffix(",TZ,Alcohol_g,Category,Source,Basis,Time_Source")
+            .unwrap();
+        for legacy in [pre_tail_food_header(), pre_tz] {
+            let content = format!("{legacy}\n2026-09-01,Snack,Banana,,serving\n");
+            let (out, cols) =
+                prepare_log_content(&content, food_log_header()).expect("a legacy prefix");
+            assert_eq!(
+                out,
+                format!("{}\n2026-09-01,Snack,Banana,,serving\n", food_log_header())
+            );
+            assert_eq!(cols.join(","), food_log_header());
+            let (again, _) = prepare_log_content(&out, food_log_header()).unwrap();
+            assert_eq!(
+                again, out,
+                "an extended header is canonical: a no-op second time"
+            );
+        }
+    }
+
+    /// Unknown columns after a legacy prefix stay where they are; the missing canonical
+    /// names go after them.
+    #[test]
+    fn a_legacy_header_with_an_unknown_column_keeps_it_and_gains_the_tail() {
+        let found = format!("{},Mood", pre_tail_food_header());
+        let cols = plan_log_header(&found, food_log_header()).unwrap();
         assert_eq!(
-            repaired,
-            format!("{}\n2026-09-01,Snack,Banana,,serving\n", food_log_header())
+            cols.join(","),
+            format!("{found},Alcohol_g,Category,Source,Basis,Time_Source")
         );
-        // The row is byte-identical.
-        assert_eq!(
-            repaired.lines().nth(1),
-            content.lines().nth(1),
-            "rows are never touched"
-        );
-        // And the migrated header is now canonical, so a second pass is a no-op.
-        assert!(repair_log_header(&repaired, food_log_header()).is_none());
     }
 
     /// A CRLF file is not a defect — RFC 4180 says CRLF — so the terminator is preserved
     /// and a canonical header under it passes untouched. A STRAY carriage return inside
-    /// the header is a different thing, and it is repaired.
+    /// the header is a different thing, and it is dropped. An extended legacy header
+    /// keeps the CR terminator too.
     #[test]
-    fn crlf_is_preserved_and_a_stray_carriage_return_is_repaired() {
+    fn crlf_is_preserved_and_a_stray_carriage_return_is_dropped() {
         let canonical = food_log_header();
-        // A canonical header with a CRLF terminator: nothing to do.
         let crlf = format!("{canonical}\r\n2026-09-01,Snack,Banana\r\n");
-        assert!(
-            repair_log_header(&crlf, canonical).is_none(),
-            "a CRLF terminator is the file's line ending, not a stray CR"
-        );
-        // A doubled carriage return leaves one INSIDE the header — repaired, terminator
-        // and rows kept exactly as they were.
+        let (same, _) = prepare_log_content(&crlf, canonical).unwrap();
+        assert_eq!(same, crlf, "a CRLF terminator is the file's line ending");
         let stray = format!("{canonical}\r\r\n2026-09-01,Snack,Banana\r\n");
-        let fixed = repair_log_header(&stray, canonical).expect("a repair");
+        let (fixed, _) = prepare_log_content(&stray, canonical).unwrap();
         assert_eq!(
             fixed, crlf,
             "the CR terminator survives; the stray one does not"
         );
+        let legacy = format!("{}\r\n2026-09-01,Snack,Banana\r\n", pre_tail_food_header());
+        let (extended, _) = prepare_log_content(&legacy, canonical).unwrap();
+        assert_eq!(
+            extended, crlf,
+            "an extended header keeps the CRLF terminator"
+        );
     }
 
+    /// Canonical order is core columns, nutrient columns, TZ, then the structured tail —
+    /// asserted by NAME. The columns ahead of each tail keep their names and positions.
     #[test]
-    fn every_log_declares_a_canonical_header_and_tz_is_last() {
-        for name in ["food-log.csv", "exercise-log.csv", "weight-log.csv"] {
-            let h = canonical_header(name).unwrap_or_else(|| panic!("{name}"));
-            assert!(
-                h.ends_with(",TZ"),
-                "{name}: TZ must be the last column — {h}"
+    fn canonical_order_is_core_then_nutrients_then_tz_then_the_tail() {
+        let food: Vec<&str> = food_log_header().split(',').collect();
+        let expected: Vec<&str> = FOOD_LOG_CORE_COLUMNS
+            .iter()
+            .copied()
+            .chain(NUTRIENT_COLUMNS.iter().map(|c| c.csv))
+            .chain([TZ_COLUMN])
+            .chain(FOOD_LOG_TAIL_COLUMNS.iter().copied())
+            .collect();
+        assert_eq!(food, expected);
+        assert_eq!(
+            FOOD_LOG_TAIL_COLUMNS,
+            ["Alcohol_g", "Category", "Source", "Basis", "Time_Source"]
+        );
+        assert!(
+            !NUTRIENT_COLUMNS.iter().any(|c| c.csv == "Alcohol_g"),
+            "Alcohol_g is in the tail after TZ, never the nutrient block before it"
+        );
+        assert_eq!(EXERCISE_LOG_TAIL_COLUMNS, ["Treadmill", "Source"]);
+        assert_eq!(WEIGHT_LOG_TAIL_COLUMNS, ["Hydration_Artifact"]);
+        for (name, tail) in [
+            ("food-log.csv", FOOD_LOG_TAIL_COLUMNS),
+            ("exercise-log.csv", EXERCISE_LOG_TAIL_COLUMNS),
+            ("weight-log.csv", WEIGHT_LOG_TAIL_COLUMNS),
+        ] {
+            let cols: Vec<&str> = canonical_header(name).unwrap().split(',').collect();
+            let tz = cols.iter().position(|c| *c == TZ_COLUMN).expect("TZ");
+            assert_eq!(
+                &cols[tz + 1..],
+                tail,
+                "{name}: the tail follows TZ, in order"
             );
         }
+        assert!(EXERCISE_LOG_HEADER.starts_with(
+            "Date,Type,Description,Distance_km,Duration,Pace_min_per_km,Elevation_m,Avg_HR,\
+Cadence,Calories,Plan_Source,Notes,Start_Time,TZ,"
+        ));
+        assert!(WEIGHT_LOG_HEADER
+            .starts_with("Date,Weight_lbs,Weight_kg,Phase,BodyFat_pct,MuscleMass_lbs,Notes,TZ,"));
         assert!(canonical_header("daily-targets.csv").is_none(), "not ours");
     }
 
-    /// The migration happens on the APPEND path, inside the same snapshot as the rows, so
+    /// The extension happens on the APPEND path, inside the same snapshot as the rows, so
     /// a later hook failure rolls the header back with them.
     #[test]
-    fn appending_migrates_the_header_in_place_and_rolls_back_with_the_rows() {
-        let dir = std::env::temp_dir().join(format!("jesse-hdr-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let old_header = food_log_header().strip_suffix(",TZ").unwrap().to_string();
-        let before = format!("{old_header}\n2026-09-01,Snack,Banana\n");
+    fn appending_extends_the_header_in_place_and_rolls_back_with_the_rows() {
+        let dir = temp_logs();
+        let before = format!("{}\n2026-09-01,Snack,Banana\n", pre_tail_food_header());
         std::fs::write(dir.join("food-log.csv"), &before).unwrap();
-
-        let snapshot =
-            append_rows_atomic(&dir, &["2026-09-03,Snack,Crackers".to_string()], &[], &[]).unwrap();
+        let row = food_cells(&blank_food("Crackers"), "2026-09-03", "Europe/Rome");
+        let snapshot = append_rows_atomic(&dir, &[row.clone()], &[], &[]).unwrap();
         let after = std::fs::read_to_string(dir.join("food-log.csv")).unwrap();
         assert_eq!(
             after,
             format!(
-                "{}\n2026-09-01,Snack,Banana\n2026-09-03,Snack,Crackers\n",
-                food_log_header()
+                "{}\n2026-09-01,Snack,Banana\n{}\n",
+                food_log_header(),
+                food_row(&blank_food("Crackers"), "2026-09-03", "Europe/Rome")
             )
         );
         // Rung-4 rollback restores the pre-append file EXACTLY, header included.
@@ -4080,6 +4697,439 @@ mod tests {
             before
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn appending_to_a_legacy_30_column_food_log_extends_the_header_and_writes_a_full_width_row() {
+        let dir = temp_logs();
+        let legacy = pre_tail_food_header();
+        assert_eq!(
+            legacy.split(',').count(),
+            30,
+            "the header every existing file has"
+        );
+        // A full 30-cell row with a quoted comma, and an older ragged one: both are the
+        // owner's bytes and must survive untouched, CRLF and all.
+        let old_rows = "2026-09-01,Breakfast,\"Salmon (canned, drained)\",1 can,serving,,,129,\
+22.5,2.3,0,,09:40,Breakfast,0,340,0.5,0,,15,1400,,,,,,,,,Europe/Rome\r\n\
+2026-09-02,Lunch,Soup,1 bowl,serving,,,220,8,6,30\r\n";
+        std::fs::write(dir.join("food-log.csv"), format!("{legacy}\r\n{old_rows}")).unwrap();
+
+        append_rows_atomic(
+            &dir,
+            &[food_cells(
+                &blank_food("Banana"),
+                "2026-09-03",
+                "Europe/Rome",
+            )],
+            &[],
+            &[],
+        )
+        .unwrap();
+
+        let after = std::fs::read_to_string(dir.join("food-log.csv")).unwrap();
+        let (head, rest) = after.split_once("\r\n").unwrap();
+        assert_eq!(
+            head,
+            food_log_header(),
+            "the header gains the five tail names"
+        );
+        assert!(
+            rest.starts_with(old_rows),
+            "every existing row is byte-identical"
+        );
+        let (header, rows) = read_csv(&after);
+        assert_eq!(header.len(), 35);
+        assert_eq!(rows.len(), 3);
+        let new = &rows[2];
+        assert_eq!(
+            new.len(),
+            header.len(),
+            "the new row is as wide as the header"
+        );
+        assert_eq!(at(&header, new, "Item"), "Banana");
+        assert_eq!(at(&header, new, "Calories"), "105");
+        assert_eq!(at(&header, new, "TZ"), "Europe/Rome");
+        assert_eq!(at(&header, new, "Alcohol_g"), "0");
+        for name in ["Category", "Source", "Basis", "Time_Source"] {
+            assert_eq!(
+                at(&header, new, name),
+                "unknown",
+                "{name}: unknown, never blank"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn appending_to_a_new_schema_log_puts_every_cell_under_its_own_name() {
+        let dir = temp_logs();
+        std::fs::write(dir.join("food-log.csv"), format!("{}\n", food_log_header())).unwrap();
+        let mut e = blank_food("IPA");
+        e.meal = "Dinner".into();
+        e.notes = Some("pint, 6%".into());
+        e.fiber_g = Some(0.0);
+        e.sodium_mg = Some(14.0);
+        e.selenium_ug = Some(2.4);
+        e.tags = FoodTags {
+            alcohol_g: Some(26.9),
+            category: Some("alcoholic_drink".into()),
+            source: Some("restaurant".into()),
+            basis: Some("label".into()),
+            time_source: Some("actual".into()),
+        };
+        let row = food_cells(&e, "2026-09-03", "Europe/Rome");
+        append_rows_atomic(&dir, &[row.clone()], &[], &[]).unwrap();
+
+        let (header, rows) = read_csv(&std::fs::read_to_string(dir.join("food-log.csv")).unwrap());
+        assert_eq!(header.join(","), food_log_header());
+        let got = &rows[0];
+        assert_eq!(got.len(), header.len());
+        // Every cell the builder named reads back under THAT name, and every column it
+        // did not name reads back blank.
+        for name in &header {
+            let want = row.cell(name).map(unquote).unwrap_or_default();
+            assert_eq!(at(&header, got, name), want, "column {name}");
+        }
+        for (name, want) in [
+            ("Item", "IPA"),
+            ("Meal", "Dinner"),
+            ("Meal_Type", "Dinner"),
+            ("Notes", "pint, 6%"),
+            ("Cal_per_100g", ""),
+            ("Fiber_g", "0"),
+            ("Sodium_mg", "14"),
+            ("Selenium_ug", "2.4"),
+            ("Potassium_mg", ""),
+            ("TZ", "Europe/Rome"),
+            ("Alcohol_g", "26.9"),
+            ("Category", "alcoholic_drink"),
+            ("Source", "restaurant"),
+            ("Basis", "label"),
+            ("Time_Source", "actual"),
+        ] {
+            assert_eq!(at(&header, got, name), want, "{name}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unknown_header_columns_survive_and_get_empty_cells() {
+        let dir = temp_logs();
+        // One unknown column between two of ours, one after the tail.
+        let mut cols: Vec<&str> = food_log_header().split(',').collect();
+        cols.insert(2, "Mood");
+        cols.push("Photo_Ref");
+        let header = cols.join(",");
+        let before = format!("{header}\n2026-09-01,Snack,calm,Banana\n");
+        std::fs::write(dir.join("food-log.csv"), &before).unwrap();
+
+        append_rows_atomic(
+            &dir,
+            &[food_cells(
+                &blank_food("Apple"),
+                "2026-09-03",
+                "Europe/Rome",
+            )],
+            &[],
+            &[],
+        )
+        .unwrap();
+
+        let after = std::fs::read_to_string(dir.join("food-log.csv")).unwrap();
+        assert!(after.starts_with(&before), "header and rows untouched");
+        let (h, rows) = read_csv(&after);
+        assert_eq!(h, cols, "the unknown columns are kept, in place");
+        let new = &rows[1];
+        assert_eq!(new.len(), cols.len(), "the row is as wide as the header");
+        assert_eq!(
+            at(&h, new, "Mood"),
+            "",
+            "an unknown column gets an empty cell"
+        );
+        assert_eq!(at(&h, new, "Photo_Ref"), "");
+        assert_eq!(at(&h, new, "Meal"), "Snack");
+        assert_eq!(at(&h, new, "Item"), "Apple");
+        assert_eq!(at(&h, new, "Category"), "unknown");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_reordered_or_foreign_header_is_not_rewritten_and_the_append_fails() {
+        let canon = food_log_header();
+        let swapped = canon.replacen("Meal,Item", "Item,Meal", 1);
+        let renamed = canon.replacen(",Item,", ",Food,", 1);
+        let doubled = format!("{canon},Notes");
+        let gapped = canon.replacen(",Fiber_g", "", 1);
+        let tz_moved = format!("{},TZ", canon.replacen(",TZ", "", 1));
+        for header in [
+            swapped.as_str(),
+            renamed.as_str(),
+            doubled.as_str(),
+            gapped.as_str(),
+            tz_moved.as_str(),
+            "foo,bar,baz",
+            "Meal,Date,Item",
+        ] {
+            let dir = temp_logs();
+            let before = format!("{header}\n2026-09-01,Snack,Banana\n");
+            std::fs::write(dir.join("food-log.csv"), &before).unwrap();
+            let r = append_rows_atomic(
+                &dir,
+                &[food_cells(
+                    &blank_food("Apple"),
+                    "2026-09-03",
+                    "Europe/Rome",
+                )],
+                &[],
+                &[],
+            );
+            let err = r
+                .err()
+                .unwrap_or_else(|| panic!("appended under {header:?}"));
+            assert!(err.contains("will not write under"), "{err}");
+            assert_eq!(
+                std::fs::read_to_string(dir.join("food-log.csv")).unwrap(),
+                before,
+                "not rewritten: {header}"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        // A refused header on a LATER file rolls back the files already written.
+        let dir = temp_logs();
+        let food_before = format!("{canon}\n");
+        std::fs::write(dir.join("food-log.csv"), &food_before).unwrap();
+        std::fs::write(
+            dir.join("weight-log.csv"),
+            "Weight_lbs,Date\n198,2026-09-01\n",
+        )
+        .unwrap();
+        let r = append_rows_atomic(
+            &dir,
+            &[food_cells(
+                &blank_food("Apple"),
+                "2026-09-03",
+                "Europe/Rome",
+            )],
+            &[],
+            &[weight_cells(&weigh_in(198.0), "2026-09-03", "Europe/Rome")],
+        );
+        assert!(r.is_err());
+        assert_eq!(
+            std::fs::read_to_string(dir.join("food-log.csv")).unwrap(),
+            food_before
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("weight-log.csv")).unwrap(),
+            "Weight_lbs,Date\n198,2026-09-01\n"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_missing_log_starts_with_the_canonical_header() {
+        let dir = temp_logs();
+        append_rows_atomic(
+            &dir,
+            &[],
+            &[exercise_cells(
+                &run_entry("Run", 5.0),
+                "2026-09-03",
+                "Europe/Rome",
+            )],
+            &[],
+        )
+        .unwrap();
+        let (h, rows) = read_csv(&std::fs::read_to_string(dir.join("exercise-log.csv")).unwrap());
+        assert_eq!(h.join(","), EXERCISE_LOG_HEADER);
+        assert_eq!(rows[0].len(), h.len());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- Exercise Type vocabulary + hydration ---------------------------------
+
+    #[test]
+    fn exercise_type_maps_synonyms_onto_the_vocabulary() {
+        for (activity, want, treadmill) in [
+            ("Run", "Run", false),
+            ("run", "Run", false),
+            ("Walk", "Walk", false),
+            ("Swim", "Swim", false),
+            ("Swimming", "Swim", false),
+            ("swimming", "Swim", false),
+            ("Bike", "Bike", false),
+            ("Treadmill run", "Run", true),
+            ("TREADMILL RUN", "Run", true),
+            ("Marathon", "Run", false),
+            ("Gardening", "Yard_Work", false),
+            ("garden work", "Yard_Work", false),
+            ("Yard work", "Yard_Work", false),
+            ("MANUAL LABOR", "Yard_Work", false),
+            ("Yard_Work", "Yard_Work", false),
+            ("Strength/Weights", "Strength", false),
+            ("Strength", "Strength", false),
+            ("Weights", "Strength", false),
+            ("Other", "Other", false),
+            ("Rowing", "Other", false),
+            ("Yoga", "Other", false),
+        ] {
+            assert_eq!(exercise_type(activity), (want, treadmill), "{activity}");
+        }
+    }
+
+    #[test]
+    fn an_exercise_row_keeps_the_original_wording_in_description() {
+        let row = |activity: &str, desc: Option<&str>| {
+            let mut x = run_entry(activity, 5.0);
+            x.description = desc.map(str::to_string);
+            let line = exercise_row(&x, "2026-09-03", "Europe/Rome");
+            let (h, rows) = read_csv(&format!("{EXERCISE_LOG_HEADER}\n{line}\n"));
+            let get = |n: &str| at(&h, &rows[0], n).to_string();
+            (
+                get("Type"),
+                get("Description"),
+                get("Treadmill"),
+                get("Source"),
+            )
+        };
+        assert_eq!(
+            row("Treadmill run", Some("easy")),
+            (
+                "Run".into(),
+                "Treadmill run: easy".into(),
+                "true".into(),
+                "unknown".into()
+            )
+        );
+        assert_eq!(
+            row("Gardening", None),
+            (
+                "Yard_Work".into(),
+                "Gardening".into(),
+                "false".into(),
+                "unknown".into()
+            )
+        );
+        assert_eq!(
+            row("Marathon", Some("Rome Marathon")),
+            (
+                "Run".into(),
+                "Rome Marathon".into(),
+                "false".into(),
+                "unknown".into()
+            ),
+            "a description that already names it is kept as is"
+        );
+        assert_eq!(
+            row("Run", Some("tempo")),
+            (
+                "Run".into(),
+                "tempo".into(),
+                "false".into(),
+                "unknown".into()
+            ),
+            "no rewording, nothing added"
+        );
+        let mut watch = run_entry("Swim", 1.5);
+        watch.source = Some("watch".into());
+        watch.treadmill = false;
+        let r = exercise_cells(&watch, "2026-09-03", "Europe/Rome");
+        assert_eq!(r.cell("Source"), Some("watch"));
+    }
+
+    #[test]
+    fn hydration_artifact_follows_a_run_over_20_km_for_two_days() {
+        let ex = |date: &str, ty: &str, km: &str| {
+            format!("{EXERCISE_LOG_HEADER}\n{date},{ty},,{km},,,,,,,,,07:00,Europe/Rome\n")
+        };
+        assert!(
+            hydration_artifact(&ex("2026-09-13", "Run", "21"), "2026-09-14"),
+            "a 21 km run the previous day"
+        );
+        assert!(
+            !hydration_artifact(&ex("2026-09-13", "Run", "19"), "2026-09-14"),
+            "a 19 km run is not enough"
+        );
+        assert!(
+            !hydration_artifact(&ex("2026-09-11", "Run", "21"), "2026-09-14"),
+            "three days earlier is outside the window"
+        );
+        assert!(hydration_artifact(
+            &ex("2026-09-14", "Run", "21"),
+            "2026-09-14"
+        ));
+        assert!(hydration_artifact(
+            &ex("2026-09-12", "Run", "21"),
+            "2026-09-14"
+        ));
+        assert!(
+            !hydration_artifact(&ex("2026-09-13", "Run", "20"), "2026-09-14"),
+            "over 20, not 20"
+        );
+        assert!(
+            hydration_artifact(&ex("2026-09-13", "Marathon", "42.2"), "2026-09-14"),
+            "a historical synonym is a Run"
+        );
+        assert!(!hydration_artifact(
+            &ex("2026-09-13", "Bike", "80"),
+            "2026-09-14"
+        ));
+        assert!(hydration_artifact(
+            &ex("2026-10-31", "Run", "21"),
+            "2026-11-01"
+        ));
+        // A ragged legacy row (no TZ, no tail) is read by name all the same.
+        let legacy = "Date,Type,Description,Distance_km\n2026-09-13,Run,,25\n";
+        assert!(hydration_artifact(legacy, "2026-09-14"));
+        assert!(
+            !hydration_artifact("", "2026-09-14"),
+            "no exercise log, no runs"
+        );
+    }
+
+    /// The weight writer computes `Hydration_Artifact` from exercise-log.csv AS WRITTEN IN
+    /// THE SAME APPEND, and a legacy weight header is extended with it.
+    #[test]
+    fn the_weight_writer_fills_hydration_artifact_from_the_exercise_log() {
+        let dir = temp_logs();
+        let legacy_weight = "Date,Weight_lbs,Weight_kg,Phase,BodyFat_pct,MuscleMass_lbs,Notes,TZ\n\
+2026-09-01,198,,,,,,Europe/Rome\n";
+        std::fs::write(dir.join("weight-log.csv"), legacy_weight).unwrap();
+        append_rows_atomic(
+            &dir,
+            &[],
+            &[exercise_cells(
+                &run_entry("Marathon", 42.2),
+                "2026-09-13",
+                "Europe/Rome",
+            )],
+            &[
+                weight_cells(&weigh_in(196.0), "2026-09-14", "Europe/Rome"),
+                weight_cells(&weigh_in(197.0), "2026-09-17", "Europe/Rome"),
+            ],
+        )
+        .unwrap();
+        let after = std::fs::read_to_string(dir.join("weight-log.csv")).unwrap();
+        assert!(
+            after.starts_with(&format!(
+                "{WEIGHT_LOG_HEADER}\n2026-09-01,198,,,,,,Europe/Rome\n"
+            )),
+            "header extended, old row untouched: {after}"
+        );
+        let (h, rows) = read_csv(&after);
+        assert_eq!(
+            at(&h, &rows[1], "Hydration_Artifact"),
+            "true",
+            "the day after"
+        );
+        assert_eq!(
+            at(&h, &rows[2], "Hydration_Artifact"),
+            "false",
+            "four days after"
+        );
+        assert_eq!(rows[1].len(), h.len());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -4487,6 +5537,7 @@ mod tests {
         let e = FoodEntry {
             eaten_at: None,
             unknowable_composite: false,
+            tags: FoodTags::default(),
             name: "Banana".into(),
             meal: "Snack".into(),
             time: Some("10:00".into()),
@@ -4542,6 +5593,7 @@ mod tests {
         let e = FoodEntry {
             eaten_at: None,
             unknowable_composite: false,
+            tags: FoodTags::default(),
             name: "Prosciutto".into(),
             meal: "Lunch".into(),
             time: Some("12:00".into()),
@@ -4594,6 +5646,7 @@ mod tests {
         let e = FoodEntry {
             eaten_at: None,
             unknowable_composite: false,
+            tags: FoodTags::default(),
             name: "Greek yogurt (full-fat)".into(),
             meal: "Breakfast".into(),
             time: Some("08:00".into()),
@@ -4678,6 +5731,7 @@ mod tests {
             DietEntry::Food(FoodEntry {
                 eaten_at: None,
                 unknowable_composite: false,
+                tags: FoodTags::default(),
                 name: "almond".into(),
                 meal: "Snack".into(),
                 time: None, // unstated → should be filled
@@ -4707,6 +5761,7 @@ mod tests {
             DietEntry::Food(FoodEntry {
                 eaten_at: None,
                 unknowable_composite: false,
+                tags: FoodTags::default(),
                 name: "toast".into(),
                 meal: "Breakfast".into(),
                 time: Some("07:15".into()), // explicit → must be preserved
@@ -4996,6 +6051,7 @@ mod tests {
         DietEntry::Food(FoodEntry {
             eaten_at: None,
             unknowable_composite: false,
+            tags: FoodTags::default(),
             name: "Banana".into(),
             meal: "Snack".into(),
             time: Some("10:00".into()),
@@ -5082,6 +6138,7 @@ mod tests {
         let e = DietEntry::Food(FoodEntry {
             eaten_at: None,
             unknowable_composite: false,
+            tags: FoodTags::default(),
             name: "Crackers".into(),
             meal: "Snack".into(),
             time: Some("15:00".into()),
@@ -5198,6 +6255,7 @@ mod tests {
         let e = FoodEntry {
             eaten_at: None,
             unknowable_composite: false,
+            tags: FoodTags::default(),
             name: "Salmon sockeye (Fiorfiore, canned)".into(),
             meal: "Breakfast".into(),
             time: Some("09:40".into()),
@@ -5277,7 +6335,8 @@ mod tests {
         e.vitamin_d_ug = Some(13.1);
 
         let cells: Vec<&str> = "2026-08-13,Snack,Salmon,1 medium (~118g),serving,,,105,1.3,\
-0.4,27,,10:40,Snack,0,340,0.5,0,420,15,1400,29,63,0,0,170,2,,13.1,Europe/Rome"
+0.4,27,,10:40,Snack,0,340,0.5,0,420,15,1400,29,63,0,0,170,2,,13.1,Europe/Rome,0,unknown,\
+unknown,unknown,unknown"
             .split(',')
             .collect();
         assert_eq!(
@@ -5337,6 +6396,7 @@ mod tests {
         let e = FoodEntry {
             eaten_at: None,
             unknowable_composite: false,
+            tags: FoodTags::default(),
             name: "Water".into(),
             meal: "Snack".into(),
             time: Some("12:00".into()),
@@ -5419,6 +6479,7 @@ mod tests {
         let f = FoodEntry {
             eaten_at: None,
             unknowable_composite: false,
+            tags: FoodTags::default(),
             name: "n".into(),
             meal: "Snack".into(),
             time: Some("09:00".into()),
@@ -5450,6 +6511,8 @@ mod tests {
             food_log_header().split(',').count()
         );
         let x = ExerciseEntry {
+            treadmill: false,
+            source: None,
             eaten_at: None,
             activity: "Run".into(),
             time: Some("06:00".into()),
@@ -5520,6 +6583,7 @@ mod tests {
         FoodEntry {
             eaten_at: None,
             unknowable_composite: false,
+            tags: FoodTags::default(),
             name: name.into(),
             meal: meal.into(),
             time: Some(time.into()),
@@ -5622,6 +6686,7 @@ mod tests {
         let with = |ca: Option<f64>, fib: Option<f64>, na: Option<f64>| FoodEntry {
             eaten_at: None,
             unknowable_composite: false,
+            tags: FoodTags::default(),
             name: "x".into(),
             meal: "Lunch".into(),
             time: Some("12:30".into()),
@@ -5687,6 +6752,7 @@ mod tests {
         let e = FoodEntry {
             eaten_at: None,
             unknowable_composite: false,
+            tags: FoodTags::default(),
             name: "Toast".into(),
             meal: "Breakfast".into(),
             time: Some("08:00".into()),
@@ -5732,6 +6798,7 @@ mod tests {
         let e = FoodEntry {
             eaten_at: None,
             unknowable_composite: false,
+            tags: FoodTags::default(),
             name: "Prosciutto".into(),
             meal: "Lunch".into(),
             time: Some("12:30".into()),
@@ -6231,9 +7298,19 @@ window.DIET_TODAY = {
     fn append_writes_rows_preserving_single_trailing_newline() {
         let dir = temp_logs();
         std::fs::write(dir.join("food-log.csv"), format!("{}\n", food_log_header())).unwrap();
-        let snap = append_rows_atomic(&dir, &["row-a".into(), "row-b".into()], &[], &[]).unwrap();
+        let a = food_cells(&blank_food("row-a"), "2026-09-03", "Europe/Rome");
+        let b = food_cells(&blank_food("row-b"), "2026-09-03", "Europe/Rome");
+        let snap = append_rows_atomic(&dir, &[a, b], &[], &[]).unwrap();
         let content = std::fs::read_to_string(dir.join("food-log.csv")).unwrap();
-        assert_eq!(content, format!("{}\nrow-a\nrow-b\n", food_log_header()));
+        assert_eq!(
+            content,
+            format!(
+                "{}\n{}\n{}\n",
+                food_log_header(),
+                food_row(&blank_food("row-a"), "2026-09-03", "Europe/Rome"),
+                food_row(&blank_food("row-b"), "2026-09-03", "Europe/Rome")
+            )
+        );
         // Rollback restores the pre-append content exactly.
         snap.rollback();
         assert_eq!(
@@ -6249,14 +7326,20 @@ window.DIET_TODAY = {
         // FILE, not a dir) makes the write fail → the whole append rolls back, so the
         // successful food append is undone (no partial rows).
         let dir = temp_logs();
-        std::fs::write(dir.join("food-log.csv"), "hdr\n").unwrap();
+        let food_before = format!("{}\n", food_log_header());
+        std::fs::write(dir.join("food-log.csv"), &food_before).unwrap();
         // Make weight-log.csv path unwritable: create it as a directory.
         std::fs::create_dir(dir.join("weight-log.csv")).unwrap();
-        let r = append_rows_atomic(&dir, &["frow".into()], &[], &["wrow".into()]);
+        let r = append_rows_atomic(
+            &dir,
+            &[food_cells(&blank_food("frow"), "2026-09-03", "Europe/Rome")],
+            &[],
+            &[weight_cells(&weigh_in(198.0), "2026-09-03", "Europe/Rome")],
+        );
         assert!(r.is_err(), "unwritable weight-log must fail the append");
         assert_eq!(
             std::fs::read_to_string(dir.join("food-log.csv")).unwrap(),
-            "hdr\n",
+            food_before,
             "food append rolled back — no partial rows"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -6411,6 +7494,7 @@ window.DIET_TODAY = {
             vitamin_d_ug: None,
             notes: None,
             unknowable_composite: false,
+            tags: FoodTags::default(),
         }
     }
 
@@ -6436,7 +7520,7 @@ window.DIET_TODAY = {
     }
 
     #[test]
-    fn header_is_the_30_canonical_columns_in_table_order() {
+    fn header_is_the_35_canonical_columns_in_canonical_order() {
         // The canonical contract, spelled out ONCE here so a reordering or rename in
         // the table is caught by a failing test rather than by a corrupted log.
         assert_eq!(
@@ -6444,9 +7528,9 @@ window.DIET_TODAY = {
             "Date,Meal,Item,Amount,Unit,Cal_per_100g,Grams,Calories,Protein_g,Fat_g,\
 Carbs_g,Notes,Time,Meal_Type,Fiber_g,Sodium_mg,SatFat_g,Sugar_g,Potassium_mg,\
 Calcium_mg,Omega3_mg,Magnesium_mg,Cholesterol_mg,TransFat_g,AddedSugar_g,Purines_mg,\
-Mercury_ug,Selenium_ug,VitaminD_ug,TZ"
+Mercury_ug,Selenium_ug,VitaminD_ug,TZ,Alcohol_g,Category,Source,Basis,Time_Source"
         );
-        assert_eq!(food_log_header().split(',').count(), 30, "30 columns");
+        assert_eq!(food_log_header().split(',').count(), 35, "35 columns");
         // The header and the row builder MUST agree on the count, or every appended row
         // is silently off by a column.
         assert_eq!(
@@ -6454,7 +7538,7 @@ Mercury_ug,Selenium_ug,VitaminD_ug,TZ"
                 .split(',')
                 .count(),
             food_log_header().split(',').count(),
-            "row builder and header agree at 30 cells"
+            "row builder and header agree at 35 cells"
         );
     }
 
@@ -6484,8 +7568,9 @@ Mercury_ug,Selenium_ug,VitaminD_ug,TZ"
             .split('"')
             .filter(|t| t.ends_with("_g") || t.ends_with("_mg") || t.ends_with("_ug"))
         {
+            // `alcohol_g` feeds the structured tail after TZ, never the nutrient block.
             let known = NUTRIENT_COLUMNS.iter().any(|c| c.key == key)
-                || ["protein_g", "carbs_g", "fat_g"].contains(&key);
+                || ["protein_g", "carbs_g", "fat_g", "alcohol_g"].contains(&key);
             assert!(known, "schema key {key:?} resolves to no table entry");
         }
         // The unit is stated for every nutrient, so the child cannot mix g, mg and ug.
@@ -6524,7 +7609,7 @@ Mercury_ug,Selenium_ug,VitaminD_ug,TZ"
     }
 
     #[test]
-    fn food_row_emits_30_cells_with_nutrients_in_table_order_then_tz() {
+    fn food_row_emits_35_cells_with_nutrients_in_table_order_then_tz_and_the_tail() {
         // Give each nutrient a DISTINCT value, then assert cell N+14 is the table's
         // N-th nutrient — the row builder's order is the table's order, not a
         // hand-written sequence.
@@ -6537,7 +7622,14 @@ Mercury_ug,Selenium_ug,VitaminD_ug,TZ"
             .has_headers(false)
             .from_reader(row.as_bytes());
         let rec = rdr.records().next().unwrap().unwrap();
-        assert_eq!(rec.len(), 30, "30 cells");
+        assert_eq!(rec.len(), 35, "35 cells");
+        let tz = 14 + NUTRIENT_COLUMNS.len();
+        assert_eq!(&rec[tz], "Europe/Rome", "TZ follows the nutrient block");
+        assert_eq!(
+            rec.iter().skip(tz + 1).collect::<Vec<_>>(),
+            ["0", "unknown", "unknown", "unknown", "unknown"],
+            "then the structured tail"
+        );
         for (i, c) in NUTRIENT_COLUMNS.iter().enumerate() {
             assert_eq!(
                 &rec[14 + i],
@@ -6578,12 +7670,13 @@ Mercury_ug,Selenium_ug,VitaminD_ug,TZ"
         let header = build_food_log_header(&cols);
         assert_eq!(
             header.split(',').count(),
-            31,
-            "one more nutrient extends the 30-column header, and TZ stays last"
+            36,
+            "one more nutrient extends the 35-column header"
         );
         assert!(
-            header.ends_with(",Iodine_ug,TZ"),
-            "appended in table order: {header}"
+            header.contains(",VitaminD_ug,Iodine_ug,TZ,Alcohol_g,")
+                && header.ends_with(",Time_Source"),
+            "appended in table order, still before TZ and the tail: {header}"
         );
 
         let schema = build_extract_schema(&cols);
@@ -6610,7 +7703,7 @@ Mercury_ug,Selenium_ug,VitaminD_ug,TZ"
         );
 
         // And the production table is untouched by the test's local copy.
-        assert_eq!(food_log_header().split(',').count(), 30);
+        assert_eq!(food_log_header().split(',').count(), 35);
     }
 
     // ---- Phase 2: the extract prompt now INSTRUCTS filling, not omission -----
@@ -6984,20 +8077,27 @@ Mercury_ug,Selenium_ug,VitaminD_ug,TZ"
     }
 
     #[test]
-    fn the_reference_basis_lands_in_notes_only_when_notes_is_empty() {
-        // Empty Notes → the basis is written.
+    fn the_reference_basis_lands_in_basis_only_when_the_row_has_none() {
+        // No basis → the verifier's line is mapped onto the vocabulary, and Notes is
+        // left alone.
         let mut e = blank_food("Banana");
         complete_food_micros(&mut e, &banana_completion());
-        assert_eq!(
-            e.notes.as_deref(),
-            Some("USDA SR Legacy 09040 banana raw, scaled to 118 g edible")
-        );
+        assert_eq!(e.tags.basis.as_deref(), Some("reference"));
+        assert_eq!(e.notes, None, "completion never writes Notes");
 
-        // Existing note text → never overwritten, even though cells were filled.
+        // `unknown` is no basis at all.
+        let mut u = blank_food("Banana");
+        u.tags.basis = Some("unknown".into());
+        complete_food_micros(&mut u, &banana_completion());
+        assert_eq!(u.tags.basis.as_deref(), Some("reference"));
+
+        // A basis the extract stated wins, even though cells were filled; Notes is kept.
         let mut e2 = blank_food("Banana");
+        e2.tags.basis = Some("label".into());
         e2.notes = Some("with peanut butter".into());
         let filled = complete_food_micros(&mut e2, &banana_completion());
         assert!(filled > 0, "cells were still completed");
+        assert_eq!(e2.tags.basis.as_deref(), Some("label"));
         assert_eq!(e2.notes.as_deref(), Some("with peanut butter"));
 
         // Nothing filled (verifier declined everything) → nothing appended to Notes.
@@ -7015,7 +8115,182 @@ Mercury_ug,Selenium_ug,VitaminD_ug,TZ"
             malformed: false,
         };
         assert_eq!(complete_food_micros(&mut e3, &c), 0);
-        assert_eq!(e3.notes, None, "an uncompleted row gets no note");
+        assert_eq!(e3.tags.basis, None, "an uncompleted row gets no basis");
+        assert_eq!(e3.notes, None);
+    }
+
+    #[test]
+    fn basis_from_reference_maps_onto_the_vocabulary() {
+        for (line, want) in [
+            (
+                "USDA SR Legacy 09040 banana raw, scaled to 118 g edible",
+                "reference",
+            ),
+            ("reference", "reference"),
+            ("Weighed", "weighed"),
+            ("per the product label, 2 slices", "label"),
+            ("weighed portion 118 g, USDA values", "weighed"),
+            ("portion judged from the photo", "photo"),
+            ("estimated from a typical recipe", "estimate"),
+            ("unknown", "unknown"),
+        ] {
+            assert_eq!(basis_from_reference(line), want, "{line}");
+        }
+    }
+
+    #[test]
+    fn alcohol_grams_prefers_the_stated_figure_then_the_macro_remainder() {
+        let mut beer = blank_food("Lager");
+        beer.kcal = Some(215.0);
+        beer.protein_g = Some(1.6);
+        beer.carbs_g = Some(17.8);
+        beer.fat_g = Some(0.0);
+        beer.tags.category = Some("alcoholic_drink".into());
+        // (215 − 4×1.6 − 4×17.8 − 9×0) / 7 = 19.63
+        assert_eq!(alcohol_grams(&beer), 19.6);
+        beer.tags.alcohol_g = Some(19.7);
+        assert_eq!(alcohol_grams(&beer), 19.7, "a stated figure wins");
+        // Floored at 0 when the macros account for every calorie.
+        let mut shandy = blank_food("Shandy");
+        shandy.tags.category = Some("alcoholic_drink".into());
+        shandy.kcal = Some(10.0);
+        assert_eq!(alcohol_grams(&shandy), 0.0);
+        // A soft drink carries only what the extract stated.
+        let mut cocoa = blank_food("Hot chocolate");
+        cocoa.tags.category = Some("soft_drink".into());
+        assert_eq!(alcohol_grams(&cocoa), 0.0);
+        cocoa.tags.alcohol_g = Some(8.0);
+        assert_eq!(alcohol_grams(&cocoa), 8.0);
+        assert_eq!(alcohol_grams(&blank_food("Banana")), 0.0);
+        // The cell is always a number.
+        let r = food_cells(&beer, "2026-09-03", "Europe/Rome");
+        assert_eq!(r.cell("Alcohol_g"), Some("19.7"));
+    }
+
+    #[test]
+    fn extract_contract_carries_the_structured_tail() {
+        let schema = diet_extract_schema();
+        let food = schema
+            .lines()
+            .find(|l| l.contains("\"kind\": \"food\""))
+            .unwrap();
+        for (key, vocab) in [
+            ("category", FOOD_CATEGORIES),
+            ("source", FOOD_SOURCES),
+            ("basis", BASIS_VALUES),
+            ("time_source", TIME_SOURCES),
+        ] {
+            assert!(
+                food.contains(&format!("\"{key}\": \"{}\"", vocab.join("|"))),
+                "the food schema offers {key} from the writer's own list"
+            );
+            assert!(is_food_key(key), "and the validator accepts {key}");
+        }
+        assert!(food.contains("\"alcohol_g\": <number"));
+        assert!(is_food_key("alcohol_g"));
+        let ex = schema
+            .lines()
+            .find(|l| l.contains("\"kind\": \"exercise\""))
+            .unwrap();
+        assert!(ex.contains(&format!("\"type\": \"{}\"", EXERCISE_TYPES.join("|"))));
+        assert!(ex.contains("\"treadmill\": <boolean>"));
+        assert!(ex.contains(&format!("\"source\": \"{}\"", EXERCISE_SOURCES.join("|"))));
+        assert!(
+            !ex.contains("\"activity\""),
+            "the schema names the field `type`"
+        );
+        for key in ["type", "treadmill", "source"] {
+            assert!(EXERCISE_KEYS.contains(&key), "{key}");
+        }
+
+        // A new-schema extract parses into the entries. Off-vocabulary words are not a
+        // rung-2 rejection: they read as unknown.
+        let parsed = parse_diet_entries(
+            r#"{"entries":[
+              {"kind":"food","name":"IPA","meal":"Dinner","kcal":250,"alcohol_g":19.7,
+               "category":"alcoholic_drink","source":"Restaurant","basis":"label",
+               "time_source":"actual"},
+              {"kind":"food","name":"Cocoa","meal":"Snack","category":"hot drink",
+               "source":null,"basis":"guess"},
+              {"kind":"exercise","type":"Run","treadmill":true,"source":"watch","distance_km":10},
+              {"kind":"exercise","activity":"Gardening"}
+            ]}"#,
+        )
+        .expect("the new schema parses");
+        let DietEntry::Food(ipa) = &parsed.entries[0] else {
+            panic!("food")
+        };
+        assert_eq!(
+            ipa.tags,
+            FoodTags {
+                alcohol_g: Some(19.7),
+                category: Some("alcoholic_drink".into()),
+                source: Some("restaurant".into()),
+                basis: Some("label".into()),
+                time_source: Some("actual".into()),
+            }
+        );
+        let DietEntry::Food(cocoa) = &parsed.entries[1] else {
+            panic!("food")
+        };
+        assert_eq!(cocoa.tags, FoodTags::default());
+        let DietEntry::Exercise(run) = &parsed.entries[2] else {
+            panic!("exercise")
+        };
+        assert_eq!(
+            (run.activity.as_str(), run.treadmill, run.source.as_deref()),
+            ("Run", true, Some("watch"))
+        );
+        let DietEntry::Exercise(yard) = &parsed.entries[3] else {
+            panic!("exercise")
+        };
+        assert_eq!(yard.activity, "Gardening", "the old key is still read");
+
+        // And the prompt states every rule the child needs.
+        let p = build_diet_extract_prompt("a pint", "the user", "2026-09-03T21:00:00+02:00");
+        for needle in [
+            "`category` is what the item IS",
+            "ml × ABV/100 × 0.789",
+            "`time_source`",
+            "Yard_Work",
+            "\"treadmill\": true",
+            "NEVER guess",
+        ] {
+            assert!(p.contains(needle), "prompt carries {needle:?}");
+        }
+    }
+
+    #[test]
+    fn an_entry_with_no_time_of_its_own_is_marked_report_unless_the_turn_was_stamped() {
+        let timed = blank_food("Lunch");
+        let mut untimed = blank_food("Snack");
+        untimed.time = None;
+        untimed.tags.time_source = Some("actual".into());
+        let mut dated = blank_food("Dinner");
+        dated.time = None;
+        dated.eaten_at = Some("2026-09-03T19:00:00+02:00".into());
+        let mut entries = vec![
+            DietEntry::Food(timed),
+            DietEntry::Food(untimed.clone()),
+            DietEntry::Food(dated),
+        ];
+        mark_reported_times(&mut entries, false);
+        let sources: Vec<Option<String>> = entries
+            .iter()
+            .map(|e| match e {
+                DietEntry::Food(f) => f.tags.time_source.clone(),
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_eq!(sources, [None, Some("report".into()), None]);
+
+        // A stamped turn is dated by the stamp, not by the send time.
+        let mut stamped = vec![DietEntry::Food(untimed)];
+        mark_reported_times(&mut stamped, true);
+        let DietEntry::Food(f) = &stamped[0] else {
+            unreachable!()
+        };
+        assert_eq!(f.tags.time_source.as_deref(), Some("actual"));
     }
 
     #[test]
@@ -7157,27 +8432,21 @@ Mercury_ug,Selenium_ug,VitaminD_ug,TZ"
     }
 
     #[test]
-    fn a_reference_basis_is_squeezed_into_one_safe_csv_line() {
+    fn a_multi_line_reference_basis_becomes_one_vocabulary_word() {
         // A multi-line / CR-carrying basis must not smuggle a bare CR into the CSV —
-        // that is exactly the defect that broke the food log's header once.
+        // that is exactly the defect that broke the food log's header once. It no longer
+        // reaches the CSV as text at all: only its vocabulary word does.
         let mut e = blank_food("Banana");
         let mut c = banana_completion();
         c.basis = Some("USDA SR Legacy\r\n09040 banana raw,\r scaled to 118 g".into());
         complete_food_micros(&mut e, &c);
-        let notes = e.notes.clone().unwrap();
-        assert!(
-            !notes.contains('\r') && !notes.contains('\n'),
-            "one line: {notes:?}"
-        );
-        assert_eq!(notes, "USDA SR Legacy 09040 banana raw, scaled to 118 g");
-        // The comma still forces RFC-4180 quoting, and the row keeps 30 fields.
+        assert_eq!(e.tags.basis.as_deref(), Some("reference"));
+        assert_eq!(e.notes, None);
         let row = food_row(&e, "2026-07-25", "Europe/Rome");
-        let mut rdr = csv::ReaderBuilder::new()
-            .has_headers(false)
-            .from_reader(row.as_bytes());
-        let rec = rdr.records().next().unwrap().unwrap();
-        assert_eq!(rec.len(), 30);
-        assert_eq!(&rec[11], &notes, "Notes cell round-trips intact");
+        let (h, rows) = read_csv(&format!("{}\n{row}\n", food_log_header()));
+        assert_eq!(rows[0].len(), h.len());
+        assert_eq!(at(&h, &rows[0], "Basis"), "reference");
+        assert_eq!(at(&h, &rows[0], "Notes"), "");
     }
 
     #[test]

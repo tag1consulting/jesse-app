@@ -14,6 +14,48 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [Bridge 0.140.0] - 2026-09-15
+
+**The diet logs gain structured columns, and the bridge now reads and writes every log by
+column name without ever removing or reordering a column.** Two defects made any schema
+change unsafe. The header repair (`repair_log_header`, called on every append) rewrote any
+header that was not byte-equal to the canonical one, so a file with extra columns lost them
+from its header while its rows kept them. And the writers emitted fixed-width rows (30 food
+cells, 14 exercise, 8 weight) by position, so a header in any other shape put cells under
+the wrong names. `parse_weight_csv` was positional with `flexible(false)` as well, so every
+weight row whose width differed from the header was silently skipped.
+
+- **New columns, appended after `TZ`.** `food-log.csv` gains `Alcohol_g`, `Category`,
+  `Source`, `Basis` and `Time_Source`; `exercise-log.csv` gains `Treadmill` and `Source`;
+  `weight-log.csv` gains `Hydration_Artifact`. Existing columns keep their names and
+  positions. On a historical row a blank new cell means unknown; every row the bridge writes
+  fills every new cell, with `unknown` rather than a guess.
+- **Rows are built by name.** The builders now return named cells (`LogRow`), rendered at
+  append under the target file's actual header: one cell per header column, an empty cell for
+  a column the bridge does not know, and a row exactly as wide as the header.
+- **Headers are only ever extended.** A legacy header (a prefix of the canonical one) gets the
+  missing names appended, and every existing row stays byte-identical. Unknown extra columns
+  are kept. A reordered, renamed, duplicated or foreign header is not rewritten: the append
+  fails with a logged error, the live turn falls through to the hosted path, and a queued meal
+  is re-queued. A missing file now starts with the canonical header.
+- **The local extract asks for the new fields.** Food items gain `alcohol_g`, `category`,
+  `source`, `basis` and `time_source`; exercise gains `treadmill`, `source`, and a `type`
+  restricted to Run, Walk, Swim, Bike, Strength, Yard_Work and Other (the old `activity` key
+  is still read). An off-vocabulary word reads as unknown and never rejects the meal. An
+  `alcoholic_drink` without `alcohol_g` gets (Calories − 4 × Protein − 4 × Carbs − 9 × Fat) / 7,
+  floored at 0. Synonyms map on write (Swimming → Swim, Treadmill run → Run with `Treadmill`
+  true, Gardening → Yard_Work, …) with the original wording kept in `Description`. An entry
+  with no time of its own on an unstamped turn is marked `Time_Source` `report`.
+- **The verify completion's `reference_basis` goes to `Basis`, not Notes**, mapped onto the
+  vocabulary, and only when the row has no basis of its own.
+- **`Hydration_Artifact`** is computed by the weight writer: true when a Run over 20 km is
+  logged on that date or either of the two dates before it, counting a run written in the
+  same turn.
+- **`parse_weight_csv` reads by header name with `flexible(true)`**, like every other reader,
+  and each `weightSeries` point gains a boolean `hydrationArtifact`. Every existing field is
+  unchanged.
+- The `JESSE_MEAL_LOG` wire format and the app are unchanged.
+
 ## [Bridge 0.139.1] - 2026-09-15
 
 **Clear RUSTSEC-2026-0285 so `main` can deploy again.** The `bridge` CI job's dependency audit
