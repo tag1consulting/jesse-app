@@ -101,19 +101,28 @@ fn normalize_proposed(v: Value) -> Option<Value> {
     has_ideas.then_some(v)
 }
 
-/// Map `weight-log.csv` (RFC 4180, header
-/// `Date,Weight_lbs,Weight_kg,Phase,BodyFat_pct,MuscleMass_lbs,Notes`) to the
-/// `weightSeries` array in file (chronological) order. Returns the rows plus a
-/// list of human-readable problems (never fails the whole file): a row is skipped
-/// when the `csv` reader rejects it (bad quoting / wrong field count), its Date is
+/// Map `weight-log.csv` (RFC 4180, columns addressed by header NAME — `Date`,
+/// `Weight_lbs`, `Weight_kg`, `Phase`, `BodyFat_pct`, `MuscleMass_lbs`, `Notes`,
+/// `Hydration_Artifact`) to the `weightSeries` array in file (chronological) order.
+/// Returns the rows plus a list of human-readable problems (never fails the whole
+/// file): a row is skipped when the `csv` reader rejects it (bad quoting), its Date is
 /// blank, or its Weight_lbs doesn't parse. Blank optional cells become `null`; a
 /// non-blank-but-unparseable optional numeric also becomes `null` rather than
-/// dropping the row. Pure and unit-testable.
+/// dropping the row. `hydrationArtifact` is `true` only when the cell reads `true`.
+///
+/// `flexible(true)`, like every other log reader here: when the writer extends the
+/// header it leaves every older row byte-identical, so a file legitimately mixes rows of
+/// the old width and the new, and a short row reads its missing cells as blank.
+/// Pure and unit-testable.
 pub fn parse_weight_csv(content: &str) -> (Vec<Value>, Vec<String>) {
     let mut rdr = csv::ReaderBuilder::new()
         .has_headers(true)
-        .flexible(false)
+        .flexible(true)
         .from_reader(content.as_bytes());
+    let idx = match rdr.headers() {
+        Ok(h) => header_index(h),
+        Err(_) => return (vec![], vec!["weight-log.csv header unreadable".into()]),
+    };
 
     let mut rows = Vec::new();
     let mut skipped: Vec<usize> = Vec::new();
@@ -143,8 +152,13 @@ pub fn parse_weight_csv(content: &str) -> (Vec<Value>, Vec<String>) {
                 continue;
             }
         };
-        let date = rec.get(0).unwrap_or("").trim();
-        let lbs = match rec.get(1).map(str::trim).unwrap_or("").parse::<f64>() {
+        let cell = |name: &str| idx.get(name).and_then(|&j| rec.get(j));
+        let date = cell("Date").unwrap_or("").trim();
+        let lbs = match cell("Weight_lbs")
+            .map(str::trim)
+            .unwrap_or("")
+            .parse::<f64>()
+        {
             Ok(v) if !date.is_empty() => v,
             _ => {
                 skipped.push(line_no);
@@ -154,11 +168,12 @@ pub fn parse_weight_csv(content: &str) -> (Vec<Value>, Vec<String>) {
         rows.push(json!({
             "date": date,
             "lbs": lbs,
-            "kg": opt_f(rec.get(2)),
-            "phase": opt_s(rec.get(3)),
-            "bf": opt_f(rec.get(4)),
-            "leanLbs": opt_f(rec.get(5)),
-            "notes": opt_s(rec.get(6)),
+            "kg": opt_f(cell("Weight_kg")),
+            "phase": opt_s(cell("Phase")),
+            "bf": opt_f(cell("BodyFat_pct")),
+            "leanLbs": opt_f(cell("MuscleMass_lbs")),
+            "notes": opt_s(cell("Notes")),
+            "hydrationArtifact": cell("Hydration_Artifact").map(str::trim) == Some("true"),
         }));
     }
 
@@ -1467,6 +1482,83 @@ mod tests {
         let (rows, errs) = parse_weight_csv(&format!("{HEADER}\n"));
         assert!(rows.is_empty());
         assert!(errs.is_empty());
+    }
+
+    const TZ_HEADER: &str = "Date,Weight_lbs,Weight_kg,Phase,BodyFat_pct,MuscleMass_lbs,Notes,TZ";
+
+    fn flags(rows: &[Value]) -> Vec<bool> {
+        rows.iter()
+            .map(|r| r["hydrationArtifact"].as_bool().expect("a JSON boolean"))
+            .collect()
+    }
+
+    #[test]
+    fn reads_legacy_8_column_rows() {
+        let csv = format!(
+            "{TZ_HEADER}\n\
+             2026-09-01,198.4,90.0,Phase 2,18.2,150.1,\"after run, light\",Europe/Rome\n"
+        );
+        let (rows, errs) = parse_weight_csv(&csv);
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["lbs"], 198.4);
+        assert_eq!(rows[0]["leanLbs"], 150.1);
+        assert_eq!(rows[0]["notes"], "after run, light");
+        assert_eq!(flags(&rows), [false], "no column, no artifact");
+    }
+
+    #[test]
+    fn reads_new_9_column_rows() {
+        let csv = format!(
+            "{TZ_HEADER},Hydration_Artifact\n\
+             2026-09-14,196.0,,,,,,Europe/Rome,true\n\
+             2026-09-17,197.0,,,,,,Europe/Rome,false\n"
+        );
+        let (rows, errs) = parse_weight_csv(&csv);
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(flags(&rows), [true, false]);
+        assert_eq!(rows[0]["lbs"], 196.0);
+    }
+
+    /// The real shape after the writer extends the header: older rows keep their eight
+    /// cells, newer ones carry nine. Positional `flexible(false)` skipped every one of
+    /// the old rows.
+    #[test]
+    fn reads_a_file_mixing_8_and_9_column_rows() {
+        let csv = format!(
+            "{TZ_HEADER},Hydration_Artifact\n\
+             2026-09-01,198.4,90.0,Phase 2,18.2,150.1,steady,Europe/Rome\n\
+             2026-09-14,196.0,,,,,,Europe/Rome,true\n\
+             2026-09-15,196.5,,,,,,Europe/Rome,\n\
+             2026-09-16,196.8,,,,,,Europe/Rome,TRUE\n"
+        );
+        let (rows, errs) = parse_weight_csv(&csv);
+        assert!(errs.is_empty(), "no row is skipped for its width: {errs:?}");
+        let dates: Vec<&str> = rows.iter().map(|r| r["date"].as_str().unwrap()).collect();
+        assert_eq!(
+            dates,
+            ["2026-09-01", "2026-09-14", "2026-09-15", "2026-09-16"]
+        );
+        assert_eq!(rows[0]["notes"], "steady");
+        assert_eq!(rows[0]["phase"], "Phase 2");
+        assert_eq!(
+            flags(&rows),
+            [false, true, false, false],
+            "true only when the cell is `true`"
+        );
+    }
+
+    #[test]
+    fn weight_columns_are_found_by_name() {
+        let csv = "Weight_lbs,Date,Hydration_Artifact,Notes\n198,2026-09-14,true,x\n";
+        let (rows, errs) = parse_weight_csv(csv);
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(rows[0]["date"], "2026-09-14");
+        assert_eq!(rows[0]["lbs"], 198.0);
+        assert_eq!(rows[0]["notes"], "x");
+        assert!(rows[0]["kg"].is_null(), "an absent column reads null");
+        assert_eq!(flags(&rows), [true]);
     }
 
     // ---- normalize_proposed ------------------------------------------------

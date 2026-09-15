@@ -225,9 +225,9 @@ pub async fn append_verified_entries(
             .cloned()
             .unwrap_or_else(|| fallback_day.to_string());
         match e {
-            DietEntry::Food(f) => food_rows.push(food_row(f, &day, &tz)),
-            DietEntry::Exercise(x) => ex_rows.push(exercise_row(x, &day, &tz)),
-            DietEntry::Weight(w) => wt_rows.push(weight_row(w, &day, &tz)),
+            DietEntry::Food(f) => food_rows.push(food_cells(f, &day, &tz)),
+            DietEntry::Exercise(x) => ex_rows.push(exercise_cells(x, &day, &tz)),
+            DietEntry::Weight(w) => wt_rows.push(weight_cells(w, &day, &tz)),
         }
     }
     days.sort();
@@ -479,6 +479,7 @@ mod tests {
             entries: vec![DietEntry::Food(FoodEntry {
                 eaten_at: None,
                 unknowable_composite: false,
+                tags: FoodTags::default(),
                 name: name.to_string(),
                 meal: "Snack".to_string(),
                 time: Some("09:00".to_string()),
