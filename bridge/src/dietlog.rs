@@ -4680,7 +4680,7 @@ Cadence,Calories,Plan_Source,Notes,Start_Time,TZ,"
         let before = format!("{}\n2026-09-01,Snack,Banana\n", pre_tail_food_header());
         std::fs::write(dir.join("food-log.csv"), &before).unwrap();
         let row = food_cells(&blank_food("Crackers"), "2026-09-03", "Europe/Rome");
-        let snapshot = append_rows_atomic(&dir, &[row.clone()], &[], &[]).unwrap();
+        let snapshot = append_rows_atomic(&dir, std::slice::from_ref(&row), &[], &[]).unwrap();
         let after = std::fs::read_to_string(dir.join("food-log.csv")).unwrap();
         assert_eq!(
             after,
@@ -4779,7 +4779,7 @@ Cadence,Calories,Plan_Source,Notes,Start_Time,TZ,"
             time_source: Some("actual".into()),
         };
         let row = food_cells(&e, "2026-09-03", "Europe/Rome");
-        append_rows_atomic(&dir, &[row.clone()], &[], &[]).unwrap();
+        append_rows_atomic(&dir, std::slice::from_ref(&row), &[], &[]).unwrap();
 
         let (header, rows) = read_csv(&std::fs::read_to_string(dir.join("food-log.csv")).unwrap());
         assert_eq!(header.join(","), food_log_header());

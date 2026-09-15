@@ -14,6 +14,13 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [Bridge 0.140.1] - 2026-09-15
+
+Two of 0.140.0's new append tests built a one-row slice with `&[row.clone()]`, which
+`cargo clippy --all-targets -- -D warnings` (the CI lint) rejects as
+`cloned_ref_to_slice_refs`. They use `std::slice::from_ref(&row)` instead. Tests only; no
+behaviour change.
+
 ## [Bridge 0.140.0] - 2026-09-15
 
 **The diet logs gain structured columns, and the bridge now reads and writes every log by
