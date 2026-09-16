@@ -14,7 +14,7 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
-## [App 1.0 (135)] - 2026-09-12
+## [App 1.0 (138)] - 2026-09-16
 
 **New health data now logs itself.** When the first body-mass reading of a diet day lands in
 Apple Health, the iPhone sends the Start-new-day refresh on its own; when new workouts land, it

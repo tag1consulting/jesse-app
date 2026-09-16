@@ -72,12 +72,12 @@ struct RootTabView: View {
 
     @State private var selection: Tab = RootTabView.defaultTab
 
-    /// Read only to repaint the icon badge on the way to the background.
+    /// Read twice below: to repaint the icon badge on the way to the background, and to
+    /// settle a workout burst whose window ran out while the app was suspended.
     @Environment(\.scenePhase) private var scenePhase
 
     /// The app-scoped coordinator, read here only to build the replayer's Tell sender.
     @Environment(RunCoordinator.self) private var coordinator
-    @Environment(\.scenePhase) private var scenePhase
 
     /// The Today screen's model lives HERE, not in `TodayTabView`, because the tab
     /// item's badge and the screen must read the same number. Injected through the

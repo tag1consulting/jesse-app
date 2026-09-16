@@ -37,10 +37,9 @@ struct ThreadListView: View {
     // default; Favorites narrows to starred threads; Watch narrows to threads
     // relayed from an Apple Watch; Auto narrows to the turns this iPhone fired by
     // itself when a weigh-in or workout landed in Apple Health; Archived shows only
-    // conversations the user has
-    // hidden from the main list (and is the one place to restore them). Stored as the
-    // raw string so it lightweight-adds over the old boolean-favorites default (an
-    // unknown value reads as `.all`).
+    // conversations the user has hidden from the main list (and is the one place to
+    // restore them). Stored as the raw string so it lightweight-adds over the old
+    // boolean-favorites default (an unknown value reads as `.all`).
     enum ListScope: String, CaseIterable {
         case all, favorites, watch, auto, archived
         var label: String {
