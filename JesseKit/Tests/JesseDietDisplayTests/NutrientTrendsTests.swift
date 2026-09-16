@@ -359,9 +359,16 @@ final class NutrientTrendsTests: XCTestCase {
 
     // MARK: - Labels (all thirteen, unabbreviated)
 
-    func testAllTwentyFullNamesPresentAndUnabbreviated() {
+    func testAllTwentySixFullNamesPresentAndUnabbreviated() {
         let names = Dictionary(uniqueKeysWithValues: TrendNutrient.allCases.map { ($0, $0.fullName) })
-        XCTAssertEqual(TrendNutrient.allCases.count, 20)
+        XCTAssertEqual(TrendNutrient.allCases.count, 26)
+        // The tier-2 six, spelled in full like every other row.
+        XCTAssertEqual(names[.caf], "Caffeine")
+        XCTAssertEqual(names[.iod], "Iodine")
+        XCTAssertEqual(names[.fe], "Iron")
+        XCTAssertEqual(names[.ret], "Retinol")
+        XCTAssertEqual(names[.ox], "Oxalate")
+        XCTAssertEqual(names[.o6], "Omega-6")
         XCTAssertEqual(names[.cal], "Calories")
         XCTAssertEqual(names[.p], "Protein")
         XCTAssertEqual(names[.f], "Fat")
@@ -549,6 +556,11 @@ final class NutrientTrendsTests: XCTestCase {
             // a weekly window sum, none of which a median answers).
             .tfat: .daily, .asug: .daily, .vd: .daily,
             .chol: .daily, .pur: .daily, .se: .daily, .hg: .daily,
+            // The tier-2 six: caffeine and retinol are day-judged ceilings; the other four
+            // are never judged here at all (a band, or informational), and answer `.daily`
+            // only because the property is total.
+            .caf: .daily, .ret: .daily,
+            .iod: .daily, .fe: .daily, .ox: .daily, .o6: .daily,
         ]
         XCTAssertEqual(expected.count, TrendNutrient.allCases.count)
         for n in TrendNutrient.allCases {
@@ -563,6 +575,14 @@ final class NutrientTrendsTests: XCTestCase {
                      "selenium's goal is a BAND — a per-day series carries one number, not two")
         XCTAssertNil(TrendNutrient.hg.dayGoal,
                      "mercury's limit is weekly — a per-day verdict is a category error")
+        // The tier-2 six, on the same terms.
+        XCTAssertEqual(TrendNutrient.caf.dayGoal, .ceiling)
+        XCTAssertEqual(TrendNutrient.ret.dayGoal, .ceiling)
+        XCTAssertNil(TrendNutrient.iod.dayGoal,
+                     "iodine's goal is a BAND — a per-day series carries one number, not two")
+        for n in [TrendNutrient.fe, .ox, .o6] {
+            XCTAssertNil(n.dayGoal, "\(n.fullName) is informational — no per-day verdict")
+        }
     }
 
     // MARK: - Rolling verdict (the gauge's colour)

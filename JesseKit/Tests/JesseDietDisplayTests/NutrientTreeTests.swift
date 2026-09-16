@@ -66,7 +66,9 @@ final class NutrientTreeTests: XCTestCase {
         // saturated/unsaturated fat and total sugars sit under their parent macro.
         XCTAssertEqual(NutrientOrder.minerals,
                        [.sodium, .potassium, .calcium, .omega3, .magnesium,
-                        .selenium, .vitaminD, .purines])
+                        .selenium, .vitaminD, .purines,
+                        // The tier-2 six are standalone too, in their own log-column order.
+                        .caffeine, .iodine, .iron, .retinol, .oxalate, .omega6])
     }
 
     func testMacroAreaNeverContainsAMineral() {

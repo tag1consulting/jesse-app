@@ -1133,6 +1133,17 @@ enum MicronutrientColor {
             // tone palette never uses pure red (see `toneColor`), so it cannot be confused
             // for a verdict colour.
             case .mercury: return .red
+            // The tier-2 standalone rows. Each needs its OWN hue: falling through to the
+            // default below would have given all six sodium's blue, which is what
+            // `testEveryStandaloneNutrientKeepsItsOwnIdentityHue` exists to catch. The
+            // system palette runs out at four, so the last two are named explicitly rather
+            // than reusing a hue that already means another nutrient.
+            case .caffeine: return .indigo
+            case .iodine: return .teal
+            case .iron: return .orange
+            case .retinol: return .green
+            case .oxalate: return Color(red: 0.62, green: 0.44, blue: 0.86)
+            case .omega6: return Color(red: 0.85, green: 0.62, blue: 0.35)
             default: return .blue // sodium (and any future standalone default)
             }
         }
