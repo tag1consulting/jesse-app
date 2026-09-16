@@ -235,6 +235,69 @@ final class MealWireDecodeTests: XCTestCase {
         XCTAssertNil(meal.magnesiumMg)
     }
 
+    // MARK: - The tier-2 nutrients on the meal wire
+
+    func testMealBlockDecodesTheThreeHealthKitBoundTier2Nutrients() throws {
+        // caffeine_mg / iodine_ug / iron_mg parse like every other unit-suffixed key.
+        let json = """
+        {"status":"done","response":"ok","session_id":"s",
+         "directives":{"meal_log":{"meals":[
+           {"id":"a","consumedAt":"2026-07-04T08:30:00+02:00","name":"Espresso and eggs",
+            "caffeine_mg":75,"iodine_ug":25,"iron_mg":1.8,"sodium_mg":140}]}}}
+        """
+        let meal = try XCTUnwrap(try decodeResult(json).directives?.mealLog?.meals.first)
+        XCTAssertEqual(meal.caffeineMg, 75)
+        XCTAssertEqual(meal.iodineUg, 25)
+        XCTAssertEqual(meal.ironMg, 1.8)
+        XCTAssertEqual(meal.sodiumMg, 140, "the existing keys are unaffected")
+        // And they survive validation into the domain meal.
+        let m = try XCTUnwrap(MealLogParser.meal(from: meal))
+        XCTAssertEqual(m.caffeineMg, 75)
+        XCTAssertEqual(m.iodineUg, 25)
+        XCTAssertEqual(m.ironMg, 1.8)
+    }
+
+    func testMealBlockOmittingTheTier2NutrientsDecodesToNil() throws {
+        // Absent is UNKNOWN, never a summed 0 — so an older bridge decodes cleanly.
+        let json = """
+        {"status":"done","response":"ok","session_id":"s",
+         "directives":{"meal_log":{"meals":[
+           {"id":"a","consumedAt":"2026-07-04T12:30:00+02:00","name":"Apple","kcal":95}]}}}
+        """
+        let meal = try XCTUnwrap(try decodeResult(json).directives?.mealLog?.meals.first)
+        XCTAssertNil(meal.caffeineMg)
+        XCTAssertNil(meal.iodineUg)
+        XCTAssertNil(meal.ironMg)
+    }
+
+    func testMealBlockIgnoresTheGaugeOnlyTier2Nutrients() throws {
+        // Retinol, oxalate and omega-6 have no HealthKit type that means the same thing, so
+        // they are not on this wire. A block that (wrongly) carried them still decodes, and
+        // they are picked up under no other name — retinol especially must never land in a
+        // vitamin A field.
+        let json = """
+        {"status":"done","response":"ok","session_id":"s",
+         "directives":{"meal_log":{"meals":[
+           {"id":"a","consumedAt":"2026-07-04T19:00:00+02:00","name":"Liver",
+            "retinol_ug":9000,"oxalate_mg":12,"omega6_g":3.4,"iron_mg":6.5}]}}}
+        """
+        let meal = try XCTUnwrap(try decodeResult(json).directives?.mealLog?.meals.first)
+        XCTAssertEqual(meal.ironMg, 6.5, "the modelled tier-2 key still parses")
+        XCTAssertNil(meal.caffeineMg)
+        XCTAssertNil(meal.iodineUg)
+        let m = try XCTUnwrap(MealLogParser.meal(from: meal))
+        XCTAssertEqual(m.ironMg, 6.5)
+    }
+
+    func testANegativeTier2NutrientRejectsTheWholeMeal() throws {
+        // App-side validation is defense in depth for the bridge's own check: a negative
+        // nutrient is nonsense, and it rejects the meal rather than being clamped.
+        let bad = JesseMeal(id: "a", consumedAt: "2026-07-04T12:30:00+02:00", name: "X",
+                            kcal: nil, proteinGrams: nil, carbGrams: nil, fatGrams: nil,
+                            fiberGrams: nil, caffeineMg: -1)
+        XCTAssertNil(MealLogParser.meal(from: bad))
+    }
+
     func testSSEDoneFrameDecodesRetractAndSeq() throws {
         let json = """
         {"response":"Moved.","session_id":"s",

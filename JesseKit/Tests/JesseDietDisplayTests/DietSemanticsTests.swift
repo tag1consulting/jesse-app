@@ -11,6 +11,172 @@ import JesseNetworking
 final class DietSemanticsTests: XCTestCase {
     typealias S = DietSemantics
 
+    // MARK: - Tier 2: caffeine ceiling, iodine band, informational rows
+
+    private func mealAt(_ time: String?, _ items: [DietItem]) -> DietMeal {
+        DietMeal(name: "Meal", time: time, items: items)
+    }
+
+    func testCaffeineIsACeilingAgainstItsStandingReferenceWhenTheDayCarriesNone() {
+        let meals = [mealAt("08:00", [DietItem(item: "Espresso", cal: 5, caf: 75)])]
+        let g = S.micronutrientGauge(.caffeine, meals: meals, targets: DietTargets(), hour: 12)
+        XCTAssertEqual(g.goal, .ceiling)
+        XCTAssertEqual(g.value, 75)
+        XCTAssertEqual(g.target, S.caffeineCeiling, "the 400 mg reference stands in")
+        XCTAssertEqual(g.goalStatus, .met)
+    }
+
+    func testCaffeineOverTheCeilingReadsOver() {
+        let meals = [mealAt("08:00", [DietItem(item: "Pot of coffee", cal: 10, caf: 520)])]
+        let g = S.micronutrientGauge(.caffeine, meals: meals,
+                                     targets: DietTargets(caffeine: 400), hour: 18)
+        XCTAssertEqual(g.goalStatus, .over(120))
+        XCTAssertEqual(g.status, .red)
+    }
+
+    func testTheLateCaffeineNoteSumsOnlyItemsAtOrAfterTheLateHour() {
+        let meals = [
+            mealAt("08:00", [DietItem(item: "Espresso", cal: 5, caf: 75)]),
+            mealAt("14:00", [DietItem(item: "Espresso", cal: 5, caf: 75)]),
+            mealAt("16:30", [DietItem(item: "Tea", cal: 2, caf: 15)]),
+        ]
+        let g = S.micronutrientGauge(.caffeine, meals: meals, targets: DietTargets(), hour: 20)
+        XCTAssertEqual(g.note, "90mg after 14:00", "at or after the hour, never before it")
+        XCTAssertNotEqual(g.status, .red, "a late note is neutral, never a red state")
+    }
+
+    func testAnItemWithNoTimeIsExcludedFromTheLateSumAndCounted() {
+        let meals = [
+            mealAt("15:00", [DietItem(item: "Cola", cal: 140, caf: 40)]),
+            mealAt(nil, [DietItem(item: "Dark chocolate", cal: 250, caf: 25)]),
+        ]
+        let g = S.micronutrientGauge(.caffeine, meals: meals, targets: DietTargets(), hour: 20)
+        XCTAssertEqual(g.note, "40mg after 14:00 · 1 item with no time not counted",
+                       "an unplaceable item is never quietly counted as early")
+    }
+
+    func testTheLateHourFollowsTheDaysOwnTargetWhenItCarriesOne() {
+        let meals = [mealAt("13:00", [DietItem(item: "Espresso", cal: 5, caf: 75)])]
+        let g = S.micronutrientGauge(.caffeine, meals: meals,
+                                     targets: DietTargets(caffeineLateHour: 12), hour: 20)
+        XCTAssertEqual(g.note, "75mg after 12:00")
+    }
+
+    func testNothingLateAndNothingUntimedLeavesNoNoteAtAll() {
+        let meals = [mealAt("07:00", [DietItem(item: "Espresso", cal: 5, caf: 75)])]
+        let g = S.micronutrientGauge(.caffeine, meals: meals, targets: DietTargets(), hour: 20)
+        XCTAssertNil(g.note)
+    }
+
+    func testIodineIsJudgedAsABandInEveryDirection() {
+        let t = DietTargets(iodine: DietBandTarget(floor: 150, ceiling: 600))
+        let inside = S.micronutrientGauge(
+            .iodine, meals: [mealAt("12:00", [DietItem(item: "Cod", cal: 100, iod: 200)])],
+            targets: t, hour: 12)
+        XCTAssertEqual(inside.goal, .band)
+        XCTAssertEqual(inside.goalStatus, .met)
+        XCTAssertEqual(inside.status, .green)
+
+        let over = S.micronutrientGauge(
+            .iodine, meals: [mealAt("12:00", [DietItem(item: "Kelp", cal: 10, iod: 900)])],
+            targets: t, hour: 12)
+        XCTAssertEqual(over.goalStatus, .over(300))
+        XCTAssertEqual(over.status, .red)
+
+        // A COMPLETE day under the floor is a measured shortfall.
+        let short = S.micronutrientGauge(
+            .iodine, meals: [mealAt("12:00", [DietItem(item: "Salmon", cal: 200, iod: 40)])],
+            targets: t, hour: 12)
+        XCTAssertEqual(short.goalStatus, .short(110))
+    }
+
+    func testIodineBandPartialDayTripsTheCeilingButNeverProvesTheFloorWasMissed() {
+        let t = DietTargets(iodine: DietBandTarget(floor: 150, ceiling: 600))
+        let unmeasured = DietItem(item: "Restaurant dish", cal: 400)
+
+        // Under the floor with something unmeasured: NO claim — the unmeasured food could
+        // carry it well past, so a shortfall would be asserting what nobody measured.
+        let low = S.micronutrientGauge(
+            .iodine,
+            meals: [mealAt("12:00", [DietItem(item: "Salmon", cal: 200, iod: 40), unmeasured])],
+            targets: t, hour: 12)
+        XCTAssertEqual(low.goalStatus, .noGoal)
+        XCTAssertEqual(low.status, .suspended)
+        XCTAssertTrue(low.remaining.contains("at least"), low.remaining)
+        XCTAssertFalse(low.remaining.contains("floor"), "never 'short' on a partial day")
+
+        // Over the ceiling with something unmeasured: PROVEN, because unknowns only add.
+        let high = S.micronutrientGauge(
+            .iodine,
+            meals: [mealAt("12:00", [DietItem(item: "Kelp", cal: 10, iod: 900), unmeasured])],
+            targets: t, hour: 12)
+        XCTAssertEqual(high.goalStatus, .over(300))
+        XCTAssertEqual(high.status, .red)
+    }
+
+    func testIodineFallsBackToTheStandingBandWhenTheDayRecordsNone() {
+        let g = S.micronutrientGauge(
+            .iodine, meals: [mealAt("12:00", [DietItem(item: "Cod", cal: 100, iod: 200)])],
+            targets: DietTargets(), hour: 12)
+        XCTAssertEqual(g.goalStatus, .met, "150–600 µg stands in for a day that carries none")
+        XCTAssertEqual(g.target, S.iodineCeiling, "the bar's reference is the ceiling")
+    }
+
+    func testRetinolIsACeilingSoALiverDayIsObvious() {
+        let meals = [mealAt("19:00", [DietItem(item: "Calf liver", cal: 260, ret: 9000)])]
+        let g = S.micronutrientGauge(.retinol, meals: meals, targets: DietTargets(), hour: 20)
+        XCTAssertEqual(g.goal, .ceiling)
+        XCTAssertEqual(g.target, S.retinolCeiling)
+        XCTAssertEqual(g.goalStatus, .over(6000))
+        XCTAssertEqual(g.status, .red)
+    }
+
+    func testTheThreeInformationalTier2RowsCarryAValueAndNoJudgment() {
+        let meals = [mealAt("12:00", [DietItem(item: "Spinach and beef", cal: 300,
+                                              fe: 6.5, ox: 750, o6: 2.4)])]
+        let cases: [(Micronutrient, Double)] = [(.iron, 6.5), (.oxalate, 750), (.omega6, 2.4)]
+        for (n, value) in cases {
+            let g = S.micronutrientGauge(n, meals: meals, targets: DietTargets(), hour: 20)
+            XCTAssertFalse(n.judged, "\(n.displayName) is informational")
+            XCTAssertEqual(g.value, value, "\(n.displayName) shows its value")
+            XCTAssertEqual(g.status, .suspended, "\(n.displayName) claims no colour")
+            XCTAssertEqual(g.goalStatus, .noGoal)
+            XCTAssertNil(g.target, "\(n.displayName) carries no target")
+        }
+    }
+
+    func testAnUnknownTier2ValueIsNeverSummedAsZero() {
+        // One item knows its iron, one does not: the total is a FLOOR, flagged partial.
+        let meals = [mealAt("12:00", [
+            DietItem(item: "Steak", cal: 400, fe: 3.0),
+            DietItem(item: "Unknown sauce", cal: 50),
+        ])]
+        let g = S.micronutrientGauge(.iron, meals: meals, targets: DietTargets(), hour: 12)
+        XCTAssertEqual(g.value, 3.0, "only the known contributor is summed")
+        XCTAssertTrue(g.partial)
+        XCTAssertEqual(g.unknownItemCount, 1)
+    }
+
+    func testTheSixTier2NutrientsSpellTheirOwnUnitsAndEducation() {
+        XCTAssertEqual(Micronutrient.caffeine.unit, "mg")
+        XCTAssertEqual(Micronutrient.iodine.unit, "µg")
+        XCTAssertEqual(Micronutrient.iron.unit, "mg")
+        XCTAssertEqual(Micronutrient.retinol.unit, "µg")
+        XCTAssertEqual(Micronutrient.oxalate.unit, "mg")
+        XCTAssertEqual(Micronutrient.omega6.unit, "g")
+        XCTAssertTrue(Micronutrient.caffeine.education.contains("400 mg a day"))
+        XCTAssertTrue(Micronutrient.iodine.education.contains("150 µg is the daily need"))
+        XCTAssertTrue(Micronutrient.iron.education.contains("a ferritin blood test does"))
+        XCTAssertTrue(Micronutrient.retinol.education.contains("3,000 µg adult upper limit"))
+        XCTAssertTrue(Micronutrient.oxalate.education.contains("kidney stones"))
+        XCTAssertTrue(Micronutrient.omega6.education.contains("linoleic acid"))
+        // Every one of them is a standalone row in the Micronutrients section.
+        for n in [Micronutrient.caffeine, .iodine, .iron, .retinol, .oxalate, .omega6] {
+            XCTAssertNil(n.parent, "\(n.displayName) is standalone")
+            XCTAssertTrue(NutrientOrder.minerals.contains(n))
+        }
+    }
+
     // MARK: - Day-style resolution
 
     func testDayStyleWinsOverDayType() {

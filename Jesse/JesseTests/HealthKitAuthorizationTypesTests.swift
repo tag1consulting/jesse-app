@@ -16,16 +16,18 @@ import HealthKit
 @MainActor
 final class HealthKitAuthorizationTypesTests: XCTestCase {
 
-    /// The share (write) set is EXACTLY the fourteen dietary quantity types a meal may
-    /// carry — the five macros plus the nine HealthKit-bound micronutrients (sodium,
+    /// The share (write) set is EXACTLY the seventeen dietary quantity types a meal may
+    /// carry — the five macros plus the twelve HealthKit-bound micronutrients (sodium,
     /// saturated fat, sugar, potassium, calcium, magnesium, cholesterol, selenium,
-    /// vitamin D) — no more, no fewer, and specifically no correlation container. The
-    /// gauge-only nutrients are absent because HealthKit has no type meaning the same
-    /// thing: omega-3 (no EPA+DHA type), trans fat, purines, mercury, and added sugar
-    /// (`dietarySugar` is TOTAL sugar, so writing the added share into it would understate
-    /// the real total). Every quantity type a `.food` sample uses must be authorized to
-    /// share, or the save fails.
-    func testShareSetIsExactlyTheFourteenDietaryQuantityTypes() {
+    /// vitamin D, caffeine, iodine, iron) — no more, no fewer, and specifically no
+    /// correlation container. The gauge-only nutrients are absent because HealthKit has no
+    /// type meaning the same thing: omega-3 (no EPA+DHA type), trans fat, purines, mercury,
+    /// oxalate, omega-6, added sugar (`dietarySugar` is TOTAL sugar, so writing the added
+    /// share into it would understate the real total), and preformed retinol
+    /// (`dietaryVitaminA` is TOTAL vitamin A including the carotenoids retinol excludes).
+    /// Every quantity type a `.food` sample uses must be authorized to share, or the save
+    /// fails.
+    func testShareSetIsExactlyTheSeventeenDietaryQuantityTypes() {
         let expected: Set<String> = Set([
             HKQuantityTypeIdentifier.dietaryEnergyConsumed,
             .dietaryProtein,
@@ -41,10 +43,23 @@ final class HealthKitAuthorizationTypesTests: XCTestCase {
             .dietaryCholesterol,
             .dietarySelenium,
             .dietaryVitaminD,
+            .dietaryCaffeine,
+            .dietaryIodine,
+            .dietaryIron,
         ].map(\.rawValue))
         let actual = Set(HealthKitMealWriter.shareTypes.map(\.identifier))
         XCTAssertEqual(actual, expected,
-                       "share set must be exactly the fourteen dietary quantity types")
+                       "share set must be exactly the seventeen dietary quantity types")
+    }
+
+    /// Preformed retinol must NEVER reach `dietaryVitaminA`. That type is TOTAL vitamin A,
+    /// which includes the plant carotenoids `retinol_ug` exists to exclude, so writing the
+    /// retinol figure there would state something the log never claimed — and would do it
+    /// in the user's permanent Health record.
+    func testRetinolIsNeverWrittenToTheTotalVitaminAType() {
+        let ids = HealthKitMealWriter.shareTypes.map(\.identifier)
+        XCTAssertFalse(ids.contains(HKQuantityTypeIdentifier.dietaryVitaminA.rawValue),
+                       "dietaryVitaminA is TOTAL vitamin A — preformed retinol is not it")
     }
 
     /// The READ set must contain no dietary type. This is NOT what makes the meal

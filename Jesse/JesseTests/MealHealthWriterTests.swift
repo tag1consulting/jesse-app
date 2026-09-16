@@ -299,13 +299,16 @@ final class MealHealthWriterTests: XCTestCase {
                           satFatGrams: Double? = nil, sugarGrams: Double? = nil,
                           potassiumMg: Double? = nil, calciumMg: Double? = nil,
                           magnesiumMg: Double? = nil, cholesterolMg: Double? = nil,
-                          seleniumUg: Double? = nil, vitaminDUg: Double? = nil) -> Meal {
+                          seleniumUg: Double? = nil, vitaminDUg: Double? = nil,
+                          caffeineMg: Double? = nil, iodineUg: Double? = nil,
+                          ironMg: Double? = nil) -> Meal {
         Meal(id: "m", consumedAt: Date(timeIntervalSince1970: 1_780_000_000),
              name: "M", kcal: kcal, proteinGrams: 20, carbGrams: 30, fatGrams: 10,
              fiberGrams: 5, sodiumMg: sodiumMg, satFatGrams: satFatGrams,
              sugarGrams: sugarGrams, potassiumMg: potassiumMg,
              calciumMg: calciumMg, magnesiumMg: magnesiumMg,
-             cholesterolMg: cholesterolMg, seleniumUg: seleniumUg, vitaminDUg: vitaminDUg)
+             cholesterolMg: cholesterolMg, seleniumUg: seleniumUg, vitaminDUg: vitaminDUg,
+             caffeineMg: caffeineMg, iodineUg: iodineUg, ironMg: ironMg)
     }
 
     private func samples(of meal: Meal, _ id: HKQuantityTypeIdentifier) -> [HKQuantitySample] {
@@ -370,15 +373,82 @@ final class MealHealthWriterTests: XCTestCase {
                       "an all-unknown magnesium writes no sample")
     }
 
-    func testMealWithEveryMicronutrientWritesFourteenSamplesAndNoGaugeOnlyOnes() {
-        // Five macros + nine HealthKit micros = fourteen. The gauge-only nutrients —
-        // omega-3, unsaturated fat, trans fat, added sugar, purines, mercury — are NOT
-        // written (no HealthKit type that means the same thing), so there is no fifteenth.
+    func testMealWithEveryMicronutrientWritesSeventeenSamplesAndNoGaugeOnlyOnes() {
+        // Five macros + twelve HealthKit micros = seventeen. The gauge-only nutrients —
+        // omega-3, unsaturated fat, trans fat, added sugar, purines, mercury, retinol,
+        // oxalate, omega-6 — are NOT written (no HealthKit type that means the same
+        // thing), so there is no eighteenth.
         let m = fullMeal(sodiumMg: 800, satFatGrams: 3, sugarGrams: 12, potassiumMg: 500,
                          calciumMg: 250, magnesiumMg: 90, cholesterolMg: 95,
-                         seleniumUg: 92, vitaminDUg: 5.7)
-        XCTAssertEqual(HealthKitMealWriter.samples(for: m).count, 14,
-                       "five macros plus the nine HealthKit-bound micronutrients")
+                         seleniumUg: 92, vitaminDUg: 5.7,
+                         caffeineMg: 75, iodineUg: 25, ironMg: 1.8)
+        XCTAssertEqual(HealthKitMealWriter.samples(for: m).count, 17,
+                       "five macros plus the twelve HealthKit-bound micronutrients")
+    }
+
+    // MARK: - The three tier-2 nutrients that DO reach Apple Health
+
+    func testCaffeineIodineAndIronWriteFromTheirKnownSumsInTheRightUnits() {
+        let m = fullMeal(caffeineMg: 75, iodineUg: 25, ironMg: 1.8)
+        let caf = samples(of: m, .dietaryCaffeine)
+        XCTAssertEqual(caf.count, 1)
+        XCTAssertEqual(caf[0].quantity.doubleValue(for: .gramUnit(with: .milli)), 75,
+                       accuracy: 0.001, "caffeine in milligrams")
+        let iod = samples(of: m, .dietaryIodine)
+        XCTAssertEqual(iod.count, 1)
+        XCTAssertEqual(iod[0].quantity.doubleValue(for: .gramUnit(with: .micro)), 25,
+                       accuracy: 0.001, "iodine in MICROgrams — milligrams would be 1000x off")
+        let fe = samples(of: m, .dietaryIron)
+        XCTAssertEqual(fe.count, 1)
+        XCTAssertEqual(fe[0].quantity.doubleValue(for: .gramUnit(with: .milli)), 1.8,
+                       accuracy: 0.001, "iron in milligrams")
+    }
+
+    func testAllUnknownTier2NutrientsWriteNoSampleAtAll() {
+        // nil ⇒ no item in the meal carried a value ⇒ NO sample, never a 0 guess.
+        let m = fullMeal(sodiumMg: 800)
+        XCTAssertTrue(samples(of: m, .dietaryCaffeine).isEmpty)
+        XCTAssertTrue(samples(of: m, .dietaryIodine).isEmpty)
+        XCTAssertTrue(samples(of: m, .dietaryIron).isEmpty)
+    }
+
+    func testAGenuineZeroTier2ValueDoesWriteASample() {
+        // A MEASURED zero is a fact about the meal — "this supplied no caffeine" — and the
+        // guidance names exactly that case, so it is written rather than dropped.
+        let m = fullMeal(caffeineMg: 0, iodineUg: 0, ironMg: 0)
+        for id in [HKQuantityTypeIdentifier.dietaryCaffeine, .dietaryIodine, .dietaryIron] {
+            XCTAssertEqual(samples(of: m, id).count, 1,
+                           "a known 0 is a fact and must be written: \(id.rawValue)")
+        }
+    }
+
+    func testRetinolOxalateAndOmega6ReachNoHealthKitTypeAtAll() {
+        // They have no field on `Meal`, so no sample can carry them. The one that matters
+        // most is retinol: `dietaryVitaminA` is TOTAL vitamin A, which includes the plant
+        // carotenoids the retinol column exists to exclude, so a meal with a known iron
+        // value writes iron and invents no vitamin A alongside it.
+        let m = fullMeal(ironMg: 6.5)
+        XCTAssertTrue(samples(of: m, .dietaryVitaminA).isEmpty,
+                      "preformed retinol must never be written as total vitamin A")
+        XCTAssertEqual(HealthKitMealWriter.samples(for: m).count, 6,
+                       "five macros plus the one known micronutrient — nothing invented")
+    }
+
+    func testATier2OnlyCorrectionRewritesOnce() async {
+        // Gaining a first caffeine estimate changes the content hash (absent ≠ 0), so the
+        // meal is delete-then-rewritten exactly once, through the same enumeration path.
+        let w = FakeMealWriter(); let p = InMemoryPending(); let ack = AckCapture()
+        let store = InMemoryWrittenStore()
+        let before = fullMeal(sodiumMg: 800)
+        store.records["m"] = WrittenMealRecord(contentHash: before.contentHash, tombstoned: false)
+        let after = fullMeal(sodiumMg: 800, caffeineMg: 75, iodineUg: 25, ironMg: 1.8)
+        XCTAssertNotEqual(before.contentHash, after.contentHash,
+                          "gaining the tier-2 nutrients must change the hash, or no rewrite fires")
+        await makeWriter(w, p, ack).apply(batch([after], seq: 2), written: store)
+        let log = await w.log()
+        XCTAssertEqual(log, [.delete("m"), .write("m")])
+        XCTAssertEqual(HealthKitMealWriter.samples(for: after).count, 9,
+                       "the rewritten correlation carries all three new types")
     }
 
     // MARK: - The three risk nutrients that DO reach Apple Health

@@ -43,6 +43,14 @@ nonisolated struct Meal: Codable, Equatable, Sendable {
     let cholesterolMg: Double?
     let seleniumUg: Double?
     let vitaminDUg: Double?
+    /// The three tier-2 nutrients HealthKit has a matching type for: caffeine and iron in
+    /// mg, iodine in µg. Retinol, oxalate and omega-6 are gauge-only — no oxalate or
+    /// omega-6 quantity exists, and `dietaryVitaminA` is TOTAL vitamin A including the
+    /// carotenoids preformed retinol excludes, so writing retinol there would overstate
+    /// what the log knows.
+    let caffeineMg: Double?
+    let iodineUg: Double?
+    let ironMg: Double?
 
     /// An explicit memberwise init so the newest nutrients DEFAULT to nil — absent, which
     /// is what "no item in this meal carried a value" means and is never the same as 0.
@@ -54,7 +62,9 @@ nonisolated struct Meal: Codable, Equatable, Sendable {
          proteinGrams: Double?, carbGrams: Double?, fatGrams: Double?, fiberGrams: Double?,
          sodiumMg: Double?, satFatGrams: Double?, sugarGrams: Double?, potassiumMg: Double?,
          calciumMg: Double?, magnesiumMg: Double?, cholesterolMg: Double? = nil,
-         seleniumUg: Double? = nil, vitaminDUg: Double? = nil) {
+         seleniumUg: Double? = nil, vitaminDUg: Double? = nil,
+         caffeineMg: Double? = nil, iodineUg: Double? = nil, ironMg: Double? = nil) {
+        self.caffeineMg = caffeineMg; self.iodineUg = iodineUg; self.ironMg = ironMg
         self.id = id; self.consumedAt = consumedAt; self.name = name; self.kcal = kcal
         self.proteinGrams = proteinGrams; self.carbGrams = carbGrams
         self.fatGrams = fatGrams; self.fiberGrams = fiberGrams
@@ -84,7 +94,8 @@ nonisolated struct Meal: Codable, Equatable, Sendable {
             ("satfat_g", satFatGrams), ("sugar_g", sugarGrams), ("potassium_mg", potassiumMg),
             ("calcium_mg", calciumMg), ("magnesium_mg", magnesiumMg),
             ("cholesterol_mg", cholesterolMg), ("selenium_ug", seleniumUg),
-            ("vitamin_d_ug", vitaminDUg),
+            ("vitamin_d_ug", vitaminDUg), ("caffeine_mg", caffeineMg),
+            ("iodine_ug", iodineUg), ("iron_mg", ironMg),
         ]
         for (key, value) in nutrients {
             if let value { parts.append("\(key)=\(value)") }
@@ -196,7 +207,7 @@ nonisolated enum MealLogParser {
         for value in [m.kcal, m.proteinGrams, m.carbGrams, m.fatGrams, m.fiberGrams,
                       m.sodiumMg, m.satFatGrams, m.sugarGrams, m.potassiumMg,
                       m.calciumMg, m.magnesiumMg, m.cholesterolMg, m.seleniumUg,
-                      m.vitaminDUg] {
+                      m.vitaminDUg, m.caffeineMg, m.iodineUg, m.ironMg] {
             if let v = value, !(v.isFinite && v >= 0) { return nil }
         }
         return Meal(id: id, consumedAt: date, name: name,
@@ -207,7 +218,8 @@ nonisolated enum MealLogParser {
                     sugarGrams: m.sugarGrams, potassiumMg: m.potassiumMg,
                     calciumMg: m.calciumMg, magnesiumMg: m.magnesiumMg,
                     cholesterolMg: m.cholesterolMg, seleniumUg: m.seleniumUg,
-                    vitaminDUg: m.vitaminDUg)
+                    vitaminDUg: m.vitaminDUg, caffeineMg: m.caffeineMg,
+                    iodineUg: m.iodineUg, ironMg: m.ironMg)
     }
 
     /// Parse an ISO-8601 date-time WITH offset, tolerating optional fractional

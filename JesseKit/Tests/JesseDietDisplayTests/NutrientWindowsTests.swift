@@ -263,4 +263,54 @@ final class NutrientWindowsTests: XCTestCase {
         XCTAssertEqual(rows.map(\.nutrient), [.cal, .na])
         XCTAssertEqual(rows.first(where: { $0.nutrient == .na })?.gauge.label, "Sodium")
     }
+
+    // MARK: - Tier 2 flows through the switcher on the same terms
+
+    func testCaffeineGetsAWindowedVerdictOnceItIsMeasured() {
+        let t = targets { $0.caffeine = 400 }
+        let s = series(days: 10, key: "caf") { _ in 520 }
+        let g = NutrientWindows.gauge(.caf, series: s, targets: t, windowDays: 7)
+        XCTAssertEqual(g.value, 520, "the row shows the window's MEDIAN")
+        XCTAssertEqual(g.target, 400)
+        XCTAssertEqual(g.status, .red, "a week median past the ceiling is red")
+        XCTAssertEqual(g.goal, .ceiling)
+        XCTAssertTrue(NutrientWindows.trackedNutrients(s).contains(.caf))
+    }
+
+    func testTheInformationalTier2RowsNeverGainAVerdictInAnyWindow() {
+        // Iron, oxalate and omega-6 carry no target and no judgment — in every mode,
+        // however many days measured them.
+        let t = targets { _ in }
+        let d = dates(from: "2026-09-01", count: 30)
+        let s = (0..<30).map { i in
+            NutrientDay(date: d[i], nutrients: [
+                "cal": val(2000, known: 5),
+                "fe": val(12, known: 3),
+                "ox": val(i % 2 == 0 ? 150 : 400, known: 3),
+                "o6": val(9, known: 3),
+            ])
+        }
+        for window in [7, 30] {
+            for n in [TrendNutrient.fe, .ox, .o6] {
+                let read = NutrientWindows.read(n, series: s, targets: t, windowDays: window)
+                XCTAssertFalse(read.hasVerdict, "\(n.fullName) is never judged")
+                let g = NutrientWindows.gauge(n, series: s, targets: t, windowDays: window)
+                XCTAssertEqual(g.status, .suspended, "\(n.fullName) at \(window)d")
+                XCTAssertEqual(g.goalStatus, .noGoal)
+            }
+        }
+        // And distribution is what an informational row leads with.
+        let ox = NutrientWindows.gauge(.ox, series: s, targets: t, windowDays: 30)
+        XCTAssertTrue(ox.remaining.hasPrefix("range 150–400 mg · known "), ox.remaining)
+    }
+
+    func testAnUnloggedTier2NutrientGetsNoRowAtAll() {
+        // Until the extract starts filling them, these nutrients have no known day, so the
+        // switcher omits them entirely rather than showing six permanent blanks.
+        let s = series(days: 10, key: "na") { _ in 1800 }
+        let tracked = NutrientWindows.trackedNutrients(s)
+        for n in [TrendNutrient.caf, .iod, .fe, .ret, .ox, .o6] {
+            XCTAssertFalse(tracked.contains(n), "\(n.fullName) has never been measured")
+        }
+    }
 }

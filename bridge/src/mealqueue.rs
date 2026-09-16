@@ -382,6 +382,9 @@ mod tests {
             cholesterol_mg: None,
             selenium_ug: None,
             vitamin_d_ug: None,
+            caffeine_mg: None,
+            iodine_ug: None,
+            iron_mg: None,
         }
     }
 

@@ -849,13 +849,23 @@ public struct JesseMeal: Decodable, Equatable, Sendable {
     public let cholesterolMg: Double?
     public let seleniumUg: Double?
     public let vitaminDUg: Double?
+    // The three tier-2 nutrients with a real HealthKit type. Retinol, oxalate and omega-6
+    // are gauge-only: HealthKit has no oxalate or omega-6 quantity, and `dietaryVitaminA`
+    // is TOTAL vitamin A including carotenoids, which preformed retinol is deliberately not.
+    public let caffeineMg: Double?
+    public let iodineUg: Double?
+    public let ironMg: Double?
     public init(id: String, consumedAt: String, name: String, kcal: Double?,
                 proteinGrams: Double?, carbGrams: Double?, fatGrams: Double?,
                 fiberGrams: Double?, sodiumMg: Double? = nil, satFatGrams: Double? = nil,
                 sugarGrams: Double? = nil, potassiumMg: Double? = nil,
                 calciumMg: Double? = nil, magnesiumMg: Double? = nil,
                 cholesterolMg: Double? = nil, seleniumUg: Double? = nil,
-                vitaminDUg: Double? = nil) {
+                vitaminDUg: Double? = nil, caffeineMg: Double? = nil,
+                iodineUg: Double? = nil, ironMg: Double? = nil) {
+        self.caffeineMg = caffeineMg
+        self.iodineUg = iodineUg
+        self.ironMg = ironMg
         self.id = id
         self.consumedAt = consumedAt
         self.name = name
@@ -889,6 +899,9 @@ public struct JesseMeal: Decodable, Equatable, Sendable {
         case cholesterolMg = "cholesterol_mg"
         case seleniumUg = "selenium_ug"
         case vitaminDUg = "vitamin_d_ug"
+        case caffeineMg = "caffeine_mg"
+        case iodineUg = "iodine_ug"
+        case ironMg = "iron_mg"
     }
 }
 

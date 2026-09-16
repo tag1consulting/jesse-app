@@ -145,6 +145,11 @@ enum TrendNutrient: String, CaseIterable, Identifiable, Sendable {
     // the Sources list and the window switcher all filter on data presence, so none of
     // them shows an empty row for a nutrient the log has never carried.
     case chol, tfat, asug, pur, hg, se, vd
+    // The tier-2 nutrients, on the same terms: their keys appear in `nutrientSeries`
+    // automatically (the bridge derives the series' column list from its one nutrient
+    // table), and until a day carries one every consumer here reads them as a nutrient with
+    // no known day — the same graceful degrade every unlogged nutrient has always taken.
+    case caf, iod, fe, ret, ox, o6
 
     var id: String { rawValue }
 
@@ -175,6 +180,12 @@ enum TrendNutrient: String, CaseIterable, Identifiable, Sendable {
         case .hg: return "Mercury"
         case .se: return "Selenium"
         case .vd: return "Vitamin D"
+        case .caf: return "Caffeine"
+        case .iod: return "Iodine"
+        case .fe: return "Iron"
+        case .ret: return "Retinol"
+        case .ox: return "Oxalate"
+        case .o6: return "Omega-6"
         }
     }
 
@@ -189,9 +200,9 @@ enum TrendNutrient: String, CaseIterable, Identifiable, Sendable {
     var unit: String {
         switch self {
         case .cal: return "kcal"
-        case .na, .k, .ca, .o3, .mg, .chol, .pur: return "mg"
-        case .p, .f, .c, .fiber, .satf, .sug, .unsat, .tfat, .asug: return "g"
-        case .se, .vd, .hg: return "µg"
+        case .na, .k, .ca, .o3, .mg, .chol, .pur, .caf, .fe, .ox: return "mg"
+        case .p, .f, .c, .fiber, .satf, .sug, .unsat, .tfat, .asug, .o6: return "g"
+        case .se, .vd, .hg, .iod, .ret: return "µg"
         }
     }
 
@@ -200,12 +211,15 @@ enum TrendNutrient: String, CaseIterable, Identifiable, Sendable {
         switch self {
         case .cal, .f, .c: return .target
         case .p, .fiber, .k, .ca, .o3, .mg, .vd: return .floor
-        case .na, .satf, .tfat, .asug: return .ceiling
+        case .na, .satf, .tfat, .asug, .caf, .ret: return .ceiling
         // Cholesterol and purines carry no judgment at all; selenium's goal is a BAND,
         // which a single per-day number cannot express, so history plots it without a
         // verdict rather than judging it against one edge; mercury's limit exists only
         // over a rolling week, so a per-day verdict is a category error.
-        case .sug, .unsat, .chol, .pur, .se, .hg: return .informational
+        // Iron, oxalate and omega-6 carry no judgment at all; iodine's goal is a BAND,
+        // which a single per-day number cannot express, so history plots it without a
+        // verdict and the rollup counts both its edges explicitly (see `bandCoachLine`).
+        case .sug, .unsat, .chol, .pur, .se, .hg, .iod, .fe, .ox, .o6: return .informational
         }
     }
 
@@ -221,9 +235,9 @@ enum TrendNutrient: String, CaseIterable, Identifiable, Sendable {
     var dayGoal: DietSemantics.Goal? {
         switch self {
         case .p, .fiber, .c, .k, .ca, .o3, .mg, .vd: return .floor
-        case .cal, .na, .satf, .tfat, .asug: return .ceiling
+        case .cal, .na, .satf, .tfat, .asug, .caf, .ret: return .ceiling
         case .f: return .window
-        case .sug, .unsat, .chol, .pur, .se, .hg: return nil
+        case .sug, .unsat, .chol, .pur, .se, .hg, .iod, .fe, .ox, .o6: return nil
         }
     }
 
@@ -235,9 +249,9 @@ enum TrendNutrient: String, CaseIterable, Identifiable, Sendable {
     /// direction, never a verdict; the colour is what an informational row withholds.
     var displayGoal: DietSemantics.Goal {
         switch self {
-        case .sug, .chol, .pur, .hg: return .ceiling
-        case .unsat: return .floor
-        case .se: return .band
+        case .sug, .chol, .pur, .hg, .ox, .o6: return .ceiling
+        case .unsat, .fe: return .floor
+        case .se, .iod: return .band
         default: return dayGoal ?? .floor
         }
     }
@@ -273,11 +287,12 @@ enum TrendNutrient: String, CaseIterable, Identifiable, Sendable {
         case .p, .fiber, .cal, .c: return .daily
         case .satf, .na, .f: return .rolling(days: 7)
         case .ca, .o3, .mg, .k: return .rolling(days: 30)
-        case .tfat, .asug, .vd: return .daily
-        // Never judged here at all (see `kind`): cholesterol and purines carry no verdict,
-        // selenium's is a band, and mercury's is the `rolling7` window sum, which is a
-        // different statistic from any median this file computes.
-        case .sug, .unsat, .chol, .pur, .se, .hg: return .daily
+        case .tfat, .asug, .vd, .caf, .ret: return .daily
+        // Never judged here at all (see `kind`): cholesterol, purines, iron, oxalate and
+        // omega-6 carry no verdict, selenium's and iodine's are bands, and mercury's is the
+        // `rolling7` window sum, which is a different statistic from any median this file
+        // computes.
+        case .sug, .unsat, .chol, .pur, .se, .hg, .iod, .fe, .ox, .o6: return .daily
         }
     }
 
@@ -315,9 +330,16 @@ enum TrendNutrient: String, CaseIterable, Identifiable, Sendable {
         case .tfat: return t.transFat
         case .asug: return t.addedSugar
         case .vd: return t.vitaminD
-        // No single number to plot against: informational (cholesterol, purines), a band
-        // (selenium), or a weekly window ceiling rather than a day target (mercury).
-        case .unsat, .chol, .pur, .se, .hg: return nil
+        // Caffeine's and retinol's ceilings are FIXED adult limits rather than parts of a
+        // day's plan — the same kind of standing number as the fat window's 50–65 g, which
+        // history already applies to every day — so falling back to the reference here does
+        // not repeat the moving-target mistake this file exists to undo.
+        case .caf: return t.caffeine ?? DietSemantics.caffeineCeiling
+        case .ret: return t.retinol ?? DietSemantics.retinolCeiling
+        // No single number to plot against: informational (cholesterol, purines, iron,
+        // oxalate, omega-6), a band (selenium, iodine), or a weekly window ceiling rather
+        // than a day target (mercury).
+        case .unsat, .chol, .pur, .se, .hg, .iod, .fe, .ox, .o6: return nil
         }
     }
 
@@ -376,7 +398,23 @@ enum TrendNutrient: String, CaseIterable, Identifiable, Sendable {
         case .hg: return item.hg
         case .se: return item.se
         case .vd: return item.vd
+        case .caf: return item.caf
+        case .iod: return item.iod
+        case .fe: return item.fe
+        case .ret: return item.ret
+        case .ox: return item.ox
+        case .o6: return item.o6
         }
+    }
+
+    /// This nutrient's BAND, for the one nutrient whose rollup counts both edges. Reached
+    /// through `Micronutrient` so the band (and its fallback) is defined in exactly one
+    /// place. Nil for every other nutrient, INCLUDING selenium: selenium's rollup line is
+    /// unchanged by this work, and quietly switching it to band counts would be a change to
+    /// an existing nutrient's reporting.
+    func band(in t: DietTargets) -> (floor: Double, ceiling: Double)? {
+        guard self == .iod else { return nil }
+        return Micronutrient.iodine.band(in: t)?.edges
     }
 
     /// The drill-down metric this nutrient maps to, so top-sources reuses the SAME
@@ -403,6 +441,12 @@ enum TrendNutrient: String, CaseIterable, Identifiable, Sendable {
         case .hg: return .micronutrient(.mercury)
         case .se: return .micronutrient(.selenium)
         case .vd: return .micronutrient(.vitaminD)
+        case .caf: return .micronutrient(.caffeine)
+        case .iod: return .micronutrient(.iodine)
+        case .fe: return .micronutrient(.iron)
+        case .ret: return .micronutrient(.retinol)
+        case .ox: return .micronutrient(.oxalate)
+        case .o6: return .micronutrient(.omega6)
         }
     }
 
@@ -432,6 +476,12 @@ enum TrendNutrient: String, CaseIterable, Identifiable, Sendable {
         case .hg: return "Methylmercury accumulates over weeks; a steady high intake is the risk, not one meal."
         case .se: return "Too little impairs thyroid and antioxidant function; too much is genuinely toxic."
         case .vd: return "Low vitamin D means poor calcium absorption, which matters under high-impact running at 51."
+        case .caf: return "Caffeine's daily limit is 400 mg; for sleep, when it was drunk matters more than the total."
+        case .iod: return "Too little iodine and too much both disturb the thyroid, which is why it is a range."
+        case .fe: return "Iron intake says nothing about iron status; only a ferritin test does."
+        case .ret: return "Preformed vitamin A accumulates; only liver or cod liver oil approaches the 3,000 µg limit."
+        case .ox: return "Oxalate matters for kidney-stone formers, more so when dehydrated."
+        case .o6: return "Omega-6 is shown for composition only; no ratio against marine omega-3 is drawn."
         }
     }
 
@@ -460,6 +510,12 @@ enum TrendNutrient: String, CaseIterable, Identifiable, Sendable {
         case .hg: return ["swordfish", "king mackerel", "bigeye tuna", "shark"]
         case .se: return ["Brazil nuts", "tuna", "sardines", "eggs", "whole grains"]
         case .vd: return ["oily fish", "egg yolk", "fortified milk", "UV-grown mushrooms"]
+        case .caf: return ["coffee", "tea", "cola", "energy drinks", "dark chocolate"]
+        case .iod: return ["sea fish", "shellfish", "dairy", "eggs", "iodized salt"]
+        case .fe: return ["red meat", "liver", "legumes", "fortified cereals", "leafy greens"]
+        case .ret: return ["liver", "cod liver oil", "butter", "egg yolk", "cheese"]
+        case .ox: return ["spinach", "chard", "rhubarb", "almonds", "cocoa"]
+        case .o6: return ["sunflower oil", "corn oil", "soybean oil", "walnuts", "poultry skin"]
         }
     }
 
@@ -491,6 +547,12 @@ enum TrendNutrient: String, CaseIterable, Identifiable, Sendable {
         case .micronutrient(.mercury): self = .hg
         case .micronutrient(.selenium): self = .se
         case .micronutrient(.vitaminD): self = .vd
+        case .micronutrient(.caffeine): self = .caf
+        case .micronutrient(.iodine): self = .iod
+        case .micronutrient(.iron): self = .fe
+        case .micronutrient(.retinol): self = .ret
+        case .micronutrient(.oxalate): self = .ox
+        case .micronutrient(.omega6): self = .o6
         }
     }
 }
@@ -1304,6 +1366,15 @@ public enum NutrientTrends {
         let analyses = coachWindows.map { analyze(series, nutrient: nutrient, targets: targets, windowDays: $0) }
         guard analyses.contains(where: { $0.hasData }) else { return nil }
 
+        // Iodine is the one nutrient here whose goal is a BAND, and a band needs BOTH
+        // counts — days under the floor and days over the ceiling — which the single-basis
+        // machinery below structurally cannot express. It gets its own line. Scoped to
+        // iodine explicitly rather than to "any nutrient carrying a band", so selenium's
+        // existing rollup line is left exactly as it is.
+        if nutrient == .iod, let band = nutrient.band(in: targets) {
+            return bandCoachLine(analyses, nutrient: nutrient, band: band)
+        }
+
         // The header's basis. A single number may be named only where every judged day in
         // the WIDEST window actually shared it — otherwise the kind alone, and for the
         // moving targets the explicit "that day's own".
@@ -1366,6 +1437,36 @@ public enum NutrientTrends {
                 s += ", targets known \(t.daysJudged)/\(t.daysKnown)"
             }
             return s
+        }
+        return "\(prefix): \(segments.joined(separator: "; "))."
+    }
+
+    /// One BANDED nutrient's rollup line: the median, the coverage, and BOTH edge counts,
+    /// e.g. "Iodine (band 150 to 600 µg): 7d median 210 known 6/7 under 1/6 over 0/6; …".
+    ///
+    /// The under-count carries the band's asymmetry into history exactly as the daily gauge
+    /// carries it into today: a PARTIAL day's total is a LOWER BOUND, so it can prove the
+    /// ceiling was crossed but can never prove the floor was missed. A partial day
+    /// therefore counts toward `over` and never toward `under` — the alternative would
+    /// report a shortfall nobody measured, which is the same error as reading a gap as a
+    /// zero.
+    ///
+    /// Both counts are over KNOWN days. The band itself is a standing physiological
+    /// reference rather than part of a day's plan, so unlike the moving calorie and carb
+    /// targets it is legitimately applied across the whole window.
+    private static func bandCoachLine(_ analyses: [NutrientTrend], nutrient: TrendNutrient,
+                                      band: (floor: Double, ceiling: Double)) -> String {
+        let prefix = "\(nutrient.fullName) (band \(fmt(band.floor, nutrient)) to "
+            + "\(fmt(band.ceiling, nutrient)) \(nutrient.unit))"
+        let segments = analyses.map { t -> String in
+            let w = windowLabel(t.windowDays)
+            guard t.daysKnown >= minKnownForDirection, let median = t.median else {
+                return "\(w) insufficient data"
+            }
+            let under = t.points.filter { !$0.isPartial && $0.value < band.floor }.count
+            let over = t.points.filter { $0.value > band.ceiling }.count
+            return "\(w) median \(fmt(median, t.nutrient)) known \(t.daysKnown)/\(t.daysInWindow)"
+                + " under \(under)/\(t.daysKnown) over \(over)/\(t.daysKnown)"
         }
         return "\(prefix): \(segments.joined(separator: "; "))."
     }

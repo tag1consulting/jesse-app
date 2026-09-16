@@ -601,10 +601,16 @@ mod tests {
 
     #[test]
     fn incomplete_food_rows_names_the_rows_to_repair_by_hand() {
-        // Row 1: complete (all seven expected columns).            → not listed
-        // Row 2: potassium + calcium blank.                        → listed
+        // Row 1: every expected column EXCEPT the newest one.       → listed (Iron_mg)
+        // Row 2: potassium + calcium blank, plus that same one.     → listed
         // Row 3: a ragged legacy row that stops before the tail.    → listed
-        // Row 4: complete but on ANOTHER date.                     → not listed
+        // Row 4: on ANOTHER date.                                   → not listed
+        //
+        // `Iron_mg` is an ExpectedWhenKnowable column appended after the structured tail,
+        // so NO row written before it existed carries a value for it. Every historical row
+        // is therefore genuinely incomplete by one column until the extract fills it — and
+        // naming those rows is precisely this report's job, so the fixture says so rather
+        // than hiding it.
         let csv = format!(
             "{h}\n\
              2026-07-25,Snack,Banana,1,serving,,,105,1.3,0.4,27,basis,10:40,Snack,3.1,1,0.1,14.4,422,6,,32\n\
@@ -614,14 +620,27 @@ mod tests {
             h = dietlog::food_log_header()
         );
         let rows = incomplete_food_rows(&csv, "2026-07-25");
-        assert_eq!(rows.len(), 2, "two incomplete rows for the date: {rows:?}");
-        assert_eq!(rows[0].item, "Soup");
-        assert_eq!(rows[0].meal, "Lunch");
-        assert_eq!(rows[0].time, "12:00");
-        assert_eq!(rows[0].missing, vec!["Potassium_mg", "Calcium_mg"]);
-        assert_eq!(rows[1].item, "Eggs");
+        assert_eq!(
+            rows.len(),
+            3,
+            "three incomplete rows for the date: {rows:?}"
+        );
+        assert_eq!(rows[0].item, "Banana");
+        assert_eq!(
+            rows[0].missing,
+            vec!["Iron_mg"],
+            "an otherwise-complete row is missing only the newest expected column"
+        );
+        assert_eq!(rows[1].item, "Soup");
+        assert_eq!(rows[1].meal, "Lunch");
+        assert_eq!(rows[1].time, "12:00");
         assert_eq!(
             rows[1].missing,
+            vec!["Potassium_mg", "Calcium_mg", "Iron_mg"]
+        );
+        assert_eq!(rows[2].item, "Eggs");
+        assert_eq!(
+            rows[2].missing,
             vec![
                 "Fiber_g",
                 "Sodium_mg",
@@ -629,7 +648,8 @@ mod tests {
                 "Sugar_g",
                 "Potassium_mg",
                 "Calcium_mg",
-                "Magnesium_mg"
+                "Magnesium_mg",
+                "Iron_mg"
             ],
             "a short legacy row is missing the whole tail"
         );
