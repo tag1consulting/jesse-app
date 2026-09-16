@@ -228,7 +228,13 @@ public nonisolated struct ComposerDraftPersisted: Equatable, Sendable, Codable {
 /// before any composer can appear (an `await` there is a visible frame of empty field),
 /// and it is one small text-only document; a WRITE on the other hand must never be on the
 /// main thread.
-public protocol ComposerDraftWriting: Sendable {
+/// `nonisolated` on the PROTOCOL, for the reason spelled out on `FlagSyncing`: this target
+/// compiles under `.defaultIsolation(MainActor.self)`, so an unannotated protocol declared
+/// here is MainActor-isolated, and an actor cannot conform to one. The sole conformer is an
+/// actor BY DESIGN (see below: the write must never be on the main thread) and already spells
+/// `nonisolated` on both synchronous requirements, so MainActor was never the intent. Under
+/// Xcode 27 the test fake, another actor, is refused outright.
+public nonisolated protocol ComposerDraftWriting: Sendable {
     /// Every stored draft, read once at launch.
     func load() -> [UUID: ComposerDraftPersisted]
     /// Replace the stored map with this one. Called only by `ComposerDraftStore.persist`.

@@ -207,9 +207,14 @@ final class PhoneWatchConnectivity: NSObject {
             if ackNow {
                 send(.ack(WatchAck(requestId: request.requestId, accepted: true)))
             }
-            let reply = await handler.handle(request, context: context) { [weak self] conversationId in
-                self?.send(.registered(WatchRegistered(requestId: request.requestId,
-                                                       conversationId: conversationId)))
+            // Captured STRONGLY, and deliberately: the enclosing `Task` already holds `self`
+            // for the whole turn, `relay` awaits the callback's own task to completion before
+            // returning, and this delegate is the app-lifetime singleton either way. A
+            // `[weak self]` here promised something it could not deliver, and Xcode 27
+            // diagnoses the mismatch with the outer strong capture rather than ignoring it.
+            let reply = await handler.handle(request, context: context) { conversationId in
+                self.send(.registered(WatchRegistered(requestId: request.requestId,
+                                                      conversationId: conversationId)))
             }
             send(.reply(reply))
         }

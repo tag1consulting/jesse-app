@@ -10,7 +10,9 @@ import Foundation
 /// query is a real token (length >= 3, so trivial 1 to 2 character queries never
 /// spend the model) AND the base matcher already found fewer than `threshold`
 /// threads (so a plentiful result set is never widened). Pure and deterministic.
-public func shouldExpand(query: String, baseMatchCount: Int, threshold: Int) -> Bool {
+// `nonisolated` explicitly, for the reason given on `filterExpansionTerms`: a pure decision
+// in a MainActor-default target, asserted directly from a nonisolated test.
+public nonisolated func shouldExpand(query: String, baseMatchCount: Int, threshold: Int) -> Bool {
     let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
     guard trimmed.count >= 3 else { return false }
     return baseMatchCount < threshold
