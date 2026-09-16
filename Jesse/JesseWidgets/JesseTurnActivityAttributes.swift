@@ -10,7 +10,11 @@ import Foundation
 /// its title, the turn's mode); the dynamic `ContentState` carries the human
 /// activity line plus the turn's start instant, so the widget renders a
 /// self-ticking elapsed timer without the app pushing an update every second.
-struct JesseTurnActivityAttributes: ActivityAttributes {
+/// `nonisolated` explicitly: both targets that compile this file default to MainActor
+/// isolation, which would make the `ActivityAttributes` CONFORMANCE MainActor-isolated and
+/// unusable from ActivityKit's `@concurrent` `Activity.update` / `Activity.end`. This is a
+/// plain value type that crosses a process boundary, so nonisolated is what it always meant.
+nonisolated struct JesseTurnActivityAttributes: ActivityAttributes {
     struct ContentState: Codable, Hashable {
         /// The coarse "what Jesse is doing" line (from `RunCoordinator.activityLabel`),
         /// e.g. "Reading the vault…". Falls back to a generic waiting line.

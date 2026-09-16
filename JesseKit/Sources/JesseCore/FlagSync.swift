@@ -49,7 +49,16 @@ public nonisolated struct ReadWrite: Sendable, Equatable {
 ///
 /// Keyed on the CONVERSATION, not a Claude session id: the flag store is conversation-keyed
 /// server-side, because a session id is not stable across a CLI fork.
-public protocol FlagSyncing: Sendable {
+///
+/// `nonisolated` on the PROTOCOL, not just on its requirement, and load-bearing: this target
+/// compiles under `.defaultIsolation(MainActor.self)`, so an unannotated protocol declared
+/// here is MainActor-isolated. That isolation is inherited by every protocol that refines it
+/// and then inferred onto every conforming type, which is how the nonisolated networking
+/// client (`JesseBridgeClient`, via `BridgeClientProtocol`) silently became MainActor and
+/// stopped compiling under Xcode 27. The seam is a `Sendable` protocol whose one requirement
+/// is nonisolated and whose real witness runs off the main actor, so nonisolated is what it
+/// always meant; every other declaration in this file states it the same way.
+public nonisolated protocol FlagSyncing: Sendable {
     // `nonisolated`: the witness is the nonisolated networking client (and test fakes),
     // called from the MainActor reconciler across an await. Marking it here keeps the
     // requirement isolation-agnostic so any Sendable conformer satisfies it.

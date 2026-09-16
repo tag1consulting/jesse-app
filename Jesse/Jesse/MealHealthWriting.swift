@@ -11,7 +11,10 @@ import JesseCore
 
 /// Writes one meal into Apple Health and reports the write-authorization posture.
 /// The one production conformer is `HealthKitMealWriter`; tests inject a fake.
-protocol MealWriting: Sendable {
+// `nonisolated` explicitly: this target defaults to MainActor isolation, so an unannotated
+// protocol here is MainActor-isolated and no actor can conform. The production conformer is
+// already a `nonisolated struct` and the test fake is an actor, so nonisolated is the intent.
+nonisolated protocol MealWriting: Sendable {
     /// Write one meal as a food correlation. `true` on success — or when there is
     /// nothing quantitative to write (a meal with no macros is a no-op that counts
     /// as done, so it isn't retried forever). `false` on a real, retryable failure.

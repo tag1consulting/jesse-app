@@ -100,7 +100,10 @@ public final class FoundationModelExpander: QueryExpanding {
 ///
 /// Foundation-only and free of any FoundationModels type, so it is testable from a
 /// target that never imports the model framework.
-public func filterExpansionTerms(_ raw: [String], original: String, maxTerms: Int = 4) -> [String] {
+// `nonisolated` explicitly: JesseSearch compiles under `.defaultIsolation(MainActor.self)`
+// for the model and the expander, and this pure helper is the documented exception. Same
+// convention as the pure declarations in `FlagSync.swift`.
+public nonisolated func filterExpansionTerms(_ raw: [String], original: String, maxTerms: Int = 4) -> [String] {
     let originalKey = original.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     var out: [String] = []
     for term in raw {

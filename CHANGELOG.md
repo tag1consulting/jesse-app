@@ -14,6 +14,52 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [App 1.0 (137)] - 2026-09-16
+
+**Five declarations now state the isolation they always meant, so the app builds under Xcode
+27.** No behaviour change: nothing about which actor any of this code runs on is different,
+only what the compiler infers about it. Xcode 27.0 / macOS 26.6.2 is what surfaced this, and it
+is not a regression from any commit here. Build 135 and earlier fail identically on this
+toolchain, and the file the first errors point at last changed in App 1.0 (115). The hosted
+runners pin `xcode-version: latest-stable` on `macos-26`, which is older, so CI never said a
+word.
+
+**The pattern, five times over.** A target that compiles under `.defaultIsolation(MainActor.self)`
+makes every unannotated declaration in it MainActor-isolated, including protocols. A protocol's
+isolation is then inherited by anything that refines it and inferred onto everything that
+conforms, so it travels a long way from where it was written, and an actor cannot conform to it
+at all. Each of these was authored as a nonisolated seam and said so in its own doc comment
+while leaving the keyword off:
+
+* `FlagSyncing` (`JesseCore`) reached `BridgeClientProtocol` and then `JesseBridgeClient`
+  itself, in `JesseNetworking`, a target that keeps Swift's nonisolated default precisely
+  because the networking surface is Sendable value types and a client used off the main actor.
+  Six errors came from this one: the `TodayCheckBody` / `TodayMoveBody` / `TodayDeferBody`
+  memberwise defaults reading `JesseBridgeClient.clientTimeZone`, plus `SentinelClient`'s calls
+  to `encodeBody` and `isoInstant` and the `Encodable` conformance passed with them.
+* `ComposerDraftWriting` (`JesseCore`) is implemented by an actor BY DESIGN, and both of its
+  synchronous requirements were already spelled `nonisolated` on that actor.
+* `MealWriting` (app target) has a `nonisolated struct` production conformer and an actor fake.
+* `filterExpansionTerms` and `shouldExpand` (`JesseSearch`) are the pure, deterministic helpers
+  in a target that is MainActor-default for its model and expander. Marking them is the same
+  convention the pure declarations in `FlagSync.swift` already follow.
+* `JesseTurnActivityAttributes` (compiled into both the app and the widget extension) had a
+  MainActor-isolated `ActivityAttributes` CONFORMANCE, which ActivityKit's `@concurrent`
+  `Activity.update` / `Activity.end` cannot use.
+
+Naming the intent at each source rather than at the call sites is deliberate. Marking
+`clientTimeZone` nonisolated would have quietened three of the first six and left the type
+MainActor-isolated; adding `.defaultIsolation(nil)` to the `JesseNetworking` target would have
+changed nothing at all, because that target already has the nonisolated default. The errors
+read "in a nonisolated context" because those structs were correct all along.
+
+**One unrelated Xcode 27 diagnostic, in `PhoneWatchConnectivity.process`:** a `[weak self]` on
+the inner callback inside a `Task` that already captures `self` strongly. The compiler is right
+that the two disagree, and the weak capture was the wrong half. `relay` awaits the callback's
+own task to completion before returning, so `self` cannot be released while that closure can
+fire, and this delegate is the app-lifetime singleton in any case. The capture is now strong
+and says why.
+
 ## [Bridge 0.142.0] - 2026-09-16
 
 **Six more per-item nutrients are extracted, logged, served and mirrored: caffeine, iodine,
