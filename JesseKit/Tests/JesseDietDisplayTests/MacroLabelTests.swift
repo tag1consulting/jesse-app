@@ -68,16 +68,19 @@ final class MacroLabelTests: XCTestCase {
                         "Saturated Fat", "Trans Fat", "Unsaturated Fat", "Cholesterol",
                         "Total Sugars", "Added Sugar",
                         "Potassium", "Calcium", "Omega-3 (EPA+DHA)", "Magnesium",
-                        "Selenium", "Vitamin D", "Purines", "Mercury"])
+                        "Selenium", "Vitamin D", "Purines", "Mercury",
+                        "Caffeine", "Iodine", "Iron", "Retinol", "Oxalate", "Omega-6"])
         // Bulk minerals, omega-3, cholesterol and purines in mg; the fats and sugars in g;
         // the trace nutrients (selenium, vitamin D, mercury) in µg — milligrams would
-        // round every one of those to "0".
+        // round every one of those to "0". The tier-2 six follow the same rule: caffeine,
+        // iron and oxalate in mg, iodine and retinol in µg, omega-6 in g.
         XCTAssertEqual(Micronutrient.allCases.map(\.unit),
                        ["mg",
                         "g", "g", "g", "mg",
                         "g", "g",
                         "mg", "mg", "mg", "mg",
-                        "µg", "µg", "mg", "µg"])
+                        "µg", "µg", "mg", "µg",
+                        "mg", "µg", "mg", "µg", "mg", "g"])
     }
 
     // MARK: - Canonical display order (fiber is a subset of carbs → sits after it)

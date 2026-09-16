@@ -14,6 +14,59 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [Bridge 0.142.0] - 2026-09-16
+
+**Six more per-item nutrients are extracted, logged, served and mirrored: caffeine, iodine,
+iron, preformed retinol (vitamin A), oxalate and omega-6.** Each is ONE row in
+`dietlog::NUTRIENT_COLUMNS`, so the CSV header, the extract schema, the extract prompt's
+NUTRIENTS section, the appended row, the Apple Health mirror, the per-day series and the
+completeness figure are all still derived from that one table.
+
+**They are appended AFTER the structured tail, and that placement is the whole design.**
+`plan_log_header` extends a legacy header only when it is a PREFIX of the canonical one, and
+every `food-log.csv` in existence already ends `TZ,Alcohol_g,Category,Source,Basis,Time_Source`.
+A column added to the nutrient block before `TZ` would therefore have made every existing
+file a mismatch and failed every append. `NutrientCol::placement` (new) says where a column
+sits; the header builder is the only thing that reads it. The canonical food header is now
+41 columns, the previous 35 plus
+`Caffeine_mg,Iodine_ug,Iron_mg,Retinol_ug,Oxalate_mg,Omega6_g`.
+
+**Unknown is still not zero, and a known zero is still a fact.** Five of the six are
+`FillClass::EstimatedRisk`: a blank cell is the normal outcome, and the per-nutrient
+`guidance` teaches the extract child when a `0` is a KNOWN fact (no caffeine in a food with
+no coffee, tea, cocoa or cola; no retinol in any plant food; no oxalate in meat, fish, eggs,
+dairy, oil or sugar) rather than a placeholder for "I don't know". Iron alone is
+`ExpectedWhenKnowable`, which moves the completeness denominator from 7 to 8 — so every row
+written before this ships now reports `Iron_mg` as missing in the audit's repair list, which
+is what that list is for.
+
+**Three of them reach Apple Health: `caffeine_mg`, `iodine_ug` and `iron_mg`** (→
+`dietaryCaffeine`, `dietaryIodine`, `dietaryIron`), summed per meal over only the rows that
+knew a value. The other three have no HealthKit type that means the same thing — there is no
+oxalate and no omega-6 quantity, and `dietaryVitaminA` is TOTAL vitamin A including the
+carotenoids preformed retinol exists to exclude, so writing retinol there would state
+something the log never claimed. They stay unknown keys on the `JESSE_MEAL_LOG` wire by
+construction.
+
+## [App 1.0 (136)] - 2026-09-16
+
+**The six new nutrients are decoded, judged and shown.** Caffeine and retinol are ceilings
+(400 mg, 3,000 µg); iodine is a BAND (150 to 600 µg) reusing selenium's evaluator, including
+the rule that a partial day can trip the ceiling but can never prove the floor was missed;
+iron, oxalate and omega-6 are informational, carrying a value and no judgment at all. Each
+opens the same shared drill-down sheet as the existing micronutrients, with its own
+education copy, and each joins the nutrient trends and the coach's NUTRIENT WINDOWS rollup
+on the existing known-days terms (caffeine and retinol report over-counts, iodine reports
+both edges of its band, the informational three report medians only).
+
+**The caffeine row carries a neutral late-in-the-day note** ("90 mg after 14:00"), because
+for sleep the timing matters more than the daily total. It is never a red state. An item's
+time is its MEAL's time — the only time the snapshot carries — and an item whose meal has no
+usable time is excluded from that sum and counted rather than quietly treated as early.
+
+**Every new field and target is optional**, so an older bridge's payload decodes unchanged
+and each absent value reads as unknown rather than 0.
+
 ## [Bridge 0.141.0] - 2026-09-16
 
 **Three Google Gemini models — Pro, Flash and Flash-Lite — are selectable in the picker.**

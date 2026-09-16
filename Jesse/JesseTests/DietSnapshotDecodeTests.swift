@@ -476,6 +476,59 @@ final class DietSnapshotDecodeTests: XCTestCase {
         XCTAssertNil(s.today.targets.vitaminD)
     }
 
+    // MARK: - The six tier-2 nutrients
+
+    func testTier2ItemFieldsAndTargetsDecode() throws {
+        let json = """
+        {
+          "asOf": "2026-09-16T09:00:00Z",
+          "today": {
+            "date": "2026-09-16",
+            "meals": [ { "name": "Breakfast", "time": "08:30", "items": [
+              { "item": "Calf liver", "cal": 260, "caf": 0, "iod": 12, "fe": 6.5,
+                "ret": 9000, "ox": 0, "o6": 1.2 }
+            ] } ],
+            "targets": { "calories": 2100, "caffeine": 400, "caffeine_late_hour": 14,
+                         "iodine": { "floor": 150, "ceiling": 600 }, "retinol": 3000 }
+          },
+          "errors": []
+        }
+        """
+        let s = try decode(json)
+        let item = try XCTUnwrap(s.today.meals.first?.items.first)
+        XCTAssertEqual(item.caf, 0, "a written zero is a KNOWN zero, not an absence")
+        XCTAssertEqual(item.iod, 12)
+        XCTAssertEqual(item.fe, 6.5)
+        XCTAssertEqual(item.ret, 9000)
+        XCTAssertEqual(item.ox, 0)
+        XCTAssertEqual(item.o6, 1.2)
+        // The four new targets, two of them spelled differently on the wire.
+        XCTAssertEqual(s.today.targets.caffeine, 400)
+        XCTAssertEqual(s.today.targets.caffeineLateHour, 14)
+        XCTAssertEqual(s.today.targets.iodine?.floor, 150)
+        XCTAssertEqual(s.today.targets.iodine?.ceiling, 600)
+        XCTAssertEqual(s.today.targets.iodine?.edges?.ceiling, 600)
+        XCTAssertEqual(s.today.targets.retinol, 3000)
+        XCTAssertEqual(s.today.targets.calories, 2100, "the old targets are unaffected")
+    }
+
+    func testAbsentTier2NutrientsAndTargetsDecodeToNil() throws {
+        // An OLDER payload — the one every deployed generator sends until the vault side
+        // catches up — must decode cleanly, with every new field nil rather than 0.
+        let s = try decode(full)
+        let item = try XCTUnwrap(s.today.meals.first?.items.first)
+        XCTAssertNil(item.caf)
+        XCTAssertNil(item.iod)
+        XCTAssertNil(item.fe)
+        XCTAssertNil(item.ret)
+        XCTAssertNil(item.ox)
+        XCTAssertNil(item.o6)
+        XCTAssertNil(s.today.targets.caffeine)
+        XCTAssertNil(s.today.targets.caffeineLateHour)
+        XCTAssertNil(s.today.targets.iodine)
+        XCTAssertNil(s.today.targets.retinol)
+    }
+
     func testRolling7DecodesTheGeneratorsRealShape() throws {
         // The shape is copied FIELD-FOR-FIELD from what the vault generator actually emits
         // (values invented, structure verbatim), because three things about it are not what

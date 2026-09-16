@@ -1909,6 +1909,61 @@ mod tests {
         assert_eq!(item["mg"], 45.0);
     }
 
+    #[test]
+    fn tier2_nutrients_populated_yield_their_numbers() {
+        // The six tier-2 cells sit AFTER the structured tail, in header order:
+        // Caffeine_mg,Iodine_ug,Iron_mg,Retinol_ug,Oxalate_mg,Omega6_g
+        let csv = format!(
+            "{h}\n\
+             2026-09-16,Breakfast,Liver and espresso,1,plate,,,260,30,11,9,,08:30,Breakfast,\
+0,140,4,0,300,20,60,25,380,0.1,0,90,1,53,7,Europe/Rome,0,food,home,label,actual,\
+75,25,6.5,9000,0,1.2\n",
+            h = food_header()
+        );
+        let (meals, errs) = reconstruct_meals(&csv, "2026-09-16");
+        assert!(errs.is_empty(), "clean row: {errs:?}");
+        let item = &meals[0]["items"][0];
+        assert_eq!(item["caf"], 75.0);
+        assert_eq!(item["iod"], 25.0);
+        assert_eq!(item["fe"], 6.5);
+        assert_eq!(item["ret"], 9000.0);
+        assert_eq!(item["ox"], 0.0, "a written 0 is a KNOWN zero, and kept");
+        assert_eq!(item["o6"], 1.2);
+        // The columns ahead of the tail are untouched by the six new cells.
+        assert_eq!(item["na"], 140.0);
+        assert_eq!(item["vd"], 7.0);
+    }
+
+    #[test]
+    fn tier2_cells_absent_on_a_legacy_row_are_null_not_zero() {
+        // Every row written before these columns existed stops short of them. Addressed by
+        // NAME, they read as nothing — and nothing is exactly what must be reported: null,
+        // never a forged 0. A 0 here would claim "this food supplied no iron", which the
+        // log never said.
+        let csv = format!(
+            "{h}\n\
+             2026-09-16,Lunch,Soup,1,bowl,,,220,8,6,30,,12:00,Lunch,7,480,2.5,9,610,120,,45\n",
+            h = food_header()
+        );
+        let (meals, errs) = reconstruct_meals(&csv, "2026-09-16");
+        assert!(
+            errs.is_empty(),
+            "a short legacy row is not an error: {errs:?}"
+        );
+        let item = &meals[0]["items"][0];
+        for key in ["caf", "iod", "fe", "ret", "ox", "o6"] {
+            assert!(
+                item[key].is_null(),
+                "absent tier-2 cell → {key} null, not 0"
+            );
+            assert_ne!(item[key], json!(0.0), "{key} must NOT read back as 0");
+        }
+        assert_eq!(
+            item["na"], 480.0,
+            "the columns it does carry are unaffected"
+        );
+    }
+
     // ---- nutrient_series ---------------------------------------------------
 
     /// The nutrients map for `date` in a series, or None if that date is absent.

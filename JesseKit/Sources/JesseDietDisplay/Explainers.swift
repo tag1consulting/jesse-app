@@ -164,6 +164,18 @@ enum Explainers {
             paras.append("Purines are shown for context only — no target, no red or green. They become uric acid, which matters if gout does and mostly doesn't otherwise; for most people the body makes far more than the diet supplies.")
         case .mercury:
             paras.append("Mercury is judged over a rolling 7-day window, never on a single day — that's the timescale your body clears it on. One tuna steak is not a problem; one every day is what the weekly number is watching for.")
+        case .caffeine:
+            paras.append("Caffeine is a ceiling: stay at or under target. The note beside the number says how much of it came late in the day, because for sleep the timing matters more than the daily total.")
+        case .iodine:
+            paras.append("Iodine is a range, not a floor: reach the low edge, stay under the high one. Both edges are real, because too much iodine disturbs the thyroid as surely as too little does.")
+        case .iron:
+            paras.append("Iron is shown for context only: no target, and no red or green. What you eat says very little about your iron status, which only a blood test can establish.")
+        case .retinol:
+            paras.append("Retinol is a ceiling, and it counts preformed vitamin A from animal foods alone. The beta carotene in carrots and greens is not counted, because the body converts only as much of it as it needs.")
+        case .oxalate:
+            paras.append("Oxalate is shown for context only: no target, and no red or green. It matters mainly for people who form kidney stones, and the numbers are estimates from published tables.")
+        case .omega6:
+            paras.append("Omega-6 is shown for composition only: no target, and no red or green. No ratio against omega-3 is drawn here, because the omega-3 figure counts marine EPA and DHA alone.")
         }
         // A window row says WHAT it is measuring before anything else about the number:
         // the scope is the thing most easily misread here, and the sheet is where a reader

@@ -504,6 +504,12 @@ mod tests {
                 mercury_ug: None,
                 selenium_ug: None,
                 vitamin_d_ug: None,
+                caffeine_mg: None,
+                iodine_ug: None,
+                iron_mg: None,
+                retinol_ug: None,
+                oxalate_mg: None,
+                omega6_g: None,
                 notes: Some("queued during outage".to_string()),
             })],
         }

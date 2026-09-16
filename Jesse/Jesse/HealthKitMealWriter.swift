@@ -43,6 +43,9 @@ nonisolated struct HealthKitMealWriter: MealWriting {
         HKQuantityType(.dietaryCholesterol),
         HKQuantityType(.dietarySelenium),
         HKQuantityType(.dietaryVitaminD),
+        HKQuantityType(.dietaryCaffeine),
+        HKQuantityType(.dietaryIodine),
+        HKQuantityType(.dietaryIron),
     ]
 
     /// The representative type whose share status stands for "meal writing" (they
@@ -81,6 +84,9 @@ nonisolated struct HealthKitMealWriter: MealWriting {
         add(.dietaryCholesterol, .gramUnit(with: .milli), meal.cholesterolMg)
         add(.dietarySelenium, .gramUnit(with: .micro), meal.seleniumUg)
         add(.dietaryVitaminD, .gramUnit(with: .micro), meal.vitaminDUg)
+        add(.dietaryCaffeine, .gramUnit(with: .milli), meal.caffeineMg)
+        add(.dietaryIodine, .gramUnit(with: .micro), meal.iodineUg)
+        add(.dietaryIron, .gramUnit(with: .milli), meal.ironMg)
         return samples
     }
 

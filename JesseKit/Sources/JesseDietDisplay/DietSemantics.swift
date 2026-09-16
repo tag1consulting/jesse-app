@@ -42,6 +42,25 @@ enum DietSemantics {
     /// a day whose `targets.purines` says nothing.
     static let purineNoteThreshold = 500.0
 
+    // The tier-2 fallbacks. Each is what a day that recorded no target of its own is read
+    // against, exactly as `mercuryWeeklyCeiling` and `defaultFiberTarget` are: standing
+    // physiological references rather than parts of a day's plan, so losing the day file's
+    // copy should not silently drop the only judgment these rows make.
+
+    /// Caffeine's daily ceiling in milligrams — the standing reference for a healthy adult.
+    static let caffeineCeiling = 400.0
+    /// The hour at or after which caffeine is counted into the row's neutral "late" note.
+    /// A sleep-timing observation, never a second ceiling and never a red state.
+    static let caffeineLateHour = 14
+    /// Iodine's BAND in micrograms: the daily need, and the adult upper limit. Both edges
+    /// are real — too much disturbs the thyroid as surely as too little — which is why one
+    /// number cannot express this goal (the same argument selenium's band rests on).
+    static let iodineFloor = 150.0
+    static let iodineCeiling = 600.0
+    /// PREFORMED vitamin A (retinol) ceiling, micrograms. Carotenoids are never counted
+    /// toward it, so in practice only liver or cod liver oil approaches this.
+    static let retinolCeiling = 3000.0
+
     /// The after-hour at/after which a still-unfinished floor turns from the neutral
     /// "coming along" tone into a gentle "worth a nudge" — and the gated "low" flags
     /// surface. Before this hour an unfilled floor is simply in progress, never a problem.
@@ -628,6 +647,13 @@ enum DietSemantics {
             partial: agg.partial, unknownItemCount: agg.unknownItemCount,
             knownItemCount: agg.knownItemCount, decimals: decimals)
 
+        // Caffeine carries a NEUTRAL timing note on every path below: how much of the day's
+        // caffeine came late. It is never a red state, and it touches neither the ceiling
+        // verdict nor the bar.
+        if n == .caffeine {
+            g.note = lateCaffeineNote(meals: meals, targets: targets)
+        }
+
         // No item that day carried the nutrient → the neutral "not tracked yet" state,
         // regardless of whether a target exists.
         guard agg.tracked else {
@@ -728,6 +754,42 @@ enum DietSemantics {
         guard line > 0, value > line else { return nil }
         return "above \(fmt(line, decimals: n.displayDecimals))\(unit) for the day — "
             + "worth a glance, not a limit"
+    }
+
+    /// The caffeine row's NEUTRAL late-in-the-day note: how much of the day's caffeine came
+    /// from items eaten at or after `targets.caffeine_late_hour` (14:00 by default), e.g.
+    /// "90 mg after 14:00". Sleep answers to TIMING more than to the daily total, and this
+    /// says so without ever becoming a verdict — it changes no colour, no goal status and
+    /// no bar, exactly like the purine note.
+    ///
+    /// AN ITEM'S TIME IS ITS MEAL'S TIME, which is the only time the snapshot carries and a
+    /// real one rather than an invented one (`DietItem` has no time field of its own). An
+    /// item whose meal carries no usable time cannot be placed before or after the hour, so
+    /// it is EXCLUDED from the sum and COUNTED — the same unknown-is-not-zero bargain every
+    /// other total here makes, rather than quietly treating it as early. Nil when nothing
+    /// was late and nothing was untimed.
+    static func lateCaffeineNote(meals: [DietMeal], targets: DietTargets) -> String? {
+        let lateHour = targets.caffeineLateHour ?? caffeineLateHour
+        let cutoff = lateHour * 60
+        var late = 0.0
+        var lateItems = 0
+        var untimed = 0
+        for meal in meals {
+            let minutes = minutesOfDay(meal.time)
+            for item in meal.items {
+                guard let v = Micronutrient.caffeine.value(in: item) else { continue }
+                if minutes < 0 { untimed += 1; continue }
+                if minutes >= cutoff { late += v; lateItems += 1 }
+            }
+        }
+        guard lateItems > 0 || untimed > 0 else { return nil }
+        let clock = String(format: "%02d:00", lateHour)
+        let n = Micronutrient.caffeine
+        var note = "\(fmt(late, decimals: n.displayDecimals))\(n.unit) after \(clock)"
+        if untimed > 0 {
+            note += " · \(untimed) item\(untimed == 1 ? "" : "s") with no time not counted"
+        }
+        return note
     }
 
     // MARK: - Rolling-window gauges (a limit defined over days, not a day)
@@ -1097,6 +1159,11 @@ enum Micronutrient: CaseIterable {
     case saturatedFat, transFat, unsaturatedFat, cholesterol
     case totalSugars, addedSugar
     case potassium, calcium, omega3, magnesium, selenium, vitaminD, purines, mercury
+    // The tier-2 nutrients, all standalone entries, in the order of their own log columns:
+    // two CEILINGS (caffeine, retinol), one BAND (iodine, which reuses selenium's
+    // evaluator including its partial-day asymmetry), and three INFORMATIONAL rows (iron,
+    // oxalate, omega-6) that carry a value and no judgment at all.
+    case caffeine, iodine, iron, retinol, oxalate, omega6
 
     /// The full, unabbreviated user-facing name — the ONLY place these are spelled.
     var displayName: String {
@@ -1116,6 +1183,12 @@ enum Micronutrient: CaseIterable {
         case .vitaminD: return "Vitamin D"
         case .purines: return "Purines"
         case .mercury: return "Mercury"
+        case .caffeine: return "Caffeine"
+        case .iodine: return "Iodine"
+        case .iron: return "Iron"
+        case .retinol: return "Retinol"
+        case .oxalate: return "Oxalate"
+        case .omega6: return "Omega-6"
         }
     }
 
@@ -1125,11 +1198,12 @@ enum Micronutrient: CaseIterable {
     /// render every one of them as "0".
     var unit: String {
         switch self {
-        case .sodium, .potassium, .calcium, .omega3, .magnesium, .cholesterol, .purines:
+        case .sodium, .potassium, .calcium, .omega3, .magnesium, .cholesterol, .purines,
+             .caffeine, .iron, .oxalate:
             return "mg"
-        case .saturatedFat, .transFat, .unsaturatedFat, .totalSugars, .addedSugar:
+        case .saturatedFat, .transFat, .unsaturatedFat, .totalSugars, .addedSugar, .omega6:
             return "g"
-        case .selenium, .vitaminD, .mercury:
+        case .selenium, .vitaminD, .mercury, .iodine, .retinol:
             return "µg"
         }
     }
@@ -1149,9 +1223,14 @@ enum Micronutrient: CaseIterable {
     var goal: DietSemantics.Goal {
         switch self {
         case .sodium, .saturatedFat, .transFat, .addedSugar, .mercury: return .ceiling
-        case .totalSugars, .cholesterol, .purines: return .ceiling
-        case .selenium: return .band
-        case .potassium, .calcium, .omega3, .magnesium, .vitaminD, .unsaturatedFat:
+        case .caffeine, .retinol: return .ceiling
+        // Informational, so the glyph is a DIRECTION and never a verdict — the same rule
+        // total sugars has always followed. Oxalate and omega-6 draw ≤ because down is the
+        // direction a reader of those rows cares about; iron draws ≥ for the same reason in
+        // the other direction. All three withhold every colour (see `judged`).
+        case .totalSugars, .cholesterol, .purines, .oxalate, .omega6: return .ceiling
+        case .selenium, .iodine: return .band
+        case .potassium, .calcium, .omega3, .magnesium, .vitaminD, .unsaturatedFat, .iron:
             return .floor
         }
     }
@@ -1162,7 +1241,8 @@ enum Micronutrient: CaseIterable {
     /// day-scoped self is never rendered (see `dayScoped`).
     var judged: Bool {
         switch self {
-        case .totalSugars, .unsaturatedFat, .cholesterol, .purines: return false
+        case .totalSugars, .unsaturatedFat, .cholesterol, .purines,
+             .iron, .oxalate, .omega6: return false
         default: return true
         }
     }
@@ -1227,6 +1307,12 @@ enum Micronutrient: CaseIterable {
         case .vitaminD: return "vitamin_d_ug"
         case .purines: return "purines_mg"
         case .mercury: return "mercury_ug"
+        case .caffeine: return "caffeine_mg"
+        case .iodine: return "iodine_ug"
+        case .iron: return "iron_mg"
+        case .retinol: return "retinol_ug"
+        case .oxalate: return "oxalate_mg"
+        case .omega6: return "omega6_g"
         }
     }
 
@@ -1250,6 +1336,12 @@ enum Micronutrient: CaseIterable {
         case .vitaminD: return item.vd
         case .purines: return item.pur
         case .mercury: return item.hg
+        case .caffeine: return item.caf
+        case .iodine: return item.iod
+        case .iron: return item.fe
+        case .retinol: return item.ret
+        case .oxalate: return item.ox
+        case .omega6: return item.o6
         }
     }
 
@@ -1274,6 +1366,13 @@ enum Micronutrient: CaseIterable {
         case .vitaminD: return t.vitaminD
         case .purines: return nil
         case .mercury: return nil
+        // The two tier-2 ceilings fall back to their standing reference when the day
+        // recorded none, exactly as mercury's weekly ceiling does.
+        case .caffeine: return t.caffeine ?? DietSemantics.caffeineCeiling
+        case .retinol: return t.retinol ?? DietSemantics.retinolCeiling
+        // Iodine's goal is a band and lives in `band(in:)`; the three informational
+        // nutrients carry no target by design.
+        case .iodine, .iron, .oxalate, .omega6: return nil
         }
     }
 
@@ -1281,7 +1380,16 @@ enum Micronutrient: CaseIterable {
     /// whose goal is a single number. Selenium alone: its floor and its upper limit sit
     /// close enough together that either edge on its own would be the wrong goal.
     func band(in t: DietTargets) -> DietBandTarget? {
-        self == .selenium ? t.selenium : nil
+        switch self {
+        case .selenium: return t.selenium
+        // Iodine falls back to the standing 150–600 µg band when the day recorded none,
+        // so the row keeps the only judgment it makes rather than degrading to a bare
+        // number. A day that DOES carry one always wins.
+        case .iodine:
+            return t.iodine ?? DietBandTarget(floor: DietSemantics.iodineFloor,
+                                              ceiling: DietSemantics.iodineCeiling)
+        default: return nil
+        }
     }
 
     /// The nutrient this one hangs off as a nutrition-label sub-entry, or nil for a
@@ -1300,7 +1408,8 @@ enum Micronutrient: CaseIterable {
         case .addedSugar: return .micronutrient(.totalSugars)
         case .saturatedFat, .transFat, .unsaturatedFat, .cholesterol: return .macro(.fat)
         case .sodium, .potassium, .calcium, .omega3, .magnesium,
-             .selenium, .vitaminD, .purines, .mercury:
+             .selenium, .vitaminD, .purines, .mercury,
+             .caffeine, .iodine, .iron, .retinol, .oxalate, .omega6:
             return nil
         }
     }
@@ -1358,6 +1467,18 @@ enum Micronutrient: CaseIterable {
             return "Purines break down into uric acid, which is what gout is about. There's no target and no red or green here: the response is individual, and for most people the diet share is a fraction of what the body makes on its own. Above roughly 500mg in a day the number is worth a glance, nothing more. Treat it as a rough species average — organ meat, anchovies, sardines, and some shellfish are high, but the spread WITHIN any one food is wide, so read the order of magnitude, never the exact figure."
         case .mercury:
             return "Mercury is judged over a rolling 7-day window, never on one day, because that's the timescale your body clears it on — one tuna steak isn't a problem, one every day is. The reference is 105µg a week. Treat the number as a rough species average: mercury varies enormously between individual fish of the same species, by size and by where it was caught, so this is the order of magnitude and never a precise figure. Big predators (swordfish, king mackerel, bigeye tuna) carry the most; salmon, sardines, and shrimp carry very little."
+        case .caffeine:
+            return "Caffeine's limit for healthy adults is 400 mg a day, about five espressos. For sleep, timing matters more than the total: caffeine's half-life is roughly five hours, so this row also shows how much came after 14:00. Values are typical amounts per drink, not measurements."
+        case .iodine:
+            return "Iodine is a range: 150 µg is the daily need and 600 µg is the adult upper limit, because too much disturbs the thyroid as surely as too little. Sea fish, dairy, eggs and iodized salt supply it; salmon, trout and most plants carry very little. Dairy iodine changes with the season, so read the number as approximate."
+        case .iron:
+            return "Iron is shown without a target. Men have no regular way to lose iron, so stores tend to climb with age and red meat, while distance running loses a little through sweat and foot strike. Intake doesn't tell you your status; a ferritin blood test does."
+        case .retinol:
+            return "This counts preformed vitamin A (retinol) from animal foods only, against the 3,000 µg adult upper limit. The vitamin A in carrots and greens is beta carotene, which the body converts only as needed, so it isn't counted. In practice only liver or cod liver oil gets near the limit."
+        case .oxalate:
+            return "Oxalate is shown for information only. It matters for people who form kidney stones, more so when dehydrated. Spinach, chard, rhubarb and almonds carry the most. Values are estimates from published tables."
+        case .omega6:
+            return "Omega-6 is mostly linoleic acid, from seed oils, nuts and poultry. It's shown for information only. There's no omega-6 to omega-3 ratio here, because the omega-3 figure counts only marine EPA and DHA, and a ratio against that would mislead."
         }
     }
 }

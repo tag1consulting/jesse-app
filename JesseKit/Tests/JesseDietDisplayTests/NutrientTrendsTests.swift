@@ -50,6 +50,70 @@ final class NutrientTrendsTests: XCTestCase {
         NutrientDay(date: date, nutrients: nutrients, targets: archived)
     }
 
+    // MARK: - Tier 2 in the coach rollup
+
+    func testCaffeineAndRetinolReportOverCountsAgainstTheirCeilings() throws {
+        let t = targets { $0.caffeine = 400; $0.retinol = 3000 }
+        let d = dates(from: "2026-09-01", count: 8)
+        // Caffeine over on 3 of 8 days; retinol over on 1 (the liver day).
+        let s = (0..<8).map { i in
+            day(d[i], ["cal": val(2000, known: 5),
+                       "caf": val(i < 3 ? 520 : 200, known: 2),
+                       "ret": val(i == 0 ? 9000 : 400, known: 2)], t)
+        }
+        let caf = try XCTUnwrap(N.coachLine(s, nutrient: .caf, targets: t))
+        XCTAssertTrue(caf.hasPrefix("Caffeine (ceiling 400 mg)"), caf)
+        XCTAssertTrue(caf.contains("over 3/8"), caf)
+        let ret = try XCTUnwrap(N.coachLine(s, nutrient: .ret, targets: t))
+        XCTAssertTrue(ret.hasPrefix("Retinol (ceiling 3000 µg)"), ret)
+        XCTAssertTrue(ret.contains("over 1/8"), ret)
+    }
+
+    func testIodineReportsBothEdgesOfItsBand() throws {
+        let t = targets { $0.iodine = DietBandTarget(floor: 150, ceiling: 600) }
+        let d = dates(from: "2026-09-01", count: 8)
+        // 2 days under the floor, 1 over the ceiling, 5 inside it.
+        let values: [Double] = [40, 80, 900, 200, 250, 300, 180, 220]
+        let s = (0..<8).map { i in
+            day(d[i], ["cal": val(2000, known: 5), "iod": val(values[i], known: 3)], t)
+        }
+        let line = try XCTUnwrap(N.coachLine(s, nutrient: .iod, targets: t))
+        XCTAssertTrue(line.hasPrefix("Iodine (band 150 to 600 µg)"), line)
+        XCTAssertTrue(line.contains("under 2/8"), line)
+        XCTAssertTrue(line.contains("over 1/8"), line)
+    }
+
+    func testAPartialIodineDayCanProveTheCeilingButNeverTheFloor() throws {
+        let t = targets { $0.iodine = DietBandTarget(floor: 150, ceiling: 600) }
+        let d = dates(from: "2026-09-01", count: 8)
+        // Every day is PARTIAL. Two sit under the floor and one over the ceiling — but a
+        // lower bound proves only the ceiling, so the under-count must stay 0.
+        let values: [Double] = [40, 80, 900, 200, 250, 300, 180, 220]
+        let s = (0..<8).map { i in
+            day(d[i], ["cal": val(2000, known: 5),
+                       "iod": val(values[i], known: 3, unknown: 2)], t)
+        }
+        let line = try XCTUnwrap(N.coachLine(s, nutrient: .iod, targets: t))
+        XCTAssertTrue(line.contains("under 0/8"), "a partial day proves no shortfall: \(line)")
+        XCTAssertTrue(line.contains("over 1/8"), "but it does prove the breach: \(line)")
+    }
+
+    func testTheThreeInformationalTier2NutrientsReportMediansOnly() throws {
+        let t = targets { _ in }
+        let d = dates(from: "2026-09-01", count: 8)
+        let s = (0..<8).map { i in
+            day(d[i], ["cal": val(2000, known: 5), "fe": val(12, known: 3),
+                       "ox": val(200, known: 3), "o6": val(9, known: 3)], t)
+        }
+        for n in [TrendNutrient.fe, .ox, .o6] {
+            let line = try XCTUnwrap(N.coachLine(s, nutrient: n, targets: t))
+            XCTAssertTrue(line.contains("median"), line)
+            XCTAssertFalse(line.contains(" over "), "\(n.fullName) is never judged: \(line)")
+            XCTAssertFalse(line.contains(" under "), "\(n.fullName) is never judged: \(line)")
+            XCTAssertEqual(n.kind, .informational)
+        }
+    }
+
     // MARK: - Unknown-aware: gaps are neither 0 nor a breach
 
     func testGapDayNeverCountsAsZeroOrUnderFloor() {
@@ -295,9 +359,16 @@ final class NutrientTrendsTests: XCTestCase {
 
     // MARK: - Labels (all thirteen, unabbreviated)
 
-    func testAllTwentyFullNamesPresentAndUnabbreviated() {
+    func testAllTwentySixFullNamesPresentAndUnabbreviated() {
         let names = Dictionary(uniqueKeysWithValues: TrendNutrient.allCases.map { ($0, $0.fullName) })
-        XCTAssertEqual(TrendNutrient.allCases.count, 20)
+        XCTAssertEqual(TrendNutrient.allCases.count, 26)
+        // The tier-2 six, spelled in full like every other row.
+        XCTAssertEqual(names[.caf], "Caffeine")
+        XCTAssertEqual(names[.iod], "Iodine")
+        XCTAssertEqual(names[.fe], "Iron")
+        XCTAssertEqual(names[.ret], "Retinol")
+        XCTAssertEqual(names[.ox], "Oxalate")
+        XCTAssertEqual(names[.o6], "Omega-6")
         XCTAssertEqual(names[.cal], "Calories")
         XCTAssertEqual(names[.p], "Protein")
         XCTAssertEqual(names[.f], "Fat")
@@ -485,6 +556,11 @@ final class NutrientTrendsTests: XCTestCase {
             // a weekly window sum, none of which a median answers).
             .tfat: .daily, .asug: .daily, .vd: .daily,
             .chol: .daily, .pur: .daily, .se: .daily, .hg: .daily,
+            // The tier-2 six: caffeine and retinol are day-judged ceilings; the other four
+            // are never judged here at all (a band, or informational), and answer `.daily`
+            // only because the property is total.
+            .caf: .daily, .ret: .daily,
+            .iod: .daily, .fe: .daily, .ox: .daily, .o6: .daily,
         ]
         XCTAssertEqual(expected.count, TrendNutrient.allCases.count)
         for n in TrendNutrient.allCases {
@@ -499,6 +575,14 @@ final class NutrientTrendsTests: XCTestCase {
                      "selenium's goal is a BAND — a per-day series carries one number, not two")
         XCTAssertNil(TrendNutrient.hg.dayGoal,
                      "mercury's limit is weekly — a per-day verdict is a category error")
+        // The tier-2 six, on the same terms.
+        XCTAssertEqual(TrendNutrient.caf.dayGoal, .ceiling)
+        XCTAssertEqual(TrendNutrient.ret.dayGoal, .ceiling)
+        XCTAssertNil(TrendNutrient.iod.dayGoal,
+                     "iodine's goal is a BAND — a per-day series carries one number, not two")
+        for n in [TrendNutrient.fe, .ox, .o6] {
+            XCTAssertNil(n.dayGoal, "\(n.fullName) is informational — no per-day verdict")
+        }
     }
 
     // MARK: - Rolling verdict (the gauge's colour)

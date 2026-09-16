@@ -258,6 +258,21 @@ pub struct Meal {
     pub selenium_ug: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vitamin_d_ug: Option<f64>,
+    /// The three HealthKit-bound TIER-2 nutrients, same pre-summed / omit-when-unknown
+    /// discipline: `caffeine_mg` and `iron_mg` (mg → `dietaryCaffeine`, `dietaryIron`) and
+    /// `iodine_ug` (MICROgrams → `dietaryIodine`).
+    ///
+    /// The other three tier-2 nutrients deliberately have NO field here. HealthKit has no
+    /// oxalate and no omega-6 quantity, and its only vitamin A measure
+    /// (`dietaryVitaminA`) is TOTAL vitamin A including the carotenoids `retinol_ug`
+    /// exists to exclude — writing preformed retinol into it would state something the log
+    /// never claimed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caffeine_mg: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iodine_ug: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iron_mg: Option<f64>,
 }
 
 /// The parsed payload of a `JESSE_MEAL_LOG` directive, plus the corrections-queue
@@ -983,6 +998,9 @@ fn parse_meal(item: &Value) -> Result<Meal, String> {
         cholesterol_mg: optional_macro(m, "cholesterol_mg")?,
         selenium_ug: optional_macro(m, "selenium_ug")?,
         vitamin_d_ug: optional_macro(m, "vitamin_d_ug")?,
+        caffeine_mg: optional_macro(m, "caffeine_mg")?,
+        iodine_ug: optional_macro(m, "iodine_ug")?,
+        iron_mg: optional_macro(m, "iron_mg")?,
     })
 }
 
@@ -1253,6 +1271,9 @@ mod tests {
                     cholesterol_mg: None,
                     selenium_ug: None,
                     vitamin_d_ug: None,
+                    caffeine_mg: None,
+                    iodine_ug: None,
+                    iron_mg: None,
                 }],
                 retract: Vec::new(),
                 corrections_seq: None,
@@ -1965,6 +1986,44 @@ mod tests {
         assert!(parse_meal_batch_v2(empty.as_object().unwrap()).is_err());
     }
 
+    /// The meal wire gains EXACTLY the three tier-2 nutrients HealthKit has a type for.
+    /// The other three stay unknown keys by construction — there is no oxalate or omega-6
+    /// quantity, and `dietaryVitaminA` is TOTAL vitamin A, which preformed retinol is not.
+    #[test]
+    fn the_meal_wire_takes_the_three_healthkit_bound_tier2_nutrients() {
+        let payload = serde_json::json!({
+            "meals": [{
+                "id": "2026-09-16-breakfast-0830",
+                "consumedAt": "2026-09-16T08:30:00+02:00",
+                "name": "Breakfast: espresso, eggs",
+                "kcal": 260.0,
+                "caffeine_mg": 75.0,
+                "iodine_ug": 25.0,
+                "iron_mg": 1.8
+            }]
+        });
+        let (meals, _) = parse_meal_batch_v2(payload.as_object().unwrap()).expect("a valid batch");
+        let m = &meals[0];
+        assert_eq!(m.caffeine_mg, Some(75.0));
+        assert_eq!(m.iodine_ug, Some(25.0));
+        assert_eq!(m.iron_mg, Some(1.8));
+        for key in ["caffeine_mg", "iodine_ug", "iron_mg"] {
+            assert!(is_meal_field(key), "{key} must ride the wire");
+        }
+        for key in ["retinol_ug", "oxalate_mg", "omega6_g"] {
+            assert!(!is_meal_field(key), "{key} must stay an unknown meal key");
+        }
+        // A meal that states none of them omits all three (never a summed 0).
+        let bare = serde_json::json!({
+            "meals": [{ "id": "a", "consumedAt": "t", "name": "Apple", "kcal": 95.0 }]
+        });
+        let (bare_meals, _) =
+            parse_meal_batch_v2(bare.as_object().unwrap()).expect("a valid batch");
+        assert_eq!(bare_meals[0].caffeine_mg, None);
+        assert_eq!(bare_meals[0].iodine_ug, None);
+        assert_eq!(bare_meals[0].iron_mg, None);
+    }
+
     #[test]
     fn meal_log_malformed_payloads_pass_through_visible() {
         for reply in [
@@ -1997,6 +2056,20 @@ mod tests {
             "JESSE_MEAL_LOG v1 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\"name\":\"n\",\"purines_mg\":170}]}",
             "JESSE_MEAL_LOG v1 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\"name\":\"n\",\"mercury_ug\":13}]}",
             "JESSE_MEAL_LOG v1 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\"name\":\"n\",\"omega3_mg\":50}]}",
+            // the three tier-2 nutrients with NO HealthKit type stay unknown keys too:
+            // there is no oxalate or omega-6 quantity, and `dietaryVitaminA` is TOTAL
+            // vitamin A, which preformed retinol deliberately is not
+            "JESSE_MEAL_LOG v1 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\"name\":\"n\",\"retinol_ug\":9000}]}",
+            "JESSE_MEAL_LOG v1 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\"name\":\"n\",\"oxalate_mg\":750}]}",
+            "JESSE_MEAL_LOG v1 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\"name\":\"n\",\"omega6_g\":2.4}]}",
+            // and the three that DO ride it reject a negative and an explicit null exactly
+            // like every older micro
+            "JESSE_MEAL_LOG v1 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\"name\":\"n\",\"caffeine_mg\":-1}]}",
+            "JESSE_MEAL_LOG v1 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\"name\":\"n\",\"iodine_ug\":-1}]}",
+            "JESSE_MEAL_LOG v1 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\"name\":\"n\",\"iron_mg\":-0.5}]}",
+            "JESSE_MEAL_LOG v1 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\"name\":\"n\",\"caffeine_mg\":null}]}",
+            "JESSE_MEAL_LOG v1 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\"name\":\"n\",\"iodine_ug\":null}]}",
+            "JESSE_MEAL_LOG v1 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\"name\":\"n\",\"iron_mg\":null}]}",
             // the three HealthKit-bound risk nutrients: negative and explicit null are
             // rejected exactly like the older micros
             "JESSE_MEAL_LOG v1 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\"name\":\"n\",\"cholesterol_mg\":-1}]}",

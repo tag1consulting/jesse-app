@@ -249,7 +249,18 @@ final class NutrientStreaksTests: XCTestCase {
             XCTAssertFalse(NutrientStreaks.judgedNutrients.contains(n),
                            "\(n.fullName) carries no per-day verdict, so no streak")
         }
-        XCTAssertEqual(NutrientStreaks.judgedNutrients.count, 14)
+        // The tier-2 six split the same way: caffeine and retinol carry a single-number day
+        // ceiling and so hold a streak; iodine's goal is a band, and iron, oxalate and
+        // omega-6 are informational, so none of those four ever can.
+        for n in [TrendNutrient.caf, .ret] {
+            XCTAssertTrue(NutrientStreaks.judgedNutrients.contains(n),
+                          "\(n.fullName) has a day goal and so has a streak")
+        }
+        for n in [TrendNutrient.iod, .fe, .ox, .o6] {
+            XCTAssertFalse(NutrientStreaks.judgedNutrients.contains(n),
+                           "\(n.fullName) carries no per-day verdict, so no streak")
+        }
+        XCTAssertEqual(NutrientStreaks.judgedNutrients.count, 16)
 
         // Even with a target and plenty of measured days, an informational nutrient produces
         // no decided day and so never appears in the list.

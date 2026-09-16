@@ -32,12 +32,16 @@ public struct DietItem: Decodable, Equatable, Sendable {
                 satf: Double? = nil, sug: Double? = nil, k: Double? = nil, ca: Double? = nil,
                 o3: Double? = nil, mg: Double? = nil, chol: Double? = nil,
                 tfat: Double? = nil, asug: Double? = nil, pur: Double? = nil,
-                hg: Double? = nil, se: Double? = nil, vd: Double? = nil) {
+                hg: Double? = nil, se: Double? = nil, vd: Double? = nil,
+                caf: Double? = nil, iod: Double? = nil, fe: Double? = nil,
+                ret: Double? = nil, ox: Double? = nil, o6: Double? = nil) {
         self.item = item; self.amount = amount; self.cal = cal; self.p = p; self.f = f
         self.c = c; self.fiber = fiber; self.na = na; self.satf = satf; self.sug = sug
         self.k = k; self.ca = ca; self.o3 = o3; self.mg = mg
         self.chol = chol; self.tfat = tfat; self.asug = asug; self.pur = pur
         self.hg = hg; self.se = se; self.vd = vd
+        self.caf = caf; self.iod = iod; self.fe = fe
+        self.ret = ret; self.ox = ox; self.o6 = o6
     }
     public var item: String
     public var amount: String?
@@ -78,6 +82,22 @@ public struct DietItem: Decodable, Equatable, Sendable {
     public var se: Double? = nil
     /// Vitamin D, micrograms. Absent (nil) = unknown, not zero.
     public var vd: Double? = nil
+    /// Caffeine, milligrams. Absent (nil) = unknown, not zero. A CEILING.
+    public var caf: Double? = nil
+    /// Iodine, micrograms. Absent (nil) = unknown, not zero. Judged as a BAND (a floor to
+    /// reach AND an upper limit to stay under), like selenium.
+    public var iod: Double? = nil
+    /// Iron, milligrams. Absent (nil) = unknown, not zero. INFORMATIONAL: intake says
+    /// nothing about status, so it carries no target and is never judged.
+    public var fe: Double? = nil
+    /// PREFORMED vitamin A (retinol), micrograms — animal sources only, never the beta
+    /// carotene in plants. Absent (nil) = unknown, not zero. A CEILING.
+    public var ret: Double? = nil
+    /// Oxalate, milligrams. Absent (nil) = unknown, not zero. INFORMATIONAL.
+    public var ox: Double? = nil
+    /// Omega-6 (mostly linoleic acid), grams. Absent (nil) = unknown, not zero.
+    /// INFORMATIONAL.
+    public var o6: Double? = nil
 }
 
 /// A logged meal: a name, an optional `HH:MM` time, and its items.
@@ -145,7 +165,11 @@ public struct DietTargets: Decodable, Equatable, Sendable {
                 magnesium: Double? = nil, transFat: Double? = nil,
                 addedSugar: Double? = nil, selenium: DietBandTarget? = nil,
                 vitaminD: Double? = nil, purines: Double? = nil,
-                mercuryWeekly: Double? = nil) {
+                mercuryWeekly: Double? = nil, caffeine: Double? = nil,
+                caffeineLateHour: Int? = nil, iodine: DietBandTarget? = nil,
+                retinol: Double? = nil) {
+        self.caffeine = caffeine; self.caffeineLateHour = caffeineLateHour
+        self.iodine = iodine; self.retinol = retinol
         self.calories = calories; self.protein = protein; self.fat = fat; self.carbs = carbs
         self.carbsBase = carbsBase; self.fiber = fiber; self.sodium = sodium
         self.satFat = satFat; self.potassium = potassium; self.sugar = sugar
@@ -198,6 +222,17 @@ public struct DietTargets: Decodable, Equatable, Sendable {
     /// Methylmercury's ceiling over the rolling WEEK, micrograms. A week's number, never
     /// divided into a per-day seventh.
     public var mercuryWeekly: Double?
+    /// Caffeine ceiling, milligrams for the day.
+    public var caffeine: Double?
+    /// The hour (0-23) at or after which caffeine is counted into the row's neutral
+    /// "late" note. A note about sleep timing, never a second ceiling.
+    public var caffeineLateHour: Int?
+    /// Iodine's BAND: a floor to reach AND an upper limit to stay under, in micrograms.
+    /// Like selenium, its two edges sit close enough together that one number cannot
+    /// express the goal — too much disturbs the thyroid as surely as too little.
+    public var iodine: DietBandTarget?
+    /// PREFORMED vitamin A (retinol) ceiling, micrograms.
+    public var retinol: Double?
 
     // Explicit keys, because four of the new ones are spelled all-lowercase on the wire
     // while their Swift names stay camelCase. Every pre-existing key is listed with the
@@ -212,6 +247,10 @@ public struct DietTargets: Decodable, Equatable, Sendable {
         case vitaminD = "vitamind"
         case purines
         case mercuryWeekly = "mercury_weekly"
+        case caffeine
+        case caffeineLateHour = "caffeine_late_hour"
+        case iodine
+        case retinol
     }
 }
 
