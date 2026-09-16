@@ -661,7 +661,7 @@ async fn run_one_call(
                     buf.push_str(&json_fragment);
                 }
             }
-            Event::ToolUseEnd { id } => {
+            Event::ToolUseEnd { id, vendor } => {
                 if let Some((name, buf)) = open_args.remove(&id) {
                     // D1 guarantees `ToolUseEnd` only after the accumulated arguments
                     // parsed, so this parse cannot fail for a conforming adapter. It is
@@ -685,6 +685,10 @@ async fn run_one_call(
                         id: id.clone(),
                         name: name.clone(),
                         arguments: arguments.clone(),
+                        // Onto the block, which IS persisted — unlike a reasoning artefact,
+                        // which this loop strips before the store sees it. That is what lets
+                        // a resumed conversation answer a tool call it made last session.
+                        vendor,
                     });
                     out.tool_uses.push(ToolUseRequest {
                         id,
@@ -1147,6 +1151,7 @@ mod reasoning_tests {
                     id: "t1".into(),
                     name: "vault_read".into(),
                     arguments: Value::Object(Default::default()),
+                    vendor: None,
                 },
             ],
         }

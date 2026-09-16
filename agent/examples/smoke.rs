@@ -140,7 +140,7 @@ async fn main() -> Result<(), String> {
             Event::ToolUseArgsDelta { json_fragment, .. } => {
                 println!("{n:>3}  ToolUseArgsDelta {} bytes", json_fragment.len())
             }
-            Event::ToolUseEnd { id } => println!("{n:>3}  ToolUseEnd ({id})"),
+            Event::ToolUseEnd { id, .. } => println!("{n:>3}  ToolUseEnd ({id})"),
             Event::Usage(u) => println!(
                 "{n:>3}  Usage in={:?} out={:?} cache_read={:?} cache_write={:?} req_id={:?}",
                 u.input_tokens,

@@ -1887,7 +1887,20 @@ pub fn parse_wire(wire: &str) -> Option<Wire> {
 /// registry: the model still appears, and if its declared wire were the problem the startup
 /// gate would say so by name.
 pub fn model_wire_from_env(prefix: &str, id: &str, kind: ModelKind) -> Wire {
-    let default = Wire::default_for_kind(kind);
+    model_wire_from_env_defaulting(prefix, id, Wire::default_for_kind(kind))
+}
+
+/// The wire for an ENV-TRIPLE model whose surface is NOT the one its kind implies:
+/// `<prefix>_WIRE` when set and recognised, else `default`.
+///
+/// [`model_wire_from_env`] is this with the kind's default filled in, which is right for a
+/// family whose provider serves the Anthropic surface. It is wrong for one that does not:
+/// Google's Gemini API is `hosted`, whose kind-default is `messages`, but Google serves no
+/// Messages surface at all — only an OpenAI-compatible `chat` one. Passing the default in
+/// keeps `<prefix>_WIRE` behaving identically for every family (an operator can still move
+/// one onto another surface from the launch environment) while letting the built-in entry
+/// start from the surface its host actually answers.
+pub fn model_wire_from_env_defaulting(prefix: &str, id: &str, default: Wire) -> Wire {
     match env_string(&format!("{prefix}_WIRE")) {
         None => default,
         Some(raw) => match parse_wire(&raw) {
@@ -2677,6 +2690,22 @@ impl ModelRegistry {
             &mut models,
             qwen_env_entry(default_health_interval, global_health_timeout),
         );
+        // The three Gemini entries. Unlike every built-in entry above them these run on the
+        // `direct` harness over the `chat` wire, because Google serves no Messages surface
+        // for a CLI harness to talk to. Each is armed by its own `_AUTH_TOKEN` alone and
+        // ships unconfigured without it, exactly like the Fireworks families.
+        upsert_model(
+            &mut models,
+            gemini_pro_env_entry(default_health_interval, global_health_timeout),
+        );
+        upsert_model(
+            &mut models,
+            gemini_flash_env_entry(default_health_interval, global_health_timeout),
+        );
+        upsert_model(
+            &mut models,
+            gemini_flash_lite_env_entry(default_health_interval, global_health_timeout),
+        );
         warn_retired_model_env();
         upsert_model(
             &mut models,
@@ -3090,6 +3119,219 @@ fn qwen_env_entry(default_interval_secs: u64, global_timeout_secs: Option<u64>) 
         // A backend triple carries its own slug; nothing for the login to be told.
         login_model: None,
     }
+}
+
+/// The root every built-in Gemini entry defaults its `base_url` to: Google's
+/// OpenAI-COMPATIBLE surface, to which the chat adapter appends `/chat/completions`.
+///
+/// **NOT `…/v1beta` AND NOT THE NATIVE SURFACE.** Google serves two different APIs from this
+/// host: the native one (`/v1beta/models/<slug>:generateContent`, its own request shape) and
+/// this OpenAI-shaped one. Only the second is a wire this crate speaks. Confirmed live on
+/// 2026-09-16: `GET <root>/models` returned 200 and listed all three slugs below.
+const GEMINI_OPENAI_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta/openai";
+
+/// The shared body of the three Gemini entries.
+///
+/// ONE CONSTRUCTOR RATHER THAN THREE COPIES, unlike the Fireworks families above, because
+/// every field that makes a Gemini entry a Gemini entry is identical across the three: the
+/// same host, the same wire, the same harness, the same three measured quirks, the same probe
+/// budget. Only the id, version, slug and deck differ, and those are the four arguments. Three
+/// spelled-out copies would mean three places for a measured quirk to drift apart in, and the
+/// quirks are the part a reader most needs to trust.
+///
+/// **THE MEASURED QUIRKS, all three probed live against this endpoint on 2026-09-16 rather
+/// than read off Google's documentation** — which matters, because the documentation does not
+/// state two of them and the compatibility layer silently discards parameters it does not
+/// implement, so a 200 proves nothing on its own:
+///
+/// * `reasoning_effort_supported: true` — HONORED. Varying `reasoning_effort` from `low` to
+///   `high` moved the thinking-token count decisively on every model (Flash 0 → 836), which a
+///   discarded parameter cannot do. This one is a real override: the agent layer defaults it
+///   ON only for `api.openai.com` and OFF for every other host, this host included.
+/// * `strict_tools: false` — SILENTLY DISCARDED. A tool schema that is INVALID under OpenAI's
+///   strict rules (an optional property, no `additionalProperties: false`) was accepted with
+///   200 on all three models, where a host enforcing `strict` must reject it. Pinned rather
+///   than left to the host default it happens to match, because the fact is measured and the
+///   default is a guess that could change.
+/// * `multiple_system_messages: false` — and this one would CORRUPT A TURN if set wrong. Two
+///   system messages were sent carrying separate facts; all three models reported the second
+///   and explicitly denied having been given the first. Several leading system messages do not
+///   merge on this host, they overwrite, so turning this on would silently discard the
+///   persona and keep only the last block.
+///
+/// `thinking: None`, which on this host means THE MODEL'S OWN DEFAULT LEVEL and not "no
+/// thinking". `None` here resolves through `thinking_for` to [`Thinking::Off`], and the chat
+/// adapter maps that to *sending no `reasoning_effort` field at all* — whereupon Gemini
+/// applies its own per-model default. That is the honest setting for this family: the defaults
+/// are tuned per tier (measured: Pro thinks hard unprompted, Flash-Lite barely at all), and
+/// Gemini 3 Pro CANNOT have thinking disabled, so there is no setting here that would mean
+/// what the neutral enum's name says.
+///
+/// NO vision pairing by default, for the reason the Kimi entry gives: all three models take
+/// image input natively (verified live — each correctly named the colour of a generated PNG,
+/// billed through `prompt_tokens`), and the `direct` harness already hands them the real image
+/// as an image block. Pairing a helper would transcribe the picture to text and hide the pixels
+/// from a model that can see them. `JESSE_MODEL_GEMINI_<X>_VISION` remains available anyway.
+fn gemini_env_entry(
+    id: &str,
+    prefix: &str,
+    family_version: &str,
+    default_slug: &str,
+    deck: PriceDeck,
+    default_interval_secs: u64,
+    global_timeout_secs: Option<u64>,
+) -> RegistryModel {
+    let backend = resolve_model_backend(
+        id,
+        env_string(&format!("{prefix}_BASE_URL")),
+        env_string(&format!("{prefix}_AUTH_TOKEN")),
+        env_string(&format!("{prefix}_MODEL")),
+        Some(GEMINI_OPENAI_BASE_URL),
+        Some(default_slug),
+    );
+    let version = model_version_from_env(prefix, Some(family_version));
+    // Read once and used twice: the probe path has to follow the wire, or an operator who
+    // moves this model onto another surface with `<prefix>_WIRE` keeps probing the old one.
+    let wire = model_wire_from_env_defaulting(prefix, id, Wire::Chat);
+    RegistryModel {
+        family: Some("Gemini".to_string()),
+        // NO EFFORT SCALE, unlike the Fireworks families. `direct` has no per-turn effort
+        // path at all, and `validate_model_config` refuses a direct model that declares one
+        // — this is a startup error, not a no-op. Per-model thinking is the `thinking` key.
+        effort: None,
+        codex: CodexTuning::default(),
+        id: id.to_string(),
+        label: derive_model_label("Gemini", version.as_deref(), None),
+        version,
+        // A new family: no id it used to be called.
+        aliases: Vec::new(),
+        kind: ModelKind::Hosted,
+        wire,
+        subagent_model: backend.as_ref().map(|(_, _, m)| m.clone()),
+        configured: backend.is_some(),
+        backend,
+        // READ-WRITE unless `<prefix>_READ_ONLY` says otherwise — the same default every
+        // model has. See [`DEFAULT_MODEL_LEVEL`].
+        level: access_level(env_flag_true(&format!("{prefix}_READ_ONLY"))),
+        // ONE HARNESS, `direct`, AND IT IS THE ONLY ONE THAT CAN DRIVE THIS FAMILY. Google
+        // serves neither an Anthropic Messages surface nor an OpenAI Responses surface, so
+        // `claude-code` and `codex` have no endpoint here to talk to; reaching Gemini from
+        // either would need a translating gateway, which this change does not build.
+        harness: DIRECT_ID.to_string(),
+        // Pinned rather than inferred. Verified live: this endpoint authenticates a Gemini
+        // API key as an HTTP bearer token.
+        auth_scheme: Some(DirectAuthScheme::Bearer),
+        quirks: DirectQuirks {
+            reasoning_effort_supported: Some(true),
+            multiple_system_messages: Some(false),
+            strict_tools: Some(false),
+        },
+        thinking: None,
+        price: model_price_from_env(prefix, deck),
+        health: HealthConfig {
+            interval_secs: default_interval_secs,
+            // Every model in this family thinks before answering and Pro cannot be told not
+            // to, so even the `max_tokens: 1` probe costs real wall clock: measured at
+            // 0.6–2.7 s on 2026-09-16, against a 3 s default. A probe that times out keeps a
+            // reachable model out of the picker entirely. See [`REASONING_HEALTH_TIMEOUT_SECS`].
+            timeout_secs: resolve_health_timeout(
+                None,
+                global_timeout_secs,
+                REASONING_HEALTH_TIMEOUT_SECS,
+            ),
+            // NOT `..HealthConfig::default()`, which hardcodes the Anthropic `/v1/messages`
+            // path. Posting that at this root is a 404, `unknown-model`, and a model that is
+            // armed and correct and permanently unselectable.
+            path: default_health_path(wire).to_string(),
+        },
+        vision: parse_vision_partners(&env_string(&format!("{prefix}_VISION")).unwrap_or_default()),
+        vision_complementary: env_flag_true(&format!("{prefix}_VISION_COMPLEMENTARY")),
+        // A backend triple carries its own slug; nothing for the login to be told.
+        login_model: None,
+    }
+}
+
+/// `gemini-pro` — Gemini 3.1 Pro, the judgment tier. Armed by
+/// `JESSE_MODEL_GEMINI_PRO_AUTH_TOKEN` alone; base URL and slug default.
+///
+/// **A PREVIEW MODEL, AND THERE IS NO STABLE ONE TO PREFER.** No Gemini 3.x Pro has ever
+/// reached GA (Google's changelog records GA promotions for Flash, Flash-Lite, Live,
+/// Transcribe, Omni Flash and Lyria, and none for Pro); the newest STABLE Pro is
+/// `gemini-2.5-pro` from June 2025. So this is not a preview chosen over a stable
+/// alternative — it is the only current Pro. Google withdrew its predecessor
+/// `gemini-3-pro-preview` on 2026-03-09, roughly four months after release, which is the
+/// notice to plan for. Repointing is `JESSE_MODEL_GEMINI_PRO_MODEL` plus `_VERSION`.
+fn gemini_pro_env_entry(
+    default_interval_secs: u64,
+    global_timeout_secs: Option<u64>,
+) -> RegistryModel {
+    gemini_env_entry(
+        "gemini-pro",
+        "JESSE_MODEL_GEMINI_PRO",
+        "3.1 Pro",
+        "gemini-3.1-pro-preview",
+        PriceDeck {
+            in_per_m: GEMINI_3P1_PRO_IN_PER_M,
+            cached_per_m: GEMINI_3P1_PRO_CACHED_PER_M,
+            cache_write_per_m: None,
+            out_per_m: GEMINI_3P1_PRO_OUT_PER_M,
+        },
+        default_interval_secs,
+        global_timeout_secs,
+    )
+}
+
+/// `gemini-flash` — Gemini 3.8 Flash, GA since 2026-09-02 and the cheap default of this
+/// family. Armed by `JESSE_MODEL_GEMINI_FLASH_AUTH_TOKEN` alone.
+///
+/// Its deck is an INTRODUCTORY rate that expires on 2026-12-31 and cannot be expressed as a
+/// dated rate here — see [`GEMINI_3P8_FLASH_IN_PER_M`] for what has to happen on 2027-01-01
+/// and why nothing happens by itself.
+fn gemini_flash_env_entry(
+    default_interval_secs: u64,
+    global_timeout_secs: Option<u64>,
+) -> RegistryModel {
+    gemini_env_entry(
+        "gemini-flash",
+        "JESSE_MODEL_GEMINI_FLASH",
+        "3.8 Flash",
+        "gemini-3.8-flash",
+        PriceDeck {
+            in_per_m: GEMINI_3P8_FLASH_IN_PER_M,
+            cached_per_m: GEMINI_3P8_FLASH_CACHED_PER_M,
+            cache_write_per_m: None,
+            out_per_m: GEMINI_3P8_FLASH_OUT_PER_M,
+        },
+        default_interval_secs,
+        global_timeout_secs,
+    )
+}
+
+/// `gemini-flash-lite` — Gemini 3.5 Flash-Lite, GA since 2026-07-21 and the cheapest tier
+/// here, for routing. Armed by `JESSE_MODEL_GEMINI_FLASH_LITE_AUTH_TOKEN` alone.
+///
+/// Measured as the one model in the family that often does not think at all: its native
+/// `usageMetadata` reported no `thoughtsTokenCount` key whatever on an unprompted turn, and
+/// its probe answered in 0.6 s. It still gets the family's reasoning probe budget, because
+/// `reasoning_effort: high` made it think harder than either sibling (998 tokens).
+fn gemini_flash_lite_env_entry(
+    default_interval_secs: u64,
+    global_timeout_secs: Option<u64>,
+) -> RegistryModel {
+    gemini_env_entry(
+        "gemini-flash-lite",
+        "JESSE_MODEL_GEMINI_FLASH_LITE",
+        "3.5 Flash-Lite",
+        "gemini-3.5-flash-lite",
+        PriceDeck {
+            in_per_m: GEMINI_3P5_FLASH_LITE_IN_PER_M,
+            cached_per_m: GEMINI_3P5_FLASH_LITE_CACHED_PER_M,
+            cache_write_per_m: None,
+            out_per_m: GEMINI_3P5_FLASH_LITE_OUT_PER_M,
+        },
+        default_interval_secs,
+        global_timeout_secs,
+    )
 }
 
 /// The per-model variables the retired Codex-surface Kimi entry (`kimi-codex`) read. Nothing
@@ -5413,7 +5655,7 @@ mod tests {
     }
 
     /// The `JESSE_MODEL_*` env-triple vars, cleared so a test's registry is deterministic.
-    const MODEL_ENV_VARS: [&str; 14] = [
+    const MODEL_ENV_VARS: [&str; 23] = [
         // The two subscription-login slugs: one arms `fable`, the other pins `opus`.
         "JESSE_MODEL_FABLE_MODEL",
         "JESSE_MODEL_OPUS_MODEL",
@@ -5426,6 +5668,15 @@ mod tests {
         "JESSE_MODEL_QWEN_BASE_URL",
         "JESSE_MODEL_QWEN_AUTH_TOKEN",
         "JESSE_MODEL_QWEN_MODEL",
+        "JESSE_MODEL_GEMINI_PRO_BASE_URL",
+        "JESSE_MODEL_GEMINI_PRO_AUTH_TOKEN",
+        "JESSE_MODEL_GEMINI_PRO_MODEL",
+        "JESSE_MODEL_GEMINI_FLASH_BASE_URL",
+        "JESSE_MODEL_GEMINI_FLASH_AUTH_TOKEN",
+        "JESSE_MODEL_GEMINI_FLASH_MODEL",
+        "JESSE_MODEL_GEMINI_FLASH_LITE_BASE_URL",
+        "JESSE_MODEL_GEMINI_FLASH_LITE_AUTH_TOKEN",
+        "JESSE_MODEL_GEMINI_FLASH_LITE_MODEL",
         "JESSE_MODEL_LOCAL_BASE_URL",
         "JESSE_MODEL_LOCAL_AUTH_TOKEN",
         "JESSE_MODEL_LOCAL_MODEL",
@@ -6055,6 +6306,12 @@ mod tests {
             "kimi-k3-codex",
             "kimi-codex",
             "qwen",
+            // The three Gemini entries, present and — with no token set — unarmed, exactly
+            // like the Fireworks families above them. Being on a different harness changes
+            // nothing about this property.
+            "gemini-pro",
+            "gemini-flash",
+            "gemini-flash-lite",
             // Registered on the subscription login, and — with no slug set — not armed. This is
             // the property the whole stage keeps: no model configuration means opus alone is
             // selectable.
@@ -6072,7 +6329,17 @@ mod tests {
         // One entry per family: the retired `kimi-codex` is an alias above, not a row here.
         assert_eq!(
             r.models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
-            ["opus", "fable", "glm", "kimi", "qwen", "local"],
+            [
+                "opus",
+                "fable",
+                "glm",
+                "kimi",
+                "qwen",
+                "gemini-pro",
+                "gemini-flash",
+                "gemini-flash-lite",
+                "local"
+            ],
             "no declarative entries appear with no config"
         );
 
@@ -6172,8 +6439,16 @@ mod tests {
             unique.len(),
             "a model registered twice: {slugs:?}"
         );
+        // NARROWED FROM "every built-in entry is a claude-code entry", which is what this
+        // assertion spelled when `direct` was not yet a harness a built-in model could name —
+        // its own message says what it was protecting, and that was never claude-code as such.
+        // The three Gemini entries run on `direct` out of necessity (Google serves no Messages
+        // surface for a CLI harness to reach), so the old spelling would assert this change
+        // away rather than catch a regression. What it guards is unchanged: nothing built in
+        // is a codex entry, and each Fireworks family is asserted claude-code by id in the
+        // loop above, which is the stronger check.
         assert!(
-            r.models.iter().all(|m| m.harness == CLAUDE_CODE_ID),
+            r.models.iter().all(|m| m.harness != CODEX_ID),
             "no built-in entry runs on codex: {:?}",
             r.models
                 .iter()

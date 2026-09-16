@@ -457,6 +457,7 @@ fn assert_thread_shape(what: &str, messages: &[Message]) {
             id: "call_1".into(),
             name: "fs_list".into(),
             arguments: json!({"path": "."}),
+            vendor: None,
         }]
     );
 
@@ -476,6 +477,7 @@ fn assert_thread_shape(what: &str, messages: &[Message]) {
             id: "call_2".into(),
             name: "fs_read".into(),
             arguments: json!({"path": "notes/a.md"}),
+            vendor: None,
         }]
     );
 

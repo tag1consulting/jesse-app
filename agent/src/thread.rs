@@ -612,6 +612,7 @@ mod tests {
                         id: "call_1".into(),
                         name: "fs_read".into(),
                         arguments: serde_json::json!({"path": "a.md"}),
+                        vendor: None,
                     },
                 ],
             },

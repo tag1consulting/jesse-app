@@ -164,6 +164,31 @@ pub enum ContentBlock {
         id: String,
         name: String,
         arguments: serde_json::Value,
+        /// **AN OPAQUE PER-CALL ARTEFACT THE HOST REQUIRES BACK**, or `None` on every host
+        /// that mints none — which is all of them but one, so `None` is overwhelmingly the
+        /// common case.
+        ///
+        /// Google's Gemini 3 models attach a signed blob to each tool call and reject the
+        /// NEXT request of the same loop if it does not come back, with a `400` naming the
+        /// call: measured on all three Gemini models on 2026-09-16, where echoing it
+        /// succeeded and stripping it failed every time. Nothing in this crate looks inside
+        /// it, and the field is deliberately named for what it IS to this layer — a vendor
+        /// blob — rather than for what Google calls it. The wire's own spelling
+        /// (`extra_content.google.thought_signature`) is known only to [`openai_chat`], so a
+        /// second host wanting the same treatment needs no change here.
+        ///
+        /// **ON `ToolUse` RATHER THAN [`ContentBlock::Reasoning`]**, which is where an opaque
+        /// provider artefact would otherwise belong. Reasoning blocks are stripped before the
+        /// thread store writes them (`crate::r#loop`'s `without_reasoning`, on the grounds
+        /// that nothing durable should hold what the owner cannot read), so a signature
+        /// parked there would survive the turn and vanish on resume — leaving a resumed
+        /// conversation permanently unable to answer its own pending tool call. This field is
+        /// persisted with the message, which is what makes a resumed loop work.
+        ///
+        /// `#[serde(default)]` so a thread written before this field existed still loads, and
+        /// `skip_serializing_if` so the millions of `None`s add nothing to the log.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        vendor: Option<serde_json::Value>,
     },
     ToolResult {
         /// The id of the [`ContentBlock::ToolUse`] this answers.
@@ -520,6 +545,12 @@ pub enum Event {
     },
     ToolUseEnd {
         id: String,
+        /// The opaque per-call artefact this host wants back with the call, or `None` when it
+        /// mints none. Carried on the CLOSING event rather than
+        /// [`Event::ToolUseStart`](Event::ToolUseStart) because a streaming host may send it
+        /// in any fragment of the call, so it is only certainly known once the call is
+        /// complete. See [`ContentBlock::ToolUse::vendor`], which is where it lands.
+        vendor: Option<serde_json::Value>,
     },
     /// A chunk of the model's reasoning, delivered ONLY when the wire exposes it.
     ///
@@ -880,6 +911,17 @@ mod tests {
                 id: "call_1".into(),
                 name: "fs_read".into(),
                 arguments: serde_json::json!({"path": "a.md"}),
+                vendor: None,
+            },
+            // The same variant CARRYING an artefact, because `None` alone would not exercise
+            // the new field: `skip_serializing_if` means a `None` never reaches the JSON at
+            // all, so a round trip of `None` proves only that the absent case still works.
+            // This is the case a resumed conversation depends on.
+            ContentBlock::ToolUse {
+                id: "call_2".into(),
+                name: "fs_read".into(),
+                arguments: serde_json::json!({"path": "b.md"}),
+                vendor: Some(serde_json::json!({"google": {"thought_signature": "AbC123=="}})),
             },
             ContentBlock::ToolResult {
                 id: "call_1".into(),

@@ -622,7 +622,7 @@ fn cases() -> Vec<Case> {
                 assert!(
                     events
                         .iter()
-                        .any(|e| matches!(e, Event::ToolUseEnd { id: eid } if *eid == id)),
+                        .any(|e| matches!(e, Event::ToolUseEnd { id: eid, .. } if *eid == id)),
                     "{name} on {wire}: the block closed"
                 );
                 assert!(
@@ -1417,7 +1417,7 @@ fn cases() -> Vec<Case> {
                 assert!(
                     events
                         .iter()
-                        .any(|e| matches!(e, Event::ToolUseEnd { id } if *id == call_id)),
+                        .any(|e| matches!(e, Event::ToolUseEnd { id, .. } if *id == call_id)),
                     "{name} on {wire}: the interleaved tool call still closes"
                 );
                 assert!(
@@ -1759,7 +1759,7 @@ async fn two_iteration_turn(wire: Wire, first: Reply, second: Reply) -> (Vec<Val
                     slot.2.push_str(json_fragment);
                 }
             }
-            Event::ToolUseEnd { id } => {
+            Event::ToolUseEnd { id, vendor } => {
                 if let Some(pos) = open.iter().position(|(i, _, _)| i == id) {
                     let (id, name, args) = open.remove(pos);
                     let arguments: Value = if args.trim().is_empty() {
@@ -1771,6 +1771,11 @@ async fn two_iteration_turn(wire: Wire, first: Reply, second: Reply) -> (Vec<Val
                         id,
                         name,
                         arguments,
+                        // CARRIED THROUGH, not defaulted to `None`. This helper exists to
+                        // assemble the assistant turn the way `r#loop` does, and the loop
+                        // puts the artefact on the block — a helper that dropped it would
+                        // make a round-trip test fail for a reason no adapter caused.
+                        vendor: vendor.clone(),
                     });
                 }
             }
@@ -2020,6 +2025,69 @@ async fn chat_never_carries_a_reasoning_artefact() {
             "the second request carried {needle:?} on a wire that has no such concept: {out}"
         );
     }
+}
+
+/// **A PER-CALL VENDOR ARTEFACT GOES BACK VERBATIM ON THE NEXT REQUEST.**
+///
+/// NOT IN TENSION WITH THE TEST ABOVE, and the distinction is the point: that one is about
+/// [`ContentBlock::Reasoning`], which this wire genuinely never mints, and its mock sends no
+/// artefact at all. This is about a blob hung on an individual TOOL CALL, which one host
+/// does mint and requires back.
+///
+/// Google's Gemini 3 models attach a signed `extra_content.google.thought_signature` to each
+/// tool call and answer `400` on the next request of the loop if it is missing — measured on
+/// all three models on 2026-09-16, where echoing it succeeded and stripping it failed every
+/// time, with the error naming the call. Nothing in this crate reads inside the blob, so the
+/// assertion is byte-identity of the whole object rather than of the key Google happens to
+/// use today.
+#[tokio::test]
+async fn chat_echoes_a_tool_call_vendor_artefact_verbatim() {
+    let first = Reply::sse(frames(&[
+        r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"get_weather","arguments":"{}"},"extra_content":{"google":{"thought_signature":"C-opaque-not-a-real-signature=="}}}]}}]}"#,
+        r#"{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+        "[DONE]",
+    ]));
+    let second = Reply::sse(frames(&[
+        r#"{"choices":[{"index":0,"delta":{"content":"18C and clear."}}]}"#,
+        r#"{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+        "[DONE]",
+    ]));
+
+    let (bodies, _events) = two_iteration_turn(Wire::Chat, first, second).await;
+    assert_eq!(
+        bodies[1].pointer("/messages/1/tool_calls/0/extra_content"),
+        Some(&json!({"google": {"thought_signature": "C-opaque-not-a-real-signature=="}})),
+        "the artefact must return under the key it arrived on, unchanged: {}",
+        bodies[1]
+    );
+}
+
+/// A tool call that carried NO artefact gains none on the way back.
+///
+/// The other half of the rule, and the one that keeps every other host working: a host that
+/// defines no `extra_content` would reject a request carrying one, so the field is omitted
+/// entirely rather than sent as a null.
+#[tokio::test]
+async fn chat_invents_no_vendor_artefact_when_the_host_minted_none() {
+    let first = Reply::sse(frames(&[
+        r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"get_weather","arguments":"{}"}}]}}]}"#,
+        r#"{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+        "[DONE]",
+    ]));
+    let second = Reply::sse(frames(&[
+        r#"{"choices":[{"index":0,"delta":{"content":"18C and clear."}}]}"#,
+        r#"{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+        "[DONE]",
+    ]));
+
+    let (bodies, _events) = two_iteration_turn(Wire::Chat, first, second).await;
+    let call = bodies[1]
+        .pointer("/messages/1/tool_calls/0")
+        .expect("the assistant turn carries the call");
+    assert!(
+        call.get("extra_content").is_none(),
+        "no artefact was minted, so the key must be absent rather than null: {call}"
+    );
 }
 
 /// A REASONING BLOCK FROM ANOTHER PROVIDER IS REFUSED BEFORE ANY BYTES GO OUT.

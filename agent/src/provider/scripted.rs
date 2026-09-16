@@ -77,7 +77,9 @@ impl Step {
                 id: id.clone(),
                 json_fragment: arguments.to_string(),
             },
-            Event::ToolUseEnd { id },
+            // `None`: a scripted provider stands in for a host, and no host this fixture
+            // models mints a per-call artefact. A test that needs one sets it explicitly.
+            Event::ToolUseEnd { id, vendor: None },
             Event::Usage(usage),
             Event::Done {
                 stop_reason: StopReason::ToolUse,
@@ -295,7 +297,7 @@ impl ScriptStep {
                         id: id.clone(),
                         json_fragment: call.arguments.to_string(),
                     });
-                    events.push(Event::ToolUseEnd { id });
+                    events.push(Event::ToolUseEnd { id, vendor: None });
                 }
                 events.push(Event::Usage(usage.to_usage()));
                 events.push(Event::Done {

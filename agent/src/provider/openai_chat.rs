@@ -215,13 +215,25 @@ fn encode_message(m: &Message, out: &mut Vec<Value>) {
                 id,
                 name,
                 arguments,
-            } => tool_calls.push(json!({
-                "id": id,
-                "type": "function",
+                vendor,
+            } => {
+                let mut call = Map::new();
+                call.insert("id".into(), json!(id));
+                call.insert("type".into(), json!("function"));
                 // Arguments go back as a STRING on this wire, not an object — the same
                 // shape they arrive in. `to_string` on the parsed value round-trips it.
-                "function": {"name": name, "arguments": arguments.to_string()},
-            })),
+                call.insert(
+                    "function".into(),
+                    json!({"name": name, "arguments": arguments.to_string()}),
+                );
+                // Echoed under the key it arrived on, byte for byte, or omitted entirely
+                // when the host minted none. Omission is the correct default: a host that
+                // never sends one would reject an `extra_content` it does not define.
+                if let Some(v) = vendor {
+                    call.insert("extra_content".into(), v.clone());
+                }
+                tool_calls.push(Value::Object(call));
+            }
             ContentBlock::ToolResult { .. } => {}
             // THE ABSENCE CASE, AND SKIPPING IS THE CORRECT BEHAVIOUR. This wire has no
             // reasoning artefact to echo: Chat Completions returns no signed thinking block
@@ -310,6 +322,10 @@ struct PartialCall {
     args: String,
     /// `ToolUseStart` has been emitted for this index.
     started: bool,
+    /// The host's opaque per-call artefact, kept exactly as it arrived. Accumulated across
+    /// fragments because a streaming host may attach it to any one of them; the last
+    /// non-null wins. `None` on every host that mints none.
+    vendor: Option<Value>,
 }
 
 /// Parses the Chat Completions event stream.
@@ -326,10 +342,38 @@ struct ChatDecoder {
     terminated: bool,
     /// Tool calls have been closed out (at the first `finish_reason`).
     flushed: bool,
+    /// This response asked for at least one tool, whatever the host's `finish_reason` says.
+    ///
+    /// The same flag, for the same reason, as the Responses decoder's `saw_function_call`:
+    /// "the model wants a tool called" has to be derived from what arrived rather than
+    /// trusted from a status field, because a host that gets that field wrong produces a
+    /// perfectly formed turn in which the loop never dispatches the tool and nothing reports
+    /// an error. See where it is read, below.
+    saw_tool_call: bool,
     done: bool,
 }
 
 impl ChatDecoder {
+    /// The slot an INDEX-LESS fragment belongs to, decided by its `id`.
+    ///
+    /// `index` is how this wire identifies a call across fragments and is authoritative
+    /// wherever it appears. Where it does not appear, the id has to do the job — and getting
+    /// that wrong silently WELDS TWO CALLS INTO ONE rather than failing cleanly.
+    ///
+    /// A known id is that call continuing. An unknown non-empty id is a NEW call and takes a
+    /// fresh slot. An empty id cannot be told apart from a continuation of whatever is
+    /// currently being built, so it takes the highest occupied slot — which is the
+    /// single-call behaviour this wire had before a host emitted two without indices.
+    fn slot_for_id(&self, id: &str) -> u64 {
+        if !id.is_empty() {
+            if let Some((k, _)) = self.calls.iter().find(|(_, c)| c.id == id) {
+                return *k;
+            }
+            return self.calls.keys().next_back().map(|k| k + 1).unwrap_or(0);
+        }
+        self.calls.keys().next_back().copied().unwrap_or(0)
+    }
+
     fn push_terminal(&mut self, out: &mut Vec<Event>, ev: Event) {
         if !self.done {
             self.done = true;
@@ -351,6 +395,10 @@ impl ChatDecoder {
             if !c.started {
                 continue;
             }
+            // A call that started carried both an id and a name, so this response asked for
+            // a tool. Recorded here rather than at the delta, because this is the point at
+            // which the call is known to be real and complete.
+            self.saw_tool_call = true;
             // Same rule as the Messages adapter: an empty argument string is a
             // no-argument call, anything else must parse, and a failure names the tool
             // rather than passing `{}` on to the loop.
@@ -369,7 +417,10 @@ impl ChatDecoder {
                 );
                 return false;
             }
-            out.push(Event::ToolUseEnd { id: c.id });
+            out.push(Event::ToolUseEnd {
+                id: c.id,
+                vendor: c.vendor,
+            });
         }
         true
     }
@@ -465,10 +516,22 @@ impl SseDecoder for ChatDecoder {
                 .and_then(Value::as_array)
             {
                 for c in calls {
-                    // A missing `index` means a single call on a host that omits it;
-                    // defaulting to 0 keeps those hosts working rather than dropping the
-                    // call, and a host that omits the index cannot be streaming two.
-                    let index = c.get("index").and_then(Value::as_u64).unwrap_or(0);
+                    // **A HOST THAT OMITS `index` CAN ABSOLUTELY BE STREAMING TWO**, which is
+                    // what the previous version of this line assumed it could not. Google's
+                    // Gemini endpoint sends no `index` at all AND emits parallel tool calls,
+                    // so defaulting every fragment to slot 0 put both calls in one slot: the
+                    // second overwrote the first's name and APPENDED its arguments, yielding
+                    // `{…}{…}` and killing the turn with a "trailing characters" protocol
+                    // violation. Measured on all three Gemini models on 2026-09-16, where it
+                    // failed every multi-document and briefing task of the eval suite.
+                    //
+                    // So `index` still decides where it is given, and [`Self::slot_for_id`]
+                    // decides where it is not.
+                    let incoming_id = c.get("id").and_then(Value::as_str).unwrap_or("");
+                    let index = match c.get("index").and_then(Value::as_u64) {
+                        Some(i) => i,
+                        None => self.slot_for_id(incoming_id),
+                    };
                     let entry = self.calls.entry(index).or_default();
                     if let Some(id) = c.get("id").and_then(Value::as_str) {
                         if !id.is_empty() {
@@ -479,6 +542,16 @@ impl SseDecoder for ChatDecoder {
                         if !name.is_empty() {
                             entry.name = name.to_string();
                         }
+                    }
+                    // THE OPAQUE ARTEFACT, CAPTURED VERBATIM AND NOT INSPECTED. Google's
+                    // Gemini 3 models hang a signed blob here and reject the next request of
+                    // the loop if it does not come back (measured on all three models,
+                    // 2026-09-16: echoing it succeeds, stripping it is a 400 naming the
+                    // call). The whole object is kept rather than the one key inside it, so
+                    // this stays true if the host adds a sibling, and so the echo is a copy
+                    // rather than a reconstruction.
+                    if let Some(extra) = c.get("extra_content").filter(|v| !v.is_null()) {
+                        entry.vendor = Some(extra.clone());
                     }
                     // `ToolUseStart` fires as soon as BOTH an id and a name are known —
                     // not on the first fragment, because a host may send `id` and
@@ -508,13 +581,34 @@ impl SseDecoder for ChatDecoder {
             }
 
             if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
-                self.stop_reason = Some(map_finish_reason(reason));
                 // Tool calls close HERE rather than at `[DONE]`: the choice is finished,
                 // so no further fragments can arrive, and closing now means `ToolUseEnd`
                 // precedes the usage chunk in the event order the docs promise.
+                //
+                // AND IT HAPPENS BEFORE THE STOP REASON IS DECIDED, because closing the
+                // calls is what establishes whether this response asked for a tool — which
+                // outranks what the host called it. Ordering only: `stop_reason` is not an
+                // event, so the event order above is unchanged.
                 if !self.flush_tool_calls(out) {
                     return;
                 }
+                // **A RESPONSE THAT CARRIED A TOOL CALL STOPS FOR TOOL USE**, whatever its
+                // `finish_reason` said. Measured on Google's Gemini endpoint on 2026-09-16:
+                // it streams a well-formed `tool_calls` delta and then reports
+                // `finish_reason: "stop"`, not `"tool_calls"`. Read literally that is
+                // `EndTurn`, and the loop ends the turn holding a tool call it never
+                // dispatched — an empty answer, and no error raised anywhere.
+                //
+                // A NO-OP ON EVERY HOST THAT GETS IT RIGHT: `api.openai.com` and Fireworks
+                // already report `tool_calls`, which maps to this same arm. Nothing here
+                // rescues a host that reports `length` — a truncated call is a different
+                // failure and keeps its own reason, because `flush_tool_calls` only counts
+                // a call that carried both an id and a name.
+                self.stop_reason = Some(if self.saw_tool_call {
+                    StopReason::ToolUse
+                } else {
+                    map_finish_reason(reason)
+                });
             }
         }
     }
@@ -554,6 +648,26 @@ impl SseDecoder for ChatDecoder {
 ///
 /// `cache_write_tokens` stays `None`: this wire has no equivalent field. That is a genuine
 /// absence and not a zero, which is why the field is `Option` (see [`Usage`]).
+///
+/// THE OTHER ARITHMETIC, and why `completion_tokens` alone is not the output bill. On most
+/// hosts `total_tokens == prompt_tokens + completion_tokens` and there is nothing to do. On
+/// Google's Gemini endpoint the identity does NOT hold: thinking tokens are billed at the
+/// output rate but are excluded from `completion_tokens`, and this wire exposes no
+/// `completion_tokens_details` to find them in. Measured live on 2026-09-16, one Gemini 3.1
+/// Pro reasoning turn reported `prompt=41, completion=123, total=632` — 468 billed output
+/// tokens, roughly four fifths of the real bill, invisible in `completion_tokens`.
+///
+/// So the output count is taken as `total - prompt` whenever the host gives a `total` that
+/// exceeds the prompt. That is not a Gemini special case: on a host where the identity holds
+/// it evaluates to exactly `completion_tokens`, which is why there is no per-host branch
+/// here. Confirmed against Gemini's native surface, where `usageMetadata` reports the split
+/// explicitly and `prompt + candidates + thoughts == total` closes to the token.
+///
+/// The difference between that and `completion_tokens` is the thinking, so it also fills in
+/// [`Usage::reasoning_tokens`] — a SUBSET of `output_tokens`, never added to it, exactly as
+/// that field documents. Left `None` when the gap is zero rather than set to `Some(0)`: a
+/// zero would claim the host measured no thinking, where the truth is that it reported no
+/// breakdown at all.
 fn apply_usage(usage: &mut Usage, v: &Value) {
     let prompt = v.get("prompt_tokens").and_then(Value::as_u64);
     let cached = v
@@ -565,8 +679,27 @@ fn apply_usage(usage: &mut Usage, v: &Value) {
     if let Some(c) = cached {
         usage.cache_read_tokens = Some(c);
     }
-    if let Some(n) = v.get("completion_tokens").and_then(Value::as_u64) {
-        usage.output_tokens = Some(n);
+    let completion = v.get("completion_tokens").and_then(Value::as_u64);
+    let total = v.get("total_tokens").and_then(Value::as_u64);
+    match (prompt, total) {
+        (Some(p), Some(t)) if t > p => {
+            let billed = t - p;
+            usage.output_tokens = Some(billed);
+            // The part of the output bill the host left out of `completion_tokens`.
+            if let Some(c) = completion {
+                let thinking = billed.saturating_sub(c);
+                if thinking > 0 {
+                    usage.reasoning_tokens = Some(thinking);
+                }
+            }
+        }
+        // No usable total (absent, or smaller than the prompt, which is nonsense): the
+        // host's own completion count is the best available answer.
+        _ => {
+            if let Some(n) = completion {
+                usage.output_tokens = Some(n);
+            }
+        }
     }
 }
 
@@ -742,6 +875,7 @@ mod tests {
                         id: "call_1".into(),
                         name: "add".into(),
                         arguments: json!({"a": 1}),
+                        vendor: None,
                     }],
                 },
                 Message {
@@ -846,6 +980,173 @@ mod tests {
     }
 
     #[test]
+    fn thinking_tokens_outside_completion_tokens_are_still_billed_as_output() {
+        // Google's Gemini endpoint reports `total_tokens` INCLUSIVE of thinking tokens that
+        // are absent from `completion_tokens`, and exposes no `completion_tokens_details` to
+        // find them in. These are the numbers one Gemini 3.1 Pro reasoning turn actually
+        // returned on 2026-09-16; reading `completion_tokens` alone under-bills it ~4x.
+        let events = decode(&[
+            r#"{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+            r#"{"choices":[],"usage":{"prompt_tokens":41,"completion_tokens":123,"total_tokens":632}}"#,
+            DONE_SENTINEL,
+        ]);
+        let usage = events
+            .iter()
+            .find_map(|e| match e {
+                Event::Usage(u) => Some(u.clone()),
+                _ => None,
+            })
+            .expect("usage emitted");
+        assert_eq!(usage.input_tokens, Some(41));
+        // 632 - 41: the visible answer AND the thinking, both billed at the output rate.
+        assert_eq!(usage.output_tokens, Some(591));
+        // A SUBSET of `output_tokens`, never added to it — see `Usage::reasoning_tokens`.
+        assert_eq!(usage.reasoning_tokens, Some(468));
+    }
+
+    #[test]
+    fn a_host_whose_total_closes_reports_no_hidden_thinking() {
+        // The overwhelmingly common case, and the reason the rule above needs no per-host
+        // branch: where `total == prompt + completion`, `total - prompt` IS
+        // `completion_tokens` and nothing changes. `reasoning_tokens` stays `None` rather
+        // than `Some(0)`, which would claim the host measured zero thinking when in truth it
+        // reported no breakdown at all.
+        let events = decode(&[
+            r#"{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+            r#"{"choices":[],"usage":{"prompt_tokens":42,"completion_tokens":3,"total_tokens":45}}"#,
+            DONE_SENTINEL,
+        ]);
+        let usage = events
+            .iter()
+            .find_map(|e| match e {
+                Event::Usage(u) => Some(u.clone()),
+                _ => None,
+            })
+            .expect("usage emitted");
+        assert_eq!(usage.input_tokens, Some(42));
+        assert_eq!(usage.output_tokens, Some(3));
+        assert_eq!(usage.reasoning_tokens, None);
+    }
+
+    #[test]
+    fn parallel_tool_calls_without_an_index_get_their_own_slots() {
+        // THE SHAPE GOOGLE'S GEMINI ENDPOINT SENDS: no `tool_calls[].index` anywhere, and
+        // two calls in one response. Keyed by a defaulted index alone they share slot 0, the
+        // second call's arguments append to the first's, and the turn dies with "trailing
+        // characters" — which is exactly how every multi-document and briefing task of the
+        // product eval suite failed on all three models before this.
+        //
+        // Note the `choices[].index` below is the CHOICE index and is unrelated; it is the
+        // absence of an index INSIDE each `tool_calls` element that matters.
+        let events = decode(&[
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"id":"call_a","type":"function","function":{"name":"vault_read","arguments":"{\"path\":\"a.md\"}"}}]}}]}"#,
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"id":"call_b","type":"function","function":{"name":"vault_read","arguments":"{\"path\":\"b.md\"}"}}]}}]}"#,
+            r#"{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+            DONE_SENTINEL,
+        ]);
+        assert!(
+            !events.iter().any(|e| matches!(e, Event::Error(_))),
+            "neither call's arguments were welded onto the other: {events:?}"
+        );
+        let starts: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                Event::ToolUseStart { id, .. } => Some(id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            starts,
+            vec!["call_a", "call_b"],
+            "two distinct calls opened"
+        );
+        let ends: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                Event::ToolUseEnd { id, .. } => Some(id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ends, vec!["call_a", "call_b"], "and both closed");
+    }
+
+    #[test]
+    fn an_indexed_host_still_accumulates_fragments_into_one_call() {
+        // The other half: where `index` IS given it stays authoritative, so a host that
+        // streams one call as several fragments (id and name only on the first) is unchanged
+        // by the id-based fallback above.
+        let events = decode(&[
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"add","arguments":"{\"a\":"}}]}}]}"#,
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"1}"}}]}}]}"#,
+            r#"{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+            DONE_SENTINEL,
+        ]);
+        assert!(
+            !events.iter().any(|e| matches!(e, Event::Error(_))),
+            "the two fragments still form one valid argument object: {events:?}"
+        );
+        let starts: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                Event::ToolUseStart { id, .. } => Some(id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(starts, vec!["call_1"], "one call, not two");
+    }
+
+    #[test]
+    fn a_tool_call_stops_for_tool_use_even_when_the_host_reports_stop() {
+        // THE EXACT SHAPE GOOGLE'S GEMINI ENDPOINT STREAMS, captured 2026-09-16: a
+        // well-formed tool call with no `index` key, then `finish_reason: "stop"` rather
+        // than `"tool_calls"`. Taken literally this is `EndTurn`, and the loop ends a turn
+        // holding a tool call it never dispatched — which reaches the caller as an answer
+        // with no text in it and no error anywhere. Every tool-using task of the product
+        // eval suite scored zero against this, with the one no-tool class passing, before
+        // the derivation below existed.
+        let events = decode(&[
+            r#"{"choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"id":"call_1","type":"function","function":{"name":"vault_list","arguments":"{}"}}]}}]}"#,
+            r#"{"choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":"stop"}]}"#,
+            DONE_SENTINEL,
+        ]);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::ToolUseEnd { id, .. } if id == "call_1")),
+            "the call still closes: {events:?}"
+        );
+        assert!(
+            matches!(
+                events.last(),
+                Some(Event::Done {
+                    stop_reason: StopReason::ToolUse
+                })
+            ),
+            "a response carrying a tool call stops for tool use: {events:?}"
+        );
+    }
+
+    #[test]
+    fn a_plain_answer_keeps_the_hosts_own_stop_reason() {
+        // The other half: with no tool call, the host's `finish_reason` stands unmodified.
+        // Without this the derivation above would turn every answer into a tool-use turn.
+        let events = decode(&[
+            r#"{"choices":[{"index":0,"delta":{"content":"hi"}}]}"#,
+            r#"{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+            DONE_SENTINEL,
+        ]);
+        assert!(
+            matches!(
+                events.last(),
+                Some(Event::Done {
+                    stop_reason: StopReason::EndTurn
+                })
+            ),
+            "no tool call, so nothing outranks the host: {events:?}"
+        );
+    }
+
+    #[test]
     fn tool_call_fragments_accumulate_by_index() {
         let events = decode(&[
             r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"add","arguments":"{\"a\":"}}]}}]}"#,
@@ -869,7 +1170,7 @@ mod tests {
         assert_eq!(frags.concat(), r#"{"a":1,"b":2}"#);
         assert!(events
             .iter()
-            .any(|e| matches!(e, Event::ToolUseEnd { id } if id == "call_1")));
+            .any(|e| matches!(e, Event::ToolUseEnd { id, .. } if id == "call_1")));
     }
 
     #[test]
