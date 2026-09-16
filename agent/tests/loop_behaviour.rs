@@ -615,7 +615,10 @@ async fn cancellation_between_tool_calls_keeps_the_thread_resumable_and_records_
                     id: "c1".into(),
                     json_fragment: "{}".into(),
                 },
-                Event::ToolUseEnd { id: "c1".into() },
+                Event::ToolUseEnd {
+                    id: "c1".into(),
+                    vendor: None,
+                },
                 Event::ToolUseStart {
                     id: "c2".into(),
                     name: "probe".into(),
@@ -624,7 +627,10 @@ async fn cancellation_between_tool_calls_keeps_the_thread_resumable_and_records_
                     id: "c2".into(),
                     json_fragment: "{}".into(),
                 },
-                Event::ToolUseEnd { id: "c2".into() },
+                Event::ToolUseEnd {
+                    id: "c2".into(),
+                    vendor: None,
+                },
                 Event::Usage(usage(50, 20)),
                 Event::Done {
                     stop_reason: WireStop::ToolUse,
@@ -718,7 +724,7 @@ fn batch(names: &[&str], u: Usage) -> Step {
             id: id.clone(),
             json_fragment: "{}".into(),
         });
-        events.push(Event::ToolUseEnd { id });
+        events.push(Event::ToolUseEnd { id, vendor: None });
     }
     events.push(Event::Usage(u));
     events.push(Event::Done {
@@ -1030,7 +1036,10 @@ async fn interleaved_text_and_tool_calls_keep_their_order_in_the_thread() {
                     id: "c1".into(),
                     json_fragment: "{}".into(),
                 },
-                Event::ToolUseEnd { id: "c1".into() },
+                Event::ToolUseEnd {
+                    id: "c1".into(),
+                    vendor: None,
+                },
                 Event::Usage(usage(10, 5)),
                 Event::Done {
                     stop_reason: WireStop::ToolUse,
@@ -1056,6 +1065,7 @@ async fn interleaved_text_and_tool_calls_keep_their_order_in_the_thread() {
                 id: "c1".into(),
                 name: "probe".into(),
                 arguments: json!({}),
+                vendor: None,
             },
         ],
         "the text the model said BEFORE the call stays before it"

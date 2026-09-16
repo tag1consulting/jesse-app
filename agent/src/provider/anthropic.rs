@@ -232,10 +232,16 @@ fn encode_block(b: &ContentBlock, model: &str) -> Result<Value, ProviderError> {
             "type": "image",
             "source": {"type": "base64", "media_type": media_type, "data": data_base64},
         }),
+        // `vendor` IS DELIBERATELY DROPPED HERE, not forgotten. It holds an opaque artefact
+        // minted by some other host for its own tool loop; this wire defines no field to
+        // carry it, and inventing one would put an unknown key in a `tool_use` block and earn
+        // a 400. A cross-wire replay is meaningless anyway — the artefact is signed by, and
+        // only intelligible to, the model that produced it.
         ContentBlock::ToolUse {
             id,
             name,
             arguments,
+            vendor: _,
         } => json!({"type": "tool_use", "id": id, "name": name, "input": arguments}),
         ContentBlock::ToolResult {
             id,
@@ -594,7 +600,10 @@ impl SseDecoder for MessagesDecoder {
                             ))),
                         );
                     }
-                    out.push(Event::ToolUseEnd { id });
+                    // `None`: this wire mints no per-call artefact. Its reasoning artefact is
+                    // a whole signed `thinking` BLOCK, carried by `Event::Reasoning`, not
+                    // something hung on an individual tool call.
+                    out.push(Event::ToolUseEnd { id, vendor: None });
                 }
             }
 
@@ -975,7 +984,7 @@ mod tests {
         ]);
         assert!(events
             .iter()
-            .any(|e| matches!(e, Event::ToolUseEnd { id } if id == "toolu_1")));
+            .any(|e| matches!(e, Event::ToolUseEnd { id, .. } if id == "toolu_1")));
     }
 
     #[test]

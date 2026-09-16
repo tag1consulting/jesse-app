@@ -348,10 +348,14 @@ fn encode_message(m: &Message, out: &mut Vec<Value>, model: &str) -> Result<(), 
                 "image_url": format!("data:{media_type};base64,{data_base64}"),
                 "detail": "auto",
             })),
+            // `vendor` dropped for the same reason the Messages adapter drops it: it belongs
+            // to another host's tool loop, this wire defines no field for it, and an unknown
+            // key on a `function_call` item is a 400.
             ContentBlock::ToolUse {
                 id,
                 name,
                 arguments,
+                vendor: _,
             } => calls.push(json!({
                 "type": "function_call",
                 "call_id": id,
@@ -576,8 +580,12 @@ impl ResponsesDecoder {
             );
             return false;
         }
+        // `None`: this wire mints no per-call artefact either. Its reasoning artefact is a
+        // separate `reasoning` item carrying `encrypted_content`, echoed through
+        // `Event::Reasoning` rather than attached to a tool call.
         out.push(Event::ToolUseEnd {
             id: call.call_id.clone(),
+            vendor: None,
         });
         true
     }
@@ -1082,6 +1090,7 @@ mod tests {
                             id: "call_1".into(),
                             name: "add".into(),
                             arguments: json!({"a": 1}),
+                            vendor: None,
                         },
                     ],
                 },
@@ -1176,7 +1185,7 @@ mod tests {
             match e {
                 Event::ToolUseStart { id, .. }
                 | Event::ToolUseArgsDelta { id, .. }
-                | Event::ToolUseEnd { id } => {
+                | Event::ToolUseEnd { id, .. } => {
                     assert_eq!(id, "call_1", "the item id must never reach a neutral event")
                 }
                 _ => {}
@@ -1184,7 +1193,7 @@ mod tests {
         }
         assert!(events
             .iter()
-            .any(|e| matches!(e, Event::ToolUseEnd { id } if id == "call_1")));
+            .any(|e| matches!(e, Event::ToolUseEnd { id, .. } if id == "call_1")));
     }
 
     #[test]

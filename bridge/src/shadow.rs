@@ -67,6 +67,59 @@ pub const FW_QWEN3P8_MAX_IN_PER_M: f64 = 2.00;
 pub const FW_QWEN3P8_MAX_CACHED_PER_M: f64 = 0.25;
 pub const FW_QWEN3P8_MAX_OUT_PER_M: f64 = 6.00;
 
+// ---------------------------------------------------------------------------
+// Google's Gemini API (`generativelanguage.googleapis.com`), NOT Fireworks. Same
+// naming rule as the decks above: named for the MODEL, version dots written `p`.
+// ---------------------------------------------------------------------------
+
+/// Gemini 3.1 Pro (preview): $2.00 in / $0.20 cached / $12.00 out (Google's Gemini API
+/// pricing page, read 2026-09-16; the slug was confirmed served by the live `/models`
+/// listing the same day). The DEFAULT deck for the `gemini-pro` registry entry, overridable
+/// via `JESSE_MODEL_GEMINI_PRO_PRICE_{IN,CACHED,OUT}`.
+///
+/// **THIS DECK IS THE ≤200k-TOKEN TIER, AND THE BADGE UNDER-REPORTS A LONGER PROMPT.** Google
+/// prices a prompt over 200k tokens at $4.00 in / $0.40 cached / $18.00 out — input and cache
+/// read double, output is 1.5x. [`PriceDeck`] is four scalars with no tier and no prompt
+/// length, so a turn that crosses 200k is reported at roughly half its true input cost.
+/// Under-reporting WITH THIS NOTE is the deliberate choice over silence; expressing it needs
+/// a tiered deck, which is a change to the price type rather than to this constant.
+///
+/// A SECOND, SMALLER UNDER-REPORT: context-cache STORAGE bills at $4.50 per 1M tokens per
+/// HOUR. That is a rate over time rather than over tokens, and there is no field for it here
+/// at all — not a zero, an absence.
+pub const GEMINI_3P1_PRO_IN_PER_M: f64 = 2.00;
+pub const GEMINI_3P1_PRO_CACHED_PER_M: f64 = 0.20;
+pub const GEMINI_3P1_PRO_OUT_PER_M: f64 = 12.00;
+
+/// Gemini 3.8 Flash: $0.75 in / $0.075 cached / $3.75 out (Gemini API pricing page, read
+/// 2026-09-16). The DEFAULT deck for the `gemini-flash` registry entry, overridable via
+/// `JESSE_MODEL_GEMINI_FLASH_PRICE_{IN,CACHED,OUT}`.
+///
+/// **THIS IS THE INTRODUCTORY RATE AND IT EXPIRES ON 2026-12-31.** From 2027-01-01 Google
+/// charges $1.50 in / $0.15 cached / $7.50 out — exactly double on all three. [`PriceDeck`]
+/// holds four scalars and consults no clock, and is resolved ONCE at registry build, so
+/// nothing here changes on that date by itself: from 2027-01-01 this deck under-reports every
+/// Flash turn by half until a human acts.
+///
+/// TWO WAYS TO ACT, NEITHER AUTOMATIC. Either set `JESSE_MODEL_GEMINI_FLASH_PRICE_IN=1.50`,
+/// `_PRICE_CACHED=0.15` and `_PRICE_OUT=7.50` in the bridge's launch environment (no release),
+/// or double these three constants (a release). A dated rate was attempted first and is not
+/// expressible by this type.
+pub const GEMINI_3P8_FLASH_IN_PER_M: f64 = 0.75;
+pub const GEMINI_3P8_FLASH_CACHED_PER_M: f64 = 0.075;
+pub const GEMINI_3P8_FLASH_OUT_PER_M: f64 = 3.75;
+
+/// Gemini 3.5 Flash-Lite: $0.30 in / $0.03 cached / $2.50 out (Gemini API pricing page, read
+/// 2026-09-16). The DEFAULT deck for the `gemini-flash-lite` registry entry, overridable via
+/// `JESSE_MODEL_GEMINI_FLASH_LITE_PRICE_{IN,CACHED,OUT}`.
+///
+/// The one Gemini deck with no asterisk on the token rates: one flat price at every prompt
+/// length, and no promotional expiry. Cache STORAGE is still billed at $1.00 per 1M tokens per
+/// hour, which this type cannot express — see the Pro note above.
+pub const GEMINI_3P5_FLASH_LITE_IN_PER_M: f64 = 0.30;
+pub const GEMINI_3P5_FLASH_LITE_CACHED_PER_M: f64 = 0.03;
+pub const GEMINI_3P5_FLASH_LITE_OUT_PER_M: f64 = 2.50;
+
 /// Opus prices: $5 in / $25 out; cache reads about a tenth of input ($0.50).
 pub const OPUS_IN_PER_M: f64 = 5.00;
 pub const OPUS_CACHED_PER_M: f64 = 0.50;

@@ -14,6 +14,139 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [Bridge 0.141.0] - 2026-09-16
+
+**Three Google Gemini models — Pro, Flash and Flash-Lite — are selectable in the picker.**
+`gemini-pro` (3.1 Pro) for judgment, `gemini-flash` (3.8 Flash) as a workhorse cheaper than
+Sonnet 5 on both input and output, and `gemini-flash-lite` (3.5 Flash-Lite) for routing. Each
+arms from one variable — `JESSE_MODEL_GEMINI_{PRO,FLASH,FLASH_LITE}_AUTH_TOKEN` — with base
+URL and slug defaulted, and ships unconfigured without it, exactly like the Fireworks
+families. All three slugs were confirmed served by the live `/models` listing on 2026-09-16.
+
+**They run on `direct` over the `chat` wire, and only there.** Google serves neither an
+Anthropic Messages surface nor an OpenAI Responses one, so no CLI harness has an endpoint to
+talk to: reaching Gemini from `claude-code` or `codex` would need a translating gateway, which
+this does not build. That is a real parity gap and it is written down rather than hidden. It
+also makes these the first built-in entries that are not claude-code entries, which is why
+`each_built_in_model_is_registered_once_on_one_harness` now asserts what its own failure
+message always said — that nothing built in is a *codex* entry — instead of that everything is
+claude-code.
+
+**Their quirks are measured, not read off the documentation**, which matters because the
+compatibility layer silently discards parameters it does not implement, so a `200` proves
+nothing on its own. `reasoning_effort` is HONORED (varying it low→high moved the thinking-token
+count on every model, which a discarded parameter cannot do). `strict` is silently IGNORED — a
+tool schema invalid under OpenAI's strict rules was accepted with `200` on all three, so the
+flag buys nothing and is pinned off. `multiple_system_messages` is pinned off because it would
+otherwise corrupt a turn: several leading system messages do not merge on this host, the last
+one wins and the rest are dropped, which would silently discard the persona.
+
+**Making the tool loop work at all needed one more fix, in the adapter rather than here:**
+this endpoint reports `finish_reason: "stop"` on a response that carried a tool call, which
+the Chat decoder read as end-of-turn and so never dispatched the tool. See the Agent 0.11.0
+entry below. Verified live afterwards on all three models through the `direct` harness from
+the phone-facing API: a two-turn loop calling `vault_list` then `vault_read` and quoting real
+vault text back, a vault write landing in the intended file, and a multi-page PDF answered
+from a figure that appears only on its third page.
+
+**A tool loop needs the thought signature back, or the next request is a `400`.** Gemini 3
+models hang a signed blob on each tool call, and omitting it on the following request fails
+with an error naming the call — measured on all three models, where echoing it succeeded and
+stripping it failed every time. The chat adapter now captures that blob verbatim and returns
+it under the key it arrived on. It rides on the tool-call block rather than on a reasoning
+artefact deliberately: reasoning blocks are stripped before the thread store writes them, so a
+signature parked there would survive the turn and vanish on resume, leaving a resumed
+conversation unable to answer its own pending tool call.
+
+**The cost badge was under-reporting every reasoning turn on this wire.** Gemini bills thinking
+tokens at the output rate but excludes them from `completion_tokens`, and exposes no
+`completion_tokens_details` to find them in — one Pro turn reported `completion=123` against a
+real output bill of 591. Output is now taken as `total - prompt`, which on every host where
+`total == prompt + completion` evaluates to exactly `completion_tokens` and changes nothing.
+Verified against Gemini's native surface, where the split is reported explicitly and
+`prompt + candidates + thoughts == total` closes to the token. Cached input needed no change:
+`prompt_tokens_details.cached_tokens` is reported once a prefix is actually cached, and the
+existing subtraction already handled it.
+
+**Three things the badge still cannot express**, each noted at its constant rather than left
+silent. Gemini 3.1 Pro charges double input and 1.5x output above a 200k-token prompt, and
+`PriceDeck` has no tier. The Flash deck is an introductory rate that becomes `1.50 / 0.15 /
+7.50` on 2027-01-01, and `PriceDeck` consults no clock and is resolved once at startup — so on
+that date either `JESSE_MODEL_GEMINI_FLASH_PRICE_{IN,CACHED,OUT}` is set in the launch
+environment or a release ships; nothing happens by itself. Context-cache storage is billed per
+hour and has no field at all.
+
+`gemini-3.1-pro-preview` is a PREVIEW model and no Gemini 3.x Pro has ever reached GA — the
+newest stable Pro is `gemini-2.5-pro` from June 2025 — so there is no stable slug to prefer.
+Google retired its predecessor on about four months' notice; repointing is
+`JESSE_MODEL_GEMINI_PRO_MODEL` plus `_VERSION` and no release.
+
+### Added
+- `gemini_pro_env_entry`, `gemini_flash_env_entry` and `gemini_flash_lite_env_entry`, over one
+  shared constructor so a measured quirk cannot drift between the three. Price decks
+  `GEMINI_3P1_PRO_*`, `GEMINI_3P8_FLASH_*` and `GEMINI_3P5_FLASH_LITE_*` in `shadow.rs`.
+- `model_wire_from_env_defaulting`, so a family whose provider serves a non-default surface can
+  start from the right wire while `<prefix>_WIRE` keeps behaving identically for every family.
+
+### Changed
+- All three probe `/chat/completions` on the family's own root with the 15 s reasoning budget:
+  every model here thinks before answering and Pro cannot be told not to, so probes measured
+  0.6–2.7 s against a 3 s default. The health path is set from the wire rather than spread from
+  `HealthConfig::default()`, which hardcodes the Anthropic path.
+- No vision pairing, for the reason the Kimi entry gives: all three take image input natively
+  (verified live, billed through `prompt_tokens`) and the harness already hands them the real
+  image, so a helper would transcribe the picture and hide the pixels from a model that can see
+  them. `_VISION` and `_VISION_COMPLEMENTARY` remain available.
+- No quota scope. `GET /jesse/models` reports `usage_scope: null` and the picker shows no usage
+  subtitle, as for a `local` model: the bridge can read Anthropic, ChatGPT and Fireworks
+  balances and has no Google equivalent.
+- No `effort` scale: `direct` has no per-turn effort path, and declaring one is a startup error.
+  Per-model thinking is the `thinking` key, left unset so each model applies its own default —
+  which is the honest setting here, since Gemini 3 Pro cannot have thinking disabled at all.
+- The clients needed no change: the picker groups by the `family` the bridge sends.
+
+## [Agent 0.11.0] - 2026-09-16
+
+**`ContentBlock::ToolUse` and `Event::ToolUseEnd` carry an opaque per-call `vendor` artefact.**
+Additive and `None` on every host but one; `#[serde(default)]` so threads written before the
+field still load, and `skip_serializing_if` so the common `None` adds nothing to the log. The
+field is named for what it is to this layer — a vendor blob — rather than for what Google calls
+it; the wire's own spelling stays inside `openai_chat`, so a second host wanting the same
+treatment needs no change to the neutral model. The Messages and Responses adapters drop it
+deliberately: neither defines a field to carry it, and an unknown key on a tool call is a `400`.
+
+**A Chat-wire response that carried a tool call now stops for tool use, whatever the host's
+`finish_reason` said.** Google's Gemini endpoint streams a well-formed `tool_calls` delta and
+then reports `finish_reason: "stop"` rather than `"tool_calls"`. Read literally that is
+`EndTurn`, so the loop ended every turn holding a tool call it never dispatched — which
+reaches the caller as an answer with no text in it and **no error raised anywhere**. Before
+this, every tool-using class of the product eval suite scored 0/3 on all three Gemini models
+while the one class needing no tools passed, which is what made the shape obvious.
+
+**And a host that omits `tool_calls[].index` can be streaming more than one call**, which
+this adapter assumed in a comment it could not. Gemini sends no index at all and emits
+parallel calls, so every fragment defaulted into slot 0: the second call overwrote the first's
+name and APPENDED its arguments, producing `{…}{…}` and killing the turn with a "trailing
+characters" protocol violation. It failed every multi-document and briefing task of the eval
+suite on all three models. Where `index` is given it stays authoritative; where it is absent
+the call's `id` now picks the slot — a known id continues that call, an unknown one opens a
+new slot, and an empty id continues whatever is currently being built, which is the
+single-call behaviour this wire had before.
+
+The stop reason is now DERIVED from whether a call actually closed, exactly as
+`openai_responses` already derives its own and for the reason that adapter states: a decoder
+that trusts the status field returns a perfectly formed turn in which the tool is never
+called. It is a no-op on every host that gets it right — `api.openai.com` and Fireworks
+report `tool_calls`, which maps to the same arm — and it deliberately does not rescue a host
+reporting `length`, since a truncated call is a different failure and only a call carrying
+both an id and a name is counted.
+
+### Changed
+- `openai_chat`'s usage normalisation takes output as `total - prompt` where the host's total
+  exceeds the prompt, and fills `reasoning_tokens` with the difference from `completion_tokens`
+  — a subset of output, never added to it, and left `None` rather than `Some(0)` when the gap
+  is zero. See the Bridge 0.141.0 entry for the measurements.
+
 ## [Bridge 0.140.1] - 2026-09-15
 
 Two of 0.140.0's new append tests built a one-row slice with `&[row.clone()]`, which

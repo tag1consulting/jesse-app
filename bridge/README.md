@@ -576,10 +576,16 @@ before the key existed resolves to exactly what it already meant**:
 Set it as `wire = "…"` in a `[[models]]` entry or as `JESSE_MODEL_<ID>_WIRE` for the
 env-triple models. `Harness::supports_wire` says which wires a harness can drive a turn over
 — `claude-code` drives `messages` only; `codex` drives `responses` (a provider endpoint) and
-`messages` (its own subscription login, which names no provider) — and
-`validate_model_config` refuses a pairing at **startup**, naming the model, the wire and the
-harness. No harness drives `chat` today, so declaring it is a startup error rather than a
-silent downgrade. The health probe's default path follows the **wire**, not the kind:
+`messages` (its own subscription login, which names no provider); `direct` drives all three —
+and `validate_model_config` refuses a pairing at **startup**, naming the model, the wire and
+the harness, rather than silently downgrading it.
+
+**`chat` IS A `direct`-ONLY SURFACE**, and the three Gemini models are what drive it: Google
+serves neither an Anthropic Messages surface nor an OpenAI Responses one, so no CLI harness
+has an endpoint there to talk to. That is a real parity gap and not an oversight — reaching
+Gemini from `claude-code` or `codex` would need a translating gateway, which nothing here
+builds. A Gemini model declaring either harness is refused at startup by the rule above.
+The health probe's default path follows the **wire**, not the kind:
 `/chat/completions` for `chat` and `responses`, `/v1/messages` for `messages`. (`responses`
 probing the chat path is deliberate and unchanged: the minimal probe body is valid on both
 OpenAI contracts, so the chat path returns a real one-token completion and a green light means
@@ -596,6 +602,15 @@ belongs to the account, not the model, so there are three scopes:
 | `claude-subscription` | `claude-code` models on the bridge's own login (`ambient`, `subscription`) | `GET https://api.anthropic.com/api/oauth/usage` with the login's OAuth token, plus the `rate_limit_event` a `claude` child writes during a turn |
 | `codex-chatgpt` | `codex` models on the ChatGPT login (any `kind` but `openai`) | `account/rateLimits/read` on a short-lived `codex app-server`, plus the `account/rateLimits/updated` notification a turn carries |
 | `fireworks` | any model whose backend host is `api.fireworks.ai` | `GET /v1/accounts/{id}/billingUsage`, month to date, once `[quota] fireworks_account_id` is set |
+
+**THE THREE GEMINI MODELS MAP TO NO SCOPE**, and report `usage_scope: null` exactly as a
+`local` model does — they fall through every arm of `scope_for_parts`, because their backend
+host is Google's and the bridge has no Google billing reader. The picker renders no usage
+subtitle for them. This is the `null` case the paragraph above describes ("any other host"),
+not a gap waiting to be filled: adding one would mean a fourth scope with its own credential,
+which this does not build. Their per-turn COST is still reported — the badge prices every turn
+from the model's deck regardless of scope — so what is missing is the account balance, not the
+spend.
 
 `GET /jesse/usage` (bearer auth, like `/jesse/models`) answers `{"scopes": [...]}`, one entry
 per scope that a configured model maps to:

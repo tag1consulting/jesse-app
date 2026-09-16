@@ -36,6 +36,38 @@ final class ModelMenuTests: XCTestCase {
         XCTAssertEqual(layout.sections[1].rows.map(\.id), ["glm"])
     }
 
+    func testTheGeminiFamilyRendersAsOneSectionAndDeclaresNoEffort() {
+        // THE THREE GEMINI MODELS REACH THE PICKER WITH NO CLIENT CHANGE AT ALL, and this is
+        // the guard for that: the menu groups by whatever `family` the bridge sends, and
+        // `opus` is the only model id hardcoded anywhere in shipping Swift. A family of three
+        // gets a header, and its rows hold registry order rather than being sorted.
+        //
+        // NO EFFORT CONTROL, and that is not an omission. These run on the `direct` harness,
+        // which has no per-turn effort path — the bridge refuses at startup a direct model
+        // that declares one — so every Gemini row arrives with `effort: null`. A picker
+        // offering an effort here would be offering something no turn could honour.
+        //
+        // `harness: "direct"` is carried because the row does carry it, but it is display
+        // information beside the version and never a choice: nothing in the layout branches
+        // on it.
+        let layout = ModelMenuLayout(
+            state: state([model("opus", family: "Claude", kind: "ambient"),
+                          model("gemini-pro", family: "Gemini",
+                                harness: "direct", version: "3.1 Pro"),
+                          model("gemini-flash", family: "Gemini",
+                                harness: "direct", version: "3.8 Flash"),
+                          model("gemini-flash-lite", family: "Gemini",
+                                harness: "direct", version: "3.5 Flash-Lite")]),
+            threadModelID: "gemini-flash", deviceDefaultID: nil, threadEffort: nil)
+        XCTAssertEqual(layout.sections.map(\.id), ["Claude", "Gemini"], "registry order, grouped")
+        XCTAssertNil(layout.sections[0].header, "a family of one is a plain row")
+        XCTAssertEqual(layout.sections[1].header, "Gemini", "three models: a header")
+        XCTAssertEqual(layout.sections[1].rows.map(\.id),
+                       ["gemini-pro", "gemini-flash", "gemini-flash-lite"],
+                       "the bridge's order, not alphabetical")
+        XCTAssertNil(layout.effort, "the direct harness has no per-turn effort path")
+    }
+
     func testAModelWithNoDeclaredEffortScaleRendersNoEffortSection() {
         let layout = ModelMenuLayout(
             state: state([model("opus", effort: scale, kind: "ambient"),

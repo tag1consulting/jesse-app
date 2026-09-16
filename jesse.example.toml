@@ -231,6 +231,41 @@ Answer the question I asked, not the one you wish I had asked.
 # fine). `local` has no defaults: all three vars are required. Every deck is overridable per
 # model via `JESSE_MODEL_<ID>_PRICE_{IN,CACHED,OUT}`.
 #
+# THE THREE GEMINI ENTRIES ARE THE EXCEPTION TO "claude-code": they run on `direct` over the
+# `chat` wire, because Google serves neither an Anthropic Messages surface nor an OpenAI
+# Responses one. No CLI harness has an endpoint there to talk to, so reaching Gemini from
+# `claude-code` or `codex` would need a translating gateway — a real parity gap, stated here
+# rather than hidden. Same arming rule as above: one var each, base URL and slug defaulted.
+#
+#     id                 model                     version         deck (in / cached / out)
+#     gemini-pro         gemini-3.1-pro-preview    3.1 Pro         2.00 / 0.20  / 12.00
+#     gemini-flash       gemini-3.8-flash          3.8 Flash       0.75 / 0.075 /  3.75
+#     gemini-flash-lite  gemini-3.5-flash-lite     3.5 Flash-Lite  0.30 / 0.03  /  2.50
+#
+#     JESSE_MODEL_GEMINI_PRO_AUTH_TOKEN=...          # an AI Studio / Gemini API key
+#     JESSE_MODEL_GEMINI_FLASH_AUTH_TOKEN=...        # the same key in all three is fine
+#     JESSE_MODEL_GEMINI_FLASH_LITE_AUTH_TOKEN=...
+#
+# THE ID NAMES A TIER HERE, NOT A VERSION, which is the same rule as above and not an
+# exception to it: `pro` / `flash` / `flash-lite` are three different models sold at three
+# different prices, not three versions of one. The VERSION is still its own key, so pointing
+# `gemini-pro` at a future 4 Pro stays `JESSE_MODEL_GEMINI_PRO_MODEL` + `_VERSION` and no
+# release. Worth knowing about that one: `gemini-3.1-pro-preview` is a PREVIEW model and no
+# Gemini 3.x Pro has ever reached GA — the newest stable Pro is `gemini-2.5-pro` from June
+# 2025 — so there is no stable slug to prefer, and Google retired its predecessor on about
+# four months' notice.
+#
+# TWO THINGS THE COST BADGE UNDER-REPORTS FOR THIS FAMILY, both because `PriceDeck` is four
+# flat rates with no tier and no clock. Gemini 3.1 Pro charges DOUBLE input and 1.5x output
+# on a prompt over 200k tokens (4.00 / 0.40 / 18.00), and the Flash deck above is an
+# INTRODUCTORY rate that becomes 1.50 / 0.15 / 7.50 on 2027-01-01. Neither changes by itself:
+# on that date, either set `JESSE_MODEL_GEMINI_FLASH_PRICE_{IN,CACHED,OUT}` here or ship a
+# release. Context-cache STORAGE (billed per hour) has no field at all.
+#
+# NO QUOTA SCOPE. `GET /jesse/models` reports `usage_scope: null` for all three and the picker
+# shows no usage subtitle, the same as a `local` model: the bridge can read Anthropic,
+# ChatGPT and Fireworks balances, and has no Google equivalent.
+#
 # KIMI K3 USED TO BE REGISTERED TWICE — `kimi` here, and `kimi-codex` on the codex harness
 # over Fireworks' Responses API, which this file once called the RECOMMENDED path for K3.
 # That is reversed: the Codex twin is RETIRED, and `kimi-codex` / `kimi-k3-codex` are now
@@ -1274,6 +1309,40 @@ Answer the question I asked, not the one you wish I had asked.
 # [models.quirks]
 # reasoning_effort_supported = false           # already the default off api.openai.com
 # strict_tools = false                         # ditto; spelled out because this host rejects it
+#
+# Google Gemini, on the same `chat` wire. THE THREE GEMINI MODELS ARE BUILT IN and need no
+# block like this — `JESSE_MODEL_GEMINI_{PRO,FLASH,FLASH_LITE}_AUTH_TOKEN` arms each on its
+# own (see "ONE MODEL, ONE HARNESS" above). This is the shape to copy for a FOURTH Gemini
+# slug the registry does not ship, and it is also where the family's measured quirks are
+# written down, because they are what a hand-rolled entry most easily gets wrong.
+# Arm it with: GEMINI_API_KEY=...
+# [[models]]
+# id = "gemini-flash-image"
+# label = "Gemini (image)"
+# kind = "hosted"
+# wire = "chat"                                # Google serves NO /v1/messages and NO /responses
+# base_url = "https://generativelanguage.googleapis.com/v1beta/openai"   # the API ROOT
+# model = "gemini-3.1-flash-image"
+# auth_token_env = "GEMINI_API_KEY"
+# harness = "direct"                           # the ONLY harness that can drive this family
+# read_only = true
+# thinking = "off"                             # NOT "no thinking" on this host: `off` sends no
+#                                              # reasoning_effort at all, so Gemini applies its
+#                                              # own per-model default. Gemini 3 Pro cannot have
+#                                              # thinking disabled by any setting.
+# price = { in_per_m = 0.30, cached_per_m = 0.03, out_per_m = 2.50 }
+# health = { timeout_secs = 15 }               # every model here thinks before answering; the
+#                                              # 3 s default is a coin toss (probes measured
+#                                              # 0.6-2.7 s). The PATH needs no entry: it follows
+#                                              # the wire to /chat/completions.
+# [models.quirks]
+# reasoning_effort_supported = true            # HONORED here, unlike most non-OpenAI hosts
+# strict_tools = false                         # silently IGNORED: an invalid strict schema is
+#                                              # accepted with 200, so `strict` buys nothing
+# multiple_system_messages = false             # MUST stay false: several system messages do not
+#                                              # merge on this host, the last one WINS and the
+#                                              # rest are dropped — turning this on silently
+#                                              # discards the persona
 #
 # OpenAI Responses, straight at the vendor — the same surface the Codex harness drives, but
 # with no child process and no shell. THIS IS THE PREFERRED WAY TO REACH AN OPENAI-SHAPED
