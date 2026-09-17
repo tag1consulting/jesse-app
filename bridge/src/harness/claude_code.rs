@@ -1039,6 +1039,33 @@ pub const MAIN_CHILD_MCP_CONFIG: &str = concat!(
     "}}"
 );
 
+/// **The six servers the owner's own replies arrive on** — `google`, `google-perseido`,
+/// `fastmail`, `slack`, `whatsapp`, `imcp` — and nothing else. The TODAY-BRIEF child's set when
+/// sent-message search is on. See [`McpSet::Replies`] for which layer holds each server.
+///
+/// **THE FIRST SET HERE THAT IS NOT A SUPERSET OF ITS PREDECESSOR.** It is [`MESSAGES_MCP_CONFIG`]
+/// with the infrastructure taken out: no qmd, no browser, no Home Assistant, no Roon, no GitHub,
+/// no RouterOS, and — the reason it exists — no UniFi and no Proxmox. Assembled from the same
+/// `mcp_*!` fragments as every set above, so a server's arguments still have exactly one
+/// spelling and this set cannot drift from the main turn's.
+///
+/// The declaration order matches [`McpSet::Replies`]'s label, which is the row key.
+pub const REPLIES_MCP_CONFIG: &str = concat!(
+    r#"{"mcpServers":{"#,
+    mcp_google!(),
+    ",",
+    mcp_google_perseido!(),
+    ",",
+    mcp_fastmail!(),
+    ",",
+    mcp_slack!(),
+    ",",
+    mcp_whatsapp!(),
+    ",",
+    mcp_imcp!(),
+    "}}"
+);
+
 /// qmd PLUS slack PLUS browser — the main turn's server set from bridge 0.66.0 until Home
 /// Assistant and Roon were added in 0.67.0. No shipped spawn site uses it today; retained
 /// for exactly the reason [`QMD_SLACK_MCP_CONFIG`] is, and it had to be SPLIT OUT rather
@@ -1183,6 +1210,53 @@ pub const READ_ROOT_TOOLS: &str = "Read,Grep,Glob";
 pub const READ_ALLOWED_TOOLS: &str = "Read(./**),Grep(./**),Glob(./**),\
 mcp__qmd__query,mcp__qmd__get,mcp__qmd__multi_get,mcp__qmd__status";
 
+/// The `--allowedTools` grant for a [`Capability::Read`] child on [`McpSet::Replies`]: the
+/// three read-only built-ins, plus the READ tools of the six message servers and NOTHING else.
+///
+/// # Every name here is already in [`crate::DEFAULT_ALLOWED_TOOLS`]
+///
+/// That is a deliberate constraint rather than a coincidence, and a test asserts it: this grant
+/// may narrow the main turn's, never widen it. A tool the main turn does not trust itself with
+/// cannot first appear on an unattended background child that closes the owner's items.
+///
+/// # What is withheld, per server, and why
+///
+/// * **`slack`** — the same six read tools the main turn gets. Its SEND tools
+///   (`conversations_add_message` and siblings) are registered by the server and withheld HERE,
+///   by name, and by nothing else. One layer.
+/// * **`whatsapp`** — the eight read tools. `send_message`, `send_file` and
+///   `send_audio_message` are withheld by this list ALONE; `download_media` is withheld too,
+///   and for a different reason — it WRITES a file, which a read child must not do.
+/// * **`imcp`** — `messages_fetch` only. `maps_search` is granted to the MAIN turn and is
+///   deliberately NOT here: it leaves the host carrying a query string, and a brief has no use
+///   for a map. The other four Maps tools are ungranted there too. iMCP registers no send tool.
+/// * **`google` / `google-perseido`** — the SIX GMAIL READ TOOLS only. Not Drive, not Calendar:
+///   the main turn's grant names those and this one must not, because a sent reply is mail.
+/// * **`fastmail`** — all three of its tools, which are all reads.
+///
+/// No `mcp__qmd__*`: this child reads the notes it was handed and searches messages, and vault
+/// search is what it does not need. No `WebSearch`/`WebFetch`, which `READ_DISALLOWED_TOOLS`
+/// denies anyway — stated here so the two lists cannot drift into disagreeing.
+pub const REPLIES_ALLOWED_TOOLS: &str = "Read(./**),Grep(./**),Glob(./**),\
+mcp__google__search_gmail_messages,mcp__google__get_gmail_message_content,\
+mcp__google__get_gmail_messages_content_batch,mcp__google__get_gmail_thread_content,\
+mcp__google__get_gmail_threads_content_batch,mcp__google__list_gmail_labels,\
+mcp__google-perseido__search_gmail_messages,\
+mcp__google-perseido__get_gmail_message_content,\
+mcp__google-perseido__get_gmail_messages_content_batch,\
+mcp__google-perseido__get_gmail_thread_content,\
+mcp__google-perseido__get_gmail_threads_content_batch,\
+mcp__google-perseido__list_gmail_labels,\
+mcp__fastmail__get_mailboxes,mcp__fastmail__search_emails,mcp__fastmail__get_email_content,\
+mcp__slack__conversations_search_messages,mcp__slack__conversations_history,\
+mcp__slack__conversations_replies,mcp__slack__channels_list,mcp__slack__channels_me,\
+mcp__slack__users_search,\
+mcp__whatsapp__search_contacts,mcp__whatsapp__list_messages,mcp__whatsapp__list_chats,\
+mcp__whatsapp__get_chat,mcp__whatsapp__get_direct_chat_by_contact,\
+mcp__whatsapp__get_contact_chats,mcp__whatsapp__get_last_interaction,\
+mcp__whatsapp__get_message_context,\
+mcp__imcp__messages_fetch";
+
 /// The `--allowedTools` grant a [`Capability::Read`] child gets FOR ONE MCP SET.
 ///
 /// # Exhaustive ON PURPOSE — never add a `_` arm
@@ -1207,6 +1281,9 @@ pub fn read_allowed_tools(mcp: McpSet) -> &'static str {
         | McpSet::MessagesBuild
         | McpSet::MessagesBuildPlaces
         | McpSet::MessagesBuildPlacesInbound => READ_ALLOWED_TOOLS,
+        // THE ONE SET WHOSE READ GRANT IS NOT THE QMD-ONLY ONE. This is the line the whole
+        // row-keyed argv exists for; see [`REPLIES_ALLOWED_TOOLS`].
+        McpSet::Replies => REPLIES_ALLOWED_TOOLS,
     }
 }
 
@@ -3483,6 +3560,149 @@ mod tests {
             .get_args()
             .map(|s| s.to_string_lossy().into_owned())
             .collect()
+    }
+
+    /// THE GOLDEN GRANT FOR `read/<the Replies label>`, per server, by name.
+    ///
+    /// Expressed through [`granted_mcp_tools`] rather than by eyeballing one 900-character
+    /// string, because that is the function CODEX derives its `enabled_tools` from — so this
+    /// pins what BOTH harnesses expose from one assertion, and a name added to the grant shows
+    /// up here as a changed list rather than hiding inside a literal.
+    #[test]
+    fn the_replies_read_grant_names_exactly_these_tools_per_server() {
+        for (server, expected) in [
+            (
+                "google",
+                vec![
+                    "search_gmail_messages",
+                    "get_gmail_message_content",
+                    "get_gmail_messages_content_batch",
+                    "get_gmail_thread_content",
+                    "get_gmail_threads_content_batch",
+                    "list_gmail_labels",
+                ],
+            ),
+            (
+                "google-perseido",
+                vec![
+                    "search_gmail_messages",
+                    "get_gmail_message_content",
+                    "get_gmail_messages_content_batch",
+                    "get_gmail_thread_content",
+                    "get_gmail_threads_content_batch",
+                    "list_gmail_labels",
+                ],
+            ),
+            (
+                "fastmail",
+                vec!["get_mailboxes", "search_emails", "get_email_content"],
+            ),
+            (
+                "slack",
+                vec![
+                    "conversations_search_messages",
+                    "conversations_history",
+                    "conversations_replies",
+                    "channels_list",
+                    "channels_me",
+                    "users_search",
+                ],
+            ),
+            (
+                "whatsapp",
+                vec![
+                    "search_contacts",
+                    "list_messages",
+                    "list_chats",
+                    "get_chat",
+                    "get_direct_chat_by_contact",
+                    "get_contact_chats",
+                    "get_last_interaction",
+                    "get_message_context",
+                ],
+            ),
+            ("imcp", vec!["messages_fetch"]),
+        ] {
+            assert_eq!(
+                granted_mcp_tools(REPLIES_ALLOWED_TOOLS, server),
+                expected,
+                "{server}: the Replies grant must name exactly these tools"
+            );
+        }
+        // NOT ONE TOOL on any server this set does not load — including qmd, which every
+        // other Read grant carries.
+        for server in [
+            "qmd",
+            "browser",
+            "homeassistant",
+            "roon",
+            "github",
+            "unifi",
+            "routeros",
+            "proxmox",
+            "build",
+            "places",
+            "inbound",
+        ] {
+            assert!(
+                granted_mcp_tools(REPLIES_ALLOWED_TOOLS, server).is_empty(),
+                "{server} must have no tool in the Replies grant"
+            );
+        }
+        // The three read-only built-ins, path-scoped, and the argv shape around them.
+        assert_eq!(
+            claude_capability_args(&test_config(), Capability::Read, McpSet::Replies),
+            vec![
+                "--tools".to_string(),
+                READ_ROOT_TOOLS.to_string(),
+                "--allowedTools".to_string(),
+                REPLIES_ALLOWED_TOOLS.to_string(),
+                "--disallowedTools".to_string(),
+                READ_DISALLOWED_TOOLS.to_string(),
+            ],
+            "the Replies row runs the read root toolset with its own grant"
+        );
+        assert!(REPLIES_ALLOWED_TOOLS.starts_with("Read(./**),Grep(./**),Glob(./**),"));
+    }
+
+    /// THE REPLIES GRANT MAY NARROW THE MAIN TURN'S, NEVER WIDEN IT.
+    ///
+    /// A tool the writes-on main turn is not trusted with must not first appear on an
+    /// unattended background child that can check the owner's items off. Asserted for every
+    /// server rather than only for the three the brief prompt named, because the direction of
+    /// the rule has nothing to do with which server it is.
+    #[test]
+    fn the_replies_grant_never_names_a_tool_the_main_turn_grant_does_not() {
+        for entry in REPLIES_ALLOWED_TOOLS
+            .split(',')
+            .filter(|e| e.starts_with("mcp__"))
+        {
+            assert!(
+                DEFAULT_ALLOWED_TOOLS.contains(entry),
+                "{entry} is granted to the brief child but not to the main turn"
+            );
+        }
+        // And the specific withholdings, by name, so a rename upstream fails here rather than
+        // silently granting. The two SEND families are the ones held back by this list ALONE.
+        for withheld in [
+            "mcp__whatsapp__send_message",
+            "mcp__whatsapp__send_file",
+            "mcp__whatsapp__send_audio_message",
+            "mcp__whatsapp__download_media",
+            "mcp__imcp__maps_search",
+            "mcp__google__search_drive_files",
+            "mcp__google__get_drive_file_content",
+            "mcp__google__list_calendars",
+            "mcp__google__get_events",
+            "mcp__google-perseido__search_drive_files",
+            "mcp__google-perseido__list_calendars",
+            "mcp__qmd__query",
+        ] {
+            assert!(
+                !REPLIES_ALLOWED_TOOLS.contains(withheld),
+                "{withheld} must not be in the Replies grant"
+            );
+        }
     }
 
     #[test]

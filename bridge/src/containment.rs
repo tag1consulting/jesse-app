@@ -243,6 +243,46 @@ pub enum McpSet {
     /// it writes into `.jesse-inbound/` under the workspace and nowhere else. See
     /// [`crate::inbound`].
     MessagesBuildPlacesInbound,
+    /// **The six servers the owner's own replies arrive on, and NOTHING else**
+    /// ([`REPLIES_MCP_CONFIG`]): `google`, `google-perseido`, `fastmail`, `slack`, `whatsapp`
+    /// and `imcp`. The TODAY-BRIEF child, when sent-message search is switched on.
+    ///
+    /// **THIS IS THE FIRST SET THAT IS NOT A SUPERSET OF THE ONE BEFORE IT.** Every set above
+    /// grew by addition, so each row's posture contained its predecessor's. This one is a
+    /// SUBSET of [`McpSet::Messages`] with the infrastructure removed: no qmd, no browser, no
+    /// Home Assistant, no GitHub, no RouterOS — and, the point of the exercise, no UniFi and no
+    /// Proxmox. The smallest existing set containing `fastmail` is [`McpSet::Morning`], eleven
+    /// servers including `proxmox_execute_vm_command`; a background child that closes the
+    /// owner's items off its own judgement has no business holding that.
+    ///
+    /// **WHAT THIS ROW IS FOR.** The brief judges "is this still open?" from the notes, and the
+    /// notes reliably record a request and miss the answer. The answer is in the owner's own
+    /// replies, which go out on whichever channel the request arrived on. A brief that searches
+    /// some channels leaves the list wrong on the others, so the set is all six or none.
+    ///
+    /// # WHICH LAYER HOLDS EACH SERVER, because they are not the same and the difference is the
+    /// whole risk statement
+    ///
+    /// * `google` and `google-perseido` — read-only at the SERVER FLAG (`--read-only`), at the
+    ///   CREDENTIAL (`*.readonly` OAuth scopes) and at the allowlist. Three layers.
+    /// * `fastmail` — the server registers three tools and all three read. There is no write
+    ///   tool to withhold, so the question of a layer does not arise.
+    /// * `imcp` — registers no send or compose tool at all; sending is absent at the root. Its
+    ///   six tools are `messages_fetch` and five Maps tools, of which this set grants only
+    ///   `messages_fetch` (NOT `maps_search`, whose egress the main turn accepts and this child
+    ///   has no use for).
+    /// * `slack` and `whatsapp` — **read-only at the ALLOWLIST ALONE.** Both servers register
+    ///   tools that SEND, and the only thing standing between this child and them is that
+    ///   [`crate::REPLIES_ALLOWED_TOOLS`] does not name them. One layer. Do NOT describe this
+    ///   pair as credential-enforced or server-enforced; that is the claim the row's probes
+    ///   exist to test rather than to assume.
+    ///
+    /// The prompt-injection property [`McpSet::contains_whatsapp`] describes is UNCHANGED here
+    /// and is not mitigated by the narrower set: message bodies are still written by anyone who
+    /// knows the number. What the narrower set changes is what a child that reads such a body
+    /// can then reach — which is now six read surfaces rather than the network and the
+    /// hypervisor. That is a real reduction and it is not a solution; see SECURITY.md.
+    Replies,
 }
 
 /// The label for [`McpSet::Messages`], written ONCE.
@@ -275,6 +315,15 @@ fastmail+unifi+routeros+proxmox+whatsapp+imcp+google-perseido+build+places";
 const MESSAGES_BUILD_PLACES_INBOUND_LABEL: &str = "qmd+slack+browser+homeassistant+roon+google+\
 github+fastmail+unifi+routeros+proxmox+whatsapp+imcp+google-perseido+build+places+inbound";
 
+/// The label for [`McpSet::Replies`], written ONCE for the reason every label above it is: a
+/// typo in the `parse` arm would fail the round trip for exactly the row a startup gate needs
+/// to resolve, and it would fail it by returning `None` rather than by failing to compile.
+///
+/// The server order here is the order the set's config declares them, and it is NOT the order
+/// [`McpSet::server_names`] reports (that one walks the predicates in their historical order).
+/// Nothing compares the two; the label is the row key and the config is what the child loads.
+const REPLIES_LABEL: &str = "google+google-perseido+fastmail+slack+whatsapp+imcp";
+
 impl McpSet {
     /// The label used in the results file and on the command line.
     pub fn label(&self) -> &'static str {
@@ -291,6 +340,7 @@ impl McpSet {
             McpSet::MessagesBuild => MESSAGES_BUILD_LABEL,
             McpSet::MessagesBuildPlaces => MESSAGES_BUILD_PLACES_LABEL,
             McpSet::MessagesBuildPlacesInbound => MESSAGES_BUILD_PLACES_INBOUND_LABEL,
+            McpSet::Replies => REPLIES_LABEL,
         }
     }
 
@@ -309,6 +359,7 @@ impl McpSet {
             MESSAGES_BUILD_LABEL => Some(McpSet::MessagesBuild),
             MESSAGES_BUILD_PLACES_LABEL => Some(McpSet::MessagesBuildPlaces),
             MESSAGES_BUILD_PLACES_INBOUND_LABEL => Some(McpSet::MessagesBuildPlacesInbound),
+            REPLIES_LABEL => Some(McpSet::Replies),
             _ => None,
         }
     }
@@ -329,6 +380,7 @@ impl McpSet {
             McpSet::MessagesBuild => MESSAGES_BUILD_MCP_CONFIG,
             McpSet::MessagesBuildPlaces => MESSAGES_BUILD_PLACES_MCP_CONFIG,
             McpSet::MessagesBuildPlacesInbound => MAIN_CHILD_MCP_CONFIG,
+            McpSet::Replies => REPLIES_MCP_CONFIG,
         }
     }
 
@@ -339,7 +391,7 @@ impl McpSet {
     /// It is a literal array rather than something derived, so adding a variant without adding
     /// it here is caught by [`every_set_round_trips_through_its_config`] rather than silently
     /// making that set unresolvable from a spawn site's config string.
-    pub const ALL: [McpSet; 10] = [
+    pub const ALL: [McpSet; 11] = [
         McpSet::None,
         McpSet::Qmd,
         McpSet::QmdSlack,
@@ -350,6 +402,7 @@ impl McpSet {
         McpSet::MessagesBuild,
         McpSet::MessagesBuildPlaces,
         McpSet::MessagesBuildPlacesInbound,
+        McpSet::Replies,
     ];
 
     /// Which shipped set a `--mcp-config` VALUE is, or `None` when it is not one of ours.
@@ -381,7 +434,9 @@ impl McpSet {
     /// possible place to be told.
     pub fn contains_qmd(&self) -> bool {
         match self {
-            McpSet::None => false,
+            // NOT in `Replies`: the brief child searches sent messages, and vault search is
+            // the one thing it does NOT need a server for — it already has the notes.
+            McpSet::None | McpSet::Replies => false,
             McpSet::Qmd
             | McpSet::QmdSlack
             | McpSet::QmdSlackBrowser
@@ -415,7 +470,10 @@ impl McpSet {
             | McpSet::Messages
             | McpSet::MessagesBuild
             | McpSet::MessagesBuildPlaces
-            | McpSet::MessagesBuildPlacesInbound => true,
+            | McpSet::MessagesBuildPlacesInbound
+            // `Replies` loads Slack for the owner's own sent messages. Its SEND tools are
+            // registered by the server and withheld by the allowlist ALONE — see the variant.
+            | McpSet::Replies => true,
         }
     }
 
@@ -423,7 +481,7 @@ impl McpSet {
     /// two siblings above, and never a `_` arm.
     pub fn contains_browser(&self) -> bool {
         match self {
-            McpSet::None | McpSet::Qmd | McpSet::QmdSlack => false,
+            McpSet::None | McpSet::Qmd | McpSet::QmdSlack | McpSet::Replies => false,
             McpSet::QmdSlackBrowser
             | McpSet::House
             | McpSet::Morning
@@ -443,7 +501,11 @@ impl McpSet {
     /// can move the entrance gate.
     pub fn contains_homeassistant(&self) -> bool {
         match self {
-            McpSet::None | McpSet::Qmd | McpSet::QmdSlack | McpSet::QmdSlackBrowser => false,
+            McpSet::None
+            | McpSet::Qmd
+            | McpSet::QmdSlack
+            | McpSet::QmdSlackBrowser
+            | McpSet::Replies => false,
             McpSet::House
             | McpSet::Morning
             | McpSet::Messages
@@ -457,7 +519,11 @@ impl McpSet {
     /// arm.
     pub fn contains_roon(&self) -> bool {
         match self {
-            McpSet::None | McpSet::Qmd | McpSet::QmdSlack | McpSet::QmdSlackBrowser => false,
+            McpSet::None
+            | McpSet::Qmd
+            | McpSet::QmdSlack
+            | McpSet::QmdSlackBrowser
+            | McpSet::Replies => false,
             McpSet::House
             | McpSet::Morning
             | McpSet::Messages
@@ -480,7 +546,11 @@ impl McpSet {
             | McpSet::Messages
             | McpSet::MessagesBuild
             | McpSet::MessagesBuildPlaces
-            | McpSet::MessagesBuildPlacesInbound => true,
+            | McpSet::MessagesBuildPlacesInbound
+            // `Replies` loads it for the work mailbox. Read-only at three layers: the
+            // `--read-only` server flag, `*.readonly` OAuth scopes, and the allowlist —
+            // which grants the GMAIL READ TOOLS ONLY, not Drive and not Calendar.
+            | McpSet::Replies => true,
         }
     }
 
@@ -491,7 +561,8 @@ impl McpSet {
             | McpSet::Qmd
             | McpSet::QmdSlack
             | McpSet::QmdSlackBrowser
-            | McpSet::House => false,
+            | McpSet::House
+            | McpSet::Replies => false,
             McpSet::Morning
             | McpSet::Messages
             | McpSet::MessagesBuild
@@ -512,7 +583,10 @@ impl McpSet {
             | McpSet::Messages
             | McpSet::MessagesBuild
             | McpSet::MessagesBuildPlaces
-            | McpSet::MessagesBuildPlacesInbound => true,
+            | McpSet::MessagesBuildPlacesInbound
+            // `Replies` loads it for the personal mailbox. The server registers three tools
+            // and all three read: there is no write tool to withhold here.
+            | McpSet::Replies => true,
         }
     }
 
@@ -525,7 +599,10 @@ impl McpSet {
             | McpSet::Qmd
             | McpSet::QmdSlack
             | McpSet::QmdSlackBrowser
-            | McpSet::House => false,
+            | McpSet::House
+            // DROPPING THIS IS HALF THE POINT OF `Replies`: a background child that closes
+            // the owner's items must not hold full network control.
+            | McpSet::Replies => false,
             McpSet::Morning
             | McpSet::Messages
             | McpSet::MessagesBuild
@@ -542,7 +619,8 @@ impl McpSet {
             | McpSet::Qmd
             | McpSet::QmdSlack
             | McpSet::QmdSlackBrowser
-            | McpSet::House => false,
+            | McpSet::House
+            | McpSet::Replies => false,
             McpSet::Morning
             | McpSet::Messages
             | McpSet::MessagesBuild
@@ -560,7 +638,10 @@ impl McpSet {
             | McpSet::Qmd
             | McpSet::QmdSlack
             | McpSet::QmdSlackBrowser
-            | McpSet::House => false,
+            | McpSet::House
+            // THE OTHER HALF OF THE POINT. `proxmox_execute_vm_command` is arbitrary command
+            // execution inside any guest; `Replies` exists so the brief child never loads it.
+            | McpSet::Replies => false,
             McpSet::Morning
             | McpSet::Messages
             | McpSet::MessagesBuild
@@ -584,7 +665,8 @@ impl McpSet {
             McpSet::Messages
             | McpSet::MessagesBuild
             | McpSet::MessagesBuildPlaces
-            | McpSet::MessagesBuildPlacesInbound => true,
+            | McpSet::MessagesBuildPlacesInbound
+            | McpSet::Replies => true,
         }
     }
 
@@ -615,7 +697,8 @@ impl McpSet {
             McpSet::Messages
             | McpSet::MessagesBuild
             | McpSet::MessagesBuildPlaces
-            | McpSet::MessagesBuildPlacesInbound => true,
+            | McpSet::MessagesBuildPlacesInbound
+            | McpSet::Replies => true,
         }
     }
 
@@ -637,7 +720,8 @@ impl McpSet {
             McpSet::Messages
             | McpSet::MessagesBuild
             | McpSet::MessagesBuildPlaces
-            | McpSet::MessagesBuildPlacesInbound => true,
+            | McpSet::MessagesBuildPlacesInbound
+            | McpSet::Replies => true,
         }
     }
 
@@ -657,7 +741,8 @@ impl McpSet {
             | McpSet::QmdSlackBrowser
             | McpSet::House
             | McpSet::Morning
-            | McpSet::Messages => false,
+            | McpSet::Messages
+            | McpSet::Replies => false,
             McpSet::MessagesBuild
             | McpSet::MessagesBuildPlaces
             | McpSet::MessagesBuildPlacesInbound => true,
@@ -682,7 +767,8 @@ impl McpSet {
             | McpSet::House
             | McpSet::Morning
             | McpSet::Messages
-            | McpSet::MessagesBuild => false,
+            | McpSet::MessagesBuild
+            | McpSet::Replies => false,
             McpSet::MessagesBuildPlaces | McpSet::MessagesBuildPlacesInbound => true,
         }
     }
@@ -705,7 +791,8 @@ impl McpSet {
             | McpSet::Morning
             | McpSet::Messages
             | McpSet::MessagesBuild
-            | McpSet::MessagesBuildPlaces => false,
+            | McpSet::MessagesBuildPlaces
+            | McpSet::Replies => false,
             McpSet::MessagesBuildPlacesInbound => true,
         }
     }
@@ -1575,6 +1662,105 @@ mod tests {
                 &format!("read/{MESSAGES_LABEL}"),
                 &format!("write/{MESSAGES_LABEL}")
             ]
+        );
+    }
+
+    /// EVERY set resolves from its own config string and its own label. The guard named in
+    /// [`McpSet::ALL`]'s doc comment: a variant added to the enum but not to `ALL` would be
+    /// unresolvable from a spawn site's `--mcp-config`, which is exactly how a child would
+    /// silently fall back to another set's grant.
+    #[test]
+    fn every_set_round_trips_through_its_config() {
+        for s in McpSet::ALL {
+            assert_eq!(
+                McpSet::from_config(s.config()),
+                Some(s),
+                "{:?} must resolve from its own config string",
+                s
+            );
+            assert_eq!(
+                McpSet::parse(s.label()),
+                Some(s),
+                "{:?} must round-trip through its label",
+                s
+            );
+        }
+        // A config this project does not ship resolves to NOTHING rather than to a guess —
+        // the property a spawn site relies on to keep an operator's own file on the posture
+        // it already had.
+        assert_eq!(McpSet::from_config(r#"{"mcpServers":{"nope":{}}}"#), None);
+        assert_eq!(McpSet::from_config("/etc/jesse/qmd.json"), None);
+        // `ALL` must not have grown a duplicate: two variants claiming one config would make
+        // `from_config` answer whichever came first.
+        let mut labels: Vec<&str> = McpSet::ALL.iter().map(|s| s.label()).collect();
+        labels.sort_unstable();
+        let before = labels.len();
+        labels.dedup();
+        assert_eq!(before, labels.len(), "two sets share a label");
+    }
+
+    /// THE `Replies` SET IS THE SIX MESSAGE SERVERS AND NOTHING ELSE — asserted server by
+    /// server, in both directions.
+    ///
+    /// The negative half is the load-bearing half and it is why every server is named rather
+    /// than the count checked: this set exists precisely to drop the infrastructure, so a
+    /// future edit that quietly let `proxmox` or `unifi` back in would restore the very
+    /// posture the row was created to avoid. A count would not notice a swap.
+    #[test]
+    fn the_replies_set_is_the_six_message_servers_and_nothing_else() {
+        let r = McpSet::Replies;
+        assert_eq!(
+            r.server_names(),
+            vec![
+                "slack",
+                "google",
+                "fastmail",
+                "whatsapp",
+                "imcp",
+                "google-perseido"
+            ],
+            "the six the owner's replies arrive on"
+        );
+        for (name, present) in [
+            ("slack", r.contains_slack()),
+            ("google", r.contains_google()),
+            ("fastmail", r.contains_fastmail()),
+            ("whatsapp", r.contains_whatsapp()),
+            ("imcp", r.contains_imessage()),
+            ("google-perseido", r.contains_google_perseido()),
+        ] {
+            assert!(present, "{name} must be loaded");
+        }
+        for (name, present) in [
+            ("qmd", r.contains_qmd()),
+            ("browser", r.contains_browser()),
+            ("homeassistant", r.contains_homeassistant()),
+            ("roon", r.contains_roon()),
+            ("github", r.contains_github()),
+            ("unifi", r.contains_unifi()),
+            ("routeros", r.contains_routeros()),
+            ("proxmox", r.contains_proxmox()),
+            ("build", r.contains_build()),
+            ("places", r.contains_places()),
+            ("inbound", r.contains_inbound()),
+        ] {
+            assert!(
+                !present,
+                "{name} must NOT be loaded: dropping the infrastructure is the whole point \
+                 of this set"
+            );
+        }
+        // IT IS A SUBSET OF THE MAIN-TURN SET, NOT A SUPERSET — the first set here of which
+        // that is true, so it is asserted rather than assumed.
+        for server in r.server_names() {
+            assert!(
+                McpSet::Messages.server_names().contains(&server),
+                "{server} is in Replies but not in the main-turn set it is drawn from"
+            );
+        }
+        assert!(
+            r.server_names().len() < McpSet::Messages.server_names().len(),
+            "Replies must be strictly narrower than the set it is drawn from"
         );
     }
 
