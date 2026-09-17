@@ -32,6 +32,7 @@ ZERO="0000000000000000000000000000000000000000"
 # Pick the diff base for what's being pushed. Prefer the remote sha git feeds us
 # on stdin (exactly what the remote already has); else the branch's upstream;
 # else HEAD~1. If none resolves (initial push with no parent), the guard skips.
+# Whatever is picked is then sanity-checked against a rewritten history below.
 base=""
 while read -r local_ref local_sha remote_ref remote_sha; do
   [ "${local_sha:-$ZERO}" = "$ZERO" ] && continue   # branch deletion — nothing to check
@@ -46,6 +47,31 @@ if [ -z "$base" ]; then
 fi
 if [ -z "$base" ]; then
   base="HEAD~1"
+fi
+
+# A REWRITTEN history invalidates every base picked above. After a rebase — the
+# documented way to bring a branch up to date before merging — the sha the remote
+# still holds is no longer an ancestor of what is being pushed, so measuring from it
+# asks the wrong question. version-guard then rejects that base as stale ("N commit(s)
+# behind origin/main") and the FIRST push after any rebase fails, on a branch whose
+# versions are in fact correct. It also left `git diff "$base" HEAD` below describing a
+# range nobody is pushing.
+#
+# When that is what happened, measure from where this branch actually SITS: its merge
+# base with the integration branch. Deliberately narrow — a base that IS an ancestor of
+# HEAD is left exactly as it was, so an ordinary push is unaffected.
+UPSTREAM_REF="${VERSION_GUARD_UPSTREAM:-origin/main}"
+if [ -n "$base" ] \
+   && git rev-parse --verify --quiet "${base}^{commit}" >/dev/null 2>&1 \
+   && ! git merge-base --is-ancestor "$base" HEAD >/dev/null 2>&1; then
+  if rewritten_base="$(git merge-base HEAD "$UPSTREAM_REF" 2>/dev/null)" \
+     && [ -n "$rewritten_base" ]; then
+    echo "pre-push: $(git rev-parse --short "$base") is not an ancestor of HEAD —" \
+         "history was rewritten."
+    echo "          Measuring from the merge base with ${UPSTREAM_REF} instead" \
+         "($(git rev-parse --short "$rewritten_base"))."
+    base="$rewritten_base"
+  fi
 fi
 
 # --- 1. Version guard ------------------------------------------------------
