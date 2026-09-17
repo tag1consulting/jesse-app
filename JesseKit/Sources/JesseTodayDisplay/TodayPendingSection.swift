@@ -157,6 +157,7 @@ struct TodayPendingRow: View {
         case .quickLog: return "fork.knife"
         case .startNewDay: return "sun.horizon"
         case .processUpdates: return "arrow.up.forward.square"
+        case .logWorkouts: return "figure.run"
         }
     }
 

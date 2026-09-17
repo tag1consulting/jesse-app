@@ -40,7 +40,7 @@ final class ThreadListArchiveTests: XCTestCase {
     private func layout(_ threads: [JesseThread], scope: ThreadListView.ListScope) -> ThreadListLayout {
         threadListLayout(threads,
                          favoritesOnly: scope == .favorites,
-                         originScope: scope == .watch ? .watch : .all,
+                         originScope: scope.originScope,
                          archivedOnly: scope == .archived,
                          searchQueries: [""],
                          expanded: [],

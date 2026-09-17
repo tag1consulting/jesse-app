@@ -8,26 +8,33 @@ import JesseCore
 // The list can be scoped by where a thread originated. `.all` is the default —
 // every thread shows, the scope is inactive. `.watch` narrows to conversations
 // relayed from an Apple Watch (`origin == .watch`), so watch-originated turns can
-// be found on their own. The scope is an ADDITIVE filter: it composes with the
+// be found on their own; `.automatic` narrows to the turns the iPhone fired by
+// itself when new health data landed, so a morning's automatic weigh-in and the
+// afternoon's workout logs can be found at a glance. The scope is an ADDITIVE filter: it composes with the
 // Favorites filter and the search query (each narrows further) and is applied
 // BEFORE date grouping, so results stay date-sectioned exactly like the others.
 
 /// Which origin the list is scoped to. `.all` matches everything (scope inactive);
-/// `.watch` matches only watch-originated threads.
+/// `.watch` matches only watch-originated threads; `.automatic` only the ones the
+/// phone fired by itself.
 public enum ThreadOriginScope {
     case all
     case watch
+    case automatic
 }
 
 /// Whether `thread` belongs in `scope`. `.all` always matches (the scope is
-/// inactive — show everything, like a blank search query); `.watch` matches only a
-/// thread whose `originValue` is `.watch`. Pure and Foundation-only so it composes
-/// before grouping and is tested directly, mirroring `threadMatches`.
+/// inactive — show everything, like a blank search query); `.watch` and
+/// `.automatic` match only a thread whose `originValue` is that origin. Pure and
+/// Foundation-only so it composes before grouping and is tested directly,
+/// mirroring `threadMatches`.
 public func threadMatchesOrigin(_ thread: JesseThread, scope: ThreadOriginScope) -> Bool {
     switch scope {
     case .all:
         return true
     case .watch:
         return thread.originValue == .watch
+    case .automatic:
+        return thread.originValue == .automatic
     }
 }

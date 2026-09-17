@@ -574,6 +574,12 @@ struct SettingsView: View {
 
                 Section {
                     Toggle("Attach health context", isOn: $attachHealthContext)
+                        // The automatic weigh-in and workout turns ride this toggle: with it
+                        // off no health block attaches, so they would arrive with nothing to
+                        // log. "Connect Apple Health" turns it on, which starts them too.
+                        .onChange(of: attachHealthContext) { _, _ in
+                            HealthAutoTrigger.shared.startIfEnabled()
+                        }
                     Toggle("Write meals to Apple Health", isOn: $writeMealsToHealth)
                         .disabled(mealWriteDenied)
                     Button {
