@@ -1104,6 +1104,34 @@ pub struct Config {
     // always been for a new server set: a code change, a battery re-run, and a
     // committed record. See SECURITY.md.
     pub today_brief_mcp_config: Option<String>,
+    // WHO THE OWNER IS, PER CHANNEL (`USER_GOOGLE_EMAIL` + `JESSE_OWN_IDENTITIES`).
+    //
+    // Keyed by `MessageChannel::key()`; each value is every address, handle or number
+    // that IS the owner on that channel. It exists for one check, in
+    // `todaybrief::validate`: a cited message counts as evidence only when the OWNER
+    // SENT IT, and a message received — however relevant — is not evidence that they
+    // acted on it.
+    //
+    // IT COMES FROM CONFIGURATION AND NEVER FROM THE MODEL, which is the whole reason
+    // it is a config field rather than something the brief turn is asked to report. A
+    // model asked "is this address you?" will say yes; it has every incentive to, since
+    // saying yes is what lets it close the item.
+    //
+    // An empty or unparseable table FAILS CLOSED: no identity matches, so every message
+    // citation is dropped, every verdict resting on one falls to `low`, and nothing
+    // auto-closes. That is why a bad value warns rather than refusing to boot — the
+    // degraded state is the safe one, and it is the state a deployment that has not
+    // configured this is already in.
+    pub own_identities: HashMap<String, Vec<String>>,
+    // Whether a `done`/`moot` verdict whose NEWEST evidence is a MESSAGE may actually
+    // close an item (`JESSE_TODAY_BRIEF_MESSAGE_CLOSES=1`). Default FALSE.
+    //
+    // Note evidence closes items exactly as it did before; this gates only the new
+    // path. `WeedAction::Close` has never fired end to end against a real day file, and
+    // sent-message search is the first thing that will produce high-confidence closes in
+    // numbers — so it gets a week of MARKING before it gets a week of CLOSING. With the
+    // flag unset such a verdict is recorded as "maybe done", carrying its citation.
+    pub today_brief_message_closes: bool,
     /// **THE SHARED INSTRUCTION BUNDLE'S SOURCE ROOT** (`JESSE_RULES_ROOT`), or `None` when
     /// the feature is not configured on this deployment.
     ///
@@ -1492,6 +1520,80 @@ pub fn env_string(name: &str) -> Option<String> {
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+}
+
+/// The owner's own identity on each message channel, for [`Config::own_identities`].
+///
+/// Two sources, and the second extends rather than replaces the first:
+///
+///   * `USER_GOOGLE_EMAIL` — already exported for `workspace-mcp`, so the work mailbox
+///     needs no new configuration to work at all.
+///   * `JESSE_OWN_IDENTITIES` — a JSON object keyed by channel, each value a string or
+///     an array of them:
+///     `{"work-mail":"a@b.com","slack":"U0123","whatsapp":["+3912345","+3998765"]}`
+///
+/// Every value is trimmed and lower-cased, because the comparison it feeds is an
+/// identity check across providers that disagree about case: mail addresses are
+/// case-insensitive in practice, Slack ids are not but are already lower-case-stable,
+/// and a phone number differs only by punctuation the caller strips separately.
+///
+/// **A MALFORMED VALUE WARNS AND YIELDS WHAT IT COULD PARSE**, never a boot failure.
+/// The degraded state is the safe one: an identity that is not listed simply fails to
+/// match, so the citation is dropped and nothing closes. Refusing to start would turn a
+/// typo in an optional enrichment into an outage.
+pub fn resolve_own_identities() -> HashMap<String, Vec<String>> {
+    let mut out: HashMap<String, Vec<String>> = HashMap::new();
+    let mut add = |channel: &str, value: &str| {
+        let v = value.trim().to_ascii_lowercase();
+        if v.is_empty() {
+            return;
+        }
+        let slot = out.entry(channel.to_string()).or_default();
+        if !slot.contains(&v) {
+            slot.push(v);
+        }
+    };
+
+    if let Some(work) = env_string("USER_GOOGLE_EMAIL") {
+        add("work-mail", &work);
+    }
+
+    let Some(raw) = env_string("JESSE_OWN_IDENTITIES") else {
+        return out;
+    };
+    match serde_json::from_str::<Value>(&raw) {
+        Ok(Value::Object(map)) => {
+            for (channel, value) in map {
+                match value {
+                    Value::String(s) => add(&channel, &s),
+                    Value::Array(items) => {
+                        for item in items.iter().filter_map(|i| i.as_str()) {
+                            add(&channel, item);
+                        }
+                    }
+                    other => eprintln!(
+                        "jesse-bridge: JESSE_OWN_IDENTITIES['{channel}'] is {}, expected a \
+                         string or an array of them — ignoring it.",
+                        match other {
+                            Value::Null => "null",
+                            Value::Bool(_) => "a boolean",
+                            Value::Number(_) => "a number",
+                            _ => "an object",
+                        }
+                    ),
+                }
+            }
+        }
+        Ok(_) => eprintln!(
+            "jesse-bridge: JESSE_OWN_IDENTITIES is not a JSON object keyed by channel — \
+             ignoring it. Message citations will all be dropped for want of an identity."
+        ),
+        Err(e) => eprintln!(
+            "jesse-bridge: JESSE_OWN_IDENTITIES does not parse as JSON ({e}) — ignoring it. \
+             Message citations will all be dropped for want of an identity."
+        ),
+    }
+    out
 }
 
 /// Parse an env var into `T`, falling back to `default` when it's unset or
@@ -4325,6 +4427,12 @@ impl Config {
             // Unset ships the brief child with no MCP servers; SETTING IT REFUSES TO
             // START (`validate_today_brief_mcp`). See the field's comment.
             today_brief_mcp_config: env_string("JESSE_TODAY_BRIEF_MCP_CONFIG"),
+            // Who the owner is per channel, for the brief's "did THEY send it" check.
+            own_identities: resolve_own_identities(),
+            // Only the exact string "1" arms message-evidence auto-close. A flag whose
+            // wrong value silently means "on" is not a flag this path may have.
+            today_brief_message_closes: env_string("JESSE_TODAY_BRIEF_MESSAGE_CLOSES").as_deref()
+                == Some("1"),
             // Optional MCP config for the MAIN turn. Unset → None → the qmd-only inline
             // const (`claude::MAIN_CHILD_MCP_CONFIG`), never the empty set.
             main_mcp_config: env_string("JESSE_MAIN_MCP_CONFIG"),

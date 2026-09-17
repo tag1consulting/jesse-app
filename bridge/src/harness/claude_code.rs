@@ -1182,13 +1182,31 @@ pub fn vaultqa_mcp_config(cfg: &Config) -> &str {
 ///
 /// Unset, this returns [`EMPTY_MCP_CONFIG`] and the brief runs on the three read-only
 /// built-ins alone, reading the notes the item links and grepping the vault.
-pub fn brief_mcp_config(cfg: &Config) -> &'static str {
-    cfg.today_brief_mcp_config
+/// **AND ONLY ON A HARNESS THAT HAS A ROW FOR THE SET.** The switch is global; a
+/// containment row is per harness. So the set loads where the record can vouch for it
+/// and nowhere else, which is the same rule the startup gate applies — asked here of
+/// the harness actually about to be spawned.
+///
+/// That is what makes `direct` run the brief WITHOUT message search rather than needing
+/// a special case: it ships no row for the set, so it gets no servers, and the brief
+/// says which channels it searched (none) rather than pretending.
+pub fn brief_mcp_config(cfg: &Config, harness_id: &str) -> &'static str {
+    let Some(set) = cfg
+        .today_brief_mcp_config
         .as_deref()
         .map(str::trim)
         .and_then(McpSet::parse)
-        .map(|set| set.config())
-        .unwrap_or(EMPTY_MCP_CONFIG)
+    else {
+        return EMPTY_MCP_CONFIG;
+    };
+    let row = ContainmentRow {
+        capability: Capability::Read,
+        mcp: set,
+    };
+    match cfg.harnesses.get(harness_id) {
+        Some(h) if h.shipped_rows().contains(&row) => set.config(),
+        _ => EMPTY_MCP_CONFIG,
+    }
 }
 
 // ---- Capability → containment flags -----------------------------------------

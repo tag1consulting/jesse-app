@@ -1462,7 +1462,7 @@ pub fn brief_child_request<'a>(
         active: ambient,
         capability: Capability::Read,
         cwd: PathBuf::from(&cfg.vault),
-        mcp_config: brief_mcp_config(cfg),
+        mcp_config: brief_mcp_config(cfg, &ambient.harness),
         write_lock: None,
         turn_id,
         // A routed one-shot produces no files: its whole output is the text it returns.

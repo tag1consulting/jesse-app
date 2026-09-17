@@ -57,6 +57,13 @@ pub(crate) fn test_config() -> Config {
         // No brief-child MCP override in the fixture — the shipped default, and the
         // only value that boots at all (setting it is a startup refusal).
         today_brief_mcp_config: None,
+        // No own-identity table in the fixture: the tests that exercise the message-citation
+        // check build their own, and a default one here would make every other test's briefs
+        // silently able to close on message evidence.
+        own_identities: std::collections::HashMap::new(),
+        // Message-evidence auto-close OFF, which is the shipped default. The tests that cover
+        // it set it explicitly, in both directions.
+        today_brief_message_closes: false,
         // No main-path MCP override in the fixture — the main turn falls back to the
         // qmd-only inline const, matching from_env's default.
         main_mcp_config: None,
