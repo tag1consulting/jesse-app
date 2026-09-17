@@ -614,7 +614,20 @@ pub fn validate_toolset_argv(
             )));
             continue;
         };
-        let running = harness.capability_args(cfg, cap);
+        // The row's SET, resolved the same way its capability is. A label this build does not
+        // know is refused rather than compared against a stand-in: the argv is keyed on the
+        // row, so comparing one row's grant against another set's posture would report a
+        // mismatch that means nothing — or, worse, agreement that does.
+        let Some(mcp) = McpSet::parse(&row.mcp_set) else {
+            errors.push(ConfigError::global(format!(
+                "the containment record has a row with an MCP set this build does not know \
+                 ('{}'). A set that does not resolve names a posture nothing here can spawn, \
+                 so the record cannot be held against this deployment.",
+                row.mcp_set
+            )));
+            continue;
+        };
+        let running = harness.capability_args(cfg, cap, mcp);
         if running != row.toolset_args {
             errors.push(ConfigError::global(format!(
                 "the toolset this deployment would run at '{}' on harness '{}' is not the one \

@@ -2454,7 +2454,7 @@ async fn run_row(
             .harnesses
             .get(&opts.harness)
             .unwrap_or_else(|| cfg.harnesses.fallback_harness())
-            .capability_args(&cfg, row.capability),
+            .capability_args(&cfg, row.capability, row.mcp),
         root_tools,
         status: status.to_string(),
         probes: results,
@@ -2695,7 +2695,7 @@ pub fn direct_results_from_battery(
             capability: level.to_string(),
             mcp_set: direct_mcp_label(cfg),
             mcp_servers: cfg.direct.mcp.iter().map(|g| g.name.clone()).collect(),
-            toolset_args: Direct.capability_args(cfg, row.capability),
+            toolset_args: Direct.capability_args(cfg, row.capability, row.mcp),
             // The tools actually at the root: the manifest, which is what `toolset_args`
             // already names. Recorded in both places because the other harnesses record a
             // CHILD'S OWN ACCOUNT here and a bridge-side declaration there, and a reader

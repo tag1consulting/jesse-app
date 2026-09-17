@@ -114,8 +114,8 @@ impl Harness for ClaudeCode {
         matches!(wire, Wire::Messages)
     }
 
-    fn capability_args(&self, cfg: &Config, capability: Capability) -> Vec<String> {
-        claude_capability_args(cfg, capability)
+    fn capability_args(&self, cfg: &Config, capability: Capability, mcp: McpSet) -> Vec<String> {
+        claude_capability_args(cfg, capability, mcp)
     }
 
     fn shipped_rows(&self) -> &'static [ContainmentRow] {
@@ -1183,6 +1183,33 @@ pub const READ_ROOT_TOOLS: &str = "Read,Grep,Glob";
 pub const READ_ALLOWED_TOOLS: &str = "Read(./**),Grep(./**),Glob(./**),\
 mcp__qmd__query,mcp__qmd__get,mcp__qmd__multi_get,mcp__qmd__status";
 
+/// The `--allowedTools` grant a [`Capability::Read`] child gets FOR ONE MCP SET.
+///
+/// # Exhaustive ON PURPOSE — never add a `_` arm
+///
+/// Same rule, and the same reason, as [`McpSet::contains_qmd`]: a wildcard here would hand a
+/// future set the qmd-only grant silently, which is the quiet direction of the mistake. With
+/// the match exhaustive, adding a set is a compile error at this line — the cheapest possible
+/// place to be told that a new row needs a grant decision.
+///
+/// Every set below returns [`READ_ALLOWED_TOOLS`], which is the invariant that keeps every
+/// committed record valid: the argv became a function of the row without any existing row's
+/// argv moving by a byte, so no battery had to be re-run to adopt the new key.
+pub fn read_allowed_tools(mcp: McpSet) -> &'static str {
+    match mcp {
+        McpSet::None
+        | McpSet::Qmd
+        | McpSet::QmdSlack
+        | McpSet::QmdSlackBrowser
+        | McpSet::House
+        | McpSet::Morning
+        | McpSet::Messages
+        | McpSet::MessagesBuild
+        | McpSet::MessagesBuildPlaces
+        | McpSet::MessagesBuildPlacesInbound => READ_ALLOWED_TOOLS,
+    }
+}
+
 /// Tools DENIED to EVERY [`Capability::Read`] child as belt-and-suspenders BEHIND the real
 /// boundary (the [`READ_ROOT_TOOLS`] root allowlist + strict MCP). It names every mutation
 /// / execution / network / orchestration class so a CLI change that widened the root set
@@ -1278,7 +1305,7 @@ pub const BASIC_DISALLOWED_TOOLS: &str =
 ///     `--max-turns` flag (verified via `--help`). The children are single-shot by
 ///     construction, but the CLI offers no turn bound to enforce it. (`--max-budget-usd`
 ///     exists but bounds cost, not agentic turns, and is not a containment control.)
-pub fn claude_capability_args(cfg: &Config, capability: Capability) -> Vec<String> {
+pub fn claude_capability_args(cfg: &Config, capability: Capability, mcp: McpSet) -> Vec<String> {
     match capability {
         Capability::Basic => vec![
             // ROOT boundary: disable the entire built-in toolset (deny-by-default).
@@ -1296,7 +1323,7 @@ pub fn claude_capability_args(cfg: &Config, capability: Capability) -> Vec<Strin
             "--tools".to_string(),
             READ_ROOT_TOOLS.to_string(),
             "--allowedTools".to_string(),
-            READ_ALLOWED_TOOLS.to_string(),
+            read_allowed_tools(mcp).to_string(),
             "--disallowedTools".to_string(),
             READ_DISALLOWED_TOOLS.to_string(),
         ],
@@ -1491,7 +1518,15 @@ pub fn build_claude_args(
     // ROOT MCP boundary, then the capability's toolset. Every spawn site assembles in
     // this order, which is what lets one builder serve all of them.
     args.extend(mcp_args(mcp_config));
-    args.extend(claude_capability_args(cfg, capability));
+    // THE SET IS RESOLVED FROM THE CONFIG STRING, because that is what a spawn site carries.
+    // A set the project does not ship (an operator's `JESSE_VAULTQA_MCP_CONFIG` file, say)
+    // resolves to `None` and therefore to the standard Read grant — byte-for-byte the
+    // behaviour before the argv was keyed on the row.
+    args.extend(claude_capability_args(
+        cfg,
+        capability,
+        McpSet::from_config(mcp_config).unwrap_or(McpSet::None),
+    ));
     if let Some(sid) = session_id {
         // A synthetic `local-<hex>` id (context carry) names a bridge-minted ledger
         // thread with NO real claude session, so it must NEVER be resumed — the CLI
@@ -1715,7 +1750,8 @@ mod tests {
     fn the_recorded_write_argv_names_the_workspace_by_token() {
         let mut cfg = crate::testutil::test_config();
         cfg.allowed_tools = format!("{DEFAULT_ALLOWED_TOOLS}Bash(git:*)");
-        let args = ClaudeCode.capability_args(&cfg, Capability::Write);
+        let args =
+            ClaudeCode.capability_args(&cfg, Capability::Write, McpSet::MessagesBuildPlacesInbound);
         let joined = args.join(" ");
         assert!(joined.contains(WORKSPACE_TOKEN), "{joined}");
         assert!(!joined.contains("/Users/"), "{joined}");
@@ -3457,7 +3493,7 @@ mod tests {
         // the comparison is on the toolset the capability owns.
         let cfg = test_config();
         assert_eq!(
-            claude_capability_args(&cfg, Capability::Read),
+            claude_capability_args(&cfg, Capability::Read, McpSet::None),
             vec![
                 "--tools".to_string(),
                 "Read,Grep,Glob".to_string(),
@@ -3648,14 +3684,14 @@ mod tests {
     fn the_attachment_grant_never_reaches_capability_args() {
         let cfg = test_config();
         for cap in [Capability::Basic, Capability::Read, Capability::Write] {
-            let args = ClaudeCode.capability_args(&cfg, cap);
+            let args = ClaudeCode.capability_args(&cfg, cap, McpSet::None);
             assert!(
                 !args.iter().any(|a| a == "--add-dir"),
                 "{cap:?}: the containment argv must not carry the per-turn read grant: {args:?}"
             );
             assert_eq!(
                 args,
-                claude_capability_args(&cfg, cap),
+                claude_capability_args(&cfg, cap, McpSet::None),
                 "{cap:?}: capability args must be byte-for-byte what the record compares"
             );
         }

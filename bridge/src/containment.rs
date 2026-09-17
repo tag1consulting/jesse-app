@@ -332,6 +332,37 @@ impl McpSet {
         }
     }
 
+    /// EVERY set this project ships, in label order. The one list [`McpSet::from_config`]
+    /// scans, and what lets a test assert that every variant round-trips through its own
+    /// config string.
+    ///
+    /// It is a literal array rather than something derived, so adding a variant without adding
+    /// it here is caught by [`every_set_round_trips_through_its_config`] rather than silently
+    /// making that set unresolvable from a spawn site's config string.
+    pub const ALL: [McpSet; 10] = [
+        McpSet::None,
+        McpSet::Qmd,
+        McpSet::QmdSlack,
+        McpSet::QmdSlackBrowser,
+        McpSet::House,
+        McpSet::Morning,
+        McpSet::Messages,
+        McpSet::MessagesBuild,
+        McpSet::MessagesBuildPlaces,
+        McpSet::MessagesBuildPlacesInbound,
+    ];
+
+    /// Which shipped set a `--mcp-config` VALUE is, or `None` when it is not one of ours.
+    ///
+    /// The inverse of [`McpSet::config`], and it exists because a spawn site carries the
+    /// config STRING while the containment row is keyed on the SET. `None` is a legitimate,
+    /// common answer — an operator's `JESSE_VAULTQA_MCP_CONFIG` file is not a shipped set —
+    /// and a caller resolving it is expected to fall back to the posture it had before, never
+    /// to guess a set.
+    pub fn from_config(config: &str) -> Option<McpSet> {
+        McpSet::ALL.into_iter().find(|s| s.config() == config)
+    }
+
     /// Whether this set loads the qmd server — i.e. whether `mcp__qmd__*` stands at the root
     /// of a child probed on this row, and therefore whether the `search_qmd` POSITIVE CONTROL
     /// must come back `allowed`.

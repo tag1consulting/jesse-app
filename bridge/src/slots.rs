@@ -688,7 +688,7 @@ mod tests {
             fn default_concurrency(&self) -> usize {
                 8
             }
-            fn capability_args(&self, _c: &Config, _cap: Capability) -> Vec<String> {
+            fn capability_args(&self, _c: &Config, _cap: Capability, _mcp: McpSet) -> Vec<String> {
                 Vec::new()
             }
             fn supports_wire(&self, w: Wire) -> bool {

@@ -104,7 +104,7 @@ fn the_record_covers_every_row_the_bridge_actually_spawns() {
                 .unwrap_or_else(|| panic!("{id}: no recorded row for {}", row.label()));
             assert_eq!(
                 rec.toolset_args,
-                harness.capability_args(&probe_config(), row.capability),
+                harness.capability_args(&probe_config(), row.capability, row.mcp),
                 "{id} {}: the recorded toolset argv must be the one THIS harness's builder \
                  produces — a row that describes a posture nothing spawns gates nothing",
                 row.label()
