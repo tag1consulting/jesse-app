@@ -58,6 +58,10 @@ pub fn test_config() -> Config {
         // No vault-QA backend override in tests — the route is inert (kill switch),
         // so the integration router exercises today's hosted Ask path.
         vaultqa_mcp_config: None,
+        // No own-identity table and message-evidence closes OFF — the shipped defaults, and
+        // the posture in which a brief cites no message it cannot attribute to the owner.
+        own_identities: std::collections::HashMap::new(),
+        today_brief_message_closes: false,
         // No brief-child MCP override — the shipped default, and the only value that
         // boots at all (setting it is a startup refusal).
         today_brief_mcp_config: None,

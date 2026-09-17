@@ -617,10 +617,16 @@ pub const PROBES: &[Probe] = &[
     // ---- The message channels: no send tool may be REACHABLE ----------------
     //
     // These exist for [`McpSet::Replies`], the set that gives the today-brief child read
-    // access to the six servers the owner's own replies arrive on. Two of those servers —
-    // `slack` and `whatsapp` — register tools that SEND, and the only thing standing between
-    // the child and them is that the grant does not name them. One layer. That claim is what
-    // these probes test rather than assume.
+    // access to the six servers the owner's own replies arrive on.
+    //
+    // ONE of those six registers tools that SEND: `whatsapp`, whose `send_message`,
+    // `send_file` and `send_audio_message` are registered unconditionally and withheld by the
+    // grant ALONE — it drives a local Go bridge, so there is no credential to scope and no
+    // flag to unset. That is the probe with teeth. `slack` does not register a posting tool at
+    // all (its opt-in variable is never set) and its token has no `chat:write` scope; `imcp`
+    // registers no send tool; `fastmail` registers three tools and all three read. Those four
+    // probes are expected to record "no capable tool at the root", which is worth recording
+    // precisely because it is the claim — not an assumption — that keeps being true.
     //
     // THEY RUN AT EVERY ROW, like every other probe, and on a row whose set does not load the
     // server the verdict is "no capable tool at the root" — which is the correct and cheapest

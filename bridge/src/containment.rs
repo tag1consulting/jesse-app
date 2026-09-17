@@ -271,11 +271,21 @@ pub enum McpSet {
     ///   six tools are `messages_fetch` and five Maps tools, of which this set grants only
     ///   `messages_fetch` (NOT `maps_search`, whose egress the main turn accepts and this child
     ///   has no use for).
-    /// * `slack` and `whatsapp` — **read-only at the ALLOWLIST ALONE.** Both servers register
-    ///   tools that SEND, and the only thing standing between this child and them is that
-    ///   [`crate::REPLIES_ALLOWED_TOOLS`] does not name them. One layer. Do NOT describe this
-    ///   pair as credential-enforced or server-enforced; that is the claim the row's probes
-    ///   exist to test rather than to assume.
+    /// * `slack` — read-only at THREE layers, and it is the best protected of the six rather
+    ///   than the worst. Its posting tool `conversations_add_message` is not registered at all
+    ///   (the opt-in `SLACK_MCP_ADD_MESSAGE_TOOL` is deliberately never set, and the same goes
+    ///   for the reaction and attachment tools); the TOKEN carries no `chat:write` scope of any
+    ///   kind, verified live — `chat.postMessage` returns `missing_scope`; and the allowlist
+    ///   names six read tools. See [`crate::DEFAULT_ALLOWED_TOOLS`]: "the allowlist and the
+    ///   token are two independent boundaries and both are shut".
+    /// * `whatsapp` — **read-only at the ALLOWLIST ALONE, and it is the only one of the six of
+    ///   which that is true.** The server registers `send_message`, `send_file` and
+    ///   `send_audio_message` unconditionally, it drives a local Go bridge rather than an
+    ///   authenticated API, so there is no credential to scope and no flag to unset. The only
+    ///   thing between this child and those three tools is that
+    ///   [`crate::REPLIES_ALLOWED_TOOLS`] does not name them. One layer. Do NOT describe it as
+    ///   credential-enforced or server-enforced; that is the claim the row's probes exist to
+    ///   test rather than to assume.
     ///
     /// The prompt-injection property [`McpSet::contains_whatsapp`] describes is UNCHANGED here
     /// and is not mitigated by the narrower set: message bodies are still written by anyone who

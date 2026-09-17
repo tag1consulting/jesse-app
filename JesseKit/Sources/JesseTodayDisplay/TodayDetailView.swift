@@ -139,6 +139,7 @@ public struct TodayDetailView: View {
             if let brief = model.brief?.brief {
                 VStack(alignment: .leading, spacing: 14) {
                     verdictLine(brief.relevance)
+                    messageEvidence(brief)
                     ForEach(Array(brief.sections.enumerated()), id: \.offset) { _, section in
                         answer(section.heading, section.answer)
                     }
@@ -219,6 +220,49 @@ public struct TodayDetailView: View {
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
         }
+    }
+
+    /// The message evidence under the verdict: WHERE it is, never what it says.
+    ///
+    /// Channel, account or chat, and date — in the same secondary style a note source gets.
+    /// The one-sentence summary the bridge validated is deliberately NOT shown: the body is
+    /// the owner's private correspondence, and a to-do list read over a shoulder should not
+    /// also be a mailbox read over a shoulder. The id is what makes the message findable,
+    /// and it is carried in the accessibility label rather than the line, which would
+    /// otherwise be mostly punctuation.
+    @ViewBuilder
+    private func messageEvidence(_ brief: TodayItemBrief) -> some View {
+        if !brief.messageCitations.isEmpty {
+            VStack(alignment: .leading, spacing: 3) {
+                ForEach(brief.messageCitations) { citation in
+                    Text("\(citation.channel.label) · \(citation.account) · \(citation.date)")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .accessibilityLabel(
+                            "\(citation.channel.label), \(citation.account), \(citation.date)")
+                }
+            }
+        }
+        if let gap = Self.unsearchedNote(brief) {
+            Text(gap)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    /// What to say when the sent-message search did not happen, or did not cover everything.
+    ///
+    /// A brief that searched nothing and a brief that searched four of six are different
+    /// claims, and neither may be left to look like "there was nothing to find". `nil` only
+    /// when all six were searched.
+    private static func unsearchedNote(_ brief: TodayItemBrief) -> String? {
+        guard brief.messagesSearchedAt != nil else { return "Sent messages were not searched." }
+        let missing = TodayMessageChannel.searchable
+            .filter { !brief.channelsSearched.contains($0) }
+        guard !missing.isEmpty else { return nil }
+        return "Not searched: " + missing.map(\.label).joined(separator: ", ") + "."
     }
 
     @ViewBuilder

@@ -1100,6 +1100,38 @@ impl BriefStore {
         }
     }
 
+    /// Whether this item's SENT-MESSAGE search has gone stale — older than 24 hours.
+    ///
+    /// # `inputsHash` cannot see messages, and that is the whole reason this exists
+    ///
+    /// The cache key is a hash of gathered FILE state. A reply the owner sends changes
+    /// nothing the hash covers, so an item whose brief was written before that reply
+    /// would keep its stale verdict forever — the cache would be working exactly as
+    /// designed and the answer would still be wrong.
+    ///
+    /// So the message search ages out on the clock instead. A brief written WITHOUT a
+    /// search never goes stale this way (`messagesSearchedAt` is `None`): there is no
+    /// search to repeat, and re-running one that cannot happen would burn a turn per
+    /// item per morning for nothing.
+    ///
+    /// RFC3339 UTC strings compare correctly as plain strings — fixed width, one zone —
+    /// which is the same property this module already relies on for ISO days, and it is
+    /// why nothing here parses a date.
+    pub fn messages_stale(&self, id: &str, now: SystemTime) -> bool {
+        let Some(searched) = self
+            .map
+            .get(id)
+            .and_then(|r| r.brief.as_ref())
+            .and_then(|b| b.messages_searched_at.as_deref())
+        else {
+            return false;
+        };
+        let Some(cutoff) = now.checked_sub(std::time::Duration::from_secs(24 * 60 * 60)) else {
+            return false;
+        };
+        searched < rfc3339_utc(cutoff).as_str()
+    }
+
     /// Write one record, preserving an auto-close block that still applies.
     ///
     /// Best-effort and never fatal: a brief that fails to persist costs one
@@ -1506,7 +1538,7 @@ pub async fn generate_one(
             Ok(raw)
         })
     };
-    generate_with(
+    let mut record = generate_with(
         &notes_root,
         &base,
         &hash,
@@ -1515,7 +1547,19 @@ pub async fn generate_one(
         &identities,
         &mut ask,
     )
-    .await
+    .await;
+    // STAMPED BY THE BRIDGE, NEVER READ FROM THE MODEL — the same rule as `generatedAt`,
+    // and here for a sharper reason. This timestamp is what the morning rebuild ages out
+    // (see `BriefStore::messages_stale`), so a model that invented a plausible one would
+    // make a brief that searched nothing look freshly searched, and the item would keep a
+    // stale verdict for as long as the invention held. The bridge knows whether the child
+    // actually had the servers; the child's word for it is not evidence.
+    if searches_messages {
+        if let Some(brief) = record.brief.as_mut() {
+            brief.messages_searched_at = Some(rfc3339_utc(SystemTime::now()));
+        }
+    }
+    record
 }
 
 /// Generate one item's brief and, if the verdict earns it, close the item.
@@ -1582,7 +1626,13 @@ pub fn queue_if_needed(st: &AppState, item: &TodayItem, today: &str) -> bool {
     }
     let inputs = gather(&notes_root(&st.cfg), item);
     let hash = inputs_hash(&inputs);
-    if !BriefStore::load(st.cfg.briefs_file()).needs_generation(&item.id, &hash) {
+    let store = BriefStore::load(st.cfg.briefs_file());
+    // TWO REASONS TO REGENERATE, and they answer different questions. The hash asks "did
+    // the FILES move?"; the staleness check asks "could a reply have arrived since we
+    // last looked?" — which the hash cannot see at all (see `messages_stale`).
+    if !store.needs_generation(&item.id, &hash)
+        && !store.messages_stale(&item.id, SystemTime::now())
+    {
         return false;
     }
     let st = st.clone();
@@ -2263,7 +2313,11 @@ mod tests {
 
         // Typed as fn POINTERS: every closure below has its own anonymous type, so an
         // un-annotated array of them refuses to unify.
-        let bends: [(&str, fn(&mut MessageCitation)); 5] = [
+        // Named rather than spelled inline: every closure below has its own anonymous type,
+        // so the array needs a concrete element type to unify at all — and an inline one is
+        // exactly the shape clippy calls a very complex type.
+        type Bend = fn(&mut MessageCitation);
+        let bends: [(&str, Bend); 5] = [
             ("account", |c| c.account = String::new()),
             ("message id", |c| c.message_id = "  ".to_string()),
             ("a parseable date", |c| c.date = "12 September".to_string()),
@@ -2337,6 +2391,61 @@ mod tests {
                 "{spelling} is the owner"
             );
         }
+    }
+
+    // ---- the message search ages out on the clock -------------------------
+
+    /// A store holding one item whose brief was searched at `stamp`.
+    fn store_searched_at(stamp: Option<String>) -> BriefStore {
+        let mut b = brief();
+        b.messages_searched_at = stamp;
+        BriefStore {
+            map: std::collections::HashMap::from([(
+                "i1".to_string(),
+                BriefRecord {
+                    status: BriefStatus::Ok,
+                    brief: Some(b),
+                    failure: None,
+                    inputs_hash: "h".to_string(),
+                    auto_close_blocked: false,
+                },
+            )]),
+        }
+    }
+
+    /// THE RULE `inputsHash` CANNOT EXPRESS. A reply the owner sends moves no file, so the
+    /// cache key does not move either — the brief would keep its stale verdict forever, with
+    /// the cache working exactly as designed.
+    #[test]
+    fn a_message_search_older_than_a_day_goes_stale_and_a_fresh_one_does_not() {
+        let now = SystemTime::now();
+        let ago = |secs: u64| {
+            Some(rfc3339_utc(
+                now.checked_sub(std::time::Duration::from_secs(secs))
+                    .expect("a time before now"),
+            ))
+        };
+        assert!(
+            store_searched_at(ago(25 * 3600)).messages_stale("i1", now),
+            "25 hours old must regenerate at the morning rebuild"
+        );
+        assert!(
+            !store_searched_at(ago(23 * 3600)).messages_stale("i1", now),
+            "23 hours old must NOT regenerate"
+        );
+    }
+
+    /// A brief written WITHOUT a search never goes stale this way, and that is not a detail:
+    /// treating "never searched" as "searched long ago" would re-run a search that cannot
+    /// happen, once per item, every morning, forever — on every deployment with the switch
+    /// off, which today is all of them.
+    #[test]
+    fn a_brief_written_without_a_search_never_goes_stale() {
+        let now = SystemTime::now();
+        assert!(!store_searched_at(None).messages_stale("i1", now));
+        // …and an id the store has never heard of is not stale either; it simply has no
+        // brief, which `needs_generation` already answers.
+        assert!(!store_searched_at(None).messages_stale("nobody", now));
     }
 
     /// A VERDICT THAT RESTED ON A DROPPED CITATION FALLS TO `low` — and with it, any chance

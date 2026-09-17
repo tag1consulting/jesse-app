@@ -287,6 +287,91 @@ public struct TodayBriefRelevance: Decodable, Equatable, Hashable, Sendable {
     }
 }
 
+/// A channel the brief can search for the owner's own sent replies.
+///
+/// Tolerant like every other enum here: a spelling this build does not know decodes as
+/// `.unknown` rather than throwing, so a bridge that grows a seventh channel does not
+/// break a phone that has not been updated.
+public enum TodayMessageChannel: String, Decodable, Equatable, Hashable, Sendable, CaseIterable {
+    case workMail = "work-mail"
+    case personalMail = "personal-mail"
+    case fastmail
+    case slack
+    case whatsapp
+    case imessage
+    case unknown
+
+    public init(from decoder: any Decoder) throws {
+        let raw = try decoder.singleValueContainer().decode(String.self)
+        self = TodayMessageChannel(rawValue: raw) ?? .unknown
+    }
+
+    /// The six the brief actually searches — `.unknown` is a decoding outcome, not a channel.
+    public static var searchable: [TodayMessageChannel] {
+        allCases.filter { $0 != .unknown }
+    }
+
+    public var label: String {
+        switch self {
+        case .workMail: "Work mail"
+        case .personalMail: "Personal mail"
+        case .fastmail: "Fastmail"
+        case .slack: "Slack"
+        case .whatsapp: "WhatsApp"
+        case .imessage: "iMessage"
+        case .unknown: "Other"
+        }
+    }
+}
+
+/// ONE MESSAGE THE OWNER SENT, cited as evidence that an item is finished.
+///
+/// Every field here was checked bridge-side before it arrived: the date parses, the id and
+/// account are present, and the sender matched the owner's own identity on that channel. A
+/// citation that failed any of those was dropped before this type ever saw it.
+///
+/// **`summary` is at most one sentence, and the page does not show it.** The body is the
+/// owner's private correspondence; the detail page shows where the evidence is, not what it
+/// says, so a shoulder-surfer reading a to-do list does not read a mailbox.
+public struct TodayMessageCitation: Decodable, Equatable, Hashable, Sendable, Identifiable {
+    public var channel: TodayMessageChannel
+    /// The mailbox, workspace channel or chat it sits in.
+    public var account: String
+    public var messageId: String
+    /// `YYYY-MM-DD`.
+    public var date: String
+    public var sender: String
+    public var summary: String
+
+    /// Stable within one brief: a provider's own message id.
+    public var id: String { messageId }
+
+    public init(channel: TodayMessageChannel = .unknown, account: String = "",
+                messageId: String = "", date: String = "", sender: String = "",
+                summary: String = "") {
+        self.channel = channel
+        self.account = account
+        self.messageId = messageId
+        self.date = date
+        self.sender = sender
+        self.summary = summary
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        channel = try c.decodeIfPresent(TodayMessageChannel.self, forKey: .channel) ?? .unknown
+        account = try c.decodeIfPresent(String.self, forKey: .account) ?? ""
+        messageId = try c.decodeIfPresent(String.self, forKey: .messageId) ?? ""
+        date = try c.decodeIfPresent(String.self, forKey: .date) ?? ""
+        sender = try c.decodeIfPresent(String.self, forKey: .sender) ?? ""
+        summary = try c.decodeIfPresent(String.self, forKey: .summary) ?? ""
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case channel, account, messageId, date, sender, summary
+    }
+}
+
 /// Seven answers about one item, plus the judgement and the provenance.
 public struct TodayItemBrief: Decodable, Equatable, Hashable, Sendable {
     public var about: TodayBriefAnswer
@@ -304,6 +389,14 @@ public struct TodayItemBrief: Decodable, Equatable, Hashable, Sendable {
     /// The note paths the answers rest on, each proven bridge-side to resolve under the
     /// notes root — a citation that escaped the vault is dropped before it reaches here.
     public var sources: [String]
+    /// Messages the OWNER sent that bear on the item, each already checked bridge-side.
+    public var messageCitations: [TodayMessageCitation]
+    /// Which channels this brief actually searched. Empty means none were — either the
+    /// switch is off or the harness has no containment row for the message servers — and
+    /// the page says so rather than letting a reader take silence for an answer.
+    public var channelsSearched: [TodayMessageChannel]
+    /// When the sent-message search ran. `nil` for a brief written without one.
+    public var messagesSearchedAt: String?
     public var generatedAt: String?
     /// Which harness and model wrote it, so a doubtful brief can be traced.
     public var harness: String?
@@ -325,7 +418,10 @@ public struct TodayItemBrief: Decodable, Equatable, Hashable, Sendable {
                 progress: TodayBriefAnswer, done: TodayBriefAnswer,
                 contacts: TodayBriefAnswer, people: [TodayBriefContact] = [],
                 relevance: TodayBriefRelevance = TodayBriefRelevance(),
-                more: String? = nil, sources: [String] = [], generatedAt: String? = nil,
+                more: String? = nil, sources: [String] = [],
+                messageCitations: [TodayMessageCitation] = [],
+                channelsSearched: [TodayMessageChannel] = [],
+                messagesSearchedAt: String? = nil, generatedAt: String? = nil,
                 harness: String? = nil, model: String? = nil) {
         self.about = about
         self.origin = origin
@@ -339,6 +435,9 @@ public struct TodayItemBrief: Decodable, Equatable, Hashable, Sendable {
         self.relevance = relevance
         self.more = more
         self.sources = sources
+        self.messageCitations = messageCitations
+        self.channelsSearched = channelsSearched
+        self.messagesSearchedAt = messagesSearchedAt
         self.generatedAt = generatedAt
         self.harness = harness
         self.model = model
@@ -367,6 +466,11 @@ public struct TodayItemBrief: Decodable, Equatable, Hashable, Sendable {
                                           forKey: .relevance) ?? TodayBriefRelevance()
         more = try c.decodeIfPresent(String.self, forKey: .more)
         sources = try c.decodeIfPresent([String].self, forKey: .sources) ?? []
+        messageCitations = try c.decodeIfPresent([TodayMessageCitation].self,
+                                                 forKey: .messageCitations) ?? []
+        channelsSearched = try c.decodeIfPresent([TodayMessageChannel].self,
+                                                 forKey: .channelsSearched) ?? []
+        messagesSearchedAt = try c.decodeIfPresent(String.self, forKey: .messagesSearchedAt)
         generatedAt = try c.decodeIfPresent(String.self, forKey: .generatedAt)
         harness = try c.decodeIfPresent(String.self, forKey: .harness)
         model = try c.decodeIfPresent(String.self, forKey: .model)
@@ -375,6 +479,7 @@ public struct TodayItemBrief: Decodable, Equatable, Hashable, Sendable {
     private enum CodingKeys: String, CodingKey {
         case about, origin, due, priority, priorityLevel, progress, done, contacts
         case people, relevance, more, sources, generatedAt, harness, model
+        case messageCitations, channelsSearched, messagesSearchedAt
     }
 }
 

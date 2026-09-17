@@ -1248,12 +1248,15 @@ mcp__qmd__query,mcp__qmd__get,mcp__qmd__multi_get,mcp__qmd__status";
 ///
 /// # What is withheld, per server, and why
 ///
-/// * **`slack`** — the same six read tools the main turn gets. Its SEND tools
-///   (`conversations_add_message` and siblings) are registered by the server and withheld HERE,
-///   by name, and by nothing else. One layer.
+/// * **`slack`** — the same six read tools the main turn gets. Its posting tool
+///   `conversations_add_message` is NOT registered by the server at all (its opt-in variable
+///   is deliberately never set), and the token holds no `chat:write` scope — so this list is
+///   the third of three shut boundaries, not the only one.
 /// * **`whatsapp`** — the eight read tools. `send_message`, `send_file` and
-///   `send_audio_message` are withheld by this list ALONE; `download_media` is withheld too,
-///   and for a different reason — it WRITES a file, which a read child must not do.
+///   `send_audio_message` ARE registered, unconditionally, and this list is the ONLY thing
+///   withholding them: the server drives a local Go bridge, so there is no credential to
+///   scope and no flag to unset. **It is the single-layer server of the six.**
+///   `download_media` is withheld too, for a different reason — it WRITES a file.
 /// * **`imcp`** — `messages_fetch` only. `maps_search` is granted to the MAIN turn and is
 ///   deliberately NOT here: it leaves the host carrying a query string, and a brief has no use
 ///   for a map. The other four Maps tools are ungranted there too. iMCP registers no send tool.

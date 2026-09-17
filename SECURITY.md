@@ -1643,6 +1643,86 @@ created the probe file; after, an empty root toolset, zero MCP servers, and zero
 executed `tool_use` across a write / ls / fetch / ToolSearch battery, with the
 endpoint still producing a title.
 
+## The today-brief child and its message servers (`Replies`, 0.144.0)
+
+The brief child judges "is this still open?" for one day-file item, unattended, ~40 times a
+morning, and its answer can **check one of the owner's items off**. From 0.144.0 it can be
+given six MCP servers — `google`, `google-perseido`, `fastmail`, `slack`, `whatsapp`, `imcp`
+— so it can read the owner's **own sent replies**, because the notes reliably record a request
+and miss the answer.
+
+### It is a SUBSET, and that is the point
+
+`McpSet::Replies` is the main-turn message set with the infrastructure removed: no qmd, no
+browser, no Home Assistant, no Roon, no GitHub, no RouterOS, and — the reason the set exists —
+**no UniFi and no Proxmox**. The smallest pre-existing set containing `fastmail` was `Morning`:
+eleven servers including `proxmox_execute_vm_command`, arbitrary command execution inside any
+guest. A background turn that closes the owner's items has no business holding that.
+
+It is the first set in this file that is **not** a superset of the one before it.
+
+### Which layer holds each server, because they are not the same
+
+| Server | Posture | Enforced by |
+|---|---|---|
+| `google`, `google-perseido` | read-only | the server's `--read-only` flag **and** the credential (`*.readonly` scopes) **and** the allowlist |
+| `fastmail` | read-only | it registers three tools and all three read — **there is no write tool to exclude** |
+| `imcp` | read-only | it registers **no send or compose tool at all**; sending is absent at the root |
+| `slack` | read-only | the posting tool is **not registered** (`SLACK_MCP_ADD_MESSAGE_TOOL` unset) **and** the token has no `chat:write` scope **and** the allowlist |
+| `whatsapp` | read-only | **the allowlist ALONE** |
+
+**WhatsApp is the single-layer server, and it is the only one of the six.** It registers
+`send_message`, `send_file` and `send_audio_message` unconditionally, and it drives a local Go
+bridge rather than an authenticated API — so there is no credential to scope and no opt-in flag
+to leave unset. The only thing standing between this child and those three tools is that
+`REPLIES_ALLOWED_TOOLS` does not name them. Do not describe WhatsApp as credential-enforced or
+server-enforced. That claim is what the row's probes exist to test rather than to assume.
+
+**Slack is the best protected of the six, not the worst**, and an earlier draft of this section
+had it backwards. Three independent boundaries are shut: `conversations_add_message` is never
+registered because its opt-in variable is deliberately unset (as are the reaction and
+attachment tools); the token carries no `chat:write` scope of any kind, verified live —
+`chat.postMessage` returns `missing_scope`; and the allowlist names six read tools. See the
+Slack section above.
+
+The grant is narrower than the main turn's everywhere, and a test asserts it can never be
+wider: the six Gmail READ tools on each Google instance (not Drive, not Calendar — a sent
+reply is mail), Fastmail's three, Slack's six, WhatsApp's eight, and `messages_fetch` on imcp.
+`maps_search` is granted to the main turn and deliberately **not** here: it leaves the host
+carrying a query string, and a brief has no use for a map.
+
+### What the battery proves, and what it does not
+
+Six hard gates, one per channel, each required `denied` at every row and every level including
+`write`: no capability this project ships grants a tool that speaks as the owner. What counts
+as the escape is **invocation, not delivery** — the probe looks for a send tool in the child's
+`tool_uses`, never for a successful result, because a send that failed for want of a recipient
+would otherwise record as containment while the tool was in fact reachable. No probe names a
+real contact; every recipient is nonce-derived and cannot exist.
+
+**What the battery cannot observe is what a server REGISTERED** — only what the child can
+call, since the tool list comes from the CLI's own init event, after the allowlist. "Slack and
+WhatsApp do register send tools" is established by reading those servers, not by this battery.
+
+### The prompt-injection surface is NARROWED, not closed
+
+Message bodies are still written by anyone who knows the owner's number, and read-only tool
+grants do not close that — they bound what the SERVER can do, not what the CHILD does with
+what it read. What the narrower set changes is what a child that reads such a body can then
+reach: six read surfaces rather than the network and the hypervisor. That is a real reduction
+and it is not a solution. The mitigation that would close it is the dedicated sandboxed unix
+user, still not implemented.
+
+### Two gates stand in front of all of it
+
+`JESSE_TODAY_BRIEF_MCP_CONFIG` takes a **set name**, never a path — a path names a file the
+gate cannot read and the child can — and the only accepted name is the `Replies` label, which
+must additionally have a **passing row** in the record of every harness that spawns it. And a
+close whose newest evidence is a MESSAGE rather than a note requires
+`JESSE_TODAY_BRIEF_MESSAGE_CLOSES=1`, default off: `WeedAction::Close` has never fired end to
+end against a real day file, so this path gets a week of marking before it gets a week of
+closing.
+
 ## Vault-QA child tool isolation (in-process boundary)
 
 The local vault-QA route (see the bridge README) spawns one **stateless,
