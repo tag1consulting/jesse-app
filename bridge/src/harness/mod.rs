@@ -1426,6 +1426,39 @@ pub fn vaultqa_child_request<'a>(
     }
 }
 
+/// The read-only TODAY-BRIEF child's request: [`Capability::Read`] and, in every
+/// configuration that boots, NO MCP servers ([`brief_mcp_config`]).
+///
+/// The cwd is the vault for the same reason the vault-QA child's is — the child has to
+/// read notes to answer, so containment comes from the TOOLSET, not from an isolated
+/// cwd. Never resumes: each brief is about one item and shares nothing with the last.
+///
+/// This child is the narrowest thing in the bridge that reads vault content, and it
+/// stays that way on purpose: it is the only turn whose answer can CLOSE one of the
+/// owner's items, and even that it cannot do alone — the bridge re-derives the
+/// decision from dates it parsed itself (see [`crate::todaybrief::weed`]).
+pub fn brief_child_request<'a>(
+    cfg: &'a Config,
+    prompt: &'a str,
+    ambient: &'a ActiveModel,
+    turn_id: &'a str,
+) -> TurnRequest<'a> {
+    TurnRequest {
+        prompt,
+        session_id: None,
+        active: ambient,
+        capability: Capability::Read,
+        cwd: PathBuf::from(&cfg.vault),
+        mcp_config: brief_mcp_config(cfg),
+        write_lock: None,
+        turn_id,
+        // A routed one-shot produces no files: its whole output is the text it returns.
+        artifact_dir: None,
+        // A single-shot child never carries an attachment.
+        attachment_dir: None,
+    }
+}
+
 /// Every harness this build knows how to construct, by id — the registry's vocabulary.
 ///
 /// A model naming an id absent from here is a startup ERROR rather than a silent fallback

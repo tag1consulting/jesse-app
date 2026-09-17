@@ -20,12 +20,19 @@ public struct TodayDetailView: View {
     /// note does not know which item linked it.
     private let item: TodayItem
     private let onOpenLink: (TodayLinkOrigin) -> Void
+    private let onCloseAsStale: (TodayItem, String) -> Void
+
+    /// The source note starts CLOSED. That is the whole change in posture: this page used
+    /// to be the note, and the note is now the citation under the answer.
+    @State private var isNoteExpanded = false
 
     public init(model: TodayDetailModel, item: TodayItem,
-                onOpenLink: @escaping (TodayLinkOrigin) -> Void = { _ in }) {
+                onOpenLink: @escaping (TodayLinkOrigin) -> Void = { _ in },
+                onCloseAsStale: @escaping (TodayItem, String) -> Void = { _, _ in }) {
         self.model = model
         self.item = item
         self.onOpenLink = onOpenLink
+        self.onCloseAsStale = onCloseAsStale
     }
 
     private var role: TodayProjectRole { TodayProjectPalette.role(for: item.project) }
@@ -97,16 +104,6 @@ public struct TodayDetailView: View {
     @ViewBuilder
     private var content: some View {
         switch model.state {
-        case .idle, .loading:
-            ProgressView()
-                .frame(maxWidth: .infinity, alignment: .center)
-                .padding(.top, 24)
-        case .loaded(let note):
-            TodayNoteView(markdown: note.markdown, onOpenLink: onOpenLink)
-        case .noDetail(let reason):
-            empty(symbol: "doc.plaintext",
-                  title: "No note behind this item",
-                  message: TodayDetailModel.noDetailMessage(reason))
         case .removed:
             empty(symbol: "questionmark.folder",
                   title: "This item is gone",
@@ -115,6 +112,180 @@ public struct TodayDetailView: View {
             empty(symbol: "wifi.exclamationmark",
                   title: "Can't reach the bridge",
                   message: message)
+        case .idle, .loading:
+            ProgressView()
+                .frame(maxWidth: .infinity, alignment: .center)
+                .padding(.top, 24)
+        case .loaded, .noDetail:
+            // THE ORDER IS THE POINT. The answers about this item come first; the
+            // document they were drawn from is below them, closed.
+            VStack(alignment: .leading, spacing: 16) {
+                briefBody
+                noteBody
+            }
+        }
+    }
+
+    // MARK: - The seven answers
+
+    /// The seven headings, in the order the brief answers them.
+    private static let headings = ["What it is", "Where it came from", "Due", "Priority",
+                                   "Done so far", "Done means", "Who knows more"]
+
+    @ViewBuilder
+    private var briefBody: some View {
+        switch model.brief?.status {
+        case .ok:
+            if let brief = model.brief?.brief {
+                VStack(alignment: .leading, spacing: 14) {
+                    verdictLine(brief.relevance)
+                    ForEach(Array(brief.sections.enumerated()), id: \.offset) { _, section in
+                        answer(section.heading, section.answer)
+                    }
+                    people(brief.people)
+                    more(brief.more)
+                    staleButton(brief)
+                }
+            }
+        case .pending:
+            // The headings with a spinner, not a spinner alone: the page keeps its shape
+            // while it fills in, and the note below stays reachable the whole time.
+            VStack(alignment: .leading, spacing: 14) {
+                HStack(spacing: 6) {
+                    ProgressView().controlSize(.small)
+                    Text("Writing the summary…")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel("Writing the summary")
+                ForEach(Self.headings, id: \.self) { heading in
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(heading)
+                            .font(.caption).fontWeight(.semibold)
+                            .foregroundStyle(.secondary)
+                        Text("—")
+                            .font(.body)
+                            .foregroundStyle(.tertiary)
+                    }
+                }
+            }
+        case .failed:
+            Label(model.brief?.failure.map { "The summary couldn't be written: \($0)" }
+                    ?? "The summary couldn't be written.",
+                  systemImage: "exclamationmark.triangle")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        case .unknown, .none:
+            // A bridge that sends no brief at all. The note below is the whole page,
+            // exactly as it was before this feature existed.
+            EmptyView()
+        }
+    }
+
+    /// One answer under its heading. An answer the notes could not support renders in a
+    /// secondary style, so "the vault doesn't say" is visibly different from an answer.
+    private func answer(_ heading: String, _ value: TodayBriefAnswer) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(heading)
+                .font(.caption).fontWeight(.semibold)
+                .foregroundStyle(.secondary)
+                .accessibilityAddTraits(.isHeader)
+            // PLAIN TEXT, never markdown: these are sentences the bridge validated, and
+            // rendering them as markdown would let a stray asterisk from a note change
+            // how an answer looks.
+            Text(value.text)
+                .font(.body)
+                .foregroundStyle(value.known ? AnyShapeStyle(.primary) : AnyShapeStyle(.secondary))
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    /// The verdict, in one line, and only when it is not the ordinary "still yours".
+    @ViewBuilder
+    private func verdictLine(_ relevance: TodayBriefRelevance) -> some View {
+        if relevance.verdict != .open && relevance.verdict != .unknown {
+            let word = switch relevance.verdict {
+            case .done: "Looks done"
+            case .moot: "Looks no longer needed"
+            case .overdue: "Overdue"
+            default: ""
+            }
+            Label("\(word). \(relevance.reason)", systemImage: relevance.verdict == .overdue
+                    ? "clock.badge.exclamationmark" : "checkmark.circle")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    @ViewBuilder
+    private func people(_ contacts: [TodayBriefContact]) -> some View {
+        if !contacts.isEmpty {
+            VStack(alignment: .leading, spacing: 3) {
+                ForEach(contacts) { person in
+                    Text("\(person.name) — \(person.role). \(person.knows)")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func more(_ text: String?) -> some View {
+        if let text, !text.isEmpty {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Also worth knowing")
+                    .font(.caption).fontWeight(.semibold)
+                    .foregroundStyle(.secondary)
+                    .accessibilityAddTraits(.isHeader)
+                Text(text)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    /// One button, on the items the bridge suspected but would not close itself.
+    @ViewBuilder
+    private func staleButton(_ brief: TodayItemBrief) -> some View {
+        if item.relevance?.stale == true && !item.checked {
+            Button {
+                onCloseAsStale(item, brief.relevance.reason)
+            } label: {
+                Label("Close as stale", systemImage: "checkmark.circle")
+            }
+            .buttonStyle(.bordered)
+            .accessibilityHint("Ticks this item off, recording why")
+        }
+    }
+
+    // MARK: - The source note, below the answers
+
+    @ViewBuilder
+    private var noteBody: some View {
+        switch model.state {
+        case .loaded(let note):
+            DisclosureGroup(isExpanded: $isNoteExpanded) {
+                TodayNoteView(markdown: note.markdown, onOpenLink: onOpenLink)
+                    .padding(.top, 6)
+            } label: {
+                Label(note.fileName, systemImage: "doc.text")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .accessibilityLabel("Source note, \(note.path)")
+            }
+        case .noDetail(let reason):
+            empty(symbol: "doc.plaintext",
+                  title: "No note behind this item",
+                  message: TodayDetailModel.noDetailMessage(reason))
+        default:
+            EmptyView()
         }
     }
 

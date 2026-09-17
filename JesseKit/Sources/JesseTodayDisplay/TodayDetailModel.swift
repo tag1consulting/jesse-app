@@ -69,6 +69,9 @@ public final class TodayDetailModel {
     private struct Cached {
         var etag: String?
         var state: State
+        /// The seven answers, cached beside the note because they arrive on the same
+        /// response and share its ETag — a `304` confirms both or neither.
+        var brief: TodayBriefEnvelope?
     }
 
     private var cache: [String: Cached] = [:]
@@ -84,6 +87,16 @@ public final class TodayDetailModel {
     public var note: TodayItemDetail? {
         if case .loaded(let note) = state { return note }
         return nil
+    }
+
+    /// The seven answers for the item on screen, if the bridge sent any.
+    ///
+    /// Read from the CACHE rather than from `state`, because an item with no note is
+    /// still an item with a brief — `.noDetail` carries only the reason, and the answers
+    /// about those items are exactly the ones that were previously unreachable.
+    public var brief: TodayBriefEnvelope? {
+        guard let id = itemID else { return nil }
+        return cache[id]?.brief
     }
 
     /// Whether anything is cached for `id` — what a view uses to decide between opening
@@ -155,15 +168,16 @@ public final class TodayDetailModel {
     private func apply(_ result: TodayDetailResult, id: String, cached: Cached?) {
         switch result {
         case .detail(let note):
-            store(.loaded(note), etag: note.etag, id: id)
+            store(.loaded(note), etag: note.etag, id: id, brief: note.brief)
         case .noDetail(let none):
-            store(.noDetail(none.reason), etag: none.etag, id: id)
+            store(.noDetail(none.reason), etag: none.etag, id: id, brief: none.brief)
         case .notModified(let tag):
             // Nothing changed, so nothing to re-render. The round trip still SUCCEEDED,
             // which is what clears a stale banner — and the tag is re-stored because a
             // `304` is the bridge confirming the one we sent.
             if let cached {
-                cache[id] = Cached(etag: tag ?? cached.etag, state: cached.state)
+                cache[id] = Cached(etag: tag ?? cached.etag, state: cached.state,
+                                   brief: cached.brief)
                 if itemID == id { state = cached.state }
             }
             clearFailure()
@@ -176,8 +190,9 @@ public final class TodayDetailModel {
         }
     }
 
-    private func store(_ state: State, etag: String?, id: String) {
-        cache[id] = Cached(etag: etag, state: state)
+    private func store(_ state: State, etag: String?, id: String,
+                       brief: TodayBriefEnvelope? = nil) {
+        cache[id] = Cached(etag: etag, state: state, brief: brief)
         if itemID == id { self.state = state }
         clearFailure()
     }

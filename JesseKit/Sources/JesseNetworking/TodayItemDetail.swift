@@ -52,9 +52,13 @@ public struct TodayItemDetail: Decodable, Equatable, Hashable, Sendable {
     /// item's link both move it.
     public var etag: String?
     public var generatedAt: String?
+    /// The seven answers about THIS ITEM, which is what the page leads with — the note
+    /// above is the source, one disclosure below it.
+    public var brief: TodayBriefEnvelope?
 
     public init(id: String, path: String = "", target: String = "", markdown: String = "",
-                truncated: Bool = false, etag: String? = nil, generatedAt: String? = nil) {
+                truncated: Bool = false, etag: String? = nil, generatedAt: String? = nil,
+                brief: TodayBriefEnvelope? = nil) {
         self.id = id
         self.path = path
         self.target = target
@@ -62,10 +66,11 @@ public struct TodayItemDetail: Decodable, Equatable, Hashable, Sendable {
         self.truncated = truncated
         self.etag = etag
         self.generatedAt = generatedAt
+        self.brief = brief
     }
 
     private enum CodingKeys: String, CodingKey {
-        case id, path, target, markdown, truncated, etag, generatedAt
+        case id, path, target, markdown, truncated, etag, generatedAt, brief
     }
 
     public init(from decoder: any Decoder) throws {
@@ -77,6 +82,9 @@ public struct TodayItemDetail: Decodable, Equatable, Hashable, Sendable {
         truncated = try c.decodeIfPresent(Bool.self, forKey: .truncated) ?? false
         etag = try c.decodeIfPresent(String.self, forKey: .etag)
         generatedAt = try c.decodeIfPresent(String.self, forKey: .generatedAt)
+        // A bridge before 0.143.0 sends no brief, and the page falls back to showing the
+        // note exactly as it always did.
+        brief = try c.decodeIfPresent(TodayBriefEnvelope.self, forKey: .brief)
     }
 
     /// The note's file name, for a title. The full path is shown as a caption, not as a
@@ -113,16 +121,23 @@ public struct TodayNoDetail: Decodable, Equatable, Hashable, Sendable {
     public var reason: TodayNoDetailReason
     public var etag: String?
     public var generatedAt: String?
+    /// **An item with no note still gets a brief.** That is the whole point of writing
+    /// one from the item line and a search rather than from a linked document: the items
+    /// that link nothing are exactly the ones a reader could previously learn nothing
+    /// about.
+    public var brief: TodayBriefEnvelope?
 
     public init(id: String, reason: TodayNoDetailReason = .noTarget,
-                etag: String? = nil, generatedAt: String? = nil) {
+                etag: String? = nil, generatedAt: String? = nil,
+                brief: TodayBriefEnvelope? = nil) {
         self.id = id
         self.reason = reason
         self.etag = etag
         self.generatedAt = generatedAt
+        self.brief = brief
     }
 
-    private enum CodingKeys: String, CodingKey { case id, reason, etag, generatedAt }
+    private enum CodingKeys: String, CodingKey { case id, reason, etag, generatedAt, brief }
 
     public init(from decoder: any Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -130,7 +145,276 @@ public struct TodayNoDetail: Decodable, Equatable, Hashable, Sendable {
         reason = try c.decodeIfPresent(TodayNoDetailReason.self, forKey: .reason) ?? .unknown
         etag = try c.decodeIfPresent(String.self, forKey: .etag)
         generatedAt = try c.decodeIfPresent(String.self, forKey: .generatedAt)
+        brief = try c.decodeIfPresent(TodayBriefEnvelope.self, forKey: .brief)
     }
+}
+
+// MARK: - The brief
+
+// The seven answers about one item (`bridge/src/todaybrief.rs`), served alongside the
+// note on the same endpoint.
+//
+// ## Why this exists at all
+//
+// The note above is almost never ABOUT the item. It is a person's journal, a project
+// file or an area overview, and several unrelated items routinely share one — so an item
+// used to open a long document with the answer somewhere inside it, or nowhere. The
+// brief is the answer; the note stays, one disclosure away, as the source.
+
+/// One of the seven answers.
+///
+/// `known == false` is a real state, not an empty string: the bridge's contract is that
+/// an answer the notes cannot support SAYS SO ("No due date is recorded.") rather than
+/// being omitted or guessed. Render those in a secondary style — the difference between
+/// "the vault does not say" and "nobody asked" is worth a reader's eye.
+public struct TodayBriefAnswer: Decodable, Equatable, Hashable, Sendable {
+    public var text: String
+    public var known: Bool
+
+    public init(text: String, known: Bool = true) {
+        self.text = text
+        self.known = known
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        text = try c.decodeIfPresent(String.self, forKey: .text) ?? ""
+        known = try c.decodeIfPresent(Bool.self, forKey: .known) ?? true
+    }
+
+    private enum CodingKeys: String, CodingKey { case text, known }
+}
+
+/// How urgent the item is. `unknown` is a real level, for the same reason
+/// `TodayBriefAnswer.known` exists.
+public enum TodayBriefPriority: String, Decodable, Equatable, Hashable, Sendable {
+    case urgent
+    case thisWeek = "this-week"
+    case whenTimeAllows = "when-time-allows"
+    case unknown
+
+    public init(from decoder: any Decoder) throws {
+        let raw = try decoder.singleValueContainer().decode(String.self)
+        self = TodayBriefPriority(rawValue: raw) ?? .unknown
+    }
+}
+
+/// Whether the item is still the user's to do.
+public enum TodayBriefVerdict: String, Decodable, Equatable, Hashable, Sendable {
+    /// Still theirs to do — the common case, and the one that shows no marker.
+    case open
+    /// The action has happened.
+    case done
+    /// No longer their action, or no longer needed.
+    case moot
+    /// A stated deadline passed and nothing shows it was met. NEVER auto-closed by the
+    /// bridge: a missed deadline is the case that most needs a person to look.
+    case overdue
+    /// A verdict this build has not heard of — read as `open`, the safe direction.
+    case unknown
+
+    public init(from decoder: any Decoder) throws {
+        let raw = try decoder.singleValueContainer().decode(String.self)
+        self = TodayBriefVerdict(rawValue: raw) ?? .unknown
+    }
+}
+
+public enum TodayBriefConfidence: String, Decodable, Equatable, Hashable, Sendable {
+    case high, low, unknown
+
+    public init(from decoder: any Decoder) throws {
+        let raw = try decoder.singleValueContainer().decode(String.self)
+        self = TodayBriefConfidence(rawValue: raw) ?? .unknown
+    }
+}
+
+/// A named person who knows more.
+public struct TodayBriefContact: Decodable, Equatable, Hashable, Sendable, Identifiable {
+    public var name: String
+    public var role: String
+    public var knows: String
+
+    /// Names are unique enough within a three-person list to key a `ForEach`.
+    public var id: String { name }
+
+    public init(name: String, role: String = "", knows: String = "") {
+        self.name = name
+        self.role = role
+        self.knows = knows
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        name = try c.decodeIfPresent(String.self, forKey: .name) ?? ""
+        role = try c.decodeIfPresent(String.self, forKey: .role) ?? ""
+        knows = try c.decodeIfPresent(String.self, forKey: .knows) ?? ""
+    }
+
+    private enum CodingKeys: String, CodingKey { case name, role, knows }
+}
+
+/// The judgement, with the evidence it rests on.
+public struct TodayBriefRelevance: Decodable, Equatable, Hashable, Sendable {
+    public var verdict: TodayBriefVerdict
+    public var reason: String
+    /// Where the evidence came from: a note path, or a channel and sender.
+    public var evidenceSource: String?
+    /// The evidence's own date, `YYYY-MM-DD`.
+    public var evidenceDate: String?
+    public var confidence: TodayBriefConfidence
+
+    public init(verdict: TodayBriefVerdict = .open, reason: String = "",
+                evidenceSource: String? = nil, evidenceDate: String? = nil,
+                confidence: TodayBriefConfidence = .low) {
+        self.verdict = verdict
+        self.reason = reason
+        self.evidenceSource = evidenceSource
+        self.evidenceDate = evidenceDate
+        self.confidence = confidence
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        verdict = try c.decodeIfPresent(TodayBriefVerdict.self, forKey: .verdict) ?? .open
+        reason = try c.decodeIfPresent(String.self, forKey: .reason) ?? ""
+        evidenceSource = try c.decodeIfPresent(String.self, forKey: .evidenceSource)
+        evidenceDate = try c.decodeIfPresent(String.self, forKey: .evidenceDate)
+        confidence = try c.decodeIfPresent(TodayBriefConfidence.self, forKey: .confidence) ?? .low
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case verdict, reason, evidenceSource, evidenceDate, confidence
+    }
+}
+
+/// Seven answers about one item, plus the judgement and the provenance.
+public struct TodayItemBrief: Decodable, Equatable, Hashable, Sendable {
+    public var about: TodayBriefAnswer
+    public var origin: TodayBriefAnswer
+    public var due: TodayBriefAnswer
+    public var priority: TodayBriefAnswer
+    public var priorityLevel: TodayBriefPriority
+    public var progress: TodayBriefAnswer
+    public var done: TodayBriefAnswer
+    public var contacts: TodayBriefAnswer
+    public var people: [TodayBriefContact]
+    public var relevance: TodayBriefRelevance
+    /// Anything useful that did not fit one of the seven.
+    public var more: String?
+    /// The note paths the answers rest on, each proven bridge-side to resolve under the
+    /// notes root — a citation that escaped the vault is dropped before it reaches here.
+    public var sources: [String]
+    public var generatedAt: String?
+    /// Which harness and model wrote it, so a doubtful brief can be traced.
+    public var harness: String?
+    public var model: String?
+
+    /// The seven, in the order the page shows them, paired with their headings.
+    public var sections: [(heading: String, answer: TodayBriefAnswer)] {
+        [("What it is", about),
+         ("Where it came from", origin),
+         ("Due", due),
+         ("Priority", priority),
+         ("Done so far", progress),
+         ("Done means", done),
+         ("Who knows more", contacts)]
+    }
+
+    public init(about: TodayBriefAnswer, origin: TodayBriefAnswer, due: TodayBriefAnswer,
+                priority: TodayBriefAnswer, priorityLevel: TodayBriefPriority = .unknown,
+                progress: TodayBriefAnswer, done: TodayBriefAnswer,
+                contacts: TodayBriefAnswer, people: [TodayBriefContact] = [],
+                relevance: TodayBriefRelevance = TodayBriefRelevance(),
+                more: String? = nil, sources: [String] = [], generatedAt: String? = nil,
+                harness: String? = nil, model: String? = nil) {
+        self.about = about
+        self.origin = origin
+        self.due = due
+        self.priority = priority
+        self.priorityLevel = priorityLevel
+        self.progress = progress
+        self.done = done
+        self.contacts = contacts
+        self.people = people
+        self.relevance = relevance
+        self.more = more
+        self.sources = sources
+        self.generatedAt = generatedAt
+        self.harness = harness
+        self.model = model
+    }
+
+    /// Tolerant like every other type here: a missing answer decodes as an explicit
+    /// unknown rather than throwing, because a brief with six good answers is still
+    /// worth showing.
+    public init(from decoder: any Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        func answer(_ key: CodingKeys) throws -> TodayBriefAnswer {
+            try c.decodeIfPresent(TodayBriefAnswer.self, forKey: key)
+                ?? TodayBriefAnswer(text: "Not recorded.", known: false)
+        }
+        about = try answer(.about)
+        origin = try answer(.origin)
+        due = try answer(.due)
+        priority = try answer(.priority)
+        priorityLevel = try c.decodeIfPresent(TodayBriefPriority.self,
+                                              forKey: .priorityLevel) ?? .unknown
+        progress = try answer(.progress)
+        done = try answer(.done)
+        contacts = try answer(.contacts)
+        people = try c.decodeIfPresent([TodayBriefContact].self, forKey: .people) ?? []
+        relevance = try c.decodeIfPresent(TodayBriefRelevance.self,
+                                          forKey: .relevance) ?? TodayBriefRelevance()
+        more = try c.decodeIfPresent(String.self, forKey: .more)
+        sources = try c.decodeIfPresent([String].self, forKey: .sources) ?? []
+        generatedAt = try c.decodeIfPresent(String.self, forKey: .generatedAt)
+        harness = try c.decodeIfPresent(String.self, forKey: .harness)
+        model = try c.decodeIfPresent(String.self, forKey: .model)
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case about, origin, due, priority, priorityLevel, progress, done, contacts
+        case people, relevance, more, sources, generatedAt, harness, model
+    }
+}
+
+/// How the brief for this item turned out.
+///
+/// `pending` is a first-class answer, not an absence: generation is background work, and
+/// an item opened before its brief exists gets an honest "being written" — the seven
+/// headings with a spinner — rather than a blank card or a spinner over the whole page.
+public enum TodayBriefStatus: String, Decodable, Equatable, Hashable, Sendable {
+    case ok, pending, failed, unknown
+
+    public init(from decoder: any Decoder) throws {
+        let raw = try decoder.singleValueContainer().decode(String.self)
+        self = TodayBriefStatus(rawValue: raw) ?? .unknown
+    }
+}
+
+/// The `brief` object on the detail response.
+public struct TodayBriefEnvelope: Decodable, Equatable, Hashable, Sendable {
+    public var status: TodayBriefStatus
+    /// Present exactly when `status == .ok`.
+    public var brief: TodayItemBrief?
+    /// Why it failed, in one sentence — shown instead of a bare "error".
+    public var failure: String?
+
+    public init(status: TodayBriefStatus, brief: TodayItemBrief? = nil,
+                failure: String? = nil) {
+        self.status = status
+        self.brief = brief
+        self.failure = failure
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        status = try c.decodeIfPresent(TodayBriefStatus.self, forKey: .status) ?? .unknown
+        brief = try c.decodeIfPresent(TodayItemBrief.self, forKey: .brief)
+        failure = try c.decodeIfPresent(String.self, forKey: .failure)
+    }
+
+    private enum CodingKeys: String, CodingKey { case status, brief, failure }
 }
 
 // MARK: - The outcome

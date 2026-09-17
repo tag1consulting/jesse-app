@@ -47,6 +47,10 @@ pub enum RoutedJob {
     DietVerify,
     /// Answering a self-referential question from the vault.
     VaultQa,
+    /// Writing the seven-answer brief for one day-file item, and judging whether
+    /// that item is still open. Reads the vault; the BRIDGE validates the answer
+    /// and decides, in code, whether anything is closed — see [`crate::todaybrief`].
+    TodayBrief,
 }
 
 impl RoutedJob {
@@ -63,7 +67,7 @@ impl RoutedJob {
     pub fn required(&self) -> Capability {
         match self {
             RoutedJob::Title | RoutedJob::DietExtract => Capability::Basic,
-            RoutedJob::VaultQa => Capability::Read,
+            RoutedJob::VaultQa | RoutedJob::TodayBrief => Capability::Read,
             RoutedJob::DietVerify => Capability::Write,
         }
     }
@@ -75,6 +79,7 @@ impl RoutedJob {
             RoutedJob::DietExtract => "diet-extract",
             RoutedJob::DietVerify => "diet-verify",
             RoutedJob::VaultQa => "vault-qa",
+            RoutedJob::TodayBrief => "today-brief",
         }
     }
 }

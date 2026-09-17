@@ -134,7 +134,8 @@ struct MacTodayView: View {
                     }
                 }
                 .navigationDestination(item: $openedItem) { item in
-                    TodayDetailView(model: detailModel, item: item, onOpenLink: openLink)
+                    TodayDetailView(model: detailModel, item: item, onOpenLink: openLink,
+                                    onCloseAsStale: closeAsStale)
                         .navigationTitle("Item")
                 }
         }
@@ -249,6 +250,14 @@ struct MacTodayView: View {
         guard !model.refuseTurnIfReadOnly() else { return }
         openedThread = processRun.start(items: items, coordinator: coordinator,
                                         context: context, day: model)
+    }
+
+    /// **Close an item the brief thinks is finished**, recording the brief's own reason
+    /// as the evidence. An ordinary check — the same mutation the checkbox sends — so
+    /// `Close it at source` picks it up afterwards like any other completion.
+    private func closeAsStale(_ item: TodayItem, _ reason: String) {
+        openedItem = nil
+        Task { await model.check(id: item.id, checked: true, evidence: reason) }
     }
 
     /// Closing a staged discussion without sending drops the context with it — a no-op

@@ -54,6 +54,9 @@ pub(crate) fn test_config() -> Config {
         // No vault-QA backend override by default — the route is inert (kill
         // switch), so tests exercise today's hosted Ask path unless they set it.
         vaultqa_mcp_config: None,
+        // No brief-child MCP override in the fixture — the shipped default, and the
+        // only value that boots at all (setting it is a startup refusal).
+        today_brief_mcp_config: None,
         // No main-path MCP override in the fixture — the main turn falls back to the
         // qmd-only inline const, matching from_env's default.
         main_mcp_config: None,

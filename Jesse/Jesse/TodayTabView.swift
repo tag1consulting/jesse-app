@@ -109,7 +109,8 @@ struct TodayTabView: View {
                     ToolbarItem(placement: .topBarLeading) { EditButton() }
                 }
                 .navigationDestination(item: $openedItem) { item in
-                    TodayDetailView(model: detailModel, item: item, onOpenLink: openLink)
+                    TodayDetailView(model: detailModel, item: item, onOpenLink: openLink,
+                                    onCloseAsStale: closeAsStale)
                         .navigationTitle("Item")
                         .navigationBarTitleDisplayMode(.inline)
                 }
@@ -248,6 +249,18 @@ struct TodayTabView: View {
         guard !model.refuseTurnIfReadOnly() else { return }
         openedThread = processRun.start(items: items, coordinator: coordinator,
                                         context: context)
+    }
+
+    /// **Close an item the brief thinks is finished**, recording the brief's own reason
+    /// as the evidence.
+    ///
+    /// An ordinary check, not a new kind of write: the same mutation the checkbox sends,
+    /// so it queues offline, replays, and `Close it at source` picks it up afterwards
+    /// like any other completion. The page pops first because the row it is about is
+    /// about to be struck through behind it.
+    private func closeAsStale(_ item: TodayItem, _ reason: String) {
+        openedItem = nil
+        Task { await model.check(id: item.id, checked: true, evidence: reason) }
     }
 
     /// **Try one refused change again.** Put it back in the queue, then run the queue —

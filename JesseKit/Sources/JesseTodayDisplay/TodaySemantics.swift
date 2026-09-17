@@ -360,6 +360,39 @@ public enum TodaySemantics {
         badgeItems(snapshot).count
     }
 
+    /// **Items the bridge closed on its own**, still sitting in the day file.
+    ///
+    /// Derived from the document rather than remembered anywhere, and that is what makes
+    /// "since the last `Process updates`" true without storing a marker: `Process
+    /// updates` is what removes checked items from the day file, so anything still here
+    /// wearing an `auto-closed:` evidence line was closed after the last run. No
+    /// timestamp to keep, nothing to reset, and nothing that can drift out of step with
+    /// the file.
+    ///
+    /// The prefix is the bridge's own (`todaybrief`): an auto-closed item is an ORDINARY
+    /// checked item — same checkbox, same `app-completed` sub-line — so the evidence text
+    /// is the only thing that distinguishes one, which is exactly why the bridge writes a
+    /// fixed prefix into it.
+    public nonisolated static func autoClosed(_ snapshot: TodaySnapshot) -> [TodayItem] {
+        snapshot.allItems.filter { item in
+            item.checked && (item.appCompleted?.evidence?.hasPrefix("auto-closed:") ?? false)
+        }
+    }
+
+    /// How many items closed themselves since the last `Process updates`.
+    public nonisolated static func autoClosedCount(_ snapshot: TodaySnapshot) -> Int {
+        autoClosed(snapshot).count
+    }
+
+    /// **Whether a row should wear the "maybe done" marker**: the brief thinks it is
+    /// finished or moot but could not clear the bar to close it, or its deadline passed.
+    ///
+    /// Done beats maybe-done, the same precedence `isPostponed` keeps: a row that is
+    /// already ticked off has nothing to suspect.
+    public nonisolated static func isMaybeStale(_ item: TodayItem) -> Bool {
+        item.relevance?.stale == true && !item.checked
+    }
+
     /// Unseen glanceable rows — the dot on the briefing sections.
     public nonisolated static func unseenReportCount(_ snapshot: TodaySnapshot) -> Int {
         snapshot.allReports.filter { !$0.seen }.count

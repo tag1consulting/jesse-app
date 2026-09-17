@@ -1374,6 +1374,59 @@ Answer the question I asked, not the one you wish I had asked.
 #                                              # body is valid on either contract.
 
 # =============================================================================
+# THE TODAY ITEM BRIEF — seven answers about one day-file item
+# =============================================================================
+#
+# Tapping an item on the day screen used to open the raw markdown of the first
+# note it linked. That note is almost never ABOUT the item — it is a person's
+# journal, a project file or an area overview, and several unrelated items
+# routinely share one — so the answer was somewhere inside a long document or
+# nowhere. The bridge now writes a short brief per item instead, and judges
+# whether the item is still open at the same time.
+#
+# THERE IS NOTHING TO CONFIGURE TO TURN IT ON. It needs a state dir (the
+# default, $HOME/.jesse-bridge) and nothing else:
+#
+#   * WHICH MODEL writes a brief is the routing rule's call, exactly like every
+#     other job the user did not pick a model for — the `offload_order` walk at
+#     `read`, then the conversation's model, then ambient. Add a fast, cheap
+#     model to `offload_order` above and briefs follow it. There is deliberately
+#     no `today_brief_model` key: a second way to name a model is a second thing
+#     to keep in step with the health prober and the level gate.
+#
+#   * THE BRIEFS THEMSELVES live in <state-dir>/today-briefs.json, never in the
+#     vault. They are derived from vault content and would look at home beside
+#     the notes, but writing them there would put generated text in files a
+#     person edits, a sync tool watches and the autocommit timer picks up.
+#
+#   * THE TIMEOUT is a const (`TODAY_BRIEF_TIMEOUT_SECS`, 120s), not a key, for
+#     the same reason the vault-QA and title timeouts are: it bounds one
+#     background child, not an operator-managed workload.
+#
+# ---------------------------------------------------------------------------
+# JESSE_TODAY_BRIEF_MCP_CONFIG — a dormant seam. SETTING IT REFUSES TO START.
+# ---------------------------------------------------------------------------
+#
+# The brief child runs at `read` with NO MCP servers: it reads the notes the
+# item links and greps the vault. It would judge "is this still open?" far
+# better if it could also search the owner's own sent replies, because the notes
+# reliably record a request and miss the answer — which is exactly how an item
+# gets added the day after it was done.
+#
+# It cannot, yet, and this variable is why it fails loudly rather than quietly.
+# The only certified read-only rows are (basic, none) and (read, none); every
+# message-carrying set in the containment record is a MAIN-TURN set that also
+# grants tools which SEND. Pointing a background child that can tick items off
+# at one of those would widen its posture to "can message people" without a
+# battery ever having probed it — and the startup gate would not catch it,
+# because an MCP set sits outside the capability check.
+#
+# So the plumbing is complete and the door is bolted: set this and the bridge
+# refuses to boot, naming what is missing. Opening it is what it has always been
+# for a new server set — a code change, a battery re-run against the live pair,
+# and a signed record. See SECURITY.md.
+
+# =============================================================================
 # [persona.style] and [persona.formatting] — THE END OF THE FILE, on purpose
 # =============================================================================
 #

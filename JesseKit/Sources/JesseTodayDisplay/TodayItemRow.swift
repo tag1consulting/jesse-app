@@ -321,7 +321,9 @@ public struct TodayItemRow: View {
     @ViewBuilder
     private var caption: some View {
         let dates = TodaySemantics.dateCaption(item)
-        if !item.project.isUnfiled || dates != nil || TodaySemantics.isPostponed(item) || queued {
+        let maybeStale = item.relevance?.stale == true
+        if !item.project.isUnfiled || dates != nil || TodaySemantics.isPostponed(item) || queued
+            || maybeStale {
             HStack(spacing: 6) {
                 // The words behind the dotted ring. A ring alone says "something about
                 // this is different"; only the caption says what, and it is the half a
@@ -347,6 +349,24 @@ public struct TodayItemRow: View {
                         .background(.quaternary, in: .capsule)
                         .foregroundStyle(.secondary)
                         .accessibilityLabel("Postponed until tomorrow")
+                }
+                // The brief suspects this is finished (or its deadline has passed) but
+                // could not clear the bar to close it. A WORD, not a colour: this is the
+                // one row cue that invites an action, and it has to reach a reader who
+                // cannot see the row beside an unmarked one. The reason rides in the
+                // accessibility label rather than the chip — the chip has to stay short
+                // enough to sit beside a project label and a date on a phone.
+                if let relevance = item.relevance, relevance.stale {
+                    let overdue = relevance.verdict == .overdue
+                    Text(overdue ? "Overdue" : "Maybe done")
+                        .font(.caption2)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 1)
+                        .background(.quaternary, in: .capsule)
+                        .foregroundStyle(.secondary)
+                        .accessibilityLabel(overdue
+                            ? "Overdue. \(relevance.reason)"
+                            : "May already be done. \(relevance.reason)")
                 }
                 if !item.project.isUnfiled {
                     Text(TodayProjectPalette.role(for: item.project).label)

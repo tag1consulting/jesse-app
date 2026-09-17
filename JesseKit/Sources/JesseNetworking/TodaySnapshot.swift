@@ -114,6 +114,14 @@ public struct TodayItem: Decodable, Equatable, Hashable, Identifiable, Sendable 
     /// a day that silently drops rows is a day the user stops trusting.
     public var deferred: Bool
     public var deferredMs: UInt64
+    /// What this item's BRIEF concluded about whether it is still the user's to do, or
+    /// `nil` when no brief has been written for it yet.
+    ///
+    /// Never a fact about the markdown — the bridge keeps it in its own store and stamps
+    /// it on, exactly as it does `deferred`. An item the bridge auto-closed is simply
+    /// `checked` with its reason on the `appCompleted` line like any other completion;
+    /// this is what marks the ones it SUSPECTS are finished but would not close.
+    public var relevance: TodayItemRelevance?
     public var range: TodaySourceRange
 
     public init(id: String, checked: Bool = false, lead: String = "", text: String = "",
@@ -121,6 +129,7 @@ public struct TodayItem: Decodable, Equatable, Hashable, Identifiable, Sendable 
                 appCompleted: TodayAppCompleted? = nil, sectionName: String = "",
                 project: TodayProject = .unfiled,
                 deferred: Bool = false, deferredMs: UInt64 = 0,
+                relevance: TodayItemRelevance? = nil,
                 range: TodaySourceRange = TodaySourceRange(start: 0, end: 0)) {
         self.id = id
         self.checked = checked
@@ -134,6 +143,7 @@ public struct TodayItem: Decodable, Equatable, Hashable, Identifiable, Sendable 
         self.project = project
         self.deferred = deferred
         self.deferredMs = deferredMs
+        self.relevance = relevance
         self.range = range
     }
 
@@ -145,7 +155,7 @@ public struct TodayItem: Decodable, Equatable, Hashable, Identifiable, Sendable 
     /// item it can render.
     private enum CodingKeys: String, CodingKey {
         case id, checked, lead, text, links, addedDate, updatedDate
-        case appCompleted, sectionName, project, deferred, deferredMs, range
+        case appCompleted, sectionName, project, deferred, deferredMs, relevance, range
     }
 
     public init(from decoder: any Decoder) throws {
@@ -164,6 +174,9 @@ public struct TodayItem: Decodable, Equatable, Hashable, Identifiable, Sendable 
         // correct reading of a bridge that has no idea what postponing is.
         deferred = try c.decodeIfPresent(Bool.self, forKey: .deferred) ?? false
         deferredMs = try c.decodeIfPresent(UInt64.self, forKey: .deferredMs) ?? 0
+        // A bridge before 0.143.0 sends no verdict, and "nothing is known about whether
+        // this is still open" is exactly what `nil` means.
+        relevance = try c.decodeIfPresent(TodayItemRelevance.self, forKey: .relevance)
         range = try c.decodeIfPresent(TodaySourceRange.self, forKey: .range)
             ?? TodaySourceRange(start: 0, end: 0)
     }
@@ -172,6 +185,33 @@ public struct TodayItem: Decodable, Equatable, Hashable, Identifiable, Sendable 
     /// top-priority item, which the bridge refuses to move (`409`). The UI hides the
     /// move menu for it rather than offering a button that always fails.
     public var isLeadItem: Bool { sectionName.isEmpty }
+}
+
+/// One item's verdict, as the day screen sees it — a thin projection of the brief's
+/// full `relevance`, which is one request away on the detail endpoint.
+public struct TodayItemRelevance: Decodable, Equatable, Hashable, Sendable {
+    public var verdict: TodayBriefVerdict
+    public var reason: String
+    /// Mark this row "maybe stale": the brief thinks it is finished or moot but could
+    /// not clear the bar to close it, or its deadline has passed. Never set on a row the
+    /// bridge actually closed — that one is just checked.
+    public var stale: Bool
+
+    public init(verdict: TodayBriefVerdict = .open, reason: String = "",
+                stale: Bool = false) {
+        self.verdict = verdict
+        self.reason = reason
+        self.stale = stale
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        verdict = try c.decodeIfPresent(TodayBriefVerdict.self, forKey: .verdict) ?? .open
+        reason = try c.decodeIfPresent(String.self, forKey: .reason) ?? ""
+        stale = try c.decodeIfPresent(Bool.self, forKey: .stale) ?? false
+    }
+
+    private enum CodingKeys: String, CodingKey { case verdict, reason, stale }
 }
 
 /// A glanceable row: a briefing-section line that carries a link and is worth

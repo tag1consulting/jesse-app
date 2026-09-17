@@ -11,9 +11,10 @@ use jesse_bridge::{
     manual_pairing_lines, open_inbound_staging, pairing_payload, prune_direct_state,
     qr_env_tristate, search_scale, sentinel_advert, serve_broker, settings_permission_drift,
     shadowing_direct_mcp_grants, show_qr_opt_in, show_token_opt_in, spawn_eviction_task,
-    spawn_scheduler, spawn_session_gc_task, start_health_prober, validate_model_config, AppState,
-    Config, ConfigError, QrArt, Runner, TokenVisibility, BINARY_DRIFT, CONTAINMENT_RECORDS,
-    DIRECT_ID, INBOUND_DIR_NAME, SEARCH_SCALE, SETTINGS_DRIFT, SHADOWING_GRANTS, UNRESOLVED_MCP,
+    spawn_scheduler, spawn_session_gc_task, start_health_prober, validate_model_config,
+    validate_today_brief_mcp, AppState, Config, ConfigError, QrArt, Runner, TokenVisibility,
+    BINARY_DRIFT, CONTAINMENT_RECORDS, DIRECT_ID, INBOUND_DIR_NAME, SEARCH_SCALE, SETTINGS_DRIFT,
+    SHADOWING_GRANTS, UNRESOLVED_MCP,
 };
 
 #[tokio::main]
@@ -50,6 +51,10 @@ async fn main() {
     // warns and continues. See `levelgate`.
     let declared = load_local_models(&cfg.home);
     let mut errors = validate_model_config(&cfg, &declared, CONTAINMENT_RECORDS);
+    // The brief child's MCP set joins the same gate. Unlike the other two per-child MCP
+    // overrides it is refused rather than honoured, because that child runs unattended
+    // and can close the owner's items — see `validate_today_brief_mcp`.
+    errors.extend(validate_today_brief_mcp(&cfg));
     // The `[concurrency]` table joins the SAME gate. A misspelled model id there is refused by
     // name rather than silently ignored — a config surface that quietly does nothing is the
     // failure mode this project keeps designing against.
