@@ -630,7 +630,20 @@ pub trait Harness: Send + Sync {
     /// no argv to give returns the strings that name its posture; what must not happen is a
     /// harness with no entry here, because that is a harness whose record vouches for
     /// nothing.
-    fn capability_args(&self, cfg: &Config, capability: Capability) -> Vec<String>;
+    /// **KEYED ON THE ROW, NOT ON THE CAPABILITY ALONE.** A containment row is a
+    /// `(capability, MCP set)` pair, and until 0.144.0 this took only the capability — so two
+    /// rows at one level were forced to carry byte-identical `toolset_args`, because three
+    /// places compare a row's recorded argv against this call by STRICT EQUALITY
+    /// ([`validate_toolset_argv`] at boot, the containment test in CI, and the battery when it
+    /// records). That made a row whose grant differs from its level-mates structurally
+    /// impossible to express: recording one would refuse startup, and widening the shared
+    /// grant instead would hand the new tools to every other child at that level.
+    ///
+    /// Taking the set closes that gap and nothing else. Every set that existed before must
+    /// still produce the argv it produced — the invariant that keeps every committed record
+    /// valid and costs no battery re-run — so a harness whose flags genuinely do not vary by
+    /// server set (Codex's sandbox mode, Direct's tool manifest) accepts this and ignores it.
+    fn capability_args(&self, cfg: &Config, capability: Capability, mcp: McpSet) -> Vec<String>;
 
     /// Every (capability, MCP set) pair THIS harness actually spawns, and therefore every
     /// row its record must carry.
@@ -1449,7 +1462,7 @@ pub fn brief_child_request<'a>(
         active: ambient,
         capability: Capability::Read,
         cwd: PathBuf::from(&cfg.vault),
-        mcp_config: brief_mcp_config(cfg),
+        mcp_config: brief_mcp_config(cfg, &ambient.harness),
         write_lock: None,
         turn_id,
         // A routed one-shot produces no files: its whole output is the text it returns.

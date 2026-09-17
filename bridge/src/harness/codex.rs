@@ -1915,7 +1915,11 @@ impl Harness for Codex {
     /// The argv WITH [`WORKSPACE_TOKEN`] still in it — this is the recorded, host-independent
     /// form the startup gate compares against. [`build_codex_args`] fills the token in when
     /// it builds a real child, because only a spawn knows its own working directory.
-    fn capability_args(&self, _cfg: &Config, capability: Capability) -> Vec<String> {
+    /// The MCP set is accepted and IGNORED, and that is a statement rather than an oversight:
+    /// Codex's containment flags are an OS sandbox mode and an approval policy, which do not
+    /// vary by which servers are loaded. Its per-server tool narrowing lives in
+    /// [`codex_mcp_args`] (`enabled_tools`), not here.
+    fn capability_args(&self, _cfg: &Config, capability: Capability, _mcp: McpSet) -> Vec<String> {
         codex_capability_args(capability)
     }
 
@@ -2223,7 +2227,7 @@ mod tests {
     /// impossible.
     #[test]
     fn the_workspace_token_is_recorded_and_filled_in_at_spawn() {
-        let recorded = Codex.capability_args(&test_config(), Capability::Write);
+        let recorded = Codex.capability_args(&test_config(), Capability::Write, McpSet::Messages);
         assert!(
             recorded
                 .iter()

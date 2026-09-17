@@ -215,7 +215,10 @@ impl Harness for Direct {
     /// own statement of what a level exposes, rather than listing them here — two lists would
     /// be two lists to keep in step, and the one that matters is the one the loop actually
     /// builds.
-    fn capability_args(&self, cfg: &Config, capability: Capability) -> Vec<String> {
+    /// The MCP set is accepted and IGNORED: this harness's grants come from its own
+    /// `[[direct.mcp]]` table rather than from an [`McpSet`], and its only shipped rows carry
+    /// `mcp:none`. See [`Harness::capability_args`] for why the parameter exists at all.
+    fn capability_args(&self, cfg: &Config, capability: Capability, _mcp: McpSet) -> Vec<String> {
         let level = Level::from(capability);
         let mut names: Vec<String> = expected_names(level)
             .into_iter()
@@ -1823,7 +1826,7 @@ mod tests {
     fn the_tools_token_is_unchanged_without_a_grant_and_carries_the_granted_names_with_one() {
         let mut cfg = crate::testutil::test_config();
         assert_eq!(
-            Direct.capability_args(&cfg, Capability::Read),
+            Direct.capability_args(&cfg, Capability::Read, McpSet::None),
             vec![
                 "--tools".to_string(),
                 "fetch_url,vault_list,vault_read,vault_search".to_string()
@@ -1832,7 +1835,7 @@ mod tests {
 
         cfg.direct.mcp = vec![grant("qmd", &["query", "get"], ActionClass::Read)];
         assert_eq!(
-            Direct.capability_args(&cfg, Capability::Read),
+            Direct.capability_args(&cfg, Capability::Read, McpSet::None),
             vec![
                 "--tools".to_string(),
                 "fetch_url,vault_list,vault_read,vault_search,mcp__qmd__get,mcp__qmd__query"
@@ -1843,7 +1846,7 @@ mod tests {
         // `basic` grants no class at all, so a grant adds nothing to it and the row the
         // record holds for `basic` is untouched by any grant.
         assert_eq!(
-            Direct.capability_args(&cfg, Capability::Basic),
+            Direct.capability_args(&cfg, Capability::Basic, McpSet::None),
             vec!["--tools".to_string(), String::new()]
         );
     }
@@ -1858,13 +1861,17 @@ mod tests {
             .insert("write_note".into(), ActionClass::VaultWrite);
         cfg.direct.mcp = vec![g];
 
-        let read = Direct.capability_args(&cfg, Capability::Read).remove(1);
+        let read = Direct
+            .capability_args(&cfg, Capability::Read, McpSet::None)
+            .remove(1);
         assert!(read.contains("mcp__notes__read_note"));
         assert!(
             !read.contains("mcp__notes__write_note"),
             "a vault_write tool is not exposed at read: {read}"
         );
-        let write = Direct.capability_args(&cfg, Capability::Write).remove(1);
+        let write = Direct
+            .capability_args(&cfg, Capability::Write, McpSet::None)
+            .remove(1);
         assert!(write.contains("mcp__notes__write_note"));
     }
 

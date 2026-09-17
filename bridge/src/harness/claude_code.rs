@@ -114,8 +114,8 @@ impl Harness for ClaudeCode {
         matches!(wire, Wire::Messages)
     }
 
-    fn capability_args(&self, cfg: &Config, capability: Capability) -> Vec<String> {
-        claude_capability_args(cfg, capability)
+    fn capability_args(&self, cfg: &Config, capability: Capability, mcp: McpSet) -> Vec<String> {
+        claude_capability_args(cfg, capability, mcp)
     }
 
     fn shipped_rows(&self) -> &'static [ContainmentRow] {
@@ -1039,6 +1039,33 @@ pub const MAIN_CHILD_MCP_CONFIG: &str = concat!(
     "}}"
 );
 
+/// **The six servers the owner's own replies arrive on** — `google`, `google-perseido`,
+/// `fastmail`, `slack`, `whatsapp`, `imcp` — and nothing else. The TODAY-BRIEF child's set when
+/// sent-message search is on. See [`McpSet::Replies`] for which layer holds each server.
+///
+/// **THE FIRST SET HERE THAT IS NOT A SUPERSET OF ITS PREDECESSOR.** It is [`MESSAGES_MCP_CONFIG`]
+/// with the infrastructure taken out: no qmd, no browser, no Home Assistant, no Roon, no GitHub,
+/// no RouterOS, and — the reason it exists — no UniFi and no Proxmox. Assembled from the same
+/// `mcp_*!` fragments as every set above, so a server's arguments still have exactly one
+/// spelling and this set cannot drift from the main turn's.
+///
+/// The declaration order matches [`McpSet::Replies`]'s label, which is the row key.
+pub const REPLIES_MCP_CONFIG: &str = concat!(
+    r#"{"mcpServers":{"#,
+    mcp_google!(),
+    ",",
+    mcp_google_perseido!(),
+    ",",
+    mcp_fastmail!(),
+    ",",
+    mcp_slack!(),
+    ",",
+    mcp_whatsapp!(),
+    ",",
+    mcp_imcp!(),
+    "}}"
+);
+
 /// qmd PLUS slack PLUS browser — the main turn's server set from bridge 0.66.0 until Home
 /// Assistant and Roon were added in 0.67.0. No shipped spawn site uses it today; retained
 /// for exactly the reason [`QMD_SLACK_MCP_CONFIG`] is, and it had to be SPLIT OUT rather
@@ -1140,19 +1167,46 @@ pub fn vaultqa_mcp_config(cfg: &Config) -> &str {
         .unwrap_or(EMPTY_MCP_CONFIG)
 }
 
-/// The MCP server set for the TODAY-BRIEF child: NO servers, unless an operator has
-/// set `JESSE_TODAY_BRIEF_MCP_CONFIG` — which refuses to start (see
-/// [`Config::today_brief_mcp_config`] and `validate_today_brief_mcp`).
+/// The MCP server set for the TODAY-BRIEF child: NO servers, unless
+/// `JESSE_TODAY_BRIEF_MCP_CONFIG` names one — and the only name that gets past
+/// `validate_today_brief_mcp` is [`McpSet::Replies`], which needs a passing row in the
+/// record of every harness that spawns it.
 ///
-/// So in every configuration that boots, this returns [`EMPTY_MCP_CONFIG`] and the
-/// brief child runs on the three read-only built-ins alone: it reads the notes the
-/// item links and greps the vault for anything newer. That is a narrower posture than
-/// the vault-QA child can be given, and it is deliberate — a background turn that
-/// closes items off its own judgement is the last place to widen a toolset.
-pub fn brief_mcp_config(cfg: &Config) -> &str {
-    cfg.today_brief_mcp_config
+/// **THE SHIPPED CONST, NEVER THE ENVIRONMENT'S STRING.** The variable supplies a set
+/// NAME; what the child loads is that set's own [`McpSet::config`], a compile-time
+/// const the containment record was taken against. So there is no path by which a file
+/// on this host reaches `--mcp-config`, and no way for the posture the record vouches
+/// for to differ from the one the child runs. That asymmetry with
+/// [`vaultqa_mcp_config`] — which still passes its value straight through — is the
+/// whole point: this child runs unattended and can check the owner's items off.
+///
+/// Unset, this returns [`EMPTY_MCP_CONFIG`] and the brief runs on the three read-only
+/// built-ins alone, reading the notes the item links and grepping the vault.
+/// **AND ONLY ON A HARNESS THAT HAS A ROW FOR THE SET.** The switch is global; a
+/// containment row is per harness. So the set loads where the record can vouch for it
+/// and nowhere else, which is the same rule the startup gate applies — asked here of
+/// the harness actually about to be spawned.
+///
+/// That is what makes `direct` run the brief WITHOUT message search rather than needing
+/// a special case: it ships no row for the set, so it gets no servers, and the brief
+/// says which channels it searched (none) rather than pretending.
+pub fn brief_mcp_config(cfg: &Config, harness_id: &str) -> &'static str {
+    let Some(set) = cfg
+        .today_brief_mcp_config
         .as_deref()
-        .unwrap_or(EMPTY_MCP_CONFIG)
+        .map(str::trim)
+        .and_then(McpSet::parse)
+    else {
+        return EMPTY_MCP_CONFIG;
+    };
+    let row = ContainmentRow {
+        capability: Capability::Read,
+        mcp: set,
+    };
+    match cfg.harnesses.get(harness_id) {
+        Some(h) if h.shipped_rows().contains(&row) => set.config(),
+        _ => EMPTY_MCP_CONFIG,
+    }
 }
 
 // ---- Capability → containment flags -----------------------------------------
@@ -1182,6 +1236,86 @@ pub const READ_ROOT_TOOLS: &str = "Read,Grep,Glob";
 /// Both sites that spawn a `Read` child run it in the vault, so `./**` IS the vault.
 pub const READ_ALLOWED_TOOLS: &str = "Read(./**),Grep(./**),Glob(./**),\
 mcp__qmd__query,mcp__qmd__get,mcp__qmd__multi_get,mcp__qmd__status";
+
+/// The `--allowedTools` grant for a [`Capability::Read`] child on [`McpSet::Replies`]: the
+/// three read-only built-ins, plus the READ tools of the six message servers and NOTHING else.
+///
+/// # Every name here is already in [`crate::DEFAULT_ALLOWED_TOOLS`]
+///
+/// That is a deliberate constraint rather than a coincidence, and a test asserts it: this grant
+/// may narrow the main turn's, never widen it. A tool the main turn does not trust itself with
+/// cannot first appear on an unattended background child that closes the owner's items.
+///
+/// # What is withheld, per server, and why
+///
+/// * **`slack`** — the same six read tools the main turn gets. Its posting tool
+///   `conversations_add_message` is NOT registered by the server at all (its opt-in variable
+///   is deliberately never set), and the token holds no `chat:write` scope — so this list is
+///   the third of three shut boundaries, not the only one.
+/// * **`whatsapp`** — the eight read tools. `send_message`, `send_file` and
+///   `send_audio_message` ARE registered, unconditionally, and this list is the ONLY thing
+///   withholding them: the server drives a local Go bridge, so there is no credential to
+///   scope and no flag to unset. **It is the single-layer server of the six.**
+///   `download_media` is withheld too, for a different reason — it WRITES a file.
+/// * **`imcp`** — `messages_fetch` only. `maps_search` is granted to the MAIN turn and is
+///   deliberately NOT here: it leaves the host carrying a query string, and a brief has no use
+///   for a map. The other four Maps tools are ungranted there too. iMCP registers no send tool.
+/// * **`google` / `google-perseido`** — the SIX GMAIL READ TOOLS only. Not Drive, not Calendar:
+///   the main turn's grant names those and this one must not, because a sent reply is mail.
+/// * **`fastmail`** — all three of its tools, which are all reads.
+///
+/// No `mcp__qmd__*`: this child reads the notes it was handed and searches messages, and vault
+/// search is what it does not need. No `WebSearch`/`WebFetch`, which `READ_DISALLOWED_TOOLS`
+/// denies anyway — stated here so the two lists cannot drift into disagreeing.
+pub const REPLIES_ALLOWED_TOOLS: &str = "Read(./**),Grep(./**),Glob(./**),\
+mcp__google__search_gmail_messages,mcp__google__get_gmail_message_content,\
+mcp__google__get_gmail_messages_content_batch,mcp__google__get_gmail_thread_content,\
+mcp__google__get_gmail_threads_content_batch,mcp__google__list_gmail_labels,\
+mcp__google-perseido__search_gmail_messages,\
+mcp__google-perseido__get_gmail_message_content,\
+mcp__google-perseido__get_gmail_messages_content_batch,\
+mcp__google-perseido__get_gmail_thread_content,\
+mcp__google-perseido__get_gmail_threads_content_batch,\
+mcp__google-perseido__list_gmail_labels,\
+mcp__fastmail__get_mailboxes,mcp__fastmail__search_emails,mcp__fastmail__get_email_content,\
+mcp__slack__conversations_search_messages,mcp__slack__conversations_history,\
+mcp__slack__conversations_replies,mcp__slack__channels_list,mcp__slack__channels_me,\
+mcp__slack__users_search,\
+mcp__whatsapp__search_contacts,mcp__whatsapp__list_messages,mcp__whatsapp__list_chats,\
+mcp__whatsapp__get_chat,mcp__whatsapp__get_direct_chat_by_contact,\
+mcp__whatsapp__get_contact_chats,mcp__whatsapp__get_last_interaction,\
+mcp__whatsapp__get_message_context,\
+mcp__imcp__messages_fetch";
+
+/// The `--allowedTools` grant a [`Capability::Read`] child gets FOR ONE MCP SET.
+///
+/// # Exhaustive ON PURPOSE — never add a `_` arm
+///
+/// Same rule, and the same reason, as [`McpSet::contains_qmd`]: a wildcard here would hand a
+/// future set the qmd-only grant silently, which is the quiet direction of the mistake. With
+/// the match exhaustive, adding a set is a compile error at this line — the cheapest possible
+/// place to be told that a new row needs a grant decision.
+///
+/// Every set below returns [`READ_ALLOWED_TOOLS`], which is the invariant that keeps every
+/// committed record valid: the argv became a function of the row without any existing row's
+/// argv moving by a byte, so no battery had to be re-run to adopt the new key.
+pub fn read_allowed_tools(mcp: McpSet) -> &'static str {
+    match mcp {
+        McpSet::None
+        | McpSet::Qmd
+        | McpSet::QmdSlack
+        | McpSet::QmdSlackBrowser
+        | McpSet::House
+        | McpSet::Morning
+        | McpSet::Messages
+        | McpSet::MessagesBuild
+        | McpSet::MessagesBuildPlaces
+        | McpSet::MessagesBuildPlacesInbound => READ_ALLOWED_TOOLS,
+        // THE ONE SET WHOSE READ GRANT IS NOT THE QMD-ONLY ONE. This is the line the whole
+        // row-keyed argv exists for; see [`REPLIES_ALLOWED_TOOLS`].
+        McpSet::Replies => REPLIES_ALLOWED_TOOLS,
+    }
+}
 
 /// Tools DENIED to EVERY [`Capability::Read`] child as belt-and-suspenders BEHIND the real
 /// boundary (the [`READ_ROOT_TOOLS`] root allowlist + strict MCP). It names every mutation
@@ -1278,7 +1412,7 @@ pub const BASIC_DISALLOWED_TOOLS: &str =
 ///     `--max-turns` flag (verified via `--help`). The children are single-shot by
 ///     construction, but the CLI offers no turn bound to enforce it. (`--max-budget-usd`
 ///     exists but bounds cost, not agentic turns, and is not a containment control.)
-pub fn claude_capability_args(cfg: &Config, capability: Capability) -> Vec<String> {
+pub fn claude_capability_args(cfg: &Config, capability: Capability, mcp: McpSet) -> Vec<String> {
     match capability {
         Capability::Basic => vec![
             // ROOT boundary: disable the entire built-in toolset (deny-by-default).
@@ -1296,7 +1430,7 @@ pub fn claude_capability_args(cfg: &Config, capability: Capability) -> Vec<Strin
             "--tools".to_string(),
             READ_ROOT_TOOLS.to_string(),
             "--allowedTools".to_string(),
-            READ_ALLOWED_TOOLS.to_string(),
+            read_allowed_tools(mcp).to_string(),
             "--disallowedTools".to_string(),
             READ_DISALLOWED_TOOLS.to_string(),
         ],
@@ -1491,7 +1625,15 @@ pub fn build_claude_args(
     // ROOT MCP boundary, then the capability's toolset. Every spawn site assembles in
     // this order, which is what lets one builder serve all of them.
     args.extend(mcp_args(mcp_config));
-    args.extend(claude_capability_args(cfg, capability));
+    // THE SET IS RESOLVED FROM THE CONFIG STRING, because that is what a spawn site carries.
+    // A set the project does not ship (an operator's `JESSE_VAULTQA_MCP_CONFIG` file, say)
+    // resolves to `None` and therefore to the standard Read grant — byte-for-byte the
+    // behaviour before the argv was keyed on the row.
+    args.extend(claude_capability_args(
+        cfg,
+        capability,
+        McpSet::from_config(mcp_config).unwrap_or(McpSet::None),
+    ));
     if let Some(sid) = session_id {
         // A synthetic `local-<hex>` id (context carry) names a bridge-minted ledger
         // thread with NO real claude session, so it must NEVER be resumed — the CLI
@@ -1715,7 +1857,8 @@ mod tests {
     fn the_recorded_write_argv_names_the_workspace_by_token() {
         let mut cfg = crate::testutil::test_config();
         cfg.allowed_tools = format!("{DEFAULT_ALLOWED_TOOLS}Bash(git:*)");
-        let args = ClaudeCode.capability_args(&cfg, Capability::Write);
+        let args =
+            ClaudeCode.capability_args(&cfg, Capability::Write, McpSet::MessagesBuildPlacesInbound);
         let joined = args.join(" ");
         assert!(joined.contains(WORKSPACE_TOKEN), "{joined}");
         assert!(!joined.contains("/Users/"), "{joined}");
@@ -3449,6 +3592,149 @@ mod tests {
             .collect()
     }
 
+    /// THE GOLDEN GRANT FOR `read/<the Replies label>`, per server, by name.
+    ///
+    /// Expressed through [`granted_mcp_tools`] rather than by eyeballing one 900-character
+    /// string, because that is the function CODEX derives its `enabled_tools` from — so this
+    /// pins what BOTH harnesses expose from one assertion, and a name added to the grant shows
+    /// up here as a changed list rather than hiding inside a literal.
+    #[test]
+    fn the_replies_read_grant_names_exactly_these_tools_per_server() {
+        for (server, expected) in [
+            (
+                "google",
+                vec![
+                    "search_gmail_messages",
+                    "get_gmail_message_content",
+                    "get_gmail_messages_content_batch",
+                    "get_gmail_thread_content",
+                    "get_gmail_threads_content_batch",
+                    "list_gmail_labels",
+                ],
+            ),
+            (
+                "google-perseido",
+                vec![
+                    "search_gmail_messages",
+                    "get_gmail_message_content",
+                    "get_gmail_messages_content_batch",
+                    "get_gmail_thread_content",
+                    "get_gmail_threads_content_batch",
+                    "list_gmail_labels",
+                ],
+            ),
+            (
+                "fastmail",
+                vec!["get_mailboxes", "search_emails", "get_email_content"],
+            ),
+            (
+                "slack",
+                vec![
+                    "conversations_search_messages",
+                    "conversations_history",
+                    "conversations_replies",
+                    "channels_list",
+                    "channels_me",
+                    "users_search",
+                ],
+            ),
+            (
+                "whatsapp",
+                vec![
+                    "search_contacts",
+                    "list_messages",
+                    "list_chats",
+                    "get_chat",
+                    "get_direct_chat_by_contact",
+                    "get_contact_chats",
+                    "get_last_interaction",
+                    "get_message_context",
+                ],
+            ),
+            ("imcp", vec!["messages_fetch"]),
+        ] {
+            assert_eq!(
+                granted_mcp_tools(REPLIES_ALLOWED_TOOLS, server),
+                expected,
+                "{server}: the Replies grant must name exactly these tools"
+            );
+        }
+        // NOT ONE TOOL on any server this set does not load — including qmd, which every
+        // other Read grant carries.
+        for server in [
+            "qmd",
+            "browser",
+            "homeassistant",
+            "roon",
+            "github",
+            "unifi",
+            "routeros",
+            "proxmox",
+            "build",
+            "places",
+            "inbound",
+        ] {
+            assert!(
+                granted_mcp_tools(REPLIES_ALLOWED_TOOLS, server).is_empty(),
+                "{server} must have no tool in the Replies grant"
+            );
+        }
+        // The three read-only built-ins, path-scoped, and the argv shape around them.
+        assert_eq!(
+            claude_capability_args(&test_config(), Capability::Read, McpSet::Replies),
+            vec![
+                "--tools".to_string(),
+                READ_ROOT_TOOLS.to_string(),
+                "--allowedTools".to_string(),
+                REPLIES_ALLOWED_TOOLS.to_string(),
+                "--disallowedTools".to_string(),
+                READ_DISALLOWED_TOOLS.to_string(),
+            ],
+            "the Replies row runs the read root toolset with its own grant"
+        );
+        assert!(REPLIES_ALLOWED_TOOLS.starts_with("Read(./**),Grep(./**),Glob(./**),"));
+    }
+
+    /// THE REPLIES GRANT MAY NARROW THE MAIN TURN'S, NEVER WIDEN IT.
+    ///
+    /// A tool the writes-on main turn is not trusted with must not first appear on an
+    /// unattended background child that can check the owner's items off. Asserted for every
+    /// server rather than only for the three the brief prompt named, because the direction of
+    /// the rule has nothing to do with which server it is.
+    #[test]
+    fn the_replies_grant_never_names_a_tool_the_main_turn_grant_does_not() {
+        for entry in REPLIES_ALLOWED_TOOLS
+            .split(',')
+            .filter(|e| e.starts_with("mcp__"))
+        {
+            assert!(
+                DEFAULT_ALLOWED_TOOLS.contains(entry),
+                "{entry} is granted to the brief child but not to the main turn"
+            );
+        }
+        // And the specific withholdings, by name, so a rename upstream fails here rather than
+        // silently granting. The two SEND families are the ones held back by this list ALONE.
+        for withheld in [
+            "mcp__whatsapp__send_message",
+            "mcp__whatsapp__send_file",
+            "mcp__whatsapp__send_audio_message",
+            "mcp__whatsapp__download_media",
+            "mcp__imcp__maps_search",
+            "mcp__google__search_drive_files",
+            "mcp__google__get_drive_file_content",
+            "mcp__google__list_calendars",
+            "mcp__google__get_events",
+            "mcp__google-perseido__search_drive_files",
+            "mcp__google-perseido__list_calendars",
+            "mcp__qmd__query",
+        ] {
+            assert!(
+                !REPLIES_ALLOWED_TOOLS.contains(withheld),
+                "{withheld} must not be in the Replies grant"
+            );
+        }
+    }
+
     #[test]
     fn the_two_read_call_sites_are_now_identical_apart_from_their_mcp_set() {
         // The point of deleting the variance: `Read` means ONE thing, so neither site can
@@ -3457,7 +3743,7 @@ mod tests {
         // the comparison is on the toolset the capability owns.
         let cfg = test_config();
         assert_eq!(
-            claude_capability_args(&cfg, Capability::Read),
+            claude_capability_args(&cfg, Capability::Read, McpSet::None),
             vec![
                 "--tools".to_string(),
                 "Read,Grep,Glob".to_string(),
@@ -3648,14 +3934,14 @@ mod tests {
     fn the_attachment_grant_never_reaches_capability_args() {
         let cfg = test_config();
         for cap in [Capability::Basic, Capability::Read, Capability::Write] {
-            let args = ClaudeCode.capability_args(&cfg, cap);
+            let args = ClaudeCode.capability_args(&cfg, cap, McpSet::None);
             assert!(
                 !args.iter().any(|a| a == "--add-dir"),
                 "{cap:?}: the containment argv must not carry the per-turn read grant: {args:?}"
             );
             assert_eq!(
                 args,
-                claude_capability_args(&cfg, cap),
+                claude_capability_args(&cfg, cap, McpSet::None),
                 "{cap:?}: capability args must be byte-for-byte what the record compares"
             );
         }

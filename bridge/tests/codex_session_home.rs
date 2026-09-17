@@ -545,7 +545,7 @@ async fn a_resumed_turn_carries_the_same_containment_it_always_did() {
     // The recorded capability arguments, with the workspace token filled in — the same list
     // the startup gate compares the compiled-in record against.
     let recorded: Vec<String> = Codex
-        .capability_args(&s.cfg, Capability::Read)
+        .capability_args(&s.cfg, Capability::Read, McpSet::Messages)
         .into_iter()
         .map(|a| a.replace(WORKSPACE_TOKEN, &s.cfg.vault))
         .collect();

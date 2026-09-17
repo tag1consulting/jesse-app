@@ -96,18 +96,126 @@ pub const REMOVED_ROLE_ENV_VARS: &[&str] = &[
 /// posture it names has been through what any new server set goes through: a probe of
 /// the live (capability, MCP set) pair, a row in the containment record, and an operator
 /// signature. Turning it on is a code change, not an env edit. See SECURITY.md.
-pub fn validate_today_brief_mcp(cfg: &Config) -> Vec<ConfigError> {
-    if cfg.today_brief_mcp_config.is_none() {
+/// **IT TAKES A SET NAME, NEVER A PATH, AND THAT IS THE WHOLE MECHANISM.** Until 0.144.0 this
+/// variable was free-form — the two forms `--mcp-config` accepts — and the only safe thing to
+/// do with it was refuse every value. A path cannot be gated: the file it names is read by the
+/// CHILD, after this gate has run, and nothing here can know what is in it. `JESSE_VAULTQA_MCP_CONFIG`
+/// still works that way and is still ungated, which is the hole this one no longer has.
+///
+/// A NAME can be gated, because it resolves to a set this build ships, whose config is a
+/// compile-time const and whose posture has a row in the record. So the accepted value is a
+/// label, the child loads [`McpSet::config`] rather than anything from the environment, and
+/// the two cannot disagree.
+pub fn validate_today_brief_mcp(cfg: &Config, records: &[(&str, &str)]) -> Vec<ConfigError> {
+    let Some(raw) = cfg
+        .today_brief_mcp_config
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
         return Vec::new();
+    };
+
+    let Some(set) = McpSet::parse(raw) else {
+        return vec![ConfigError::global(format!(
+            "JESSE_TODAY_BRIEF_MCP_CONFIG is '{raw}', which is not the name of an MCP server \
+             set this build ships. It takes a SET NAME, not a path and not inline JSON — a \
+             path names a file this gate cannot read and the child can, so it could never be \
+             vouched for. The only accepted value is '{REPLIES}' (or unset, which runs the \
+             brief with no servers).",
+            REPLIES = McpSet::Replies.label(),
+        ))];
+    };
+
+    // A set that parses but is not the one this child may have. The main-turn set HAS a
+    // passing `read` row, so a rule that only asked "does a passing row exist" would accept
+    // it — and hand an unattended, self-closing turn the browser, the house, the network and
+    // the hypervisor. The brief child gets the message servers or it gets nothing.
+    if set != McpSet::Replies {
+        return vec![ConfigError::global(format!(
+            "JESSE_TODAY_BRIEF_MCP_CONFIG names the '{}' set, which the today-brief child may \
+             not load. It runs unattended, ~40 times a morning, and its answer can CHECK OFF \
+             one of the owner's items; the only set narrow enough for that is '{}' — the six \
+             servers the owner's own replies arrive on, with no infrastructure behind them. \
+             Set it to that label or unset it.",
+            set.label(),
+            McpSet::Replies.label(),
+        ))];
     }
-    vec![ConfigError::global(
-        "JESSE_TODAY_BRIEF_MCP_CONFIG is set, and no containment row vouches for a \
-         today-brief child with MCP servers loaded. The brief child runs unattended and \
-         can check items off, so its server set is not an env-tunable setting: add the \
-         (read, <your set>) row to the containment record, re-run the battery against it, \
-         and have the record signed. Unset the variable to start."
-            .to_string(),
-    )]
+
+    // The row has to exist and PASS, on every harness in this deployment that would spawn it.
+    let row = ContainmentRow {
+        capability: Capability::Read,
+        mcp: set,
+    };
+    let label = row.label();
+    let mut errors = Vec::new();
+    let mut shipped_anywhere = false;
+    for id in harnesses_in_use(cfg) {
+        let Some(harness) = cfg.harnesses.get(&id) else {
+            continue;
+        };
+        if !harness.shipped_rows().contains(&row) {
+            continue; // this harness does not spawn the set; it needs no row for it
+        }
+        shipped_anywhere = true;
+        let file = containment_record_path(&id);
+        let passing = records
+            .iter()
+            .find(|(rid, _)| *rid == id)
+            .and_then(|(_, text)| parse_results(text).ok())
+            .is_some_and(|r| read_row_passes(&r, &label));
+        if !passing {
+            errors.push(ConfigError::global(format!(
+                "JESSE_TODAY_BRIEF_MCP_CONFIG names '{}', but harness '{id}' has no PASSING \
+                 '{label}' row in {file}. A posture with no passing row is not one this \
+                 project ships: run `cargo run --features containment-probe --bin \
+                 containment-probe -- --harness {id} --rows {label} --write`, commit {file}, \
+                 and restart. Unset the variable to start now.",
+                set.label(),
+            )));
+        }
+    }
+    if !shipped_anywhere {
+        errors.push(ConfigError::global(format!(
+            "JESSE_TODAY_BRIEF_MCP_CONFIG names '{}', but no harness this deployment uses \
+             SPAWNS that row — it is not in any `shipped_rows` list, so no battery has ever \
+             been recorded against it and nothing can vouch for it. Adding the row is a code \
+             change and a live battery, not an env edit. Unset the variable to start.",
+            set.label(),
+        )));
+    }
+    errors
+}
+
+/// Which committed record file a harness's row lives in — named in an error so an operator is
+/// told the FILE to go look at, not just the row.
+pub fn containment_record_path(harness: &str) -> &'static str {
+    match harness {
+        CODEX_ID => "bridge/containment-codex.toml",
+        DIRECT_ID => "bridge/containment-direct.toml",
+        _ => "bridge/containment.toml",
+    }
+}
+
+/// Whether a `read` row exists in this record and meets every hard gate.
+///
+/// The same rule [`highest_passing_level`] applies, asked of ONE row rather than of a level:
+/// hard gates only, because the known-open baselines are recorded reality and blocking on them
+/// would make the posture ungrantable forever. The empty check is not pedantry — `all()` over
+/// no probes is `true`, so a row with its probes missing would otherwise read as passing.
+fn read_row_passes(record: &BatteryResults, label: &str) -> bool {
+    let Some((_, mcp_label)) = label.split_once('/') else {
+        return false;
+    };
+    record.row("read", mcp_label).is_some_and(|row| {
+        let gates: Vec<&ProbeResult> = row
+            .probes
+            .iter()
+            .filter(|p| p.class == ProbeClass::HardGate.label())
+            .collect();
+        !gates.is_empty() && gates.iter().all(|p| p.status == "pass")
+    })
 }
 
 /// The highest level a harness has a PASSING battery for in the record, or `None` when it
@@ -614,7 +722,20 @@ pub fn validate_toolset_argv(
             )));
             continue;
         };
-        let running = harness.capability_args(cfg, cap);
+        // The row's SET, resolved the same way its capability is. A label this build does not
+        // know is refused rather than compared against a stand-in: the argv is keyed on the
+        // row, so comparing one row's grant against another set's posture would report a
+        // mismatch that means nothing — or, worse, agreement that does.
+        let Some(mcp) = McpSet::parse(&row.mcp_set) else {
+            errors.push(ConfigError::global(format!(
+                "the containment record has a row with an MCP set this build does not know \
+                 ('{}'). A set that does not resolve names a posture nothing here can spawn, \
+                 so the record cannot be held against this deployment.",
+                row.mcp_set
+            )));
+            continue;
+        };
+        let running = harness.capability_args(cfg, cap, mcp);
         if running != row.toolset_args {
             errors.push(ConfigError::global(format!(
                 "the toolset this deployment would run at '{}' on harness '{}' is not the one \
@@ -1666,16 +1787,176 @@ mod tests {
         assert!(errors.is_empty(), "{errors:?}");
     }
 
+    /// The brief child's switch, held against every value an operator might reach for.
+    ///
+    /// The four refusals are not variations on one check. A PATH cannot be gated at all (the
+    /// file is read by the child, after this runs); `qmd` and the MAIN-TURN label both parse
+    /// and one of them even has a passing row, so only an explicit "this set, and no other"
+    /// rule refuses them; and a hand-written subset is not a label this build knows, which is
+    /// the case that would otherwise silently resolve to nothing.
+    #[test]
+    fn the_brief_mcp_switch_takes_one_set_name_and_refuses_everything_else() {
+        let records = claude_only(claude_record());
+        let with = |value: Option<&str>| {
+            let mut cfg = test_config();
+            cfg.today_brief_mcp_config = value.map(str::to_string);
+            validate_today_brief_mcp(&cfg, &records)
+        };
+
+        // Unset, and set-but-blank, are the shipped posture: no servers, no complaint.
+        assert!(with(None).is_empty());
+        assert!(with(Some("   ")).is_empty());
+
+        // A PATH — the form the variable used to take, and the form that can never be
+        // vouched for.
+        let e = with(Some("/etc/jesse/replies.json"));
+        assert_eq!(e.len(), 1, "{e:?}");
+        assert!(
+            e[0].message.contains("not the name of an MCP server set"),
+            "{}",
+            e[0]
+        );
+        assert!(e[0].message.contains(McpSet::Replies.label()), "{}", e[0]);
+
+        // Inline JSON, for the same reason.
+        assert_eq!(with(Some(r#"{"mcpServers":{}}"#)).len(), 1);
+
+        // A five-server subset someone wrote by hand: not a label this build ships.
+        let e = with(Some("google+fastmail+slack+whatsapp+imcp"));
+        assert_eq!(e.len(), 1, "{e:?}");
+        assert!(
+            e[0].message.contains("not the name of an MCP server set"),
+            "{}",
+            e[0]
+        );
+
+        // `qmd` PARSES. It is refused because it is not the one set this child may have.
+        let e = with(Some("qmd"));
+        assert_eq!(e.len(), 1, "{e:?}");
+        assert!(e[0].message.contains("may not load"), "{}", e[0]);
+
+        // THE MAIN-TURN LABEL, which has a PASSING `read` row in the committed record — so a
+        // rule that only asked "is there a passing row" would accept it and hand an
+        // unattended, self-closing turn the network and the hypervisor.
+        let main_turn = McpSet::MessagesBuildPlacesInbound.label();
+        assert!(
+            read_row_passes(&record(), &format!("read/{main_turn}")),
+            "precondition: the main-turn read row passes, which is why the rule cannot be \
+             'any passing row'"
+        );
+        let e = with(Some(main_turn));
+        assert_eq!(e.len(), 1, "{e:?}");
+        assert!(e[0].message.contains("may not load"), "{}", e[0]);
+        assert!(e[0].message.contains(McpSet::Replies.label()), "{}", e[0]);
+    }
+
+    /// THE `Replies` LABEL IS ACCEPTED, NOW THAT ITS ROW PASSES ON BOTH HARNESSES.
+    ///
+    /// This test was written as its own converse and flipped here, which is the point: until
+    /// the live battery of 2026-09-17 ran, no record vouched for the row and the gate refused
+    /// the label with "no PASSING row". Both harnesses now spawn the row AND have a passing
+    /// record for it, so the switch opens — and the refusing branch is kept honest below by
+    /// doctoring a record rather than by deleting the assertion.
+    #[test]
+    fn the_replies_label_is_accepted_now_that_its_row_passes() {
+        let mut cfg = test_config();
+        cfg.today_brief_mcp_config = Some(McpSet::Replies.label().to_string());
+        let errors = validate_today_brief_mcp(&cfg, &claude_only(claude_record()));
+        assert!(
+            errors.is_empty(),
+            "the committed record now vouches for this row, so the switch must open: {errors:?}"
+        );
+
+        // AND THE REFUSING BRANCH STILL WORKS. With the shipped record passing, the only way
+        // to keep "no passing row is refused" under test is to doctor one — deleting the
+        // assertion because reality moved is how a gate quietly stops gating.
+        let mut broken = record();
+        broken
+            .rows
+            .iter_mut()
+            .find(|r| r.capability == "read" && r.mcp_set == McpSet::Replies.label())
+            .expect("the Replies row is recorded")
+            .probes
+            .iter_mut()
+            .find(|p| p.class == ProbeClass::HardGate.label())
+            .expect("a hard gate")
+            .status = "failing".to_string();
+        let text = render_results(&broken);
+        let errors = validate_today_brief_mcp(&cfg, &claude_only(&text));
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        let message = &errors[0].message;
+        assert!(message.contains("no PASSING"), "{message}");
+        assert!(message.contains(McpSet::Replies.label()), "{message}");
+        assert!(message.contains("bridge/containment.toml"), "{message}");
+        // The precondition that makes the assertion above mean what it says: the row IS
+        // spawned, so this is "nothing vouches for it", not "nothing runs it".
+        let row = ContainmentRow {
+            capability: Capability::Read,
+            mcp: McpSet::Replies,
+        };
+        assert!(ClaudeCode.shipped_rows().contains(&row));
+        assert!(Codex.shipped_rows().contains(&row));
+        assert!(
+            read_row_passes(&record(), &row.label()),
+            "the committed record must vouch for this row"
+        );
+    }
+
+    /// A row that exists but does NOT pass is refused, naming the row and the file.
+    #[test]
+    fn a_set_whose_row_is_failing_is_refused_naming_the_row_and_the_file() {
+        // The record is doctored rather than the shipped one edited: the question is what the
+        // gate does with a failing row, and no shipped row is failing.
+        let mut r = record();
+        let row = r
+            .rows
+            .iter_mut()
+            .find(|row| row.capability == "read" && row.mcp_set == "none")
+            .expect("the read/none row");
+        row.probes
+            .iter_mut()
+            .find(|p| p.class == ProbeClass::HardGate.label())
+            .expect("a hard gate")
+            .status = "failing".to_string();
+        assert!(!read_row_passes(&r, "read/none"));
+        // …and the converse, so the helper is not vacuously true.
+        assert!(read_row_passes(&record(), "read/none"));
+        // A row with no hard gates at all must not read as passing: `all()` over nothing is
+        // true, which would make a stripped row the easiest way past this gate.
+        let mut empty = record();
+        empty
+            .rows
+            .iter_mut()
+            .find(|row| row.capability == "read" && row.mcp_set == "none")
+            .expect("the read/none row")
+            .probes
+            .clear();
+        assert!(!read_row_passes(&empty, "read/none"));
+        // The file an operator is sent to, per harness.
+        assert_eq!(
+            containment_record_path(CLAUDE_CODE_ID),
+            "bridge/containment.toml"
+        );
+        assert_eq!(
+            containment_record_path(CODEX_ID),
+            "bridge/containment-codex.toml"
+        );
+    }
+
     #[test]
     fn every_removed_role_var_is_checked_and_the_kept_ones_are_not() {
         for var in REMOVED_ROLE_ENV_VARS {
             assert!(var.starts_with("JESSE_"), "{var}");
         }
-        // The four that stay: they name an output shape or an MCP server set, not a model.
+        // The five that stay: they name an output shape or an MCP server set, not a model.
+        // `JESSE_TODAY_BRIEF_MCP_CONFIG` is here rather than among the removed ones because it
+        // is not a role backend and still works — but unlike its two MCP siblings it is GATED,
+        // by `validate_today_brief_mcp`, and takes a set NAME rather than a path.
         for kept in [
             "JESSE_DIET_MICRO_COMPLETE",
             "JESSE_VAULTQA_MCP_CONFIG",
             "JESSE_MAIN_MCP_CONFIG",
+            "JESSE_TODAY_BRIEF_MCP_CONFIG",
             "JESSE_SHADOW_MODEL",
         ] {
             assert!(

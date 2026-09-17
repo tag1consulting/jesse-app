@@ -33,7 +33,7 @@ impl Harness for NoTranscriptHarness {
     fn expresses(&self, _capability: Capability) -> bool {
         true
     }
-    fn capability_args(&self, _cfg: &Config, _capability: Capability) -> Vec<String> {
+    fn capability_args(&self, _cfg: &Config, _capability: Capability, _mcp: McpSet) -> Vec<String> {
         Vec::new()
     }
     fn transcript_dir(&self, _cfg: &Config) -> Option<PathBuf> {
@@ -88,7 +88,7 @@ impl Harness for FixedDirHarness {
     fn expresses(&self, _capability: Capability) -> bool {
         true
     }
-    fn capability_args(&self, _cfg: &Config, _capability: Capability) -> Vec<String> {
+    fn capability_args(&self, _cfg: &Config, _capability: Capability, _mcp: McpSet) -> Vec<String> {
         Vec::new()
     }
     fn transcript_dir(&self, _cfg: &Config) -> Option<PathBuf> {
