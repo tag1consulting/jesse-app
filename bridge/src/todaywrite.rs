@@ -927,6 +927,25 @@ fn mutate(
     build: impl FnOnce(&TodaySnapshot, &Located) -> Result<Option<Effect>, ApiError>,
 ) -> Result<Response, ApiError> {
     let if_match = required_if_match(headers)?;
+    mutate_with_if_match(st, &if_match, id, at, day_claim, build)
+}
+
+/// The body of [`mutate`], with the precondition passed in rather than read off a
+/// request.
+///
+/// Split out for exactly one second caller — [`auto_close_item`] — and split this way on
+/// purpose: the bridge closing an item on a brief's verdict must go through the SAME
+/// journal, the same day guard, the same `If-Match` check and the same splice as a tap
+/// from the phone, or it becomes a second writer of the day file with its own rules. The
+/// only thing it does not have is a `HeaderMap`, so that is the only thing that moved.
+fn mutate_with_if_match(
+    st: &AppState,
+    if_match: &str,
+    id: &str,
+    at: &str,
+    day_claim: Option<&str>,
+    build: impl FnOnce(&TodaySnapshot, &Located) -> Result<Option<Effect>, ApiError>,
+) -> Result<Response, ApiError> {
     let day = day_file_path(&st.cfg);
     // Sampled BEFORE the mutex so the answer is about the agent, not about
     // another tap: a tap we are queued behind is not a turn.
@@ -977,7 +996,7 @@ fn mutate(
     // THE PRECONDITION, before anything is recorded or written. A `412` must
     // touch nothing at all — not the file, not the journal — so that a client
     // holding a stale view refetches instead of editing blind.
-    if !if_match_matches(&if_match, &snapshot_etag(&snapshot)) {
+    if !if_match_matches(if_match, &snapshot_etag(&snapshot)) {
         return Err((
             StatusCode::PRECONDITION_FAILED,
             "the day file changed since you read it — refetch GET /jesse/today".to_string(),
@@ -1073,6 +1092,15 @@ pub async fn jesse_today_check(
     ))?;
     let at = body.at.clone();
     let day = body.day.clone();
+    // UNCHECKING IS THE OWNER OVERRULING THE BRIEF, and it has to stick. If this item
+    // was auto-closed, the sweep would otherwise re-judge the same inputs, reach the
+    // same verdict and close it again — so the reversal is recorded against the inputs
+    // that produced it. A change to the item or its notes clears the block, because then
+    // it is a different question. Recorded for every uncheck, not only for an auto-close:
+    // "this is not done" is the same statement however the box came to be ticked.
+    if !body.checked {
+        BriefStore::block_auto_close(st.cfg.briefs_file(), &id);
+    }
     mutate(&st, &headers, &id, &at, day.as_deref(), move |_, _| {
         Ok(Some(Effect::Check {
             checked: body.checked,
@@ -1080,6 +1108,48 @@ pub async fn jesse_today_check(
             stamp,
         }))
     })
+}
+
+/// Check one item off because its BRIEF concluded it is already done or moot, recording
+/// `evidence` beneath it.
+///
+/// Returns whether the item was actually closed. `Ok(false)` is the ordinary answer when
+/// the day file moved between the brief being written and this call — the morning
+/// rebuild, a tap on the phone, an agent turn — and it is the reason this reads the
+/// snapshot and passes its own tag as the precondition rather than writing blind. A
+/// brief written against a document that no longer exists must lose, quietly.
+///
+/// **Nothing about this is a new write path.** It is [`mutate_with_if_match`] with
+/// [`Effect::Check`], which is byte-for-byte what `POST /jesse/today/items/{id}/check`
+/// does: the same journal-before-edit, the same splice, the same `app-completed`
+/// sub-line grammar. An auto-closed item is therefore an ordinary checked item — it
+/// stays visible, it shows its evidence, `Process updates` closes it at source like any
+/// other, and unchecking it costs nothing.
+pub fn auto_close_item(st: &AppState, id: &str, evidence: &str) -> Result<bool, ApiError> {
+    let at = rfc3339_utc(SystemTime::now());
+    let zone = effective_tz(None, &st.profile, system_time_to_ms(SystemTime::now()));
+    let Some(stamp) = stamp_from_iso(&at, &zone) else {
+        return Ok(false);
+    };
+    // Read the day file's tag and immediately use it as the precondition. Anything that
+    // rewrites the file between these two lines wins, and this call does nothing.
+    let (_, snapshot) = build_snapshot(&st.cfg);
+    let if_match = snapshot_etag(&snapshot);
+    let evidence = evidence.to_string();
+    let result = mutate_with_if_match(st, &if_match, id, &at, None, move |_, _| {
+        Ok(Some(Effect::Check {
+            checked: true,
+            evidence: Some(evidence),
+            stamp,
+        }))
+    });
+    match result {
+        Ok(response) => Ok(response.status().is_success()),
+        // The document moved, or the item is no longer in it. Both mean "not closed",
+        // and neither is an error worth surfacing: the next sweep re-judges it.
+        Err((StatusCode::PRECONDITION_FAILED, _)) | Err((StatusCode::GONE, _)) => Ok(false),
+        Err(e) => Err(e),
+    }
 }
 
 /// `POST /jesse/today/items/{id}/move` — reorder one item within the document.
@@ -1285,6 +1355,148 @@ mod tests {
             .chain(snapshot.sections.iter().flat_map(|s| s.items.iter()))
             .find(|i| i.lead.starts_with(lead_starts))
             .unwrap_or_else(|| panic!("no item starting {lead_starts:?}"))
+    }
+
+    // ---- Auto-close: the bridge acting on a brief's verdict ------------------
+    //
+    // Synthetic vault, synthetic day file, invented content — the auto-close writes to a
+    // temp directory and never to anyone's real notes.
+
+    struct AutoVault {
+        root: PathBuf,
+    }
+
+    impl AutoVault {
+        fn new(name: &str) -> Self {
+            let root = std::env::temp_dir()
+                .join(format!("jesse-autoclose-{name}-{}", crate::random_hex()));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(root.join(crate::config::VAULT_SUBDIR)).unwrap();
+            Self { root }
+        }
+
+        fn day(&self) -> PathBuf {
+            self.root.join(crate::config::VAULT_SUBDIR).join(TODAY_FILE)
+        }
+
+        fn write_day(&self, body: &str) {
+            std::fs::write(self.day(), body).unwrap();
+        }
+
+        fn state(&self) -> AppState {
+            AppState::new(Config {
+                vault: self.root.to_string_lossy().into_owned(),
+                ..testutil::test_config()
+            })
+        }
+    }
+
+    impl Drop for AutoVault {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    /// The whole second half of the feature, end to end: a verdict becomes a ticked box
+    /// with its reason underneath, in the ordinary grammar.
+    #[test]
+    fn an_auto_close_checks_the_item_and_writes_its_evidence_line() {
+        let v = AutoVault::new("closes");
+        v.write_day(
+            "# Today\n\n## Do now\n\n* [ ] **Send Robin the figures.** (Added 2026-09-10)\n",
+        );
+        let st = v.state();
+        let (_, snapshot) = build_snapshot(&st.cfg);
+        let id = snapshot.sections[0].items[0].id.clone();
+
+        let closed = auto_close_item(
+            &st,
+            &id,
+            "auto-closed: you sent them on the thread (Slack #acme, 2026-09-12)",
+        )
+        .unwrap();
+
+        assert!(closed, "a live item with a good tag closes");
+        let after = std::fs::read_to_string(v.day()).unwrap();
+        assert!(
+            after.contains("* [x] **Send Robin the figures.**"),
+            "the box is ticked: {after}"
+        );
+        assert!(
+            after.contains("app-completed"),
+            "it uses the ORDINARY completion grammar, not a second one: {after}"
+        );
+        assert!(
+            after.contains("auto-closed: you sent them on the thread"),
+            "the reason is visible in the file: {after}"
+        );
+        // An auto-closed item is a CHECKED item, not a deleted one — it stays on screen
+        // until `Process updates` takes it, so an unchecked mistake loses nothing.
+        let (_, fresh) = build_snapshot(&st.cfg);
+        assert_eq!(fresh.counts.done, 1);
+        assert_eq!(fresh.counts.open, 0);
+    }
+
+    /// An id the day file no longer holds closes nothing, and is not an error: the day
+    /// was rebuilt under a brief that was written about the old wording.
+    #[test]
+    fn an_auto_close_for_an_item_that_is_gone_writes_nothing_and_does_not_error() {
+        let v = AutoVault::new("gone");
+        v.write_day("# Today\n\n## Do now\n\n* [ ] **A thing.** (Added 2026-09-10)\n");
+        let st = v.state();
+        let before = std::fs::read_to_string(v.day()).unwrap();
+
+        let closed = auto_close_item(&st, "ffffffffffff", "auto-closed: nope (x, 2026-09-12)");
+
+        assert!(!closed.unwrap(), "nothing to close");
+        assert_eq!(
+            std::fs::read_to_string(v.day()).unwrap(),
+            before,
+            "a brief about an item that is gone must not touch the file"
+        );
+    }
+
+    /// THE PRECONDITION. A tag that no longer describes the file closes nothing — the
+    /// same `412` a phone with a stale view gets, reached through the same function.
+    #[test]
+    fn a_stale_tag_refuses_the_close_and_leaves_the_file_untouched() {
+        let v = AutoVault::new("stale");
+        v.write_day("# Today\n\n## Do now\n\n* [ ] **A thing.** (Added 2026-09-10)\n");
+        let st = v.state();
+        let (_, snapshot) = build_snapshot(&st.cfg);
+        let id = snapshot.sections[0].items[0].id.clone();
+
+        // Someone rewrites the day file after the brief was written against it.
+        v.write_day(
+            "# Today\n\n## Do now\n\n* [ ] **A thing.** (Added 2026-09-10)\n\
+             * [ ] **Another thing.** (Added 2026-09-11)\n",
+        );
+        let before = std::fs::read_to_string(v.day()).unwrap();
+
+        let refused = mutate_with_if_match(
+            &st,
+            "\"a-tag-from-before-the-rewrite\"",
+            &id,
+            "2026-09-12T09:30:00Z",
+            None,
+            |_, _| {
+                Ok(Some(Effect::Check {
+                    checked: true,
+                    evidence: Some("auto-closed: stale (x, 2026-09-12)".to_string()),
+                    stamp: "2026-09-12 09:30".to_string(),
+                }))
+            },
+        );
+
+        assert!(
+            matches!(refused, Err((StatusCode::PRECONDITION_FAILED, _))),
+            "a tag from before the rewrite must be refused"
+        );
+        assert_eq!(
+            std::fs::read_to_string(v.day()).unwrap(),
+            before,
+            "a 412 touches nothing at all"
+        );
     }
 
     // ---- The check flip ----------------------------------------------------

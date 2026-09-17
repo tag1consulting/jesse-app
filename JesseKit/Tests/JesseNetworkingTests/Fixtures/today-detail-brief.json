@@ -1,0 +1,64 @@
+{
+  "id": "a1b2c3d4e5f6",
+  "status": "ok",
+  "path": "Projects/Acme/Filing.md",
+  "target": "todo-list/Projects/Acme/Filing",
+  "markdown": "# Filing\n\nThe Acme filing note. Shared by several items.\n",
+  "truncated": false,
+  "etag": "\"abc123\"",
+  "generatedAt": "2026-09-17T08:00:00Z",
+  "brief": {
+    "status": "ok",
+    "brief": {
+      "about": {
+        "text": "Sign the 2024 and 2025 Acme filings and approve the two cheques.",
+        "known": true
+      },
+      "origin": {
+        "text": "An email from Dana Whitfield on 2026-09-02. Added to the list on 2026-09-10.",
+        "known": true
+      },
+      "due": {
+        "text": "No due date is recorded.",
+        "known": false
+      },
+      "priority": {
+        "text": "Dana cannot file until both cheques are approved.",
+        "known": true
+      },
+      "priorityLevel": "this-week",
+      "progress": {
+        "text": "Nothing recorded yet.",
+        "known": true
+      },
+      "done": {
+        "text": "Both filings are signed and both cheques approved.",
+        "known": true
+      },
+      "contacts": {
+        "text": "Dana Whitfield prepared the filings and knows the deadline.",
+        "known": true
+      },
+      "people": [
+        {
+          "name": "Dana Whitfield",
+          "role": "accountant",
+          "knows": "the filing deadline and what the cheques cover"
+        }
+      ],
+      "relevance": {
+        "verdict": "open",
+        "reason": "Nothing shows the filings were signed.",
+        "evidenceSource": null,
+        "evidenceDate": null,
+        "confidence": "low"
+      },
+      "more": "The 2023 filing went the same way and took two days.",
+      "sources": ["Projects/Acme/Filing.md", "Dashboard/Acme.md"],
+      "inputsHash": "0123456789abcdef",
+      "generatedAt": "2026-09-17T08:00:00Z",
+      "harness": "claude-code",
+      "model": "opus"
+    }
+  }
+}

@@ -59,6 +59,16 @@ pub const DEFAULT_SESSION_TTL_DAYS: u64 = 90;
 // under a full turn.
 pub const VAULTQA_TIMEOUT_SECS: u64 = 60;
 
+// Hard timeout (seconds) for one TODAY-BRIEF child (see `crate::todaybrief`).
+// Twice `VAULTQA_TIMEOUT_SECS` because the two children answer different shapes of
+// question: a vault-QA lookup is a person waiting on a phone, while a brief is
+// background work nobody is watching — it reads the item's linked notes and its
+// Dashboard entry, then searches the vault for evidence NEWER than the item. A
+// brief that times out costs a `pending` card that fills itself in on the next
+// poll, where a vault-QA overrun costs a visibly slower answer. A const, not
+// env-tunable, for the same reason both of those are.
+pub const TODAY_BRIEF_TIMEOUT_SECS: u64 = 120;
+
 // The notes subdirectory inside the vault repo (`$JESSE_VAULT/<VAULT_SUBDIR>`). It was
 // `todo-list` until the 2026-08-06 relocation renamed it to `vault` (repo moved to
 // `~/jesse`, so the Obsidian vault is `~/jesse/vault`). Anything that composes a path
@@ -1077,6 +1087,23 @@ pub struct Config {
     // empty-servers const) and runs on the three read-only built-ins alone — qmd is
     // simply absent, never an error. Only the vault-QA child ever reads this.
     pub vaultqa_mcp_config: Option<String>,
+    // The MCP server set for the TODAY-BRIEF child (env `JESSE_TODAY_BRIEF_MCP_CONFIG`),
+    // mirroring `vaultqa_mcp_config` above. Unset — the shipped default — means the
+    // child loads NO MCP servers and answers from the three read-only built-ins alone.
+    //
+    // THIS IS A DORMANT SEAM AND SETTING IT REFUSES TO START. The brief would judge
+    // "is this still open?" far better if it could search the owner's own sent
+    // replies, because the notes routinely record a request and miss the answer. But
+    // the only certified read-only rows are (Basic, none) and (Read, none): every
+    // message-carrying set the record vouches for is a MAIN-TURN set that also grants
+    // tools which SEND. Pointing this at one would widen a background child's posture
+    // to "can message people" without a battery ever having probed it, and
+    // `levelgate` would not catch it — an MCP set is deliberately outside the
+    // capability gate (see `REMOVED_ROLE_ENV_VARS`). So the plumbing is here, the
+    // refusal is in `validate_today_brief_mcp`, and turning it on is what it has
+    // always been for a new server set: a code change, a battery re-run, and a
+    // committed record. See SECURITY.md.
+    pub today_brief_mcp_config: Option<String>,
     /// **THE SHARED INSTRUCTION BUNDLE'S SOURCE ROOT** (`JESSE_RULES_ROOT`), or `None` when
     /// the feature is not configured on this deployment.
     ///
@@ -1391,6 +1418,23 @@ impl Config {
         self.state_dir
             .as_deref()
             .map(|d| PathBuf::from(d).join("today-intents.json"))
+    }
+
+    /// The file the per-item Today BRIEFS are cached in (a sibling of
+    /// `today-intents.json`), or `None` when persistence is disabled — then briefs are
+    /// in-memory only and a restart regenerates them, the same degradation every other
+    /// store has.
+    ///
+    /// **In the state dir, never in the notes tree.** A brief is derived from vault
+    /// content and would look at home beside the note it describes, but writing it
+    /// there would put generated text in a file a person edits, a third-party tool
+    /// syncs and the autocommit timer watches — and would make this feature a second
+    /// writer of the vault. It holds vault CONTENT (the answers quote the notes), so it
+    /// stays here and never reaches a log line, the metrics log, or provenance.
+    pub fn briefs_file(&self) -> Option<PathBuf> {
+        self.state_dir
+            .as_deref()
+            .map(|d| PathBuf::from(d).join("today-briefs.json"))
     }
 
     /// The vault write lock's broker socket.
@@ -4278,6 +4322,9 @@ impl Config {
             // Optional MCP config path for the vault-QA child (the qmd server). Unset →
             // None → the child runs the read-only built-ins only, qmd absent.
             vaultqa_mcp_config: env_string("JESSE_VAULTQA_MCP_CONFIG"),
+            // Unset ships the brief child with no MCP servers; SETTING IT REFUSES TO
+            // START (`validate_today_brief_mcp`). See the field's comment.
+            today_brief_mcp_config: env_string("JESSE_TODAY_BRIEF_MCP_CONFIG"),
             // Optional MCP config for the MAIN turn. Unset → None → the qmd-only inline
             // const (`claude::MAIN_CHILD_MCP_CONFIG`), never the empty set.
             main_mcp_config: env_string("JESSE_MAIN_MCP_CONFIG"),

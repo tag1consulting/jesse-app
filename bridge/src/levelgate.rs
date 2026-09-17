@@ -80,6 +80,36 @@ pub const REMOVED_ROLE_ENV_VARS: &[&str] = &[
     "JESSE_DIET_PROBATION",
 ];
 
+/// Refuse to start when the TODAY-BRIEF child has been pointed at an MCP server set.
+///
+/// **This is the one MCP override that is gated, and the asymmetry is deliberate.**
+/// `JESSE_VAULTQA_MCP_CONFIG` and `JESSE_MAIN_MCP_CONFIG` are ungated (see
+/// [`REMOVED_ROLE_ENV_VARS`]) because an MCP set was left outside the capability, and
+/// both of them configure a child answering a question a person just asked and is
+/// sitting there waiting for. The brief child is different in the one way that matters:
+/// it runs unattended, ~40 times a morning, and its answer can CHECK OFF one of the
+/// owner's items. Widening what an unattended, self-closing turn can reach is not a
+/// setting, and the gate that would otherwise catch it does not look at MCP sets.
+///
+/// So the plumbing is complete — [`Config::today_brief_mcp_config`] flows to
+/// `brief_mcp_config` and into the child's request — and this refuses to boot until the
+/// posture it names has been through what any new server set goes through: a probe of
+/// the live (capability, MCP set) pair, a row in the containment record, and an operator
+/// signature. Turning it on is a code change, not an env edit. See SECURITY.md.
+pub fn validate_today_brief_mcp(cfg: &Config) -> Vec<ConfigError> {
+    if cfg.today_brief_mcp_config.is_none() {
+        return Vec::new();
+    }
+    vec![ConfigError::global(
+        "JESSE_TODAY_BRIEF_MCP_CONFIG is set, and no containment row vouches for a \
+         today-brief child with MCP servers loaded. The brief child runs unattended and \
+         can check items off, so its server set is not an env-tunable setting: add the \
+         (read, <your set>) row to the containment record, re-run the battery against it, \
+         and have the record signed. Unset the variable to start."
+            .to_string(),
+    )]
+}
+
 /// The highest level a harness has a PASSING battery for in the record, or `None` when it
 /// has none at all.
 ///

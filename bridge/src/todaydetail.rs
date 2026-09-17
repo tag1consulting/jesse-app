@@ -220,8 +220,54 @@ pub fn detail_etag(detail: &Result<Detail, NoDetail>) -> String {
     }
 }
 
-fn detail_body(id: &str, detail: &Result<Detail, NoDetail>, etag: &str) -> Value {
-    match detail {
+/// The tag the endpoint actually serves: the note's tag, plus the brief.
+///
+/// **The brief has to be in the tag or the feature does not arrive.** Generation is
+/// background work that finishes seconds or minutes after the page was first opened; if
+/// the tag covered only the note, that page would keep receiving `304` and would show a
+/// spinner over a brief that had been ready for a minute. Folding the brief in means a
+/// finished generation moves the tag, the next poll gets a body, and the seven answers
+/// appear on their own.
+pub fn detail_etag_with_brief(detail: &Result<Detail, NoDetail>, brief: Option<&Value>) -> String {
+    let brief = brief.map(|b| b.to_string()).unwrap_or_default();
+    strong_etag(&format!("{}\u{0}{brief}", detail_etag(detail)))
+}
+
+/// The `brief` object for one item, and the thing that starts one when there is none.
+///
+/// Returns `None` when briefs are off entirely (no state dir), in which case the
+/// response carries no `brief` key at all and the app renders exactly what it rendered
+/// before this feature existed — the same degradation every other store here has.
+///
+/// A record whose `inputsHash` no longer matches the item is treated as absent: the item
+/// or its notes have been edited, so the cached answers are about a question nobody is
+/// asking any more. That is also where on-demand generation starts — an item opened
+/// before the sweep reached it answers `pending` and queues itself.
+fn brief_envelope(st: &AppState, item: &TodayItem, today: &str) -> Option<Value> {
+    st.cfg.briefs_file()?;
+    let inputs = todaybrief::gather(&notes_root(&st.cfg), item);
+    let hash = todaybrief::inputs_hash(&inputs);
+    let store = todaybrief::BriefStore::load(st.cfg.briefs_file());
+    if let Some(record) = store.get(&item.id).filter(|r| r.inputs_hash == hash) {
+        return Some(match record.status {
+            todaybrief::BriefStatus::Ok => json!({"status": "ok", "brief": record.brief}),
+            todaybrief::BriefStatus::Failed => {
+                json!({"status": "failed", "failure": record.failure})
+            }
+            todaybrief::BriefStatus::Pending => json!({"status": "pending"}),
+        });
+    }
+    todaybrief::queue_if_needed(st, item, today);
+    Some(json!({"status": "pending"}))
+}
+
+fn detail_body(
+    id: &str,
+    detail: &Result<Detail, NoDetail>,
+    etag: &str,
+    brief: Option<&Value>,
+) -> Value {
+    let mut body = match detail {
         Ok(d) => json!({
             "id": id,
             "status": "ok",
@@ -239,7 +285,14 @@ fn detail_body(id: &str, detail: &Result<Detail, NoDetail>, etag: &str) -> Value
             "etag": etag,
             "generatedAt": rfc3339_utc(SystemTime::now()),
         }),
+    };
+    // Alongside the note fields, on BOTH answers: an item that links nothing still gets
+    // a brief, and those are precisely the items a reader could otherwise learn nothing
+    // about.
+    if let (Some(obj), Some(brief)) = (body.as_object_mut(), brief) {
+        obj.insert("brief".to_string(), brief.clone());
     }
+    body
 }
 
 /// `GET /jesse/today/items/:id/detail` — the note behind one item.
@@ -273,7 +326,12 @@ pub async fn jesse_today_detail(
     })?;
 
     let detail = detail_for(&notes_root(&st.cfg), located.item);
-    let etag = detail_etag(&detail);
+    let today = snapshot
+        .date
+        .clone()
+        .unwrap_or_else(|| rfc3339_utc(SystemTime::now())[..10].to_string());
+    let brief = brief_envelope(&st, located.item, &today);
+    let etag = detail_etag_with_brief(&detail, brief.as_ref());
     if let Some(inm) = headers
         .get(axum::http::header::IF_NONE_MATCH)
         .and_then(|v| v.to_str().ok())
@@ -284,7 +342,7 @@ pub async fn jesse_today_detail(
             );
         }
     }
-    let body = detail_body(&id, &detail, &etag);
+    let body = detail_body(&id, &detail, &etag, brief.as_ref());
     Ok((
         StatusCode::OK,
         [
@@ -570,7 +628,7 @@ mod tests {
 
         let detail = detail_for(&notes_root(&cfg), &snapshot.sections[0].items[0]);
         let etag = detail_etag(&detail);
-        let body = detail_body(&id, &detail, &etag);
+        let body = detail_body(&id, &detail, &etag, None);
         assert_eq!(body["status"], "ok");
         assert_eq!(body["path"], "Projects/Demo.md");
         assert!(body["markdown"]

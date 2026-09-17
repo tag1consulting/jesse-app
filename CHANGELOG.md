@@ -14,6 +14,99 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [Bridge 0.143.0, App 1.0 (139)] - 2026-09-17
+
+**Tapping a day-file item now opens seven answers about THAT ITEM, and items that are
+already finished weed themselves off the list.** The root cause of the first half: the
+detail page served a SHARED SOURCE DOCUMENT instead of an item-level answer. `detail_for`
+resolved an item's first wiki link and the app rendered that note's markdown verbatim — but
+that note is almost never about the item. It is a person's journal, a project file or an
+area overview, and several unrelated items routinely share one, so the answer was somewhere
+inside a long document or nowhere at all. Rendering the note better could not fix that; the
+reader needed an answer, and the answer had to be about the item.
+
+**`todaybrief` gathers the inputs deterministically, and only then asks a model.** For one
+item it collects, with no model in the loop: the item line verbatim, its `Today.md` section
+heading, its `app-completed` sub-line, the matching entry on its Dashboard topic page
+together with the `## ` heading that carries the urgency, and every wiki-linked note that
+resolves through `todaydetail`'s existing sandbox. Those bytes are hashed into
+`inputsHash`, which with the item id is the cache key — identical inputs never pay for a
+second turn. The Dashboard entry is matched by the NOTE BOTH LINES LINK rather than by
+wording, because the two files word the same task differently; a lead-text match would miss
+most real pairs and, worse, could hand a turn another item's deadline.
+
+**The seven answers are a fixed shape, and "unknown" is one of the answers.** `about`,
+`origin`, `due`, `priority`, `progress`, `done`, `contacts` — each plain text, at most two
+sentences and 300 characters, first sentence first. An answer the notes cannot support is
+an explicit unknown carrying one sentence naming what is missing, never an omission and
+never a guess; the app renders those in a secondary style. **THE `Added` DATE IS NEVER A DUE
+DATE**, stated in the prompt because it is exactly the wrong answer the old page invited.
+Validation enforces the shape and the caps, and drops any `sources` path that does not
+resolve under the notes root — a citation that escaped the vault never reaches the reader.
+A rejected answer is retried ONCE with the complaint appended; a second rejection is stored
+as a typed failure rather than retried again.
+
+**The weeding is decided in code, not by the model.** The turn returns a `relevance`
+verdict — `open`, `done`, `moot` or `overdue` — with a reason, a dated source and a
+confidence. `todaybrief::weed` then re-derives the decision from dates the BRIDGE parsed:
+an item is auto-closed only when the verdict is `done` or `moot`, the model said `high`
+confidence, AND the evidence cites a dated source strictly NEWER than the item's own
+`updated`/`Added` date. **ABSENCE OF ACTIVITY IS NEVER EVIDENCE** — silence in a thread
+does not make an item done, and there is deliberately no way to express "nothing happened"
+as support for a verdict. `overdue` never auto-closes, because a missed deadline is the
+case that most needs a person to look. Everything that fails a gate stays open and is
+marked "maybe done" instead: a wrong auto-close is worse than a missed one, and that trade
+is made in one function.
+
+**An auto-closed item is an ORDINARY checked item.** The close runs through the same code
+`POST /jesse/today/items/{id}/check` runs — `mutate_with_if_match`, which is `mutate` with
+the precondition passed in rather than read off a request — so it takes the same day-file
+lock, the same journal-before-edit, the same `If-Match` guard and the same splice. It reads
+the day file's tag and immediately uses it as its own precondition, so anything that
+rewrites the file in between wins and the close quietly does nothing. The item stays
+visible, wears its reason on an `app-completed` line beginning `auto-closed:`, and
+`Process updates` closes it at source like any other. Unchecking one records a block keyed
+to `inputsHash`, so the same inputs never close it again — and a change to the item or its
+notes clears that block, because then it is a different question.
+
+**The brief child is the narrowest thing in the bridge that reads vault content.** It runs
+at `Capability::Read` with NO MCP servers, on the certified `(read, none)` containment row,
+via a new `RoutedJob::TodayBrief` — so it works on `claude-code`, `codex` and `direct` with
+no harness-specific path and no hardcoded model, and which model serves it is the
+`offload_order` walk like every other routed job. The child carries the PICKED model
+rather than the ambient one, which matters on exactly one harness: a spawned child is
+pointed at its backend by `apply_routed_env`, but `direct` gets no env layer on purpose and
+builds its provider from the model it is handed — so the ambient model the four older
+one-shots pass made every direct turn fail before it was attempted ("model 'opus' has no
+direct provider"). Measured on a live day file: the direct cell failed outright with
+`ambient` and runs with the pick. `JESSE_TODAY_BRIEF_MCP_CONFIG` exists and
+**REFUSES TO START**: the brief would judge "is this still open?" far better if it could
+search the owner's own sent replies, but every message-carrying set in the record is a
+main-turn set that also grants tools which SEND, and an unattended child that can tick items
+off is the last place to widen a posture a battery never probed. The plumbing is complete
+and the door is bolted; opening it is a code change, a battery re-run and a signed record.
+
+**Cost is measured per brief.** Routed one-shots used a null sink and recorded no usage at
+all on a spawned harness; `run_routed_oneshot` now returns the usage alongside the text, and
+the brief path logs tokens and dollars per item. A morning rebuild regenerates roughly 40
+items, at a concurrency of 2 so the sweep is never why a phone turn queues.
+
+Briefs live in `<state-dir>/today-briefs.json`, never in the notes tree — they are derived
+from vault content and would look at home beside the notes, but writing them there would put
+generated text in files a person edits and a sync tool watches. With no state dir the whole
+feature is inert and every path is byte-for-byte what it was. The sweep is triggered from
+the read path, because the bridge has no file watcher: it hashes the day file and returns
+immediately when nothing moved.
+
+**App 138** leads the detail page with the seven answers under short headings, shows the
+verdict in one line when it is not `open`, and puts the source note in a disclosure group
+that starts CLOSED — the note is now the citation under the answer rather than the page
+itself. `pending` shows the headings with a spinner and keeps the note reachable; `failed`
+says so in one line. A "maybe done" or "Overdue" chip marks a row, with the reason in its
+accessibility label, and the detail page offers one button, Close as stale. The day states
+how many items closed themselves since the last `Process updates` — derived from the
+document rather than remembered, since `Process updates` is what removes checked items, so
+there is no marker to keep in step.
 ## [App 1.0 (138)] - 2026-09-16
 
 **New health data now logs itself.** When the first body-mass reading of a diet day lands in

@@ -289,7 +289,7 @@ async fn run_stateless_oneshot(
     mut cmd: Command,
     timeout_secs: u64,
     label: &str,
-) -> Result<String, ApiError> {
+) -> Result<(String, ShadowUsage), ApiError> {
     let mut child = cmd.spawn().map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -413,7 +413,10 @@ async fn run_stateless_oneshot(
     };
 
     match resolve_stream_outcome(harness.id(), terminal, &streamed, &stderr) {
-        ClaudeOutcome::Ok { result, .. } => Ok(result),
+        // The usage rides along rather than being dropped: a one-shot has no `TurnTrace`
+        // to file it against, so this return value is the ONLY place a caller can learn
+        // what its child cost. See `run_brief_child`, which logs it per brief.
+        ClaudeOutcome::Ok { result, usage, .. } => Ok((result, usage)),
         ClaudeOutcome::Fatal { message } | ClaudeOutcome::Retryable { message, .. } => {
             Err((StatusCode::BAD_GATEWAY, message))
         }
@@ -439,7 +442,7 @@ async fn run_routed_oneshot(
     pick: &RoutedPick,
     timeout_secs: u64,
     label: &str,
-) -> Result<String, ApiError> {
+) -> Result<(String, ShadowUsage), ApiError> {
     match harness.runner() {
         Runner::Spawned(h) => {
             let mut cmd = h.build_turn(cfg, req)?;
@@ -458,7 +461,7 @@ async fn run_routed_oneshot(
             let _cancel_on_drop = cancel.clone().drop_guard();
             let mut fut = h.run_turn(cfg, req, &sink, cancel.clone());
             match timeout(Duration::from_secs(timeout_secs), &mut fut).await {
-                Ok(Ok(out)) => Ok(out.text),
+                Ok(Ok(out)) => Ok((out.text, out.usage)),
                 Ok(Err(TurnFailure::Fatal { message })) => Err((StatusCode::BAD_GATEWAY, message)),
                 Ok(Err(TurnFailure::Cancelled)) => {
                     Err((StatusCode::BAD_GATEWAY, format!("{label} was cancelled")))
@@ -527,7 +530,10 @@ pub async fn run_claude_oneshot(
     // otherwise (ambient backend). Main turns never call this.
     // The routing rule's pick for this job. `RoutedPick::log` already named the model and
     // harness that serves it (no prompt content), so there is no second provenance line.
-    run_routed_oneshot(cfg, harness, &req, pick, timeout_secs, "title generation").await
+    // A title has no use for the usage the one-shot now reports back.
+    run_routed_oneshot(cfg, harness, &req, pick, timeout_secs, "title generation")
+        .await
+        .map(|(text, _usage)| text)
 }
 
 /// The stateless diet EXTRACT one-shot: parse a raw food/exercise/weigh-in
@@ -548,7 +554,9 @@ pub async fn run_diet_extract(
     let ambient = ActiveModel::ambient();
     let turn_id = oneshot_turn_id("diet-extract");
     let req = diet_child_request(cfg, prompt, &ambient, &turn_id);
-    run_routed_oneshot(cfg, harness, &req, pick, timeout_secs, "diet extraction").await
+    run_routed_oneshot(cfg, harness, &req, pick, timeout_secs, "diet extraction")
+        .await
+        .map(|(text, _usage)| text)
 }
 
 /// The stateless diet VERIFY one-shot: a hosted judgment call that never touches
@@ -569,7 +577,9 @@ pub async fn run_diet_verify(
     let ambient = ActiveModel::ambient();
     let turn_id = oneshot_turn_id("diet-verify");
     let req = diet_child_request(cfg, prompt, &ambient, &turn_id);
-    run_routed_oneshot(cfg, harness, &req, pick, timeout_secs, "diet verification").await
+    run_routed_oneshot(cfg, harness, &req, pick, timeout_secs, "diet verification")
+        .await
+        .map(|(text, _usage)| text)
 }
 
 /// Run the contained read-only vault-QA child: a toolless-except-read one-shot
@@ -587,7 +597,46 @@ pub async fn run_vaultqa_child(
     let ambient = ActiveModel::ambient();
     let turn_id = oneshot_turn_id("vaultqa");
     let req = vaultqa_child_request(cfg, prompt, &ambient, &turn_id);
-    run_routed_oneshot(cfg, harness, &req, pick, timeout_secs, "vault-QA lookup").await
+    run_routed_oneshot(cfg, harness, &req, pick, timeout_secs, "vault-QA lookup")
+        .await
+        .map(|(text, _usage)| text)
+}
+
+/// Run the contained read-only TODAY-BRIEF child ([`brief_child_request`]): one item's
+/// gathered inputs in, one JSON brief out. Returns the child's RAW text together with
+/// what it cost, for [`crate::todaybrief`] to validate and log.
+///
+/// **The usage is returned rather than logged here**, because this function cannot know
+/// which model's price deck applies — the caller holds the [`RoutedPick`] and resolves
+/// the deck from the registry. It is the only routed one-shot that asks for its usage
+/// back, and the reason is that a brief is the only one that runs ~40 times in a
+/// morning: a per-item cost nobody can see is a per-morning cost nobody can budget.
+///
+/// No transport retry, exactly like its four siblings. The brief pipeline DOES retry
+/// once, but on a VALIDATION failure with the error appended — a different thing, and it
+/// lives in `todaybrief` where the validator's complaint is in scope.
+pub async fn run_brief_child(
+    cfg: &Config,
+    prompt: &str,
+    timeout_secs: u64,
+    pick: &RoutedPick,
+) -> Result<(String, ShadowUsage), ApiError> {
+    let harness = cfg.harnesses.serving_pick(pick);
+    // THE PICKED MODEL, not the ambient one — and the difference only shows on an
+    // in-process harness. A spawned child is pointed at its backend by
+    // `apply_routed_env`, so passing `ambient` there is harmless and is what the four
+    // older one-shots do. `direct` gets no env layer on purpose: it builds its provider
+    // from THIS model's own registry entry, so handing it `ambient` made it look up a
+    // provider for `opus`, find none, and fail every turn without attempting one.
+    // Measured: with `ambient` the whole direct cell failed; with the pick it runs.
+    let active = cfg
+        .model_registry
+        .get(&pick.id)
+        .map(ActiveModel::from_registry)
+        .unwrap_or_else(ActiveModel::ambient);
+    let turn_id = oneshot_turn_id("today-brief");
+    let req = brief_child_request(cfg, prompt, &active, &turn_id);
+    run_routed_oneshot(cfg, harness, &req, pick, timeout_secs, "today-brief").await
 }
 
 /// Invoke the agent in the vault, streaming its output. Returns (reply_text,

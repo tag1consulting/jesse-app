@@ -58,6 +58,9 @@ pub fn test_config() -> Config {
         // No vault-QA backend override in tests — the route is inert (kill switch),
         // so the integration router exercises today's hosted Ask path.
         vaultqa_mcp_config: None,
+        // No brief-child MCP override — the shipped default, and the only value that
+        // boots at all (setting it is a startup refusal).
+        today_brief_mcp_config: None,
         // No main-path MCP override — the main turn falls back to the qmd-only const.
         main_mcp_config: None,
         // Badge off in the fixture: the exact-`response` turn assertions predate it

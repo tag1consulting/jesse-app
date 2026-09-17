@@ -110,6 +110,16 @@ pub struct TodayItem {
     /// which is the correct cold-start answer.
     pub deferred: bool,
     pub deferred_ms: u64,
+    /// What the item's BRIEF concluded about whether this is still the user's to do,
+    /// or `None` when no brief has been generated for it yet.
+    ///
+    /// Not the day file's answer and not a claim about the markdown — it comes from
+    /// [`crate::todaybrief::BriefStore`], stamped on by [`hydrate`] exactly as
+    /// `deferred` and a report row's `seen` are. An item the bridge auto-closed is
+    /// simply `checked` with an `app-completed` line like any other completion; this
+    /// field is what lets a client mark the ones it has NOT closed but suspects are
+    /// finished. Absent store → `None` on every item, which is the correct cold start.
+    pub relevance: Option<ItemRelevance>,
     pub range: SourceRange,
 }
 
@@ -979,6 +989,10 @@ fn build_item(
         // report row's `seen`.
         deferred: false,
         deferred_ms: 0,
+        // Likewise the brief's verdict: nothing in the markdown says an item is
+        // probably finished, and nothing should. `BriefStore::merge_into` stamps it
+        // on afterwards, keeping this parse a pure function of its own source.
+        relevance: None,
         range: span(lines),
         text,
     }
@@ -1448,7 +1462,14 @@ pub async fn jesse_today(
     // contract, and accepting one silently without ever looking at it is how a client comes
     // to believe it is being honoured somewhere it is not.
     let _zone = request_zone(&st, q.client_tz.as_deref(), "GET /jesse/today");
-    let (_, snapshot) = build_snapshot(&st.cfg);
+    let (raw, snapshot) = build_snapshot(&st.cfg);
+    // THE BRIEF SWEEP'S TRIGGER. The bridge has no file watcher — every read re-parses
+    // the day file — so the only signal that the document changed is somebody asking for
+    // it. The sweep hashes the source and returns immediately when it matches the last
+    // one, which is what keeps this off the critical path of an ordinary poll; when it
+    // does not match, it queues the items whose inputs moved and returns. Nothing here
+    // waits on a model.
+    todaybrief::sweep(&st, raw.as_deref(), &snapshot);
     Ok(today_response(&headers, &snapshot))
 }
 
@@ -1523,6 +1544,10 @@ pub fn hydrate(cfg: &Config, snapshot: &mut TodaySnapshot) {
     ProjectRollup::load(cfg).stamp_into(snapshot);
     GlanceStore::load(cfg.state_dir.as_deref()).merge_into(snapshot);
     DeferStore::load(cfg.state_dir.as_deref()).merge_into(snapshot);
+    // The brief's verdict, on the SAME footing as the two stores above and for the same
+    // reason: a stamping pass that ran on the read side and not the write side would move
+    // the etag between a `GET` and its `If-Match` and 412 every mutation.
+    BriefStore::load(cfg.briefs_file()).merge_into(snapshot);
 }
 
 #[cfg(test)]

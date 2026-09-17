@@ -215,6 +215,23 @@ public struct TodayListView: View {
                                      isOn: $model.isBadgeFilterOn)
                     .listRowSeparator(.hidden)
             }
+            // What closed ITSELF since the last `Process updates`. Said out loud, in the
+            // day rather than in a toolbar, because the bridge ticking items off is the
+            // one thing on this screen the user did not do — and a count they can see is
+            // what makes it reviewable rather than something that just happens. The rows
+            // are still here, checked, with their reasons; `Process updates` is what
+            // finally takes them away.
+            let autoClosed = TodaySemantics.autoClosedCount(snapshot)
+            if autoClosed > 0 {
+                Label(autoClosed == 1
+                        ? "1 item closed itself since the last Process updates."
+                        : "\(autoClosed) items closed themselves since the last Process updates.",
+                      systemImage: "sparkles")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .listRowSeparator(.hidden)
+            }
             if !snapshot.leadItems.isEmpty {
                 Section {
                     // No `.onMove`, no `.draggable`: the standing item sits above every
