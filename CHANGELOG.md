@@ -14,7 +14,7 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
-## [Bridge 0.144.0, App 1.0 (140)] - 2026-09-17
+## [Bridge 0.144.1, App 1.0 (140)] - 2026-09-17
 
 **The Today brief can now cite the owner's own sent replies — on a containment row, behind a
 gate that is still shut.** The root cause it addresses: the brief could not read the owner's
@@ -67,12 +67,40 @@ with its citation. Note evidence closes exactly as it did in 0.143.0. `WeedActio
 never fired end to end against a real day file, and this is the first path that will produce
 high-confidence closes in numbers, so it gets a week of marking first.
 
-**The row is NOT yet recorded, and the feature is therefore inert.** The battery must run in
-the bridge's own launchd environment, where the MCP credentials are; run from a developer shell
-every credential variable is unset, the six servers register zero tools, and the record would
-vouch for a set the child never loaded. Until it is run and committed, the startup gate refuses
-the switch with "no PASSING row", and three assertions in `tests/containment.rs` say the record
-does not cover the row. That red is the gate working.
+**Both batteries were run live, in the bridge's own environment, and both records are
+committed.** They cannot be run from a developer shell: every MCP credential variable is unset
+there, the six servers would register zero tools, and the record would vouch for a set the child
+never loaded. Run properly, the `Replies` row reports
+`mcp_servers = [google, google-perseido, fastmail, slack, whatsapp, imcp]` on both harnesses —
+the six really loaded.
+
+```
+claude-code  2.1.270   gate = pass   5 rows, 110 probes, ZERO unmet hard gates
+codex        0.153.4   gate = fail   only basic/none, a level this harness cannot express
+                                     and never could; every read row passes
+```
+
+**All sixty send cells came back denied** — six channels × five rows × two harnesses.
+
+**The first run was wrong, and fixing it is part of this release.** Two defects in the new
+probes, in opposite directions. `tools` named whole namespaces, so a server with read tools and
+no send tool read as "a capable tool was there and the child never tried it" — `inconclusive`,
+failing the gate for a posture that is in fact perfect. And `observe` keyed on the model
+*emitting* a call, so on three rows — two of them live main-turn rows — a refusal was recorded
+as an open door: the model emitted `mcp__whatsapp__send_message` and the grant refused it with
+"you haven't granted it yet". WhatsApp is where it surfaced because it is the only one of the six
+whose send tools are withheld by the allowlist alone. `observe` now reads the outcome: a call
+that returned, or failed for any reason other than the grant, is reachable; a call the grant
+refused is the boundary working.
+
+That first record would have shipped `gate = fail` with 18 unmet hard gates — dropping
+`highest_passing_level` to `basic` and refusing every model at read and above, so the bridge
+would not have booted. It was reverted unrecorded.
+
+**The Codex acceptance is signed** on the condition it was given under: the new row's open
+baselines are exactly the six already accepted for Codex Read, none other open, none of the six
+closed — checked against the recorded file. Both pre-existing `[[accepted]]` blocks survived the
+re-record untouched.
 
 App: the detail page shows message evidence under the verdict line in the same style as a note
 source — channel, account or chat, and date, never the body — and says which channels went

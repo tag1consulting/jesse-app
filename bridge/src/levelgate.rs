@@ -1850,20 +1850,39 @@ mod tests {
         assert!(e[0].message.contains(McpSet::Replies.label()), "{}", e[0]);
     }
 
-    /// THE `Replies` LABEL IS REFUSED UNTIL ITS ROW ACTUALLY PASSES.
+    /// THE `Replies` LABEL IS ACCEPTED, NOW THAT ITS ROW PASSES ON BOTH HARNESSES.
     ///
-    /// Both harnesses now SPAWN the row — it is in their `shipped_rows` — but no record
-    /// vouches for it yet, because its battery has to run in the launchd credential
-    /// environment. So the switch stays shut, and the error names the row, the harness and the
-    /// file rather than blaming the operator's spelling.
-    ///
-    /// This is the state the feature ships in until that battery is run and committed. When it
-    /// is, this test's assertion flips to the accepting branch and nothing else here moves.
+    /// This test was written as its own converse and flipped here, which is the point: until
+    /// the live battery of 2026-09-17 ran, no record vouched for the row and the gate refused
+    /// the label with "no PASSING row". Both harnesses now spawn the row AND have a passing
+    /// record for it, so the switch opens — and the refusing branch is kept honest below by
+    /// doctoring a record rather than by deleting the assertion.
     #[test]
-    fn the_replies_label_is_refused_until_its_row_passes() {
+    fn the_replies_label_is_accepted_now_that_its_row_passes() {
         let mut cfg = test_config();
         cfg.today_brief_mcp_config = Some(McpSet::Replies.label().to_string());
         let errors = validate_today_brief_mcp(&cfg, &claude_only(claude_record()));
+        assert!(
+            errors.is_empty(),
+            "the committed record now vouches for this row, so the switch must open: {errors:?}"
+        );
+
+        // AND THE REFUSING BRANCH STILL WORKS. With the shipped record passing, the only way
+        // to keep "no passing row is refused" under test is to doctor one — deleting the
+        // assertion because reality moved is how a gate quietly stops gating.
+        let mut broken = record();
+        broken
+            .rows
+            .iter_mut()
+            .find(|r| r.capability == "read" && r.mcp_set == McpSet::Replies.label())
+            .expect("the Replies row is recorded")
+            .probes
+            .iter_mut()
+            .find(|p| p.class == ProbeClass::HardGate.label())
+            .expect("a hard gate")
+            .status = "failing".to_string();
+        let text = render_results(&broken);
+        let errors = validate_today_brief_mcp(&cfg, &claude_only(&text));
         assert_eq!(errors.len(), 1, "{errors:?}");
         let message = &errors[0].message;
         assert!(message.contains("no PASSING"), "{message}");
@@ -1878,8 +1897,8 @@ mod tests {
         assert!(ClaudeCode.shipped_rows().contains(&row));
         assert!(Codex.shipped_rows().contains(&row));
         assert!(
-            !read_row_passes(&record(), &row.label()),
-            "the committed record must not yet vouch for this row"
+            read_row_passes(&record(), &row.label()),
+            "the committed record must vouch for this row"
         );
     }
 
