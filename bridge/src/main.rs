@@ -54,7 +54,7 @@ async fn main() {
     // The brief child's MCP set joins the same gate. Unlike the other two per-child MCP
     // overrides it is refused rather than honoured, because that child runs unattended
     // and can close the owner's items — see `validate_today_brief_mcp`.
-    errors.extend(validate_today_brief_mcp(&cfg));
+    errors.extend(validate_today_brief_mcp(&cfg, CONTAINMENT_RECORDS));
     // The `[concurrency]` table joins the SAME gate. A misspelled model id there is refused by
     // name rather than silently ignored — a config surface that quietly does nothing is the
     // failure mode this project keeps designing against.

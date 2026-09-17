@@ -1167,18 +1167,27 @@ pub fn vaultqa_mcp_config(cfg: &Config) -> &str {
         .unwrap_or(EMPTY_MCP_CONFIG)
 }
 
-/// The MCP server set for the TODAY-BRIEF child: NO servers, unless an operator has
-/// set `JESSE_TODAY_BRIEF_MCP_CONFIG` — which refuses to start (see
-/// [`Config::today_brief_mcp_config`] and `validate_today_brief_mcp`).
+/// The MCP server set for the TODAY-BRIEF child: NO servers, unless
+/// `JESSE_TODAY_BRIEF_MCP_CONFIG` names one — and the only name that gets past
+/// `validate_today_brief_mcp` is [`McpSet::Replies`], which needs a passing row in the
+/// record of every harness that spawns it.
 ///
-/// So in every configuration that boots, this returns [`EMPTY_MCP_CONFIG`] and the
-/// brief child runs on the three read-only built-ins alone: it reads the notes the
-/// item links and greps the vault for anything newer. That is a narrower posture than
-/// the vault-QA child can be given, and it is deliberate — a background turn that
-/// closes items off its own judgement is the last place to widen a toolset.
-pub fn brief_mcp_config(cfg: &Config) -> &str {
+/// **THE SHIPPED CONST, NEVER THE ENVIRONMENT'S STRING.** The variable supplies a set
+/// NAME; what the child loads is that set's own [`McpSet::config`], a compile-time
+/// const the containment record was taken against. So there is no path by which a file
+/// on this host reaches `--mcp-config`, and no way for the posture the record vouches
+/// for to differ from the one the child runs. That asymmetry with
+/// [`vaultqa_mcp_config`] — which still passes its value straight through — is the
+/// whole point: this child runs unattended and can check the owner's items off.
+///
+/// Unset, this returns [`EMPTY_MCP_CONFIG`] and the brief runs on the three read-only
+/// built-ins alone, reading the notes the item links and grepping the vault.
+pub fn brief_mcp_config(cfg: &Config) -> &'static str {
     cfg.today_brief_mcp_config
         .as_deref()
+        .map(str::trim)
+        .and_then(McpSet::parse)
+        .map(|set| set.config())
         .unwrap_or(EMPTY_MCP_CONFIG)
 }
 
