@@ -912,7 +912,7 @@ pub fn parse_capability(s: &str) -> Option<Capability> {
 /// row label — including an operator signature on `write/qmd`. None of that had anything to
 /// do with Slack. Two harnesses with genuinely different postures must not share one row
 /// list.
-pub const CLAUDE_CODE_SHIPPED_ROWS: [ContainmentRow; 4] = [
+pub const CLAUDE_CODE_SHIPPED_ROWS: [ContainmentRow; 5] = [
     ContainmentRow {
         capability: Capability::Basic,
         mcp: McpSet::None,
@@ -928,6 +928,13 @@ pub const CLAUDE_CODE_SHIPPED_ROWS: [ContainmentRow; 4] = [
     ContainmentRow {
         capability: Capability::Write,
         mcp: McpSet::MessagesBuildPlacesInbound,
+    },
+    // The TODAY-BRIEF child with sent-message search on. A THIRD `Read` containment, which is
+    // the whole reason a row is keyed on (capability, MCP set): this one reads the owner's own
+    // replies on six servers and holds none of the infrastructure the row above it does.
+    ContainmentRow {
+        capability: Capability::Read,
+        mcp: McpSet::Replies,
     },
 ];
 
@@ -950,7 +957,7 @@ pub const CLAUDE_CODE_SHIPPED_ROWS: [ContainmentRow; 4] = [
 /// widening of the read sandbox these signatures speak to, so neither undermines them — both
 /// are separate, explicitly accepted risks recorded in SECURITY.md. Do not rename these rows
 /// again without going back for the same decision.
-pub const CODEX_SHIPPED_ROWS: [ContainmentRow; 4] = [
+pub const CODEX_SHIPPED_ROWS: [ContainmentRow; 5] = [
     ContainmentRow {
         capability: Capability::Basic,
         mcp: McpSet::None,
@@ -966,6 +973,14 @@ pub const CODEX_SHIPPED_ROWS: [ContainmentRow; 4] = [
     ContainmentRow {
         capability: Capability::Write,
         mcp: McpSet::Messages,
+    },
+    // The brief child on Codex, for the standing reason a capability lands on every harness in
+    // the same change. Its LABEL is the same as Claude Code's — the set is one set — so unlike
+    // every widening before it this row orphans no Codex signature: it adds a row rather than
+    // re-pointing one.
+    ContainmentRow {
+        capability: Capability::Read,
+        mcp: McpSet::Replies,
     },
 ];
 
@@ -1061,7 +1076,21 @@ pub fn hard_gate_requirement(
         "write_escape_parent"
         | "write_escape_symlink"
         | "write_escape_state_dir"
-        | "write_escape_delegated" => ProbeVerdict::Denied,
+        | "write_escape_delegated"
+        // THE MESSAGE CHANNELS, DENIED AT EVERY ROW AND EVERY LEVEL — including `write`.
+        //
+        // No capability this project ships grants a tool that sends a message as the owner.
+        // `Write` means the vault, and it has never meant "may speak to people": the main
+        // turn loads Slack and WhatsApp and is granted their READ tools only. So these sit
+        // with the write escapes rather than with the positive controls — there is no row at
+        // which the answer is allowed to be anything but `denied`, and a row where one opens
+        // is a finding whatever else that row was for.
+        | "message_send_slack"
+        | "message_send_whatsapp"
+        | "message_send_imessage"
+        | "message_send_mail_work"
+        | "message_send_mail_personal"
+        | "message_send_fastmail" => ProbeVerdict::Denied,
         "read_vault_file" | "search_vault" => {
             if cap >= Capability::Read {
                 ProbeVerdict::Allowed
@@ -1611,7 +1640,8 @@ mod tests {
                 "basic/none",
                 "read/none",
                 &format!("read/{MESSAGES_BUILD_PLACES_INBOUND_LABEL}"),
-                &format!("write/{MESSAGES_BUILD_PLACES_INBOUND_LABEL}")
+                &format!("write/{MESSAGES_BUILD_PLACES_INBOUND_LABEL}"),
+                &format!("read/{REPLIES_LABEL}")
             ]
         );
 
@@ -1660,7 +1690,8 @@ mod tests {
                 "basic/none",
                 "read/none",
                 &format!("read/{MESSAGES_LABEL}"),
-                &format!("write/{MESSAGES_LABEL}")
+                &format!("write/{MESSAGES_LABEL}"),
+                &format!("read/{REPLIES_LABEL}")
             ]
         );
     }

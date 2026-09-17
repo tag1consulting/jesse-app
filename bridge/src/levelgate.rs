@@ -1850,30 +1850,37 @@ mod tests {
         assert!(e[0].message.contains(McpSet::Replies.label()), "{}", e[0]);
     }
 
-    /// THE `Replies` LABEL IS REFUSED UNTIL A HARNESS ACTUALLY SPAWNS THE ROW.
+    /// THE `Replies` LABEL IS REFUSED UNTIL ITS ROW ACTUALLY PASSES.
     ///
-    /// This is the state the set ships in until its live battery passes and the row joins a
-    /// `shipped_rows` list: the name resolves, and nothing vouches for it. The error says so
-    /// in those terms rather than blaming the operator's spelling.
+    /// Both harnesses now SPAWN the row — it is in their `shipped_rows` — but no record
+    /// vouches for it yet, because its battery has to run in the launchd credential
+    /// environment. So the switch stays shut, and the error names the row, the harness and the
+    /// file rather than blaming the operator's spelling.
+    ///
+    /// This is the state the feature ships in until that battery is run and committed. When it
+    /// is, this test's assertion flips to the accepting branch and nothing else here moves.
     #[test]
-    fn the_replies_label_is_refused_while_no_harness_ships_its_row() {
+    fn the_replies_label_is_refused_until_its_row_passes() {
         let mut cfg = test_config();
         cfg.today_brief_mcp_config = Some(McpSet::Replies.label().to_string());
         let errors = validate_today_brief_mcp(&cfg, &claude_only(claude_record()));
         assert_eq!(errors.len(), 1, "{errors:?}");
-        assert!(
-            errors[0].message.contains("SPAWNS that row"),
-            "{}",
-            errors[0]
-        );
-        // Stated as a precondition so this test turns into its own converse the day the row
-        // lands: nothing ships it yet.
+        let message = &errors[0].message;
+        assert!(message.contains("no PASSING"), "{message}");
+        assert!(message.contains(McpSet::Replies.label()), "{message}");
+        assert!(message.contains("bridge/containment.toml"), "{message}");
+        // The precondition that makes the assertion above mean what it says: the row IS
+        // spawned, so this is "nothing vouches for it", not "nothing runs it".
         let row = ContainmentRow {
             capability: Capability::Read,
             mcp: McpSet::Replies,
         };
-        assert!(!ClaudeCode.shipped_rows().contains(&row));
-        assert!(!Codex.shipped_rows().contains(&row));
+        assert!(ClaudeCode.shipped_rows().contains(&row));
+        assert!(Codex.shipped_rows().contains(&row));
+        assert!(
+            !read_row_passes(&record(), &row.label()),
+            "the committed record must not yet vouch for this row"
+        );
     }
 
     /// A row that exists but does NOT pass is refused, naming the row and the file.
