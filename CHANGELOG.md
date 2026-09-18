@@ -14,6 +14,40 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [Bridge 0.145.1] - 2026-09-18
+
+**0.145.0 made the Codex record observe its MCP root; this is the run that observed it.**
+Putting the per-server `enabled_tools` lines into `Codex::capability_args` left every
+committed Codex row's `toolset_args` short by exactly those lines, so the shipped posture no
+longer matched the record and four tests said so. A record cannot be repaired by editing it —
+only by re-running the battery — so this is that run, live on the Studio against the pinned
+codex-cli 0.153.4, with the bridge's LaunchAgent environment loaded so the credential-backed
+servers registered their tools instead of starting empty and vouching for a set the child
+never loaded.
+
+**Nothing moved.** Every probe id, class, verdict and status is identical to the 2026-09-17
+record; the probe's own summary reads "nothing moved since 2026-09-17 (this run CONFIRMS the
+previous one)". The two hard gates not met at `basic/none` (`read_vault_file`, `search_vault`)
+were already not met — Codex cannot express `basic`, which is why the file-level `gate` still
+reads `fail`.
+
+### Changed
+
+- **`toolset_args` carries the grant**, one `enabled_tools` entry per server on each of the
+  three rows that load an MCP set (14, 14 and 6). The two `mcp:none` rows are untouched,
+  having no server to grant.
+- **`root_tools` is observed**, recorded with `root_tools_source = "observed-mcp-listing"` on
+  every row. The write row's real root surface is 212 tools where the old record declared 2 —
+  that gap is what 0.145.0 existed to close, and this is the first record that shows it.
+  `imcp` is in the listing on all three rows that configure it, which is the check worth
+  repeating on any future re-record: a message server that registers zero tools looks
+  identical to one the credentials never reached.
+- `mcp_servers` is sorted; the members are unchanged. Evidence strings now name which send
+  tool was not called rather than only that none was.
+
+`bridge/containment.toml` is untouched, byte for byte — the Claude Code posture did not move
+in 0.145.0 and nothing here re-recorded it.
+
 ## [Bridge 0.145.0] - 2026-09-18
 
 **The Codex containment record declared what it should have observed, and the Codex brief
