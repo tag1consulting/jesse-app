@@ -1206,10 +1206,28 @@ pub struct RowResult {
     /// actually probed, rather than trusting the row label.
     #[serde(default)]
     pub toolset_args: Vec<String>,
-    /// The tools the CHILD reported at its root. Informational; NOT compared, because at
-    /// `Write` this is whatever built-in set the CLI ships and would churn on every upgrade.
+    /// The tools at the child's root. Informational; NOT compared, because at `Write` this is
+    /// whatever built-in set the CLI ships and would churn on every upgrade.
     #[serde(default)]
     pub root_tools: Vec<String>,
+    /// WHERE THE LINE ABOVE CAME FROM — see [`crate::RootSource`], whose `label` writes it.
+    ///
+    /// Most cells of this table are `denied` because nothing capable stood at the root, so
+    /// every one of those verdicts is worth exactly the provenance of the root. Until 0.145.0
+    /// the Codex record SYNTHESIZED its root from configuration and said nothing about having
+    /// done so, which made an assumption and an observation look identical in the file.
+    ///
+    /// EMPTY ON A RECORD WRITTEN BEFORE 0.145.0, and rendered only when it is not — which is
+    /// what keeps a record that has not been re-run byte-identical to what the writer emits
+    /// for it. An empty value means the same thing it meant then: unstated.
+    ///
+    /// **THE HEADER PARAGRAPH EXPLAINING THE FOUR VALUES IS OWED**, and is deliberately not in
+    /// [`render_results`] yet. The header is shared by every record, so adding it would rewrite
+    /// all three committed files — including the Claude Code one, which 0.145.0 was required to
+    /// leave untouched. Add it with the next change that re-records every harness; until then
+    /// the four values are documented on [`crate::RootSource`] and in SECURITY.md.
+    #[serde(default)]
+    pub root_tools_source: String,
     /// `pass` when every hard gate at this row is met and nothing is inconclusive.
     pub status: String,
     #[serde(default, rename = "probe")]
@@ -1606,6 +1624,15 @@ pub fn render_results(r: &BatteryResults) -> String {
             toml_array(&row.toolset_args)
         ));
         s.push_str(&format!("root_tools = {}\n", toml_array(&row.root_tools)));
+        // Only when the row states it — see [`RowResult::root_tools_source`]. A record written
+        // before 0.145.0 carries no such key, and emitting an empty one would make this
+        // writer's output differ from every committed file that has not been re-run.
+        if !row.root_tools_source.is_empty() {
+            s.push_str(&format!(
+                "root_tools_source = {}\n",
+                toml_string(&row.root_tools_source)
+            ));
+        }
         s.push_str(&format!("status = {}\n", toml_string(&row.status)));
         for p in &row.probes {
             s.push_str("\n[[row.probe]]\n");
@@ -1982,6 +2009,7 @@ mod tests {
                 mcp_servers: vec!["qmd".to_string()],
                 toolset_args: vec!["--tools".to_string(), READ_ROOT_TOOLS.to_string()],
                 root_tools: vec!["Read".to_string(), "Grep".to_string(), "Glob".to_string()],
+                root_tools_source: "observed-init-event".to_string(),
                 status: "pass".to_string(),
                 probes: vec![
                     ProbeResult {

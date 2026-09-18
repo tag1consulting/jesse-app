@@ -667,11 +667,25 @@ pub fn codex_model_args(active: &ActiveModel) -> Vec<String> {
 ///
 /// 3. **`enabled_tools` — this is Codex's tool allowlist, and it is STRONGER than Claude
 ///    Code's.** Codex has no `--allowedTools`, so without this every tool a loaded server
-///    advertises stands at the root. With it, an omitted tool is ABSENT rather than refused:
-///    a child asked for `conversations_join` got `TypeError: tools.mcp__slack__
-///    conversations_join is not a function`. The names come from
-///    [`granted_mcp_tools`] reading the SAME `--allowedTools` string Claude Code is given, so
-///    the two harnesses cannot drift apart — there is one allowlist, expressed twice.
+///    advertises stands at the root. With it, an omitted tool is ABSENT rather than refused.
+///
+///    **HOW ABSENT, MEASURED AGAINST 0.153.4 ON 2026-09-18, because the answer changed and
+///    the consequence for the containment record is real.** On 0.146.0 a child asked for
+///    `conversations_join` got `TypeError: tools.mcp__slack__conversations_join is not a
+///    function` — it emitted the call and the tool layer refused it. That does NOT reproduce
+///    on 0.153.4: an ungranted tool is not in the model's tool list at all, so no call is
+///    emitted and there is nothing to refuse. A child granted only `mcp__qmd__status` and
+///    told in as many words to call `mcp__qmd__query` answered that the tool "isn't available
+///    in this session" and made no call.
+///
+///    That is a STRONGER boundary and a WEAKER observation, and the battery has to say so:
+///    a Codex send probe can only ever record absence, never an attempt that was stopped, so
+///    what the record must prove is that the tool really is absent from the CHILD rather than
+///    from a config file this process read. See [`crate::RootSource`].
+///
+///    The names come from [`granted_mcp_tools`] reading the SAME `--allowedTools` string
+///    Claude Code is given — via [`row_allowed_tools`], one function for both harnesses — so
+///    the two cannot drift apart. There is one allowlist, expressed twice.
 pub fn codex_mcp_args(
     harness: &'static str,
     mcp_config: &str,
@@ -769,20 +783,12 @@ pub fn codex_mcp_args(
                 ));
             }
         }
-        // The tool allowlist, derived from the one Claude Code is given — point 3.
-        //
-        // A server with NO granted tool still gets an EMPTY list rather than the key being
-        // omitted, and the difference is the whole safety property: an omitted key means
-        // "every tool this server advertises", which is the opposite of what an empty grant
-        // means. Failing closed here costs nothing (no shipped set has such a server) and
-        // makes a future ungranted server inert instead of wide open.
-        let granted = granted_mcp_tools(allowed_tools, name);
-        let rendered: Vec<String> = granted.iter().map(|t| toml_string(t)).collect();
+        // The tool allowlist, derived from the one Claude Code is given — point 3. Rendered
+        // by [`enabled_tools_override`], which is also what [`codex_enabled_tools_args`] puts
+        // in the RECORDED argv, so the grant the record shows and the grant the child runs
+        // are one string produced once.
         args.push("-c".to_string());
-        args.push(format!(
-            "mcp_servers.{name}.enabled_tools=[{}]",
-            rendered.join(", ")
-        ));
+        args.push(enabled_tools_override(name, allowed_tools));
         // Auto-approve what survived that allowlist — point 2. Ordered AFTER the allowlist
         // so it reads as "approve these", not "approve anything".
         args.push("-c".to_string());
@@ -899,6 +905,67 @@ pub const CODEX_MCP_ENV_PASSTHROUGH: &[(&str, &[&str])] = &[
 /// `Authorization` header of [`MAIN_CHILD_MCP_CONFIG`] — one variable, two spellings, and
 /// they must not drift apart.
 pub const CODEX_MCP_BEARER_ENV: &[(&str, &str)] = &[("homeassistant", "HA_MCP_TOKEN")];
+
+/// One server's `enabled_tools` override, in Codex's `-c key=value` spelling.
+///
+/// A server with NO granted tool still gets an EMPTY list rather than the key being omitted,
+/// and the difference is the whole safety property: an omitted key means "every tool this
+/// server advertises", which is the opposite of what an empty grant means. Failing closed here
+/// costs nothing (no shipped set has such a server) and makes a future ungranted server inert
+/// instead of wide open.
+///
+/// ONE RENDERER, TWO CALLERS, and that is the point of it being a function. [`codex_mcp_args`]
+/// puts this on the CHILD's argv; [`codex_enabled_tools_args`] puts it in the argv
+/// [`Codex::capability_args`] hands the containment record and the startup gate. If those two
+/// were spelled separately the record could vouch for a grant the child never ran — which is
+/// exactly the class of defect this whole change exists to remove.
+fn enabled_tools_override(server: &str, allowed_tools: &str) -> String {
+    let granted = granted_mcp_tools(allowed_tools, server);
+    let rendered: Vec<String> = granted.iter().map(|t| toml_string(t)).collect();
+    format!(
+        "mcp_servers.{server}.enabled_tools=[{}]",
+        rendered.join(", ")
+    )
+}
+
+/// The `enabled_tools` half of an MCP server set's argv, for the RECORD rather than for a
+/// child: one `-c mcp_servers.<name>.enabled_tools=[…]` pair per server, in the same order
+/// [`codex_mcp_args`] emits them.
+///
+/// # Why the record needs this and did not have it
+///
+/// Codex's containment flags are an OS sandbox mode and an approval policy, so
+/// [`Codex::capability_args`] used to return those alone and the record said NOTHING about
+/// which MCP tools the child could call. That is the strongest boundary this harness has —
+/// an ungranted tool is ABSENT, not refused — and it was the one boundary no committed row
+/// described. Worse, it made a real defect invisible: [`Codex::command`] built the grant from
+/// the main turn's list rather than the row's, so the [`McpSet::Replies`] brief child ran with
+/// Drive, Calendar and `maps_search`, and no row's `toolset_args` would have shown it.
+///
+/// Including it here puts the grant under the same three checks the sandbox flags are already
+/// under — [`crate::validate_toolset_argv`] at boot, the containment test in CI, and the
+/// battery when it records — all of which compare by STRICT EQUALITY.
+///
+/// The SERVER DEFINITIONS are deliberately NOT here: a command, an args list, a URL and an
+/// `env_vars` passthrough describe where a server lives, not what the child may do with it,
+/// and they are what make a set's argv host- and vendor-specific. The grant is the boundary.
+pub fn codex_enabled_tools_args(mcp_config: &str, allowed_tools: &str) -> Vec<String> {
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(mcp_config) else {
+        return Vec::new();
+    };
+    let Some(servers) = parsed.get("mcpServers").and_then(|v| v.as_object()) else {
+        return Vec::new();
+    };
+    servers
+        .keys()
+        .flat_map(|name| {
+            [
+                "-c".to_string(),
+                enabled_tools_override(name, allowed_tools),
+            ]
+        })
+        .collect()
+}
 
 /// Every tool granted on `server`, read out of the SAME `--allowedTools` string Claude Code
 /// is handed — the one source of truth for what an MCP server may expose.
@@ -1739,7 +1806,25 @@ impl Codex {
     /// Fails with [`HarnessError::unavailable`] when this turn was asked to resume a session
     /// whose saved thread is not on this host — see [`codex_home_for_turn`].
     pub fn command(&self, cfg: &Config, req: &TurnRequest<'_>) -> Result<Command, HarnessError> {
-        let mcp = codex_mcp_args(CODEX_ID, req.mcp_config, &cfg.allowed_tools)?;
+        // THE ROW'S GRANT, NOT THE MAIN TURN'S. This read `cfg.allowed_tools` until 0.145.0,
+        // which meant every Codex child at every level ran the main turn's allowlist: the
+        // [`McpSet::Replies`] brief child had Drive reads, Calendar reads and `maps_search`
+        // while SECURITY.md said its grant was Gmail-only, and the vault-QA and shadow
+        // children had the whole main-turn list at `Read`. [`row_allowed_tools`] is the same
+        // choice Claude Code makes, made once for both harnesses.
+        //
+        // The SET is resolved from the config string because that is what a spawn site
+        // carries, exactly as `claude_child_args` resolves it; a set this build does not ship
+        // resolves to `None` and therefore to the standard `Read` grant.
+        let mcp = codex_mcp_args(
+            CODEX_ID,
+            req.mcp_config,
+            row_allowed_tools(
+                cfg,
+                req.capability,
+                McpSet::from_config(req.mcp_config).unwrap_or(McpSet::None),
+            ),
+        )?;
         // `None` for the subscription-OAuth posture, which is every turn that came before
         // this and still the deployed one. See [`codex_provider_args`].
         let provider = codex_provider_args(req.active);
@@ -1915,12 +2000,22 @@ impl Harness for Codex {
     /// The argv WITH [`WORKSPACE_TOKEN`] still in it — this is the recorded, host-independent
     /// form the startup gate compares against. [`build_codex_args`] fills the token in when
     /// it builds a real child, because only a spawn knows its own working directory.
-    /// The MCP set is accepted and IGNORED, and that is a statement rather than an oversight:
-    /// Codex's containment flags are an OS sandbox mode and an approval policy, which do not
-    /// vary by which servers are loaded. Its per-server tool narrowing lives in
-    /// [`codex_mcp_args`] (`enabled_tools`), not here.
-    fn capability_args(&self, _cfg: &Config, capability: Capability, _mcp: McpSet) -> Vec<String> {
-        codex_capability_args(capability)
+    /// TWO HALVES, and the second one is new in 0.145.0. The sandbox flags are an OS sandbox
+    /// mode and an approval policy, which genuinely do not vary by which servers are loaded.
+    /// The `enabled_tools` grant does vary by row, is the STRONGEST boundary this harness has
+    /// (an ungranted MCP tool is absent, not refused), and was the one boundary no committed
+    /// row described — see [`codex_enabled_tools_args`] for what that concealed.
+    ///
+    /// Every pre-existing Codex row's argv therefore moves, which invalidates the committed
+    /// Codex record until the battery is re-run. Claude Code's does not move by a byte: its
+    /// grant was already in its argv, as `--allowedTools`.
+    fn capability_args(&self, cfg: &Config, capability: Capability, mcp: McpSet) -> Vec<String> {
+        let mut args = codex_capability_args(capability);
+        args.extend(codex_enabled_tools_args(
+            mcp.config(),
+            row_allowed_tools(cfg, capability, mcp),
+        ));
+        args
     }
 
     fn attachment_support(&self) -> &'static AttachmentSupport {
@@ -3091,6 +3186,102 @@ mod tests {
             auth_failure_message(CODEX_ID, &detail),
             auth_failure_message(CODEX_ID, &detail)
         );
+    }
+
+    // ---- The row's grant, on the child AND in the record ---------------------------
+
+    /// THE BRIEF CHILD RUNS THE BRIEF CHILD'S GRANT ON THIS HARNESS TOO.
+    ///
+    /// Until 0.145.0 `Codex::command` built `enabled_tools` from `cfg.allowed_tools` — the
+    /// MAIN TURN's list — whatever row it was spawning, so the `Replies` child had Drive
+    /// reads, Calendar reads and `maps_search` on Codex while SECURITY.md said the grant was
+    /// Gmail-only everywhere. The six Gmail reads below are the whole of what `google` may do
+    /// on that row.
+    #[test]
+    fn a_codex_read_child_runs_its_own_rows_grant() {
+        let cfg = test_config();
+        let replies = Codex.capability_args(&cfg, Capability::Read, McpSet::Replies);
+        let flat = replies.join(" ");
+        assert!(
+            flat.contains(
+                r#"mcp_servers.google.enabled_tools=["search_gmail_messages", "get_gmail_message_content", "get_gmail_messages_content_batch", "get_gmail_thread_content", "get_gmail_threads_content_batch", "list_gmail_labels"]"#
+            ),
+            "{replies:?}"
+        );
+        // The main turn grants these on `google`; this row must not.
+        for withheld in ["search_drive_files", "list_calendars", "maps_search"] {
+            assert!(
+                !flat.contains(withheld),
+                "`{withheld}` reached the Replies child's argv: {replies:?}"
+            );
+        }
+        // …and no send tool of any of the six, which is what the battery's hard gates assert
+        // against a live child and this asserts against the argv that spawns it.
+        for server in McpSet::Replies.server_names() {
+            for tool in granted_mcp_tools(
+                row_allowed_tools(&cfg, Capability::Read, McpSet::Replies),
+                server,
+            ) {
+                assert!(
+                    !is_message_send_tool(&format!("mcp__{server}__{tool}")),
+                    "a send tool is granted on {server}: {tool}"
+                );
+            }
+        }
+
+        // A DIFFERENT ROW AT THE SAME LEVEL GETS A DIFFERENT GRANT, which is the whole reason
+        // `capability_args` is keyed on the row rather than on the capability alone.
+        let morning = Codex.capability_args(&cfg, Capability::Read, McpSet::Morning);
+        assert_ne!(replies, morning);
+        assert!(
+            morning
+                .join(" ")
+                .contains(r#"mcp_servers.google.enabled_tools=[]"#),
+            "the standard Read grant names no Google tool at all: {morning:?}"
+        );
+    }
+
+    /// THE TWO HALVES DIFFER IN EXACTLY ONE PLACE. The sandbox flags are the same at one
+    /// level whatever the set; only the `enabled_tools` lines move. Stated as a test because a
+    /// change that made the sandbox posture vary by MCP set would be a change to the boundary
+    /// that nothing else here would notice.
+    #[test]
+    fn two_rows_at_one_level_differ_only_in_their_enabled_tools() {
+        let cfg = test_config();
+        let sandbox = codex_capability_args(Capability::Read);
+        for set in [McpSet::Replies, McpSet::Morning, McpSet::None] {
+            let args = Codex.capability_args(&cfg, Capability::Read, set);
+            assert_eq!(args[..sandbox.len()], sandbox[..], "{set:?}: {args:?}");
+            assert_eq!(
+                &args[sandbox.len()..],
+                codex_enabled_tools_args(
+                    set.config(),
+                    row_allowed_tools(&cfg, Capability::Read, set)
+                ),
+                "{set:?}"
+            );
+        }
+    }
+
+    /// THE RECORDED GRANT AND THE SPAWNED GRANT ARE ONE STRING, produced once. A record that
+    /// vouched for a grant the child did not run would be the same defect this change removes,
+    /// reintroduced one layer up.
+    #[test]
+    fn the_recorded_enabled_tools_are_the_ones_the_child_gets() {
+        let cfg = test_config();
+        for set in McpSet::ALL {
+            for capability in [Capability::Read, Capability::Write] {
+                let allowed = row_allowed_tools(&cfg, capability, set);
+                let child = codex_mcp_args(CODEX_ID, set.config(), allowed).expect("translates");
+                for line in codex_enabled_tools_args(set.config(), allowed) {
+                    assert!(
+                        child.contains(&line),
+                        "{set:?}/{capability:?}: the record names `{line}`, which the child's \
+                         argv does not carry: {child:?}"
+                    );
+                }
+            }
+        }
     }
 
     /// The three overrides Codex needs and Claude Code does not — see `codex_mcp_args`.

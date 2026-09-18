@@ -1160,12 +1160,51 @@ pub fn main_mcp_config<'a>(cfg: &'a Config, harness: &dyn SpawnedHarness) -> &'a
 }
 
 /// The MCP server set for the vault-QA child (and the shadow child, which shares its
-/// builder): `JESSE_VAULTQA_MCP_CONFIG` when set, else NO servers.
-pub fn vaultqa_mcp_config(cfg: &Config) -> &str {
-    cfg.vaultqa_mcp_config
+/// builder): NO servers, unless `JESSE_VAULTQA_MCP_CONFIG` names the one set this child may
+/// load.
+///
+/// **THE SHIPPED CONST, NEVER THE ENVIRONMENT'S STRING** — the same rule
+/// [`brief_mcp_config`] follows, and the last path pass-through in the bridge to adopt it.
+/// Until 0.145.0 this variable's value went straight to `--mcp-config`, so any file on the
+/// host reached this child (and the shadow child, which shares this builder): a set nothing
+/// had probed, described by nothing the record could check, loaded by a child running in the
+/// vault at `Read`. A path cannot be gated, because the file it names is read by the CHILD
+/// after the startup gate has run. A NAME can be, so this takes a name.
+///
+/// [`validate_vaultqa_mcp`] refuses anything else at startup, so by the time this runs the
+/// value is either absent or `qmd`; an unparseable one reaching here anyway degrades to NO
+/// servers rather than to a guess.
+///
+/// # Why this child is NOT gated on a passing row, when the brief child is
+///
+/// The asymmetry is deliberate and is the same one [`crate::validate_today_brief_mcp`] states
+/// from its side. The brief child runs UNATTENDED, ~40 times a morning, and its answer can
+/// check off one of the owner's items; widening what it reaches is not a setting, so it is
+/// gated on a probed, recorded, signed row. This child answers a question a person just asked
+/// and is sitting there waiting for. Holding it to a compile-time const closes the hole that
+/// mattered — no host file reaches it — without gating an interactive answer on a battery run.
+pub fn vaultqa_mcp_config(cfg: &Config) -> &'static str {
+    match cfg
+        .vaultqa_mcp_config
         .as_deref()
-        .unwrap_or(EMPTY_MCP_CONFIG)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(McpSet::parse)
+    {
+        Some(set) if set == VAULTQA_MCP_SET => set.config(),
+        Some(_) | None => EMPTY_MCP_CONFIG,
+    }
 }
+
+/// The ONE set the vault-QA child may load, named once so the gate and the builder cannot
+/// disagree about it.
+///
+/// [`McpSet::Qmd`] and nothing wider: vault search is the whole job of this child, and every
+/// larger set carries a server that reaches off the host. It is not "any set with a passing
+/// row" for the reason [`crate::validate_today_brief_mcp`] gives about the brief child — the
+/// main-turn set HAS a passing `read` row, and a pass-based rule would therefore hand this
+/// child the browser, the house, the network and the hypervisor.
+pub const VAULTQA_MCP_SET: McpSet = McpSet::Qmd;
 
 /// The MCP server set for the TODAY-BRIEF child: NO servers, unless
 /// `JESSE_TODAY_BRIEF_MCP_CONFIG` names one — and the only name that gets past
@@ -1429,15 +1468,22 @@ pub fn claude_capability_args(cfg: &Config, capability: Capability, mcp: McpSet)
             // may read, nothing more.
             "--tools".to_string(),
             READ_ROOT_TOOLS.to_string(),
+            // THROUGH [`row_allowed_tools`], not through `read_allowed_tools` directly. The
+            // string is the same one it always was; what changed is that Codex now reads the
+            // grant from the same function, so the two harnesses cannot drift into granting
+            // one row two different things. See that function for the drift this closed.
             "--allowedTools".to_string(),
-            read_allowed_tools(mcp).to_string(),
+            row_allowed_tools(cfg, capability, mcp).to_string(),
             "--disallowedTools".to_string(),
             READ_DISALLOWED_TOOLS.to_string(),
         ],
         Capability::Write => {
             // Today's exact writes-on posture: the configured lists, and NO root
             // `--tools` flag (so the full built-in toolset stands at the root).
-            let mut args = vec!["--allowedTools".to_string(), cfg.allowed_tools.clone()];
+            let mut args = vec![
+                "--allowedTools".to_string(),
+                row_allowed_tools(cfg, capability, mcp).to_string(),
+            ];
             if !cfg.disallowed_tools.trim().is_empty() {
                 args.push("--disallowedTools".to_string());
                 args.push(cfg.disallowed_tools.clone());
@@ -4035,15 +4081,18 @@ mod tests {
             "vault-QA child (no MCP config)"
         );
 
-        // 3b. The same child with the qmd MCP config path set: passed through verbatim.
+        // 3b. The same child with the variable set to the ONE set name it accepts: the child
+        //     loads that set's SHIPPED CONST. It used to be handed the value verbatim, so a
+        //     path reached `--mcp-config` and any file on the host could configure a `Read`
+        //     child running in the vault. See `vaultqa_mcp_config`.
         let mut cfg_mcp = test_config();
-        cfg_mcp.vaultqa_mcp_config = Some("/etc/jesse/qmd.json".to_string());
+        cfg_mcp.vaultqa_mcp_config = Some(VAULTQA_MCP_SET.label().to_string());
         assert_eq!(
             cmd_argv(&build_vaultqa_child_command(&cfg_mcp, "PROMPT")),
             golden(&[
                 "--strict-mcp-config",
                 "--mcp-config",
-                "/etc/jesse/qmd.json",
+                QMD_ONLY_MCP_CONFIG,
                 "--tools",
                 "Read,Grep,Glob",
                 "--allowedTools",
@@ -4051,7 +4100,7 @@ mod tests {
                 "--disallowedTools",
                 "Bash,Write,Edit,NotebookEdit,WebFetch,WebSearch,Task,Agent,ToolSearch,Workflow,TodoWrite,Skill",
             ]),
-            "vault-QA child (qmd MCP config)"
+            "vault-QA child (qmd set named)"
         );
 
         // 4. DIET children (extract + verify) → Basic. Empty root toolset, no MCP.
@@ -4349,18 +4398,34 @@ mod tests {
         );
     }
 
+    /// THE VARIABLE NAMES A SET; THE CHILD LOADS THE SHIPPED CONST.
+    ///
+    /// This used to pass the value STRAIGHT THROUGH to `--mcp-config`, so any file on the host
+    /// reached a `Read` child running in the vault — and the shadow child, which shares this
+    /// builder. A path cannot be gated (the child reads it after the gate has run), so the
+    /// variable takes a name and the child loads that set's compile-time const, exactly as the
+    /// brief child's did from 0.144.0.
     #[test]
-    fn vaultqa_child_uses_mcp_config_path_when_set() {
-        // When JESSE_VAULTQA_MCP_CONFIG is set, its PATH is passed straight to
-        // --mcp-config (the CLI accepts a path or inline JSON), so the qmd server loads.
+    fn the_vaultqa_child_loads_the_shipped_set_not_a_host_file() {
         let mut cfg = test_config();
-        cfg.vaultqa_mcp_config = Some("/etc/jesse/qmd.json".to_string());
+        cfg.vaultqa_mcp_config = Some(VAULTQA_MCP_SET.label().to_string());
         let cmd = build_vaultqa_child_command(&cfg, "hi");
         assert_eq!(
             cmd_arg_value(&cmd, "--mcp-config").as_deref(),
-            Some("/etc/jesse/qmd.json"),
-            "the configured MCP config path must be passed verbatim"
+            Some(QMD_ONLY_MCP_CONFIG),
+            "the child must load the shipped const for the named set"
         );
         assert!(cmd_has_flag(&cmd, "--strict-mcp-config"));
+
+        // Unset is unchanged: no servers at all.
+        cfg.vaultqa_mcp_config = None;
+        assert_eq!(vaultqa_mcp_config(&cfg), EMPTY_MCP_CONFIG);
+
+        // A PATH REACHES NO CHILD. The startup gate refuses this value outright
+        // (`validate_vaultqa_mcp`); this asserts the builder is safe even so, because a
+        // degradation to "no servers" is the only direction that cannot load something
+        // nothing probed.
+        cfg.vaultqa_mcp_config = Some("/etc/jesse/qmd.json".to_string());
+        assert_eq!(vaultqa_mcp_config(&cfg), EMPTY_MCP_CONFIG);
     }
 }

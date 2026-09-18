@@ -657,6 +657,22 @@ fn check_answer(field: &str, a: &Answer) -> Result<(), BriefInvalid> {
     Ok(())
 }
 
+/// A model output that passed [`validate`], plus the one fact about the CHECKING that
+/// the brief itself cannot carry.
+///
+/// A brief that survives validation is the brief minus whatever was refused, so by the
+/// time it exists the refusals are invisible in it: three citations that were all
+/// fabricated and zero citations that were never made produce the same brief. Carrying
+/// the count out separately is what lets [`BriefRecord::citations_dropped`] keep it, and
+/// what turns "how often does the citation filter actually fire" into a question the
+/// store answers rather than one a week of logs is grepped for.
+#[derive(PartialEq, Debug, Clone)]
+pub struct Validated {
+    pub brief: TodayItemBrief,
+    /// How many message citations the filter refused on this output.
+    pub citations_dropped: usize,
+}
+
 /// Parse and check one model output.
 ///
 /// Three jobs, in order: parse the JSON, enforce the shape and the caps, and
@@ -676,7 +692,7 @@ pub fn validate(
     harness: &str,
     model: &str,
     identities: &std::collections::HashMap<String, Vec<String>>,
-) -> Result<TodayItemBrief, BriefInvalid> {
+) -> Result<Validated, BriefInvalid> {
     let json = extract_json_object(raw);
     let mut brief: TodayItemBrief =
         serde_json::from_str(&json).map_err(|e| BriefInvalid::NotJson(e.to_string()))?;
@@ -774,7 +790,10 @@ pub fn validate(
     brief.generated_at = rfc3339_utc(SystemTime::now());
     brief.harness = harness.to_string();
     brief.model = model.to_string();
-    Ok(brief)
+    Ok(Validated {
+        brief,
+        citations_dropped: dropped,
+    })
 }
 
 /// Whether this citation's sender IS the owner, on that citation's own channel.
@@ -867,6 +886,45 @@ fn extract_json_object(raw: &str) -> String {
 // Weeding
 // ---------------------------------------------------------------------------
 
+/// WHICH GATE HELD AN ITEM OPEN. One variant per `MarkStale` site in [`weed`], and
+/// they are not interchangeable.
+///
+/// "It was marked rather than closed" is the answer to a question nobody asked. The
+/// questions actually worth answering are "how much of the marking is the message
+/// switch being off?" and "how much is the model refusing to commit?", and those have
+/// opposite fixes: the first is arming a flag, the second is a prompt or a model. One
+/// bit could not tell them apart, so the bridge records which gate fired and the store
+/// answers both by counting.
+///
+/// Serialized kebab-case, like [`BriefStatus`], so a day's marking is one `jq` over
+/// `today-briefs.json` rather than a reading of the log.
+#[derive(PartialEq, Eq, Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum StaleReason {
+    /// The verdict was `overdue`: a stated deadline passed. Never auto-closed at any
+    /// confidence, so this one is a decision, not a shortfall.
+    Overdue,
+    /// A `done` or `moot` verdict the model itself would only call `low` confidence.
+    NotHighConfidence,
+    /// A confident verdict that named no evidence source, no evidence date, or neither.
+    /// Absence of activity is not evidence, and an unsourced claim is not either.
+    NoDatedEvidence,
+    /// An evidence date that was not a `YYYY-MM-DD` day, so nothing could be compared.
+    EvidenceDateNotADay,
+    /// The ITEM carries no `Added`/`updated` date, so no evidence can be dated against
+    /// it. The shortfall is in the day file, not in the brief.
+    ItemUndated,
+    /// The evidence is not strictly newer than the item: a source the item already knew
+    /// about is not news that the item is finished.
+    EvidenceNotNewer,
+    /// EVERY GATE PASSED EXCEPT THE SWITCH. This item would have been closed on message
+    /// evidence had `JESSE_TODAY_BRIEF_MESSAGE_CLOSES` been set — which is exactly the
+    /// population the week of marking exists to measure, and the reason this enum is
+    /// worth its keep. Counting these is how "would it have been right?" gets an answer
+    /// before the flag is armed, instead of after.
+    MessageClosesOff,
+}
+
 /// What the bridge should do with an item, given its brief.
 #[derive(PartialEq, Debug, Clone)]
 pub enum WeedAction {
@@ -874,8 +932,23 @@ pub enum WeedAction {
     Leave,
     /// Check it off, with this evidence line.
     Close { evidence: String },
-    /// Leave it open, but tell the app it may be finished.
-    MarkStale,
+    /// Leave it open, but tell the app it may be finished — and say which gate held it.
+    MarkStale { reason: StaleReason },
+}
+
+impl WeedAction {
+    /// What [`BriefRecord::stale_reason`] should hold for this decision.
+    ///
+    /// The other two outcomes collapse to `None` on purpose: an item left alone and an
+    /// item closed are both already legible — one has an `open` verdict, the other has a
+    /// check mark and an evidence line — and inventing reasons for them would put three
+    /// kinds of "nothing to report" in a field that exists to count one thing.
+    pub fn stale_reason(&self) -> Option<StaleReason> {
+        match self {
+            WeedAction::MarkStale { reason } => Some(*reason),
+            WeedAction::Leave | WeedAction::Close { .. } => None,
+        }
+    }
 }
 
 /// Decide what to do with an item, **in code**, from dates the bridge parsed.
@@ -895,30 +968,49 @@ pub enum WeedAction {
 /// the user sees "this may be done" and one button, rather than the bridge
 /// silently closing something on a guess. A wrong auto-close is worse than a
 /// missed one, and this function is where that trade is made.
+///
+/// Every mark carries the [`StaleReason`] of the gate that produced it, so the marking
+/// this function does can be counted by cause afterwards instead of read one item at a
+/// time. Naming the reasons changes nothing about what closes — the gates, their order
+/// and their verdicts are exactly as they were.
 pub fn weed(brief: &TodayItemBrief, inputs: &BriefInputs, message_closes: bool) -> WeedAction {
     let r = &brief.relevance;
     match r.verdict {
         BriefVerdict::Open => return WeedAction::Leave,
-        BriefVerdict::Overdue => return WeedAction::MarkStale,
+        BriefVerdict::Overdue => {
+            return WeedAction::MarkStale {
+                reason: StaleReason::Overdue,
+            }
+        }
         BriefVerdict::Done | BriefVerdict::Moot => {}
     }
     if r.confidence != Confidence::High {
-        return WeedAction::MarkStale;
+        return WeedAction::MarkStale {
+            reason: StaleReason::NotHighConfidence,
+        };
     }
     let (Some(source), Some(date)) = (r.evidence_source.as_deref(), r.evidence_date.as_deref())
     else {
-        return WeedAction::MarkStale;
+        return WeedAction::MarkStale {
+            reason: StaleReason::NoDatedEvidence,
+        };
     };
     if !is_iso_day(date) {
-        return WeedAction::MarkStale;
+        return WeedAction::MarkStale {
+            reason: StaleReason::EvidenceDateNotADay,
+        };
     }
     // ISO days compare correctly as strings. An item with no date of its own
     // cannot have its evidence dated against it, so it is never auto-closed.
     let Some(as_of) = inputs.as_of() else {
-        return WeedAction::MarkStale;
+        return WeedAction::MarkStale {
+            reason: StaleReason::ItemUndated,
+        };
     };
     if date <= as_of {
-        return WeedAction::MarkStale;
+        return WeedAction::MarkStale {
+            reason: StaleReason::EvidenceNotNewer,
+        };
     }
     // THE FOURTH GATE, AND IT IS NEW: a close whose newest evidence is a MESSAGE rather than
     // a note needs `JESSE_TODAY_BRIEF_MESSAGE_CLOSES=1`.
@@ -928,9 +1020,13 @@ pub fn weed(brief: &TodayItemBrief, inputs: &BriefInputs, message_closes: bool) 
     // the first time: `WeedAction::Close` has never fired end to end against a real day file,
     // and the honest order is a week of marking before a week of closing. The verdict is not
     // discarded, it is recorded as "maybe done" with its citation, so the owner sees exactly
-    // what would have closed and can judge the rule by its output.
+    // what would have closed and can judge the rule by its output — and it is recorded under
+    // its OWN reason, so "what would have closed with the flag on" is a count over the store
+    // rather than a re-reading of every marked item.
     if !message_closes && !looks_like_note_path(source) {
-        return WeedAction::MarkStale;
+        return WeedAction::MarkStale {
+            reason: StaleReason::MessageClosesOff,
+        };
     }
     WeedAction::Close {
         evidence: format!("auto-closed: {} ({source}, {date})", r.reason.trim()),
@@ -1004,6 +1100,23 @@ pub struct BriefRecord {
     /// by construction, because the record it lives on is replaced.
     #[serde(default)]
     pub auto_close_blocked: bool,
+    /// How many message citations [`validate`] refused on the output that became this
+    /// record. Zero on a `Pending` or `Failed` record: no output ever reached the filter.
+    ///
+    /// The brief cannot carry this, because a dropped citation leaves no trace in the
+    /// brief it was dropped from (see [`Validated`]). Kept here so the fabrication rate is
+    /// a number, and so a morning where the filter fired on every item is visible as one.
+    #[serde(default)]
+    pub citations_dropped: usize,
+    /// Which gate held this item open, when [`weed`] marked it rather than closing it.
+    ///
+    /// `None` covers all three of the other outcomes — left alone, closed, or never
+    /// weeded at all — and they are not worth distinguishing here: the verdict and the
+    /// check mark already say which. What is worth keeping is WHY an item that looked
+    /// finished was not closed, and above all how many of those were held only by
+    /// `JESSE_TODAY_BRIEF_MESSAGE_CLOSES` being unset.
+    #[serde(default)]
+    pub stale_reason: Option<StaleReason>,
 }
 
 impl BriefRecord {
@@ -1016,6 +1129,8 @@ impl BriefRecord {
             failure: None,
             inputs_hash: inputs_hash.to_string(),
             auto_close_blocked: false,
+            citations_dropped: 0,
+            stale_reason: None,
         }
     }
 
@@ -1419,8 +1534,55 @@ pub fn retry_prompt(base: &str, invalid: &BriefInvalid) -> String {
     )
 }
 
-/// One answer from a model: its text, or a transport-level failure message.
-type AskResult = Result<String, String>;
+/// What one attempt to a model spent, carried back to be LOGGED AFTER VALIDATION.
+///
+/// The cost line used to be printed by the closure that earned it, which is the obvious
+/// place and the wrong one now: the number the live check is watching — how many message
+/// citations the validator refused — does not exist until the output has been through
+/// [`validate`], and a cost line that had to be joined to a second line by item id and
+/// attempt number to be read would not be a cost line anyone reads. So the closure
+/// reports what it spent and [`generate_with`] prints the pair as one line.
+///
+/// Content-free by construction: ids, counts and dollars, never a word of the brief.
+pub struct AttemptCost {
+    pub item_id: String,
+    pub attempt: u32,
+    pub model: String,
+    pub harness: String,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cost_usd: f64,
+    pub wall_ms: u128,
+}
+
+impl AttemptCost {
+    /// Print this attempt's line. `citations_dropped` is `None` for an output the
+    /// validator REJECTED — a rejected output never reaches the citation filter, so
+    /// "0 dropped" would be a claim the attempt never made, and the line says `-`.
+    fn log(&self, citations_dropped: Option<usize>) {
+        let dropped = match citations_dropped {
+            Some(n) => n.to_string(),
+            None => "-".to_string(),
+        };
+        eprintln!(
+            "jesse-bridge: today-brief item={} attempt={} model='{}' harness={} in={} out={} \
+             cost_usd={:.5} wall_ms={} citations_dropped={dropped}",
+            self.item_id,
+            self.attempt,
+            self.model,
+            self.harness,
+            self.input_tokens,
+            self.output_tokens,
+            self.cost_usd,
+            self.wall_ms,
+        );
+    }
+}
+
+/// One answer from a model: its text and what it cost, or a transport-level failure
+/// message. The cost is `None` when there was nothing to spend — a test closure has no
+/// child, no deck and no wall clock worth printing.
+type AskResult = Result<(String, Option<AttemptCost>), String>;
 
 /// The two-attempt contract, with the network handed in.
 ///
@@ -1449,25 +1611,37 @@ pub async fn generate_with(
         failure,
         inputs_hash: hash.to_string(),
         auto_close_blocked: false,
+        citations_dropped: 0,
+        stale_reason: None,
     };
     let mut prompt = base_prompt.to_string();
     let mut last: Option<BriefInvalid> = None;
     for _ in 0..2 {
-        let raw = match ask(prompt.clone()).await {
-            Ok(raw) => raw,
+        let (raw, cost) = match ask(prompt.clone()).await {
+            Ok(answered) => answered,
+            // Nothing is logged for a transport failure: the model never answered, so
+            // there is no attempt to price.
             Err(message) => return failed(Some(message)),
         };
         match validate(&raw, notes_root, hash, harness, model, identities) {
-            Ok(brief) => {
+            Ok(valid) => {
+                if let Some(cost) = cost.as_ref() {
+                    cost.log(Some(valid.citations_dropped));
+                }
                 return BriefRecord {
                     status: BriefStatus::Ok,
-                    brief: Some(brief),
+                    brief: Some(valid.brief),
                     failure: None,
                     inputs_hash: hash.to_string(),
                     auto_close_blocked: false,
-                }
+                    citations_dropped: valid.citations_dropped,
+                    stale_reason: None,
+                };
             }
             Err(invalid) => {
+                if let Some(cost) = cost.as_ref() {
+                    cost.log(None);
+                }
                 prompt = retry_prompt(base_prompt, &invalid);
                 last = Some(invalid);
             }
@@ -1510,7 +1684,7 @@ pub async fn generate_one(
     // doubtful answer with no way to find out which model wrote it.
     let harness = pick.harness.clone();
     let model = pick.id.clone();
-    let mut attempt = 0;
+    let mut attempt: u32 = 0;
     let mut ask = move |prompt: String| -> BoxFuture<AskResult> {
         attempt += 1;
         // Everything the future touches is OWNED by it, which is what makes it `'static`
@@ -1523,19 +1697,21 @@ pub async fn generate_one(
             let (raw, usage) = run_brief_child(&cfg, &prompt, TODAY_BRIEF_TIMEOUT_SECS, &pick)
                 .await
                 .map_err(|(_status, message)| message)?;
-            // ONE cost line per attempt, content-free: item id, model, tokens, dollars.
-            // A brief nobody can price is a morning nobody can budget.
-            eprintln!(
-                "jesse-bridge: today-brief item={item_id} attempt={attempt} model='{}' \
-                 harness={} in={} out={} cost_usd={:.5} wall_ms={}",
-                pick.id,
-                pick.harness,
-                usage.input_tokens.unwrap_or(0),
-                usage.output_tokens.unwrap_or(0),
-                usage.cost_on(&deck),
-                started.elapsed().map(|d| d.as_millis()).unwrap_or(0),
-            );
-            Ok(raw)
+            // ONE cost line per attempt, content-free: item id, model, tokens, dollars and
+            // how many citations were refused. A brief nobody can price is a morning nobody
+            // can budget. Handed back rather than printed here, because the last of those
+            // numbers is only known once this answer has been validated.
+            let cost = AttemptCost {
+                item_id,
+                attempt,
+                model: pick.id.clone(),
+                harness: pick.harness.clone(),
+                input_tokens: usage.input_tokens.unwrap_or(0),
+                output_tokens: usage.output_tokens.unwrap_or(0),
+                cost_usd: usage.cost_on(&deck),
+                wall_ms: started.elapsed().map(|d| d.as_millis()).unwrap_or(0),
+            };
+            Ok((raw, Some(cost)))
         })
     };
     let mut record = generate_with(
@@ -1580,12 +1756,16 @@ async fn generate_and_weed(st: AppState, item: TodayItem, today: String) {
     // does not queue a duplicate turn.
     BriefStore::record(briefs_file.clone(), &item.id, BriefRecord::pending(&hash));
 
-    let record = generate_one(st.cfg.clone(), st.health.clone(), &inputs, &today).await;
+    let mut record = generate_one(st.cfg.clone(), st.health.clone(), &inputs, &today).await;
     let action = record
         .brief
         .as_ref()
         .map(|b| weed(b, &inputs, st.cfg.today_brief_message_closes))
         .unwrap_or(WeedAction::Leave);
+    // THE DECISION IS WRITTEN DOWN, not just acted on. An item the bridge marked rather
+    // than closed is indistinguishable in the store from one it never had an opinion
+    // about, unless the gate that held it is recorded alongside the brief that reached it.
+    record.stale_reason = action.stale_reason();
     BriefStore::record(briefs_file.clone(), &item.id, record);
 
     let WeedAction::Close { evidence } = action else {
@@ -1959,10 +2139,11 @@ mod tests {
             &no_ids(),
         )
         .unwrap();
-        assert_eq!(got.inputs_hash, "abc123");
-        assert_eq!(got.harness, "codex");
-        assert_eq!(got.model, "gpt-x");
-        assert!(!got.generated_at.is_empty());
+        assert_eq!(got.brief.inputs_hash, "abc123");
+        assert_eq!(got.brief.harness, "codex");
+        assert_eq!(got.brief.model, "gpt-x");
+        assert!(!got.brief.generated_at.is_empty());
+        assert_eq!(got.citations_dropped, 0, "nothing was cited, nothing fell");
     }
 
     #[test]
@@ -2070,7 +2251,7 @@ mod tests {
         ];
         let got = validate(&json_of(&b), &v.notes(), "h", "direct", "m", &no_ids()).unwrap();
         assert_eq!(
-            got.sources,
+            got.brief.sources,
             vec![
                 "Projects/Real.md".to_string(),
                 "Slack #partners, 2026-09-16, from Robin Ellis".to_string(),
@@ -2166,12 +2347,16 @@ mod tests {
         let inputs = inputs_added("2026-09-10");
         assert_eq!(
             weed(&done_with("2026-09-02", Confidence::High), &inputs, false),
-            WeedAction::MarkStale
+            WeedAction::MarkStale {
+                reason: StaleReason::EvidenceNotNewer
+            }
         );
         // Same day is not newer either.
         assert_eq!(
             weed(&done_with("2026-09-10", Confidence::High), &inputs, false),
-            WeedAction::MarkStale
+            WeedAction::MarkStale {
+                reason: StaleReason::EvidenceNotNewer
+            }
         );
     }
 
@@ -2180,7 +2365,9 @@ mod tests {
         let inputs = inputs_added("2026-09-10");
         assert_eq!(
             weed(&done_with("2026-09-12", Confidence::Low), &inputs, false),
-            WeedAction::MarkStale
+            WeedAction::MarkStale {
+                reason: StaleReason::NotHighConfidence
+            }
         );
     }
 
@@ -2190,7 +2377,12 @@ mod tests {
         let inputs = inputs_added("2026-09-10");
         let mut b = done_with("2026-09-12", Confidence::High);
         b.relevance.verdict = BriefVerdict::Overdue;
-        assert_eq!(weed(&b, &inputs, false), WeedAction::MarkStale);
+        assert_eq!(
+            weed(&b, &inputs, false),
+            WeedAction::MarkStale {
+                reason: StaleReason::Overdue
+            }
+        );
     }
 
     #[test]
@@ -2206,10 +2398,20 @@ mod tests {
         let inputs = inputs_added("2026-09-10");
         let mut b = done_with("2026-09-12", Confidence::High);
         b.relevance.evidence_date = None;
-        assert_eq!(weed(&b, &inputs, false), WeedAction::MarkStale);
+        assert_eq!(
+            weed(&b, &inputs, false),
+            WeedAction::MarkStale {
+                reason: StaleReason::NoDatedEvidence
+            }
+        );
         let mut b = done_with("2026-09-12", Confidence::High);
         b.relevance.evidence_source = None;
-        assert_eq!(weed(&b, &inputs, false), WeedAction::MarkStale);
+        assert_eq!(
+            weed(&b, &inputs, false),
+            WeedAction::MarkStale {
+                reason: StaleReason::NoDatedEvidence
+            }
+        );
     }
 
     /// An item with no date of its own cannot have evidence dated against it.
@@ -2221,7 +2423,9 @@ mod tests {
         assert_eq!(inputs.as_of(), None);
         assert_eq!(
             weed(&done_with("2026-09-12", Confidence::High), &inputs, false),
-            WeedAction::MarkStale
+            WeedAction::MarkStale {
+                reason: StaleReason::ItemUndated
+            }
         );
     }
 
@@ -2251,8 +2455,10 @@ mod tests {
         let b = done_with_message("2026-09-12");
         assert_eq!(
             weed(&b, &inputs, false),
-            WeedAction::MarkStale,
-            "the default is to MARK, not to close"
+            WeedAction::MarkStale {
+                reason: StaleReason::MessageClosesOff
+            },
+            "the default is to MARK, not to close — and to say the switch is why"
         );
         assert_eq!(
             weed(&b, &inputs, true),
@@ -2301,7 +2507,9 @@ mod tests {
         let v = Vault::new("citation");
         let mut b = done_with_message("2026-09-12");
         b.message_citations = vec![c];
-        validate(&json_of(&b), &v.notes(), "h", "direct", "m", ids).expect("the brief is valid")
+        validate(&json_of(&b), &v.notes(), "h", "direct", "m", ids)
+            .expect("the brief is valid")
+            .brief
     }
 
     /// EVERY FIELD IS REQUIRED, and a citation missing one is dropped rather than repaired.
@@ -2408,6 +2616,8 @@ mod tests {
                     failure: None,
                     inputs_hash: "h".to_string(),
                     auto_close_blocked: false,
+                    citations_dropped: 0,
+                    stale_reason: None,
                 },
             )]),
         }
@@ -2457,12 +2667,19 @@ mod tests {
         b.message_citations = vec![citation(MessageChannel::Slack, "someone@example.com")];
         let got = validate(&json_of(&b), &v.notes(), "h", "direct", "m", &owner_ids())
             .expect("still a valid brief");
-        assert!(got.message_citations.is_empty());
-        assert_eq!(got.relevance.confidence, Confidence::Low);
-        // …so even with the flag armed, it cannot close.
+        assert!(got.brief.message_citations.is_empty());
         assert_eq!(
-            weed(&got, &inputs_added("2026-09-10"), true),
-            WeedAction::MarkStale
+            got.citations_dropped, 1,
+            "the refusal is counted, not just made"
+        );
+        assert_eq!(got.brief.relevance.confidence, Confidence::Low);
+        // …so even with the flag armed, it cannot close — and the reason names the
+        // confidence, not the switch, because the downgrade is what stopped it first.
+        assert_eq!(
+            weed(&got.brief, &inputs_added("2026-09-10"), true),
+            WeedAction::MarkStale {
+                reason: StaleReason::NotHighConfidence
+            }
         );
         // The converse: a surviving citation keeps the verdict it came with.
         let kept = validated_with(citation(MessageChannel::Slack, "u0owner"), &owner_ids());
@@ -2490,7 +2707,9 @@ mod tests {
             assert_eq!(got.message_citations.len(), 1, "{}", channel.label());
             assert_eq!(
                 weed(&got, &inputs_added("2026-09-10"), false),
-                WeedAction::MarkStale,
+                WeedAction::MarkStale {
+                    reason: StaleReason::MessageClosesOff
+                },
                 "{}: a message body cannot talk its way past the flag",
                 channel.label()
             );
@@ -2512,6 +2731,8 @@ mod tests {
             failure: None,
             inputs_hash: hash.to_string(),
             auto_close_blocked: false,
+            citations_dropped: 0,
+            stale_reason: None,
         }
     }
 
@@ -2626,6 +2847,8 @@ mod tests {
                 failure: None,
                 inputs_hash: "h".to_string(),
                 auto_close_blocked: false,
+                citations_dropped: 0,
+                stale_reason: None,
             },
         );
         BriefStore::load(Some(path.clone())).merge_into(&mut snapshot);
@@ -2644,6 +2867,96 @@ mod tests {
                 .clone()
                 .unwrap()
                 .stale
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    // ---- what the record remembers about the decision ---------------------
+
+    /// BOTH FIELDS SURVIVE THE ROUND TRIP, and under the names a query will look for.
+    /// The spelling is half the feature: these exist so a week of marking is one `jq`
+    /// over `today-briefs.json`, and a field nobody can name is not one.
+    #[test]
+    fn the_dropped_count_and_the_stale_reason_round_trip_through_the_store() {
+        let path = temp_briefs();
+        let mut record = ok_record("hash-1");
+        record.citations_dropped = 2;
+        record.stale_reason = Some(StaleReason::MessageClosesOff);
+        BriefStore::record(Some(path.clone()), "item-a", record);
+
+        let store = BriefStore::load(Some(path.clone()));
+        let back = store.get("item-a").expect("the record persisted");
+        assert_eq!(back.citations_dropped, 2);
+        assert_eq!(back.stale_reason, Some(StaleReason::MessageClosesOff));
+
+        let raw = std::fs::read_to_string(&path).expect("the store is on disk");
+        assert!(raw.contains(r#""citationsDropped":2"#), "{raw}");
+        assert!(
+            raw.contains(r#""staleReason":"message-closes-off""#),
+            "{raw}"
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// A RECORD WRITTEN BEFORE EITHER FIELD EXISTED still loads, as nothing dropped and
+    /// no reason — the same degradation every other store here gives an older file,
+    /// rather than a morning that reads as empty because one key is missing.
+    #[test]
+    fn a_record_without_the_new_fields_loads_as_nothing_dropped_and_no_reason() {
+        let path = temp_briefs();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            r#"{"v":1,"briefs":{"item-a":{"status":"pending","inputsHash":"hash-1"}}}"#,
+        )
+        .unwrap();
+        let store = BriefStore::load(Some(path.clone()));
+        let back = store.get("item-a").expect("an older record still loads");
+        assert_eq!(back.citations_dropped, 0);
+        assert_eq!(back.stale_reason, None);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// "WOULD HAVE CLOSED WITH THE FLAG ON" IS NOW A QUERY, and this is the query.
+    ///
+    /// The first item passes every gate and is held open by the switch alone — proven by
+    /// closing the very same brief with the switch armed. The second is held open by the
+    /// model's own doubt, which no flag would change. A count that could not tell those
+    /// two apart would say nothing about whether to arm the flag.
+    #[test]
+    fn an_item_held_open_only_by_the_message_switch_records_that_reason() {
+        let path = temp_briefs();
+        let inputs = inputs_added("2026-09-10");
+
+        let held_by_the_switch = done_with_message("2026-09-12");
+        assert!(
+            matches!(
+                weed(&held_by_the_switch, &inputs, true),
+                WeedAction::Close { .. }
+            ),
+            "the premise: this one closes the moment the switch is armed"
+        );
+        let mut record = ok_record("hash-1");
+        record.stale_reason = weed(&held_by_the_switch, &inputs, false).stale_reason();
+        record.brief = Some(held_by_the_switch);
+        BriefStore::record(Some(path.clone()), "item-a", record);
+
+        let doubted = done_with("2026-09-12", Confidence::Low);
+        let mut record = ok_record("hash-2");
+        record.stale_reason = weed(&doubted, &inputs, false).stale_reason();
+        record.brief = Some(doubted);
+        BriefStore::record(Some(path.clone()), "item-b", record);
+
+        let store = BriefStore::load(Some(path.clone()));
+        assert_eq!(
+            store.get("item-a").unwrap().stale_reason,
+            Some(StaleReason::MessageClosesOff),
+            "the switch, and only the switch, held this one open"
+        );
+        assert_eq!(
+            store.get("item-b").unwrap().stale_reason,
+            Some(StaleReason::NotHighConfidence),
+            "and this one is not in that count"
         );
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
@@ -2745,7 +3058,10 @@ mod tests {
         let mut ask = |prompt: String| -> BoxFuture<AskResult> {
             calls.push(prompt);
             n += 1;
-            ready(Ok(if n == 1 { broken.clone() } else { good.clone() }))
+            ready(Ok((
+                if n == 1 { broken.clone() } else { good.clone() },
+                None,
+            )))
         };
         let record = generate_with(
             &v.notes(),
@@ -2788,7 +3104,7 @@ mod tests {
         let mut n = 0;
         let mut ask = |_p: String| -> BoxFuture<AskResult> {
             n += 1;
-            ready(Ok(over_cap.clone()))
+            ready(Ok((over_cap.clone(), None)))
         };
         let record =
             generate_with(&v.notes(), "BASE", "h", "direct", "m", &no_ids(), &mut ask).await;
@@ -2820,6 +3136,41 @@ mod tests {
         assert_eq!(
             record.failure.as_deref(),
             Some("today-brief exceeded the 120s limit")
+        );
+    }
+
+    /// THE COUNT REACHES THE RECORD, not just the validator that made it.
+    ///
+    /// One citation from the owner and one from somebody else: the brief keeps the first
+    /// and the record remembers that a second was refused — which is the whole point, since
+    /// the surviving brief looks identical to one that only ever cited the owner.
+    #[tokio::test]
+    async fn a_refused_citation_is_counted_on_the_record_it_produced() {
+        let v = Vault::new("dropped-record");
+        let mut b = done_with_message("2026-09-12");
+        b.message_citations = vec![
+            citation(MessageChannel::Slack, "u0owner"),
+            citation(MessageChannel::Slack, "someone-else@example.com"),
+        ];
+        let answered = json_of(&b);
+        let mut ask = |_p: String| -> BoxFuture<AskResult> { ready(Ok((answered.clone(), None))) };
+        let record = generate_with(
+            &v.notes(),
+            "BASE",
+            "hash-1",
+            "direct",
+            "m",
+            &owner_ids(),
+            &mut ask,
+        )
+        .await;
+
+        assert_eq!(record.status, BriefStatus::Ok);
+        assert_eq!(record.citations_dropped, 1);
+        assert_eq!(
+            record.brief.expect("a valid brief").message_citations.len(),
+            1,
+            "the owner's own citation survives"
         );
     }
 }

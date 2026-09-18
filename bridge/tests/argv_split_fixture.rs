@@ -79,6 +79,22 @@
 //! are byte-for-byte unchanged, and no Codex row gained a containment argument or lost one.
 //! Every `-c` override in the old capture is in the new one, in the same order.
 //!
+//! **REGENERATED AGAIN, in bridge 0.145.0, and this one is short — ONE site and THIRTEEN
+//! arguments.** `codex/main-read` and nothing else. Every changed argument is an
+//! `enabled_tools` line, every one of them NARROWS, and the argv is the same length before and
+//! after: 135 arguments, none gained, none lost.
+//!
+//! This capture is the defect, preserved. `Codex::command` built the grant from
+//! `cfg.allowed_tools` — the MAIN TURN's list — whatever row it was spawning, so a Codex child
+//! at `Read` (the vault-QA child, the shadow child, the today-brief child) carried Slack's six
+//! reads, GitHub's twenty-five, Google's sixteen, Proxmox's sixty-eight and the rest, while the
+//! Claude Code child at the same row carried `READ_ALLOWED_TOOLS` — qmd's four and nothing
+//! else. The old capture names those grants; the new one has `[]` for all thirteen non-qmd
+//! servers and keeps qmd's four. `row_allowed_tools` is now what both harnesses ask.
+//!
+//! Everything else is byte-for-byte: every Claude Code row, `codex/main-write`,
+//! `codex/main-write-resume`, and the diet, title and vault-QA children.
+//!
 //! To regenerate — which should only ever happen alongside a DELIBERATE argv change, in the
 //! same commit as its changelog entry: `JESSE_ARGV_FIXTURE_WRITE=1 cargo test --test
 //! argv_split_fixture`.

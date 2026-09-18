@@ -188,6 +188,57 @@ pub fn validate_today_brief_mcp(cfg: &Config, records: &[(&str, &str)]) -> Vec<C
     errors
 }
 
+/// Refuse to start when `JESSE_VAULTQA_MCP_CONFIG` is anything but unset or the one set name
+/// the vault-QA child may load.
+///
+/// **This closes the bridge's last MCP path pass-through.** Until 0.145.0 this variable's
+/// value went straight to `--mcp-config` on the vault-QA child and the shadow child, which
+/// share a builder: any file on the host reached a `Read` child running in the vault, carrying
+/// servers no battery had probed and no record could describe. The brief child's variable was
+/// closed the same way in 0.144.0, and for the same reason a path cannot be gated at all — the
+/// file it names is read by the CHILD, after this has run.
+///
+/// **IT IS DELIBERATELY NOT GATED ON A PASSING ROW, and that asymmetry with
+/// [`validate_today_brief_mcp`] is the point rather than an omission.** That gate demands a
+/// probed, recorded, operator-signed row because the brief child runs unattended ~40 times a
+/// morning and its answer can CHECK OFF one of the owner's items. The vault-QA child answers a
+/// question a person just asked and is sitting there waiting for; holding it to a compile-time
+/// const is what closes the hole that mattered, and gating an interactive answer on a battery
+/// run would buy nothing for it. See [`vaultqa_mcp_config`], which states the same split from
+/// the builder's side.
+pub fn validate_vaultqa_mcp(cfg: &Config) -> Vec<ConfigError> {
+    let Some(raw) = cfg
+        .vaultqa_mcp_config
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return Vec::new();
+    };
+    // THE SHAPE IS NAMED BACK, because the two wrong values fail for different reasons and an
+    // operator staring at a refusing bridge needs to know which one they have. Every
+    // deployment that ran this variable before 0.145.0 set it to a PATH, so that is the
+    // message most likely to be read.
+    let shape = if McpSet::parse(raw).is_some() {
+        "the name of a set this child may not load"
+    } else if raw.starts_with('{') {
+        "inline JSON"
+    } else {
+        "a path, or a label this build does not ship"
+    };
+    match McpSet::parse(raw) {
+        Some(set) if set == VAULTQA_MCP_SET => Vec::new(),
+        Some(_) | None => vec![ConfigError::global(format!(
+            "JESSE_VAULTQA_MCP_CONFIG is '{raw}', which is {shape}. It takes a SET NAME, not a \
+             path and not inline JSON — a path names a file this gate cannot read and the \
+             child can, so it could never be vouched for. The two accepted values are '{}' \
+             and unset (which runs the vault-QA and shadow children with no MCP servers at \
+             all).",
+            VAULTQA_MCP_SET.label(),
+        ))],
+    }
+}
+
 /// Which committed record file a harness's row lives in — named in an error so an operator is
 /// told the FILE to go look at, not just the row.
 pub fn containment_record_path(harness: &str) -> &'static str {
@@ -1313,11 +1364,43 @@ mod tests {
         assert!(e.message.contains("JESSE_ALLOWED_TOOLS"), "{e}");
     }
 
+    /// **CLAUDE CODE'S ARGV DID NOT MOVE BY A BYTE IN 0.145.0**, stated on its own so the
+    /// claim survives while the CODEX record is stale.
+    ///
+    /// 0.145.0 put Codex's `enabled_tools` grant into its recorded argv, which invalidates
+    /// every committed Codex row until the battery is re-run live — so
+    /// [`the_shipped_posture_matches_the_record_exactly`] is red between that change and that
+    /// run, and a reader cannot tell from it whether the OTHER harness moved too. This asks
+    /// the one question that must stay answerable throughout: the Claude Code record was not
+    /// re-recorded in that change, and nothing in it had to be.
+    #[test]
+    fn the_claude_code_record_is_untouched_by_the_codex_grant_change() {
+        let (_, text) = CONTAINMENT_RECORDS
+            .iter()
+            .find(|(id, _)| *id == CLAUDE_CODE_ID)
+            .expect("the claude-code record is embedded");
+        let record = parse_results(text).expect("parses");
+        let errors = validate_toolset_argv(&test_config(), &ClaudeCode, &record);
+        assert!(
+            errors.is_empty(),
+            "the committed claude-code record no longer matches the shipped posture, which \
+             this change was required not to do: {errors:?}"
+        );
+    }
+
     #[test]
     fn the_shipped_posture_matches_the_record_exactly() {
         // Strict equality, no normalization: the shipped defaults ARE what was probed. Every
         // embedded record against its own harness, because a comparison that only ever ran
         // against Claude Code's flags is the bug this became a set to fix.
+        //
+        // **RED UNTIL THE CODEX BATTERY IS RE-RUN.** 0.145.0 put Codex's `enabled_tools` grant
+        // into its recorded argv (see `codex_enabled_tools_args`), so every committed Codex
+        // row's `toolset_args` is now short by exactly those lines. That is the gate working:
+        // a posture with no matching record is not one this project ships, and weakening this
+        // to go green would make the gate lie. It clears when
+        // `containment-probe --harness codex --write` is run where the credentials are and
+        // `bridge/containment-codex.toml` is committed.
         for (id, text) in CONTAINMENT_RECORDS {
             let r = parse_results(text).expect("parses");
             let h: Box<dyn Harness> = match *id {
@@ -1949,9 +2032,11 @@ mod tests {
             assert!(var.starts_with("JESSE_"), "{var}");
         }
         // The five that stay: they name an output shape or an MCP server set, not a model.
-        // `JESSE_TODAY_BRIEF_MCP_CONFIG` is here rather than among the removed ones because it
-        // is not a role backend and still works — but unlike its two MCP siblings it is GATED,
-        // by `validate_today_brief_mcp`, and takes a set NAME rather than a path.
+        // Two of the three MCP ones are GATED and take a set NAME rather than a path —
+        // `JESSE_TODAY_BRIEF_MCP_CONFIG` by `validate_today_brief_mcp` (which also demands a
+        // passing row) and `JESSE_VAULTQA_MCP_CONFIG` by `validate_vaultqa_mcp` (which does
+        // not; see that function for why the two children differ). `JESSE_MAIN_MCP_CONFIG` is
+        // still a free-form pass-through and is out of scope here.
         for kept in [
             "JESSE_DIET_MICRO_COMPLETE",
             "JESSE_VAULTQA_MCP_CONFIG",
@@ -1963,6 +2048,44 @@ mod tests {
                 !REMOVED_ROLE_ENV_VARS.contains(&kept),
                 "{kept} is not a role backend and must keep working"
             );
+        }
+    }
+
+    /// THE VAULT-QA VARIABLE TAKES A SET NAME, AND EXACTLY ONE.
+    ///
+    /// Every value that is not `qmd` or unset is refused at startup, and the message has to
+    /// name the variable and the two accepted values — every deployment that used this
+    /// variable before 0.145.0 set it to a PATH, so the operator reading the refusal is
+    /// holding the one value the message must explain.
+    #[test]
+    fn the_vaultqa_mcp_variable_accepts_one_set_name_and_nothing_else() {
+        let mut cfg = test_config();
+
+        cfg.vaultqa_mcp_config = None;
+        assert!(validate_vaultqa_mcp(&cfg).is_empty(), "unset must start");
+        cfg.vaultqa_mcp_config = Some("  ".to_string());
+        assert!(validate_vaultqa_mcp(&cfg).is_empty(), "blank is unset");
+        cfg.vaultqa_mcp_config = Some(McpSet::Qmd.label().to_string());
+        assert!(validate_vaultqa_mcp(&cfg).is_empty(), "'qmd' must start");
+
+        for refused in [
+            // The shape every prior deployment carried.
+            "/etc/jesse/qmd.json",
+            // Inline JSON, the other thing `--mcp-config` accepts.
+            r#"{"mcpServers":{}}"#,
+            // A real set name that is not this child's — the brief child's…
+            McpSet::Replies.label(),
+            // …and the main turn's, which HAS a passing `read` row and must still be refused.
+            McpSet::MessagesBuildPlacesInbound.label(),
+        ] {
+            cfg.vaultqa_mcp_config = Some(refused.to_string());
+            let errors = validate_vaultqa_mcp(&cfg);
+            assert_eq!(errors.len(), 1, "{refused} must be refused");
+            let message = &errors[0].message;
+            assert!(message.contains("JESSE_VAULTQA_MCP_CONFIG"), "{message}");
+            assert!(message.contains(refused), "{message}");
+            assert!(message.contains("'qmd'"), "{message}");
+            assert!(message.contains("unset"), "{message}");
         }
     }
 
