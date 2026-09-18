@@ -151,6 +151,7 @@ struct ThreadListView: View {
     }
 
     var body: some View {
+        let _ = RenderProbe.body("ThreadListView")
         VStack(spacing: 0) {
             // The away banner sits ABOVE the offline one, and the order is deliberate: being
             // away is a standing fact about how the bridge is reading dates, while being

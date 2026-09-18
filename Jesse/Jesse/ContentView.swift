@@ -49,6 +49,7 @@ struct ContentView: View {
     }
 
     var body: some View {
+        let _ = RenderProbe.body("ContentView")
         Group {
             if sizeClass == .compact {
                 // iPhone / compact: the original stack — unchanged behavior.

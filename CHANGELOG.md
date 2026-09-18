@@ -14,6 +14,69 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [App 1.0 (141)] - 2026-09-18
+
+**The unread badge stopped re-rendering the whole app on every save.** The markers that
+arrived in App 1.0 (135) were right; where their NUMBER came from was not.
+
+### Fixed
+
+- **A `@Query` over every conversation sat on the app's ROOT view.** `RootTabView` read
+  `jesseUnreadCount(threads)` for the Chats badge and the icon, and `MacRootView` read it
+  for the Dock tile. A `@Query` is refetched on every save that touches its entity, each
+  refetch re-evaluates the view's body, and THAT body builds all three tabs — so a
+  conversation title arriving, a star, a read mark or any of the several saves one sync pass
+  makes rebuilt the Health and Today screens while the user was in Chats. Before the badge
+  landed, only `ThreadListView` held a thread query, and a save re-rendered the list and
+  nothing else.
+
+- **Measured in the simulator on a store of 300 conversations** (`RenderProbe` logs one
+  line per body evaluation; `scripts/render-probe.sh` counts them between the marks
+  `UnreadBadgeRenderUITests` drives). Body evaluations per action, before → after:
+
+  | | root shell | Health tab | Today tab | Chats tab | thread list |
+  |---|---|---|---|---|---|
+  | cold launch (300 adopted) | 5 → 3 | 4 → **0** | 4 → **0** | 3 → 3 | 15 → 14 |
+  | foreground, nothing changed | 4 → 4 | 4 → **0** | 4 → **0** | 4 → 4 | 24 → 24 |
+  | opening an unread conversation | 3 → 1 | 1 → **0** | 1 → **0** | 1 → 1 | 6 → 6 |
+  | a reply landing on a sync pull | 7 → 5 | 6 → **0** | 6 → **0** | 4 → 4 | 27 → 27 |
+
+  The two screens nobody is looking at now cost nothing, the shell itself re-evaluates less,
+  and the list is untouched — it owns its own query and is the one view that SHOULD re-render
+  when a conversation changes. Per save, the badge's own work went from fetching all 300 rows
+  and walking them to one `fetchCount` (4.75 ms → 0.09 ms in the simulator, printed by
+  `UnreadBadgeShellTests`), and at most one of those per 250 ms rather than one per save.
+
+- **`UnreadCounter` (JesseCore) is the badge's number now**, shared by both shells: one
+  observable `Int`, recomputed with `fetchCount` over a `#Predicate` (not archived, and
+  `last_reply_ms > read_through_ms`), so no conversation is materialized and no `turns`
+  relationship is faulted. It listens for `ModelContext.didSave` from EVERY context on the
+  container — the background delivery context, a sync, another window — coalesces a burst of
+  saves into ONE recount at the end of a 250 ms window, and assigns the value only when it
+  actually differs. A save that cannot change the badge now invalidates nothing at all.
+
+- **The unread rule itself did not change.** `jesseUnreadCount` is still the definition, the
+  counter is pinned equal to it over a fixture covering every shape it distinguishes
+  (`UnreadCounterTests`), and one clock, last-writer-wins on `read_updated_ms`, the archived
+  exclusion and the mark-read gate are all exactly as they were. No schema change, no new
+  stored property, no staged migration. The bridge is untouched.
+
+- **The shell no longer hands its tabs a fresh closure on every build.** `HealthTabView` and
+  `TodayTabView` take an `onReplay` closure, which SwiftUI cannot compare, so a rebuilt shell
+  re-evaluated both screens whatever else was true. Both are now `Equatable` on what they
+  actually render — which model, and whether they are the selected tab — with the closure
+  excluded, and the shell applies `.equatable()`. One measured consequence, and the intended
+  one: an unselected tab's body is no longer built at launch, so its `.task` and `.onChange`
+  handlers are installed when the tab is first shown. What each of them does off-screen, and
+  why none of it is lost, is written down beside the call site. `MacRootView` keeps its own
+  `@Query`, and should: that view IS the list.
+
+- **Marking a conversation read no longer saves inside the push animation.** Both detail
+  views called `markReadIfOnScreen()` synchronously from `onAppear`, which put a sqlite write
+  (and every live query's reaction to it) into the frames animating the transcript in. It now
+  runs one hop later, re-checking the same gate, so a conversation that left the screen in
+  between is still not marked.
+
 ## [Bridge 0.144.1, App 1.0 (140)] - 2026-09-17
 
 **The Today brief can now cite the owner's own sent replies — on a containment row, behind a

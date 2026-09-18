@@ -82,6 +82,7 @@ struct TodayTabView: View {
     @State private var stagedThreadID: UUID?
 
     var body: some View {
+        let _ = RenderProbe.body("TodayTabView")
         NavigationStack {
             TodayListView(model: model,
                           isProcessing: processRun.isRunning(coordinator),
@@ -293,5 +294,18 @@ struct TodayTabView: View {
     private func dropUnsentContext() {
         if let id = stagedThreadID { coordinator.clearAttachedContext(for: id) }
         stagedThreadID = nil
+    }
+}
+
+// MARK: - Equatable
+
+/// The Today tab's half of the same rule `HealthTabView`'s conformance states: two values
+/// are the same screen when they show the same day model and agree on whether this is the
+/// selected tab, and the `onReplay` closure — fresh on every build of the shell, and never
+/// something this screen renders — is excluded so that a shell rebuild does not rebuild the
+/// day.
+extension TodayTabView: Equatable {
+    static func == (lhs: TodayTabView, rhs: TodayTabView) -> Bool {
+        lhs.isActive == rhs.isActive && lhs.model === rhs.model
     }
 }
