@@ -1385,6 +1385,41 @@ pub fn title_child_request<'a>(
     }
 }
 
+/// The `--allowedTools` grant ONE CONTAINMENT ROW carries, for every harness.
+///
+/// # Why this is harness-neutral, and why both harnesses must call it
+///
+/// There is ONE allowlist in this project, expressed twice: Claude Code is handed the string
+/// itself, and [`granted_mcp_tools`] reads the same string to build Codex's per-server
+/// `enabled_tools`. Until this function existed the two harnesses chose that string in two
+/// places — [`claude_capability_args`] asked [`read_allowed_tools`] for the ROW's grant, while
+/// [`Codex::command`] reached for `cfg.allowed_tools`, the MAIN TURN's list, whatever row it
+/// was spawning. So the [`McpSet::Replies`] brief child ran the Gmail-only grant on Claude
+/// Code and the main turn's grant — Drive reads, Calendar reads, `maps_search` — on Codex,
+/// while SECURITY.md said the grant was Gmail-only everywhere.
+///
+/// One function, both callers, for the same reason [`codex_refused_tool`] has one matcher: a
+/// boundary described in two places is a boundary that will eventually be two boundaries.
+///
+/// # What each level returns
+///
+/// * [`Capability::Basic`] — the EMPTY string. The root toolset is already empty
+///   ([`claude_capability_args`]) and a grant over no tools grants nothing; Codex cannot
+///   express this level at all ([`Codex::expresses`]) and gets the `Read` posture's grant when
+///   something asks anyway.
+/// * [`Capability::Read`] — [`read_allowed_tools`], which is exhaustive over [`McpSet`] with
+///   no `_` arm, so a new set is a compile error at the line that must decide its grant.
+/// * [`Capability::Write`] — the deployment's configured main-turn list. A write-capable turn
+///   IS the main turn; there is no narrower row at this level today, and if one is ever added
+///   it belongs in a `read_allowed_tools`-shaped match here rather than in either harness.
+pub fn row_allowed_tools(cfg: &Config, capability: Capability, mcp: McpSet) -> &str {
+    match capability {
+        Capability::Basic => "",
+        Capability::Read => read_allowed_tools(mcp),
+        Capability::Write => &cfg.allowed_tools,
+    }
+}
+
 /// A stateless DIET child's request (extract or verify): [`Capability::Basic`] with no MCP
 /// servers, and the neutral scratch base as cwd so the large vault `CLAUDE.md` cannot
 /// auto-load (the extract/verify contract is inlined in the prompt). That cwd is a

@@ -830,6 +830,40 @@ async fn probe_exchange(conn: &mut Connection, prompt: &str, cwd: &Path) -> Step
         .ok_or_else(|| Stop::Protocol("the thread response named no thread id".to_string()))?
         .to_string();
 
+    // THE CHILD'S OWN ACCOUNT OF ITS MCP ROOT, asked for BEFORE the turn runs.
+    //
+    // This is the App Server's answer to Claude Code's `system`/`init` event, and the battery
+    // had nothing playing that part until 0.145.0: Codex's record SYNTHESIZED its root toolset
+    // and its server list from configuration, so a send probe scored "no capable tool at the
+    // root" from a config file rather than from the child, and a credential-less run — every
+    // server starting, finding nothing and registering ZERO tools — would have written a
+    // byte-identical row.
+    //
+    // Measured against codex-cli 0.153.4: the response carries one entry per configured server
+    // with its `serverInfo` and a `tools` map, and that map is the set AFTER `enabled_tools`
+    // narrowing (a server granted `["status"]` reports one tool; granted `[]` reports none,
+    // while still reaching `ready`). So it is the child's ACTUAL MCP root, which is what the
+    // scoring rules want. It is also strictly less than Claude Code's event tells us: Claude
+    // Code lists what each server REGISTERED, before the allowlist, so its record can show a
+    // tool the grant then refused. Codex's cannot, and SECURITY.md says so in those words.
+    //
+    // It goes in the PROBE exchange only. A real turn never sends it — the bridge has no use
+    // for the answer, and a request on the turn path would be a change to what the record has
+    // to speak for.
+    // A CLI THAT DOES NOT KNOW THE METHOD MUST NOT COST THE WHOLE ROW. An error response is
+    // swallowed: the transcript then carries no listing, `parse_codex_trace` falls back to
+    // declaring the root from the grant and says so in `root_tools_source`, and every probe
+    // still runs. Propagating it would turn a missing observation into six `inconclusive`
+    // verdicts, which is the one direction this battery may never fail in.
+    let id = conn.request("mcpServerStatus/list", json!({})).await?;
+    match probe_await(conn, id).await {
+        // A method this CLI does not implement answers with a JSON-RPC error, which arrives
+        // as `Stop::Turn`. Swallowed on purpose.
+        Ok(_) | Err(Stop::Turn(_)) => {}
+        // A child that DIED is a different thing entirely, and still ends the exchange.
+        Err(e) => return Err(e),
+    }
+
     let id = conn
         .request(
             "turn/start",

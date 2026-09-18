@@ -544,8 +544,13 @@ async fn a_resumed_turn_carries_the_same_containment_it_always_did() {
 
     // The recorded capability arguments, with the workspace token filled in — the same list
     // the startup gate compares the compiled-in record against.
+    //
+    // ASKED FOR THE SET THE CHILD ABOVE ACTUALLY SPAWNS. Since 0.145.0 `capability_args`
+    // carries the row's per-server `enabled_tools` grant as well as the sandbox flags, so the
+    // set is no longer decorative here: naming a different one would compare this child
+    // against a grant for servers it never loaded.
     let recorded: Vec<String> = Codex
-        .capability_args(&s.cfg, Capability::Read, McpSet::Messages)
+        .capability_args(&s.cfg, Capability::Read, McpSet::None)
         .into_iter()
         .map(|a| a.replace(WORKSPACE_TOKEN, &s.cfg.vault))
         .collect();

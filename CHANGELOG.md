@@ -14,6 +14,129 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [Bridge 0.145.1] - 2026-09-18
+
+**0.145.0 made the Codex record observe its MCP root; this is the run that observed it.**
+Putting the per-server `enabled_tools` lines into `Codex::capability_args` left every
+committed Codex row's `toolset_args` short by exactly those lines, so the shipped posture no
+longer matched the record and four tests said so. A record cannot be repaired by editing it —
+only by re-running the battery — so this is that run, live on the Studio against the pinned
+codex-cli 0.153.4, with the bridge's LaunchAgent environment loaded so the credential-backed
+servers registered their tools instead of starting empty and vouching for a set the child
+never loaded.
+
+**Nothing moved.** Every probe id, class, verdict and status is identical to the 2026-09-17
+record; the probe's own summary reads "nothing moved since 2026-09-17 (this run CONFIRMS the
+previous one)". The two hard gates not met at `basic/none` (`read_vault_file`, `search_vault`)
+were already not met — Codex cannot express `basic`, which is why the file-level `gate` still
+reads `fail`.
+
+### Changed
+
+- **`toolset_args` carries the grant**, one `enabled_tools` entry per server on each of the
+  three rows that load an MCP set (14, 14 and 6). The two `mcp:none` rows are untouched,
+  having no server to grant.
+- **`root_tools` is observed**, recorded with `root_tools_source = "observed-mcp-listing"` on
+  every row. The write row's real root surface is 212 tools where the old record declared 2 —
+  that gap is what 0.145.0 existed to close, and this is the first record that shows it.
+  `imcp` is in the listing on all three rows that configure it, which is the check worth
+  repeating on any future re-record: a message server that registers zero tools looks
+  identical to one the credentials never reached.
+- `mcp_servers` is sorted; the members are unchanged. Evidence strings now name which send
+  tool was not called rather than only that none was.
+
+`bridge/containment.toml` is untouched, byte for byte — the Claude Code posture did not move
+in 0.145.0 and nothing here re-recorded it.
+
+## [Bridge 0.145.0] - 2026-09-18
+
+**The Codex containment record declared what it should have observed, and the Codex brief
+child ran the wrong grant.** 0.144.1 recorded six send probes as `denied` on every row of both
+harnesses. On `claude-code` those denials are observations — the CLI's init event lists what
+each server registered, and the WhatsApp probe recorded the grant refusing an emitted call on
+all three rows that load message servers. On `codex` all thirty were declarations:
+`parse_codex_trace` synthesized `root_tools` as `Bash` plus `mcp__qmd__status`, and copied
+`mcp_servers` from the set definition rather than reading it off the child. Every send probe
+therefore scored "no capable tool at the root" from a config file, before the code looked at
+what the child did, and a battery run **without** the credentials in the bridge's environment
+— every server starting, finding nothing and registering zero tools — would have written a
+byte-identical row.
+
+**The second half of the root cause: `Codex::command` built `enabled_tools` from
+`cfg.allowed_tools` — the main turn's list — whatever row it was spawning.** So on Codex the
+`Replies` today-brief child had Google Drive reads, Google Calendar reads and `maps_search`,
+and the vault-QA and shadow children carried the entire main-turn list at `Read`, while
+SECURITY.md said the grant was Gmail-only everywhere. The Claude Code child at the same rows
+carried the row's grant, because `claude_capability_args` asked `read_allowed_tools` for it.
+Neither of these was a send hole — an ungranted Codex tool is absent rather than refused, which
+is stronger than the Claude Code grant — but the record vouched for a posture it had not
+measured.
+
+### Fixed
+
+- **Codex observes its MCP root instead of declaring it.** The App Server does emit the
+  events, which nothing here had asked for: `mcpServer/startupStatus/updated` (one per
+  configured server, `starting` then `ready`) and the `mcpServerStatus/list` request, whose
+  response carries a `tools` map per server. Measured against codex-cli 0.153.4: that map is
+  the set **after** `enabled_tools` narrowing, so it is the child's actual MCP root. The probe
+  driver now issues the request before the turn and `parse_codex_trace` reads the response.
+  Where no listing is present the root falls back to the grant **tool by tool**, never a
+  namespace — a namespace entry would credit the child with a capability an ungranted Codex
+  tool does not have, turning every send probe `inconclusive` for a tool that does not exist.
+- **Every row records where its root came from**, in a new `root_tools_source` key:
+  `observed-init-event`, `observed-mcp-listing`, `declared-from-grant` or `not-read`. Most
+  cells of this table are `denied` because nothing capable stood at the root, so each of those
+  verdicts is worth exactly the provenance of the root — and the file did not say.
+- **Observation beats declaration in the verdict.** A child that invoked a probe tool and had
+  it refused by the tool layer now records that refusal as the evidence whether or not the root
+  lists the tool; an absence records what the child **did** do beside what the argv made
+  impossible, so "tools used: none" is visibly a child that never tried rather than one whose
+  attempt went unnoticed.
+- **Codex runs the row's grant, and the record shows it.** `row_allowed_tools` is one
+  harness-neutral function both harnesses ask, so the two cannot drift, and
+  `Codex::capability_args` now carries the per-server `enabled_tools` lines — putting the
+  strongest boundary this harness has under the same three strict-equality checks the sandbox
+  flags are under (the startup gate, CI, and the battery when it records).
+- **`JESSE_VAULTQA_MCP_CONFIG` takes a set NAME, not a path**, closing the last MCP path
+  pass-through in the bridge. Accepted: unset (no servers, as before) or `qmd`; anything else
+  is refused at startup with a message naming the variable, the value's shape and the two
+  accepted values. The child loads the shipped const, so no file on this host reaches
+  `--mcp-config` for the vault-QA or shadow child. It is deliberately **not** gated on a
+  passing row the way the brief child's switch is: that child runs unattended and can check off
+  the owner's items, this one answers a person who is waiting.
+- **The brief record carries `citationsDropped` and `staleReason`**, so "how many citations
+  did the owner-identity check refuse" and "would this item have closed with
+  `JESSE_TODAY_BRIEF_MESSAGE_CLOSES` on" are queries over the store rather than guesses.
+  `WeedAction::MarkStale` names its reason. Nothing about what closes, or when, changed.
+
+### Corrected
+
+- **An ungranted MCP tool on codex-cli 0.153.4 produces no refusal at all**, because there is
+  nothing to refuse: the tool is absent from the model's tool list and no call is emitted. The
+  `TypeError: tools.… is not a function` shape documented against 0.146.0 did not reproduce. A
+  Codex send probe can therefore only ever record absence, never an attempt that was stopped —
+  a stronger boundary and a weaker observation, which is precisely why the record now has to
+  show that the tool is absent from the **child**.
+- **SECURITY.md said the battery "cannot observe what a server REGISTERED".** That is true of
+  Codex and false of Claude Code, whose init event lists registered tools before the allowlist
+  — which is how the record establishes that WhatsApp registers three send tools and Slack
+  registers none. The section now distinguishes the two harnesses.
+
+### Operator note
+
+**The Codex containment record is invalidated by this change and must be re-recorded before
+this bridge can serve a Codex turn**, because every Codex row's `toolset_args` is now short by
+its `enabled_tools` lines. Run, where the credentials are:
+
+```
+cargo run --features containment-probe --bin containment-probe -- --harness codex --write
+```
+
+`bridge/containment.toml` is untouched and no Claude Code argv moved.
+
+**`JESSE_VAULTQA_MCP_CONFIG` in the LaunchAgent plist must change from a path to `qmd`, or be
+removed, before this bridge is started.** The old value now refuses to boot.
+
 ## [App 1.0 (141)] - 2026-09-18
 
 **The unread badge stopped re-rendering the whole app on every save.** The markers that
