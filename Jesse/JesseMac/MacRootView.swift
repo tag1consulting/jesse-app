@@ -178,8 +178,20 @@ struct MacRootView: View {
     }
 
     /// Conversations holding a reply nobody has seen — the Dock tile's number, from the
-    /// same shared rule the phone's badges use (archived excluded, no `turns` faulted).
-    private var unreadCount: Int { jesseUnreadCount(threads) }
+    /// same counter the phone's tab badge and icon read.
+    ///
+    /// It used to be `jesseUnreadCount(threads)` over the sidebar's own query. That was
+    /// cheaper here than it was on the phone (this view IS the list, so it is entitled to
+    /// re-render when a conversation changes — see `sidebar`), which is exactly why the
+    /// `@Query` above stays: the sidebar renders from it, the selection resolves through
+    /// it, and the empty-thread reaper walks it. What moved is only WHERE THE NUMBER COMES
+    /// FROM, so that the rule, the coalescing and the change-detection have one
+    /// implementation for both shells rather than a count per window.
+    private var unreadCount: Int { unread.unreadCount }
+
+    /// The one counter for this store, resolved from the container the same way the
+    /// phone's shell resolves it.
+    private var unread: UnreadCounter { UnreadCounter.shared(for: context.container) }
 
     /// Delete never-used empty threads: no turns, never sent (no session), no unsent draft,
     /// and not the one currently running. Deliberately narrow, so it can never take a thread

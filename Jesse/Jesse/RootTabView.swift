@@ -76,6 +76,10 @@ struct RootTabView: View {
     /// settle a workout burst whose window ran out while the app was suspended.
     @Environment(\.scenePhase) private var scenePhase
 
+    /// Read for ONE thing: the container the unread counter is resolved from (see
+    /// `unread`). Nothing here fetches, inserts or saves — the shell owns no model objects.
+    @Environment(\.modelContext) private var context
+
     /// The app-scoped coordinator, read here only to build the replayer's Tell sender.
     @Environment(RunCoordinator.self) private var coordinator
 
@@ -145,6 +149,7 @@ struct RootTabView: View {
     var replayerBox: IntentReplayerBox?
 
     var body: some View {
+        let _ = RenderProbe.body("RootTabView")
         TabView(selection: $selection) {
             ForEach(Tab.allCases) { tab in
                 view(for: tab)
@@ -186,6 +191,12 @@ struct RootTabView: View {
         .onChange(of: unreadCount, initial: true) { _, count in applyIconBadge(count) }
         .onChange(of: scenePhase) { _, phase in
             if phase == .background { applyIconBadge(unreadCount) }
+            // COMING BACK, recount from the store. Every in-process write announces itself
+            // (see `UnreadCounter`), but a suspended process announces nothing: a push may
+            // have stamped the icon with the bridge's own number while this app was not
+            // running to agree or disagree with it. One count query per activation settles
+            // that, and publishes nothing unless the number really moved.
+            if phase == .active { unread.recountNow() }
         }
         .onChange(of: todayModel.serverSnapshot) { _, _ in
             watchLink?.pushCurrent()
@@ -248,6 +259,38 @@ struct RootTabView: View {
         link.pushCurrent()
     }
 
+    /// THE `.equatable()` IS LOAD-BEARING, on both tabs that take a closure.
+    ///
+    /// This body re-evaluates for reasons that have nothing to do with the Health or Today
+    /// screens: a tab switch, a scene-phase change, the Chats badge's number moving. Each
+    /// time, it hands both tabs a NEW `onReplay` closure — `replayNow` is a method
+    /// reference, so the value differs every build — and SwiftUI cannot prove two closures
+    /// equal, so it has to assume the view changed and re-evaluate it. Both screens were
+    /// therefore rebuilding while the user was somewhere else entirely.
+    ///
+    /// `.equatable()` makes the comparison the views' own (`isActive` and which model they
+    /// are showing, closure excluded — see their `Equatable` conformances), so a rebuild of
+    /// this shell that changes nothing about a tab costs nothing in that tab. Their own
+    /// `@State` and observed models still invalidate them exactly as before: equality only
+    /// decides whether a NEW value from the parent is worth re-rendering.
+    ///
+    /// ONE MEASURED CONSEQUENCE, and it is the intended one: an UNSELECTED tab's body is no
+    /// longer evaluated at launch at all (it used to be, four times, purely because the
+    /// shell kept rebuilding). Its `.task` and `.onChange` handlers are therefore installed
+    /// when the tab is first shown rather than at launch, which costs nothing here because
+    /// nothing either screen does OFF SCREEN depends on them:
+    ///
+    ///  * Both tabs' `.task { probe() }` only refreshes the SHARED reachability model, which
+    ///    `ContentView` probes on appear and on every foreground anyway.
+    ///  * The Today tab's after-turn refresh deliberately runs whether or not the tab is up
+    ///    (a Process-updates batch rewrites the day file, so the BADGE is wrong until it is
+    ///    re-read) — and it still does, because a batch can only be STARTED from that
+    ///    screen, so its body has been evaluated and its handlers installed before there is
+    ///    ever anything to settle.
+    ///  * The Today badge itself is `todayModel.tabBadgeCount`, primed from cache by THIS
+    ///    view's `.task` at launch, never by the tab's.
+    ///  * A weigh-in or workout that arrives with no view hierarchy at all goes through the
+    ///    static `sharedHealthModel`, never through the tab.
     @ViewBuilder
     private func view(for tab: Tab) -> some View {
         switch tab {
@@ -256,9 +299,11 @@ struct RootTabView: View {
         case .health:
             HealthTabView(isActive: selection == .health, model: healthModel,
                           onReplay: replayNow)
+                .equatable()
         case .today:
             TodayTabView(isActive: selection == .today, model: todayModel,
                          onReplay: replayNow)
+                .equatable()
         }
     }
 
@@ -272,13 +317,27 @@ struct RootTabView: View {
     }
 
     /// Conversations holding a reply nobody has seen — the Chats badge, and the number the
-    /// app icon carries. The shared rule (archived excluded, no `turns` faulted); see
-    /// `jesseUnreadCount`.
-    private var unreadCount: Int { jesseUnreadCount(threads) }
+    /// app icon carries.
+    ///
+    /// THE SHELL NO LONGER HOLDS THE CONVERSATIONS. This used to be
+    /// `jesseUnreadCount(threads)` over a `@Query` of every row, declared right here on the
+    /// app's root view, and that one line was the app's worst render dependency: a `@Query`
+    /// is refetched on every save that touches its entity, each refetch re-evaluated THIS
+    /// body, and this body builds all three tabs — so a title arriving, a star, or any of
+    /// the several saves one sync pass makes rebuilt the Health and Today screens while the
+    /// user was in Chats.
+    ///
+    /// `UnreadCounter` answers the same question with a count query, coalesces bursts, and
+    /// publishes only when the number actually changes; the rule it counts by is still
+    /// `jesseUnreadCount`'s (see `UnreadCounter.unreadDescriptor`). The per-row dot and the
+    /// semibold title are untouched — `ThreadListView` has its own query, and the list is
+    /// the one view that SHOULD re-render when a conversation changes.
+    private var unreadCount: Int { unread.unreadCount }
 
-    /// Every conversation row, for the badge alone. `@Query` keeps it live, so reading a
-    /// thread updates both the tab badge and the icon without anything having to tell them.
-    @Query private var threads: [JesseThread]
+    /// The one counter for this store. Resolved from the container rather than held in
+    /// `@State` so the iPhone and the Mac shell reach the same object the same way, and so
+    /// it survives this struct being rebuilt (which it is, on every tab switch).
+    private var unread: UnreadCounter { UnreadCounter.shared(for: context.container) }
 
     /// Paint (or clear) the app-icon badge.
     ///

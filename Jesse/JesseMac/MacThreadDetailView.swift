@@ -82,7 +82,12 @@ struct MacThreadDetailView: View {
             mode = thread.modeValue
             restoreDraft()
             isOnScreen = true
-            markReadIfOnScreen()
+            // One hop later, for the reason the phone's `onAppear` states: marking read is
+            // a save, and a save inside the transaction that swaps the detail column puts a
+            // database write into the frames that draw the new transcript. The gate is
+            // re-checked when it runs, so a selection that moved on in between marks
+            // nothing.
+            Task { markReadIfOnScreen() }
         }
         // The three moments a transcript is read, the same three as the phone's: it came on
         // screen (above), its window became key again, and a reply landed while it was

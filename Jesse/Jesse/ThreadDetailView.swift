@@ -208,7 +208,14 @@ struct ThreadDetailView: View {
             restoreDraft()
             if attachedContext != nil && turns.isEmpty { inputFocused = true }
             isOnScreen = true
-            markReadIfOnScreen()
+            // NOT ON THIS TURN OF THE LOOP. `onAppear` runs inside the push's own
+            // transaction, and marking read is a `context.save()` — a sqlite write, plus
+            // whatever every live query over the container does about it — so doing it here
+            // put a database write inside the frames that animate the transcript in. One
+            // hop later the animation is committed and the save is nobody's frame.
+            // `markReadIfOnScreen` re-checks the gate when it runs, so a conversation that
+            // left the screen in between is (correctly) not marked.
+            Task { markReadIfOnScreen() }
         }
         // THE THREE MOMENTS A TRANSCRIPT IS READ, and there are only three: it came on
         // screen (above), the app came back to the foreground with it still there, and a

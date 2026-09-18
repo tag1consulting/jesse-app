@@ -59,6 +59,7 @@ struct HealthTabView: View {
     private let reachability = BridgeReachabilityModel.shared
 
     var body: some View {
+        let _ = RenderProbe.body("HealthTabView")
         NavigationStack {
             HealthDashboardContent(model: model)
                 // DECLARATION ORDER IS LEFT-TO-RIGHT, and the trailing items are ordered
@@ -293,5 +294,26 @@ struct HealthTabView: View {
     private func retryPending(_ intent: PendingIntentRecord) {
         model.retryPending(id: intent.id)
         onReplay()
+    }
+}
+
+// MARK: - Equatable
+
+/// WHAT MAKES TWO `HealthTabView` VALUES THE SAME SCREEN: the model it is showing, and
+/// whether it is the selected tab. Nothing else is an input.
+///
+/// `onReplay` is deliberately NOT part of it. It is a call back into the shell — "drain the
+/// offline queue now" — and the shell builds a functionally identical closure on every
+/// evaluation of its own body, which SwiftUI can only treat as a change. Comparing what the
+/// screen RENDERS, and ignoring the closure it may later call, is what lets
+/// `RootTabView`'s `.equatable()` skip this whole screen when the shell was rebuilt for a
+/// reason that has nothing to do with the Health tab (a tab switch, a scene phase, the
+/// Chats badge moving).
+///
+/// This is not a claim that the screen never re-renders: its `@State`, its `@AppStorage`
+/// and the observed `HealthDashboardModel` invalidate it exactly as before.
+extension HealthTabView: Equatable {
+    static func == (lhs: HealthTabView, rhs: HealthTabView) -> Bool {
+        lhs.isActive == rhs.isActive && lhs.model === rhs.model
     }
 }
