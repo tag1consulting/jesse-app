@@ -14,6 +14,26 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [App 1.0 (142)] - 2026-09-20
+
+**Repo hygiene only. No app code changed; the binary is byte-for-byte what 141 built.**
+
+### Changed
+
+- **The Watch scheme is committed as Xcode writes it.** Xcode strips the cached
+  `BlueprintName` label from the `BuildableProductRunnable` blocks of the LaunchAction and
+  ProfileAction each time it saves `Jesse Watch App.xcscheme`, so the same two-line deletion
+  kept reappearing as an uncommitted diff. The label is advisory: the target is resolved
+  through `BlueprintIdentifier` (`B0D06A00000000000000A014`), and both
+  `scripts/local-ci-macos.sh` and `.github/workflows/ios-ci.yml` select the scheme by
+  filename with `-scheme "Jesse Watch App"`. Nothing reads the removed lines.
+
+- **The build number moves 141 to 142 because `version-guard.sh` requires it.** The guard
+  treats any change under `Jesse/` as an app change, with no carve-out for scheme files, and
+  a scheme edit is exactly the kind of change that carve-out would have to guess at. Bumping
+  is cheaper than loosening the guard, so the version moves for a change that alters no
+  shipped byte.
+
 ## [Bridge 0.145.1] - 2026-09-18
 
 **0.145.0 made the Codex record observe its MCP root; this is the run that observed it.**
