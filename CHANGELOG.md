@@ -14,6 +14,34 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [App 1.0 (143)] - 2026-09-20
+
+**Repo hygiene only. No Swift source changed.**
+
+### Changed
+
+- **Xcode 27's recommended settings are accepted as the dialog wrote them.**
+  `LastUpgradeCheck` moves 2660 to 2700 in `project.pbxproj`, and `LastUpgradeVersion`
+  moves 2660 to 2700 in all three shared schemes. That bookkeeping is what the
+  "Update to recommended settings" banner was asking for. Nothing else in the project file
+  moved: no target identifiers, no file references, no build phases. The hand authored
+  target IDs (the `B0D06A00...` pattern) are untouched.
+
+- **`DEAD_CODE_STRIPPING = YES` on the two Mac targets.** The dialog added it to
+  `com.tag1.JesseMac` and `com.tag1.JesseMacTests`, Debug and Release. The setting already
+  defaults on for iOS and watchOS and defaults off for macOS, which is why only these four
+  configurations were flagged. This is the one change with a runtime consequence: the linker
+  may now drop symbols the Mac app references only by runtime name lookup. Nothing in the
+  app is known to do that, and no build has confirmed it, because
+  `scripts/local-ci-macos.sh` is currently red on Xcode 27 for an unrelated reason
+  (`BGTaskScheduler.submit` deprecated in iOS 27, warnings as errors, reproducible on
+  `main`).
+
+- **The build number moves 142 to 143 because `version-guard.sh` requires it.** The pre-push
+  hook measures from the pushed range's base, not from the merge base with `main`, so an
+  additional commit touching `Jesse/` needs its own bump even on a branch that already
+  bumped once.
+
 ## [App 1.0 (142)] - 2026-09-20
 
 **Repo hygiene only. No app code changed; the binary is byte-for-byte what 141 built.**
