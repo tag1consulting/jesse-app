@@ -113,6 +113,27 @@ final class HealthKitAuthorizationTypesTests: XCTestCase {
                       "delete predicate dropped the external-id clause")
     }
 
+    /// The workout-detail and overnight types must be IN the read set. A type the
+    /// block renders but never requests reads empty forever, and silently: HealthKit
+    /// makes read denial and "never asked" indistinguishable, so there is no runtime
+    /// signal at all. This list is that signal.
+    func testReadSetCoversTheWorkoutDetailAndOvernightTypes() {
+        let required: Set<String> = Set(
+            [HKQuantityTypeIdentifier.swimmingStrokeCount,
+             .waterTemperature,
+             .workoutEffortScore,
+             .estimatedWorkoutEffortScore,
+             .appleSleepingBreathingDisturbances,
+             .stepCount,
+             .distanceWalkingRunning].map(\.rawValue)
+        ).union([HKCategoryTypeIdentifier.sleepApneaEvent,
+                 .hypertensionEvent].map(\.rawValue))
+        let actual = Set(HealthContextProvider.readTypes.map(\.identifier))
+        XCTAssertTrue(required.isSubset(of: actual),
+                      "read set is missing \(required.subtracting(actual)) — the block would "
+                      + "render those fields as permanently absent")
+    }
+
     /// No identifier in ANY authorization set (read or share) may be a correlation
     /// type — HealthKit forbids requesting authorization for `HKCorrelationType` at
     /// all, and doing so crashes at the `requestAuthorization` call. This makes the

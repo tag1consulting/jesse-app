@@ -602,7 +602,17 @@ struct SettingsView: View {
                 } footer: {
                     Text("Jesse attaches a compact summary of your recent Apple Health — last night’s sleep, resting heart rate and other daily vitals, plus your recent workouts — so you can ask it to log one (“Log my swim”) or reflect on how you’re doing. With “Write meals” on, meals you log (“log lunch: …”) are also saved to Health as nutrition entries. Nothing is read or written until you connect, and you can turn either off anytime.")
                 }
-                .onAppear { mealWriteDenied = HealthKitMealWriter.isWriteDenied() }
+                .onAppear {
+                    mealWriteDenied = HealthKitMealWriter.isWriteDenied()
+                    // An app update that adds read types does NOT re-prompt on its
+                    // own: the user is still "authorized" for the old set, so every
+                    // new type reads empty forever and the block silently loses the
+                    // detail. Ask again here, and ONLY when HealthKit says the set
+                    // has actually grown, for someone who already connected once.
+                    if attachHealthContext {
+                        Task { _ = await HealthContextProvider.requestAuthorizationIfTypesGrew() }
+                    }
+                }
 
                 Section {
                     Toggle("Attach location context", isOn: $attachLocationContext)

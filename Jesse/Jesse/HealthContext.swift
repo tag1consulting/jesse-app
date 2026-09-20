@@ -12,7 +12,7 @@ import Foundation
 //   - `DailySummary` (+ its member value types) — the daily metrics, each optional.
 //   - `HealthSnapshot` — daily summary + workouts, what the provider returns.
 //   - `DailySummaryFormatter` — one line per present metric, fixed order.
-//   - `HealthContextFormatter` — composes both subsections under the 3 KiB cap.
+//   - `HealthContextFormatter` — composes both subsections under the 4 KiB cap.
 //   - `HealthContextPolicy` / `HealthContextResolver` — the attach decision + wiring.
 //   - `HealthContextTimeout` / `HealthContextGather` / `HealthMetricFetches` — the
 //     single combined bounded gather with per-metric failure isolation.
@@ -39,15 +39,19 @@ nonisolated struct DatedValue: Equatable, Sendable {
     var date: Date
 }
 
-/// The three irregular heart-rhythm notification kinds Apple Health records.
+/// The health-notification kinds Apple Health records as one-off events: the three
+/// irregular heart-rhythm ones, plus the sleep-apnea and hypertension notifications
+/// newer watch hardware writes. All five render the same way, on one line.
 nonisolated enum HREventKind: String, Equatable, Sendable, CaseIterable {
-    case low, high, irregular
+    case low, high, irregular, sleepApnea, hypertension
     /// Fixed render order and label.
     var label: String {
         switch self {
         case .low: return "low"
         case .high: return "high"
         case .irregular: return "irregular"
+        case .sleepApnea: return "sleep apnea"
+        case .hypertension: return "hypertension"
         }
     }
 }
@@ -67,9 +71,21 @@ nonisolated struct OvernightVitals: Equatable, Sendable {
     var oxygenSaturation: Double?
     /// Wrist-temperature DEVIATION from baseline, in °C (may be negative).
     var wristTemperatureDeviation: Double?
+    /// Overnight breathing disturbances per hour. Hardware dependent — a watch that
+    /// does not measure it simply leaves the segment off the line.
+    var breathingDisturbances: Double?
+
+    init(respiratoryRate: Double? = nil, oxygenSaturation: Double? = nil,
+         wristTemperatureDeviation: Double? = nil, breathingDisturbances: Double? = nil) {
+        self.respiratoryRate = respiratoryRate
+        self.oxygenSaturation = oxygenSaturation
+        self.wristTemperatureDeviation = wristTemperatureDeviation
+        self.breathingDisturbances = breathingDisturbances
+    }
 
     var isEmpty: Bool {
-        respiratoryRate == nil && oxygenSaturation == nil && wristTemperatureDeviation == nil
+        respiratoryRate == nil && oxygenSaturation == nil
+            && wristTemperatureDeviation == nil && breathingDisturbances == nil
     }
 }
 
@@ -477,6 +493,9 @@ nonisolated enum DailySummaryFormatter {
         if let t = v.wristTemperatureDeviation {
             parts.append(String(format: "wrist temp %+.1f°C", t))
         }
+        if let b = v.breathingDisturbances {
+            parts.append(String(format: "breathing disturbances %.1f/h", b))
+        }
         return parts.isEmpty ? nil : "Overnight: " + parts.joined(separator: ", ")
     }
 
@@ -516,12 +535,16 @@ nonisolated enum DailySummaryFormatter {
 /// Composes the two-subsection health-context block the phone attaches to a turn:
 /// the daily summary followed by the recent workouts. One hard byte ceiling
 /// (`maxBytes`) over the WHOLE block, with a truncation priority that keeps the
-/// high-value daily summary intact and sheds workout detail: drop the oldest
-/// workout lines first, then a boundary workout's running-dynamics suffix — never
-/// truncating mid-line. Returns nil when neither subsection has anything.
+/// high-value daily summary intact and sheds workout detail in tiers — never
+/// truncating mid-line. Older workouts still drop before newer ones; within one
+/// workout the segments shed from the right, cheapest information first: the
+/// per-km splits, then the detail suffix, then the running dynamics, then the line
+/// itself. Returns nil when neither subsection has anything.
 nonisolated enum HealthContextFormatter {
-    /// Hard byte ceiling on the whole rendered block (well under the bridge's 4 KiB).
-    static let maxBytes = 3 * 1024
+    /// Hard byte ceiling on the whole rendered block. The bridge's ceiling is 8 KiB
+    /// and the diet rollup shares the budget (see `DietContextComposer`), so this
+    /// stays well under it even with a full five-workout block.
+    static let maxBytes = 4 * 1024
 
     static func block(daily: DailySummary,
                       workouts: [WorkoutSummary],
@@ -540,9 +563,11 @@ nonisolated enum HealthContextFormatter {
         }
 
         // Workouts subsection: newest-first, within 48h, at most maxWorkouts. Then
-        // greedily fit under the remaining budget — a workout keeps its dynamics
-        // suffix if it fits, else the suffix is dropped, else the (older) line is
-        // dropped. Header cost is reserved so it always fits with its lines.
+        // greedily fit under the remaining budget. Each workout is offered in four
+        // tiers, widest first — everything, minus splits, minus detail, minus
+        // dynamics — and the first that fits is taken; if even the bare base line
+        // does not fit, this and every older workout are dropped. Header cost is
+        // reserved so it always fits with its lines.
         let cutoff = now.addingTimeInterval(-WorkoutContextFormatter.windowHours * 3600)
         let candidates = workouts
             .filter { $0.end >= cutoff }
@@ -554,16 +579,17 @@ nonisolated enum HealthContextFormatter {
         var workoutUsed = headerReserve
         for w in candidates {
             let base = WorkoutContextFormatter.baseLine(for: w, timeZone: timeZone)
-            let full = base + WorkoutContextFormatter.dynamicsSuffix(for: w)
-            if used + workoutUsed + cost(full) <= maxBytes {
-                workoutLines.append(full)
-                workoutUsed += cost(full)
-            } else if used + workoutUsed + cost(base) <= maxBytes {
-                workoutLines.append(base)
-                workoutUsed += cost(base)
-            } else {
+            let withDynamics = base + WorkoutContextFormatter.dynamicsSuffix(for: w)
+            let withDetail = withDynamics + WorkoutContextFormatter.detailSuffix(for: w)
+            let withSplits = withDetail + WorkoutContextFormatter.splitsSuffix(for: w)
+            let tiers = [withSplits, withDetail, withDynamics, base]
+            guard let fitted = tiers.first(where: {
+                used + workoutUsed + cost($0) <= maxBytes
+            }) else {
                 break // this and every older workout are dropped
             }
+            workoutLines.append(fitted)
+            workoutUsed += cost(fitted)
         }
         if !workoutLines.isEmpty {
             sections.append([WorkoutContextFormatter.header(count: workoutLines.count)] + workoutLines)
@@ -618,9 +644,9 @@ nonisolated enum HealthContextResolver {
 /// only joins the two subsections and, defensively, keeps the higher-value HealthKit
 /// block alone if the combined block would somehow exceed the ceiling.
 nonisolated enum DietContextComposer {
-    /// Hard ceiling on the combined block — the HealthKit block self-limits to 3 KiB and
-    /// the diet rollup to ~2.5 KiB, so 6 KiB leaves clear headroom under the 8 KiB cap.
-    static let maxBytes = 6 * 1024
+    /// Hard ceiling on the combined block — the HealthKit block self-limits to 4 KiB and
+    /// the diet rollup to ~2.5 KiB, so 7 KiB leaves clear headroom under the 8 KiB cap.
+    static let maxBytes = 7 * 1024
 
     static func combine(healthBlock: String?, dietRollup: String?) -> String? {
         let health = healthBlock.flatMap { $0.isEmpty ? nil : $0 }

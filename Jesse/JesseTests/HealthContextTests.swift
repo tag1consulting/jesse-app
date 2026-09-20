@@ -419,21 +419,22 @@ final class HealthContextTests: XCTestCase {
         Weight: 78.4 kg (2026-07-03)
 
         1 recent workout from Apple Health (last 48h, newest first):
-        Swim — 2026-07-04 06:30, 30m, 1.5 km, 420 kcal, avg HR 132, max HR 158 (Apple Watch)
+        Swim — 2026-07-04 06:30, 30m, 1500 m, 420 kcal, avg HR 132, max HR 158 (Apple Watch)
         """
         XCTAssertEqual(block, expected)
     }
 
-    /// With no daily data, the composed block is byte-identical to the shipped
-    /// workouts-only block — an empty daily section adds nothing (no header, no
-    /// leading blank line).
-    func testWorkoutsOnlyBlockIsByteIdenticalToShippedFeature() {
+    /// With no daily data, the composed block is the workouts subsection and
+    /// nothing else — an empty daily section adds no header and no leading blank
+    /// line. (The swim's distance is whole meters now, not a rounded kilometer;
+    /// the LAYOUT is what this pins.)
+    func testWorkoutsOnlyBlockHasNoDailyScaffolding() {
         let block = HealthContextFormatter.block(
             daily: .empty, workouts: [swim(start: date(2026, 7, 4, 6, 30))],
             now: now, timeZone: utc)
         XCTAssertEqual(block, """
         1 recent workout from Apple Health (last 48h, newest first):
-        Swim — 2026-07-04 06:30, 30m, 1.5 km, 420 kcal, avg HR 132, max HR 158 (Apple Watch)
+        Swim — 2026-07-04 06:30, 30m, 1500 m, 420 kcal, avg HR 132, max HR 158 (Apple Watch)
         """)
     }
 
@@ -483,8 +484,8 @@ final class HealthContextTests: XCTestCase {
     // MARK: - Composer: truncation priority + max-size fit
 
     /// The realistic maximal block — all daily metrics, 5 workouts, all with running
-    /// dynamics — fits comfortably under the 3 KiB self-cap.
-    func testMaximalBlockFitsUnderThreeKiB() {
+    /// dynamics — fits comfortably under the self-cap.
+    func testMaximalBlockFitsUnderTheCap() {
         let runs = (0..<5).map { i in
             WorkoutSummary(activityName: "Run", start: date(2026, 7, 4, 5 + i, 0), duration: 3000,
                            distanceMeters: 9000, activeEnergyKcal: 560,
@@ -495,7 +496,7 @@ final class HealthContextTests: XCTestCase {
         }
         let block = HealthContextFormatter.block(daily: fullDaily(), workouts: runs,
                                                  now: now, timeZone: utc)!
-        XCTAssertLessThanOrEqual(block.utf8.count, 3 * 1024)
+        XCTAssertLessThanOrEqual(block.utf8.count, HealthContextFormatter.maxBytes)
         XCTAssertTrue(block.hasPrefix("Daily health summary"))
         XCTAssertTrue(block.contains("5 recent workouts"), "all five workouts retained")
     }
@@ -503,11 +504,14 @@ final class HealthContextTests: XCTestCase {
     /// The daily summary is never shed; the oldest workout LINES are dropped first to
     /// fit, and no line is ever truncated mid-way.
     func testTruncationKeepsDailyAndDropsOldestWorkoutLines() {
-        let long = String(repeating: "x", count: 600)
+        // Sized so five of these cannot fit the 4 KiB ceiling alongside the daily
+        // summary, which is what puts the drop-oldest rung under test.
+        let long = String(repeating: "x", count: 800)
         let all = (0..<5).map { swim(start: date(2026, 7, 4, 5 + $0, 0), source: long) }
         let block = HealthContextFormatter.block(daily: fullDaily(), workouts: all,
                                                  now: now, timeZone: utc)!
-        XCTAssertLessThanOrEqual(block.utf8.count, 3 * 1024, "hard 3 KiB ceiling")
+        XCTAssertLessThanOrEqual(block.utf8.count, HealthContextFormatter.maxBytes,
+                                 "hard 4 KiB ceiling")
         // Daily summary fully present.
         XCTAssertTrue(block.contains("Weight: 78.4 kg (2026-07-03)"))
         XCTAssertTrue(block.contains("Sleep (last night):"))
@@ -545,6 +549,126 @@ final class HealthContextTests: XCTestCase {
         XCTAssertLessThanOrEqual(block.utf8.count, HealthContextFormatter.maxBytes)
         XCTAssertTrue(block.contains(base), "the base line is kept, in full")
         XCTAssertFalse(block.contains("power 245 W"), "dynamics suffix dropped to fit")
+    }
+
+
+    // MARK: - Daily summary: the newer overnight signals
+
+    /// Breathing disturbances ride the existing overnight line, after wrist temp,
+    /// and are absent (not zero, not "n/a") on hardware that does not write them.
+    func testOvernightBreathingDisturbances() {
+        var d = DailySummary()
+        d.vitals = OvernightVitals(respiratoryRate: 14, oxygenSaturation: 0.96,
+                                   wristTemperatureDeviation: 0.3,
+                                   breathingDisturbances: 3.14)
+        XCTAssertEqual(DailySummaryFormatter.lines(from: d, now: now, timeZone: utc),
+                       ["Overnight: 14 breaths/min, SpO2 96%, wrist temp +0.3°C, "
+                        + "breathing disturbances 3.1/h"])
+
+        d.vitals = OvernightVitals(respiratoryRate: 14)
+        XCTAssertEqual(DailySummaryFormatter.lines(from: d, now: now, timeZone: utc),
+                       ["Overnight: 14 breaths/min"], "absent renders nothing at all")
+    }
+
+    /// Sleep apnea and hypertension notifications render exactly like the three
+    /// heart-rhythm kinds, in `allCases` order, on the same line.
+    func testSleepApneaAndHypertensionEventsRenderLikeTheOthers() {
+        var d = DailySummary()
+        d.hrEvents = [
+            HREventSummary(kind: .hypertension, count: 1, mostRecent: date(2026, 7, 2, 8, 0)),
+            HREventSummary(kind: .sleepApnea, count: 4, mostRecent: date(2026, 7, 3, 5, 30)),
+            HREventSummary(kind: .high, count: 2, mostRecent: date(2026, 7, 3, 14, 22)),
+        ]
+        XCTAssertEqual(DailySummaryFormatter.lines(from: d, now: now, timeZone: utc),
+            ["HR events: 2 high (latest 2026-07-03 14:22), "
+             + "4 sleep apnea (latest 2026-07-03 05:30), "
+             + "1 hypertension (latest 2026-07-02 08:00)"])
+        // The same 7-day recency rule applies to the new kinds.
+        d.hrEvents = [HREventSummary(kind: .sleepApnea, count: 3,
+                                     mostRecent: date(2026, 6, 1, 0, 0))]
+        XCTAssertTrue(DailySummaryFormatter.lines(from: d, now: now, timeZone: utc).isEmpty)
+    }
+
+    // MARK: - Composer: the four-tier shedding order
+
+    /// Under a budget that admits only part of one workout's line, the segments go
+    /// in a fixed order — splits, then detail, then dynamics, then the line itself —
+    /// and a kept segment is always whole.
+    func testShedsSplitsThenDetailThenDynamicsThenTheLine() {
+        // One workout whose four tiers differ only by the suffixes, sized by the
+        // source string so each rung of the ladder can be isolated with a budget.
+        func probe(sourceLength: Int) -> WorkoutSummary {
+            WorkoutSummary(activityName: "Run", start: date(2026, 7, 4, 7, 0),
+                           duration: 2700, distanceMeters: 8000, source:
+                               String(repeating: "x", count: sourceLength),
+                           averageRunningPowerW: 245, groundContactTimeMs: 240,
+                           verticalOscillationCm: 8.1, strideLengthM: 1.15,
+                           isIndoor: false, averageMETs: 9.4,
+                           elevationAscendedM: 84, stepCount: 4400,
+                           splitSecondsPerKm: [358, 361, 364, 359, 360, 362, 357, 363])
+        }
+        let w = probe(sourceLength: 1)
+        let base = WorkoutContextFormatter.baseLine(for: w, timeZone: utc)
+        let dyn = WorkoutContextFormatter.dynamicsSuffix(for: w)
+        let detail = WorkoutContextFormatter.detailSuffix(for: w)
+        let splits = WorkoutContextFormatter.splitsSuffix(for: w)
+        XCTAssertFalse(dyn.isEmpty); XCTAssertFalse(detail.isEmpty); XCTAssertFalse(splits.isEmpty)
+
+        let headerReserve = WorkoutContextFormatter.header(count: 1).utf8.count + 1
+        // Pad the source so the chosen tier's line exactly fills the budget. The
+        // four tiers, widest first.
+        let tiers = [base + dyn + detail + splits, base + dyn + detail, base + dyn, base]
+        for (rung, tier) in tiers.enumerated() {
+            let padding = HealthContextFormatter.maxBytes - headerReserve - 1
+                - tier.utf8.count + 1  // source is already 1 byte long
+            let padded = probe(sourceLength: padding)
+            let block = HealthContextFormatter.block(daily: .empty, workouts: [padded],
+                                                     now: now, timeZone: utc)!
+            XCTAssertLessThanOrEqual(block.utf8.count, HealthContextFormatter.maxBytes)
+            let line = block.split(separator: "\n").map(String.init)[1]
+            XCTAssertEqual(line.utf8.count,
+                           HealthContextFormatter.maxBytes - headerReserve - 1,
+                           "rung \(rung) is the widest tier that fits")
+            XCTAssertEqual(rung >= 1, !line.contains("splits/km"), "rung \(rung): splits")
+            XCTAssertEqual(rung >= 2, !line.contains("avg METs"), "rung \(rung): detail")
+            XCTAssertEqual(rung >= 3, !line.contains("power 245 W"), "rung \(rung): dynamics")
+        }
+    }
+
+    /// Even with everything present, the five newest workouts and a full daily
+    /// summary stay inside the block's own ceiling.
+    func testMaximalDetailedBlockFitsUnderFourKiB() {
+        let runs = (0..<5).map { i in
+            WorkoutSummary(activityName: "Run", start: date(2026, 7, 4, 5 + i, 0), duration: 3000,
+                           distanceMeters: 9000, activeEnergyKcal: 560,
+                           averageHeartRateBPM: 152, maxHeartRateBPM: 176,
+                           source: "Apple Watch Ultra 2",
+                           averageRunningPowerW: 248, groundContactTimeMs: 238,
+                           verticalOscillationCm: 8.3, strideLengthM: 1.18,
+                           productType: "Watch7,5", isIndoor: false, averageMETs: 9.4,
+                           effortScore: 7, effortScoreIsUserRated: true,
+                           elevationAscendedM: 84, elevationDescendedM: 80, stepCount: 4900,
+                           weatherTemperatureC: 18, weatherHumidityPercent: 60,
+                           splitSecondsPerKm: Array(repeating: 361, count: 9))
+        }
+        let block = HealthContextFormatter.block(daily: fullDaily(), workouts: runs,
+                                                 now: now, timeZone: utc)!
+        XCTAssertLessThanOrEqual(block.utf8.count, HealthContextFormatter.maxBytes)
+        XCTAssertTrue(block.contains("5 recent workouts"), "all five workouts retained")
+        XCTAssertTrue(block.contains("splits/km"), "with their splits")
+    }
+
+    /// The whole point of the two ceilings: a maximum-size health block and a
+    /// full-size diet rollup still travel together under the combined cap, which is
+    /// itself under the bridge's 8 KiB.
+    func testMaxHealthBlockPlusFullRollupFitsUnderSevenKiB() throws {
+        let health = String(repeating: "x", count: HealthContextFormatter.maxBytes)
+        let rollup = String(repeating: "y", count: 2560)   // 2.5 KiB
+        let combined = try XCTUnwrap(DietContextComposer.combine(healthBlock: health,
+                                                                 dietRollup: rollup))
+        XCTAssertTrue(combined.contains(rollup), "the rollup is not shed to fit")
+        XCTAssertLessThanOrEqual(combined.utf8.count, DietContextComposer.maxBytes)
+        XCTAssertLessThanOrEqual(combined.utf8.count, 8 * 1024, "under the bridge ceiling")
     }
 
     // MARK: - Policy
@@ -660,7 +784,7 @@ final class HealthContextTests: XCTestCase {
         XCTAssertTrue(rollup.contains("TODAY RAN HOT"), rollup)
         // Composed with a full-size HealthKit block, the whole context stays under the
         // ceiling that keeps it inside the bridge's 8 KiB cap.
-        let health = String(repeating: "x", count: 3 * 1024)
+        let health = String(repeating: "x", count: HealthContextFormatter.maxBytes)
         let combined = try XCTUnwrap(DietContextComposer.combine(healthBlock: health,
                                                                  dietRollup: rollup))
         XCTAssertTrue(combined.contains("TODAY RAN HOT"))
