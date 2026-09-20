@@ -51,6 +51,39 @@ final class HealthContextProviderTests: XCTestCase {
         XCTAssertEqual(snap, .empty)
     }
 
+    /// The detail fields ride the same seam as the eight the provider always had —
+    /// including the nested `SwimDetail` — so nothing is flattened or lost between
+    /// the provider and the formatter.
+    func testWorkoutDetailSurvivesTheGatherSeam() async {
+        let detailed = WorkoutSummary(
+            activityName: "Swim", start: Date(timeIntervalSince1970: 1_783_146_600),
+            duration: 3300, distanceMeters: 1650, source: "Apple Watch",
+            productType: "Watch7,5", isIndoor: true, averageMETs: 7.2,
+            effortScore: 6, effortScoreIsUserRated: true,
+            elevationAscendedM: 12, elevationDescendedM: 10, stepCount: 0,
+            weatherTemperatureC: 18, weatherHumidityPercent: 60,
+            splitSecondsPerKm: [358, 361],
+            swim: SwimDetail(lapLengthM: 25, location: .pool, lapCount: 66,
+                             strokeCount: 1840, swimSeconds: 2890, averageSWOLF: 52,
+                             waterTemperatureC: 27.5,
+                             lapsByStroke: ["freestyle": 60, "breaststroke": 6]))
+        var f = HealthMetricFetches.empty
+        f.workouts = { [detailed] }
+        let snap = await HealthContextProvider(fetches: f).snapshot()
+        XCTAssertEqual(snap.workouts, [detailed])
+        XCTAssertEqual(snap.workouts.first?.swim?.lapsByStroke,
+                       ["freestyle": 60, "breaststroke": 6])
+    }
+
+    /// A workout read that throws still costs only the workouts, and the newer
+    /// overnight signals travel on the vitals metric like the rest of them.
+    func testBreathingDisturbancesRideTheVitalsMetric() async {
+        var f = HealthMetricFetches.empty
+        f.vitals = { OvernightVitals(respiratoryRate: 14, breathingDisturbances: 3.1) }
+        let snap = await HealthContextProvider(fetches: f).snapshot()
+        XCTAssertEqual(snap.daily.vitals?.breathingDisturbances, 3.1)
+    }
+
     func testSuccessfulFetchesPassThrough() async {
         var f = HealthMetricFetches.empty
         // Build the (Sendable) workout on the main actor, then capture the value — the

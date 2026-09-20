@@ -14,6 +14,72 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [App 1.0 (144)] - 2026-09-20
+
+### Added
+
+- **The workout lines carry the swim, run and general detail Apple Health already
+  held.** Root cause: `HealthContextProvider.summary(for:)` reduced an `HKWorkout` to
+  eight fields and threw away everything else the sample carried — its events, its
+  metadata, its source revision and every sample related to it — so a swim's laps,
+  strokes and SWOLF, a run's elevation and cadence, the indoor flag, the weather, the
+  effort score and the recording watch model never reached the block at all. On top of
+  that, distance was rounded to 0.1 km before anything downstream saw it, so a 1,650 m
+  swim arrived as `1.6 km` and no correct per-100m pace could be computed from it by
+  anyone, ever.
+
+  Every workout line can now carry `indoor`/`outdoor`, `effort 6/10 (rated|est)`,
+  `avg METs`, `temp`/`humidity`, and the recording device's product type inside the
+  existing source parentheses. Swims add pool length or open water, lap count, stroke
+  count, swim time, per-100m pace, SWOLF, water temperature and a per-stroke lap
+  breakdown. Runs, walks and hikes add per-km pace, step cadence, ascent and descent,
+  plus a `splits/km` list (at most 30). Anything derived here rather than read from the
+  device is marked `(computed)`, so an agent reading the block can always tell
+  arithmetic from a measurement.
+
+- **Two pure reducers, `SwimLapReducer` and `SplitReducer`.** Lap events become a lap
+  count, swim time, mean SWOLF and a per-stroke tally; the distance samples a workout
+  owns become per-km splits, interpolating linearly inside the sample that crosses each
+  boundary. Both are Foundation-only and fully unit tested; the provider maps
+  HealthKit's shapes into plain values and decides nothing, exactly as `SleepReducer` is
+  fed today.
+
+- **Overnight breathing disturbances, sleep-apnea and hypertension notifications** in
+  the daily summary — the signals newer watch hardware writes. Breathing disturbances
+  ride the existing `Overnight:` line; the two notification kinds render on the existing
+  events line exactly like the three heart-rhythm kinds.
+
+- **Authorization is re-requested when the read set grows.** An installed, already
+  authorized app is never re-prompted by HealthKit on its own, so every newly added read
+  type would have read empty forever — silently, since read denial and "never asked" are
+  indistinguishable by design. The Apple Health settings section now asks again, and only
+  when `statusForAuthorizationRequest(toShare:read:)` reports `.shouldRequest`.
+
+### Changed
+
+- **Distance is no longer rounded before a pace can be computed from it.** A swim prints
+  whole meters at any length (`1650 m`); everything else prints two decimals of a
+  kilometer (`7.84 km`), keeping whole meters under 1 km.
+
+- **`activityName` names every activity type a person plausibly records on a watch**,
+  including `.other` as `Other`. It previously mapped ten types and printed `Workout`
+  for everything else, so an "Other" session, a mixed-cardio session and a core session
+  were indistinguishable in the block.
+
+- **The byte cap sheds workout detail in four tiers**, widest first: the splits suffix,
+  then the detail suffix, then the running-dynamics suffix, then the line itself. Older
+  workouts still drop before newer ones and no line is ever truncated mid-way.
+
+- **`HealthContextFormatter.maxBytes` 3 KiB to 4 KiB and `DietContextComposer.maxBytes`
+  6 KiB to 7 KiB.** The bridge's 8 KiB ceiling is unchanged, and a maximum-size health
+  block still travels beside a full-size diet rollup under it.
+
+- **Per-workout enrichment now runs concurrently** rather than one workout after another,
+  so the added reads cost less wall clock inside the unchanged ~1.5 s gather bound than
+  the serial running-dynamics loop they replace. Every new read degrades to nil on error,
+  denial, absence or timeout; absent data renders nothing at all, never a zero or a
+  placeholder.
+
 ## [App 1.0 (143)] - 2026-09-20
 
 **Repo hygiene only. No Swift source changed.**

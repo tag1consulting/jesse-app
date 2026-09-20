@@ -47,9 +47,13 @@ nonisolated struct HealthContextProvider: HealthContextProviding {
         .stepCount, .bodyMass, .bodyFatPercentage, .leanBodyMass, .runningPower,
         .runningGroundContactTime, .runningVerticalOscillation, .runningStrideLength,
         .walkingAsymmetryPercentage, .appleWalkingSteadiness,
+        // Workout detail + the overnight signals newer watch hardware writes.
+        .swimmingStrokeCount, .waterTemperature, .workoutEffortScore,
+        .estimatedWorkoutEffortScore, .appleSleepingBreathingDisturbances,
     ]
     private static let categoryReadIdentifiers: [HKCategoryTypeIdentifier] = [
         .sleepAnalysis, .lowHeartRateEvent, .highHeartRateEvent, .irregularHeartRhythmEvent,
+        .sleepApneaEvent, .hypertensionEvent,
     ]
 
     /// Hard bound on the whole combined gather — the send path waits at most this
@@ -215,6 +219,23 @@ nonisolated struct HealthContextProvider: HealthContextProviding {
         }
     }
 
+    /// Re-request authorization ONLY when the requested type set has grown since the
+    /// user last answered the prompt. An app updated with new read types is still
+    /// "authorized" for the old set, so HealthKit never asks again on its own and
+    /// every new type reads empty forever — silently, because read denial and
+    /// "never asked" are indistinguishable by design.
+    /// `statusForAuthorizationRequest` is the one signal that says the set has
+    /// grown; anything but `.shouldRequest` (including an error, which reports
+    /// `.unknown`) leaves the user alone. Returns true only when a prompt was
+    /// actually shown and answered without error.
+    static func requestAuthorizationIfTypesGrew() async -> Bool {
+        guard HKHealthStore.isHealthDataAvailable() else { return false }
+        let status = try? await HKHealthStore().statusForAuthorizationRequest(
+            toShare: HealthKitMealWriter.shareTypes, read: readTypes)
+        guard status == .shouldRequest else { return false }
+        return await requestAuthorization()
+    }
+
     // MARK: - Live HealthKit queries (the only HealthKit-touching code)
 
     /// Build the live metric fetches. Each closure runs one bounded read and throws
@@ -258,20 +279,143 @@ nonisolated struct HealthContextProvider: HealthContextProviding {
             }
             store.execute(q)
         }
-        var out: [WorkoutSummary] = []
-        for w in workouts {
-            var s = summary(for: w)
-            if w.workoutActivityType == .running {
-                s = await addingRunningDynamics(to: s, workout: w, store: store)
+        // Enrich every workout CONCURRENTLY — the query-backed detail below is
+        // several reads per workout, and the whole gather shares one ~1.5s bound.
+        // (The shipped code walked the workouts serially, so this is strictly less
+        // wall clock than before even with the added reads.) Order is restored
+        // from the index because a task group completes out of order.
+        var enriched: [(Int, WorkoutSummary)] = await withTaskGroup(
+            of: (Int, WorkoutSummary).self
+        ) { group in
+            for (i, w) in workouts.enumerated() {
+                group.addTask {
+                    let enriched = await enrich(summary(for: w), workout: w)
+                    return (i, enriched)
+                }
             }
-            out.append(s)
+            var acc: [(Int, WorkoutSummary)] = []
+            for await pair in group { acc.append(pair) }
+            return acc
         }
-        return out
+        enriched.sort { $0.0 < $1.0 }
+        return enriched.map(\.1)
+    }
+
+    /// Fill the fields that need their own query, each independently best-effort:
+    /// a failed, denied or empty read leaves its field nil and the formatter omits
+    /// it, exactly as the running dynamics have always degraded. The reads inside
+    /// one workout run concurrently too.
+    private static func enrich(_ base: WorkoutSummary, workout w: HKWorkout) async -> WorkoutSummary {
+        let isSwim = base.swim != nil
+        let needsStrokes = isSwim && base.swim?.strokeCount == nil
+        let onFoot = base.isFootDistance
+        let isRun = w.workoutActivityType == .running
+
+        // Each of these makes its own HKHealthStore inside the query: the store is
+        // not Sendable and must never be captured across a task boundary.
+        async let effort = effortScore(for: w)
+        async let dynamics: WorkoutSummary? = when(isRun) {
+            await addingRunningDynamics(to: base, workout: w)
+        }
+        async let strokes: Double? = when(needsStrokes) {
+            try await sumOverWorkout(.swimmingStrokeCount, unit: .count(), workout: w)
+        }
+        async let water: Double? = when(isSwim) {
+            try await avgOverWorkout(.waterTemperature, unit: .degreeCelsius(), workout: w)
+        }
+        async let steps: Double? = when(onFoot) {
+            try await sumOverWorkout(.stepCount, unit: .count(), workout: w)
+        }
+        async let splits: [Double]? = when(onFoot) { try await perKmSplits(for: w) }
+
+        var s = await dynamics ?? base
+        if let e = await effort {
+            s.effortScore = e.score
+            s.effortScoreIsUserRated = e.userRated
+        }
+        if let strokes = await strokes { s.swim?.strokeCount = strokes }
+        if let water = await water { s.swim?.waterTemperatureC = water }
+        s.stepCount = await steps
+        if let splits = await splits, !splits.isEmpty { s.splitSecondsPerKm = splits }
+        return s
+    }
+
+    /// Run one read and flatten every failure to nil, so a thrown, denied or empty
+    /// read costs exactly its own field and nothing else.
+    private static func bestEffort<T>(_ read: () async throws -> T?) async -> T? {
+        (try? await read()) ?? nil
+    }
+
+    /// `bestEffort`, but only when the field applies to this activity at all — a
+    /// cycle never asks for a swim's water temperature.
+    private static func when<T>(_ condition: Bool, _ read: () async throws -> T?) async -> T? {
+        condition ? await bestEffort(read) : nil
+    }
+
+    /// The workout's effort score and whether it is the user's own rating. The
+    /// user-rated score wins over the watch's estimate when both exist.
+    ///
+    /// The association is read with `predicateForWorkoutEffortSamplesRelated`, the
+    /// predicate the SDK provides for exactly this, rather than
+    /// `HKWorkoutEffortRelationshipQuery`: that query is LONG-RUNNING (its handler
+    /// fires again on every later change, and it must be stopped on the same store
+    /// that executed it), which means capturing a non-Sendable `HKHealthStore` in a
+    /// `@Sendable` handler and hand-guarding the continuation against a second
+    /// resume. A one-shot sample query has neither hazard and answers the same
+    /// question.
+    private static func effortScore(for w: HKWorkout) async -> (score: Double, userRated: Bool)? {
+        if let rated = await bestEffort({ try await effortSample(.workoutEffortScore, for: w) }) {
+            return (rated, true)
+        }
+        if let est = await bestEffort({ try await effortSample(.estimatedWorkoutEffortScore, for: w) }) {
+            return (est, false)
+        }
+        return nil
+    }
+
+    private static func effortSample(_ id: HKQuantityTypeIdentifier,
+                                     for w: HKWorkout) async throws -> Double? {
+        guard HKHealthStore.isHealthDataAvailable() else { return nil }
+        let store = HKHealthStore()
+        let predicate = HKQuery.predicateForWorkoutEffortSamplesRelated(workout: w, activity: nil)
+        let sort = [NSSortDescriptor(key: HKSampleSortIdentifierEndDate, ascending: false)]
+        let sample: HKQuantitySample? = try await withCheckedThrowingContinuation { cont in
+            let q = HKSampleQuery(sampleType: HKQuantityType(id), predicate: predicate,
+                                  limit: 1, sortDescriptors: sort) { _, s, error in
+                if let error { cont.resume(throwing: error); return }
+                cont.resume(returning: s?.first as? HKQuantitySample)
+            }
+            store.execute(q)
+        }
+        return sample?.quantity.doubleValue(for: .appleEffortScore())
+    }
+
+    /// Per-kilometer splits from the walking/running distance samples the workout
+    /// owns. `SplitReducer` does the interpolation; this only lifts the samples out.
+    private static func perKmSplits(for w: HKWorkout) async throws -> [Double] {
+        let store = HKHealthStore()
+        let predicate = HKQuery.predicateForObjects(from: w)
+        let sort = [NSSortDescriptor(key: HKSampleSortIdentifierStartDate, ascending: true)]
+        let samples: [HKQuantitySample] = try await withCheckedThrowingContinuation { cont in
+            let q = HKSampleQuery(sampleType: HKQuantityType(.distanceWalkingRunning),
+                                  predicate: predicate, limit: HKObjectQueryNoLimit,
+                                  sortDescriptors: sort) { _, s, error in
+                if let error { cont.resume(throwing: error); return }
+                cont.resume(returning: (s as? [HKQuantitySample]) ?? [])
+            }
+            store.execute(q)
+        }
+        return SplitReducer.splitSeconds(samples.map {
+            DistanceSample(start: $0.startDate, end: $0.endDate,
+                           meters: $0.quantity.doubleValue(for: .meter()))
+        })
     }
 
     /// Reduce one workout to a pure `WorkoutSummary`, reading energy / distance /
-    /// heart-rate from the statistics Apple Watch attaches to the workout. Any
-    /// missing stat is left nil (the formatter omits that field).
+    /// heart-rate from the statistics Apple Watch attaches to the workout and the
+    /// rest from its metadata, its source revision and its events — all of which
+    /// are already in hand, so none of this costs a query. Any missing stat is left
+    /// nil (the formatter omits that field).
     private static func summary(for w: HKWorkout) -> WorkoutSummary {
         let kcal = w.statistics(for: HKQuantityType(.activeEnergyBurned))?
             .sumQuantity()?.doubleValue(for: .kilocalorie())
@@ -287,14 +431,87 @@ nonisolated struct HealthContextProvider: HealthContextProviding {
             activeEnergyKcal: kcal,
             averageHeartRateBPM: avgHR,
             maxHeartRateBPM: maxHR,
-            source: w.sourceRevision.source.name)
+            source: w.sourceRevision.source.name,
+            productType: w.sourceRevision.productType,
+            isIndoor: metaBool(w.metadata, HKMetadataKeyIndoorWorkout),
+            averageMETs: metaQuantity(w.metadata, HKMetadataKeyAverageMETs,
+                                      HKUnit(from: "kcal/(kg*hr)")),
+            elevationAscendedM: metaQuantity(w.metadata, HKMetadataKeyElevationAscended, .meter()),
+            elevationDescendedM: metaQuantity(w.metadata, HKMetadataKeyElevationDescended, .meter()),
+            weatherTemperatureC: metaQuantity(w.metadata, HKMetadataKeyWeatherTemperature,
+                                              .degreeCelsius()),
+            // HKUnit.percent() is a 0…1 fraction (see HKUnit.h), as the existing
+            // SpO2 read already assumes; the block renders a percent.
+            weatherHumidityPercent: metaQuantity(w.metadata, HKMetadataKeyWeatherHumidity,
+                                                 .percent()).map { $0 * 100 },
+            swim: swimDetail(for: w))
+    }
+
+    /// The swim aggregates that need no query: pool length and location from the
+    /// workout's metadata, the lap roll-up from its events, and the stroke count
+    /// from the statistics it already carries. nil for a non-swim, and for a swim
+    /// that recorded none of it.
+    private static func swimDetail(for w: HKWorkout) -> SwimDetail? {
+        guard w.workoutActivityType == .swimming else { return nil }
+        var d = SwimDetail()
+        d.lapLengthM = metaQuantity(w.metadata, HKMetadataKeyLapLength, .meter())
+        if let raw = metaNumber(w.metadata, HKMetadataKeySwimmingLocationType)
+            .map({ HKWorkoutSwimmingLocationType(rawValue: Int($0)) }) ?? nil {
+            switch raw {
+            case .pool: d.location = .pool
+            case .openWater: d.location = .openWater
+            default: break
+            }
+        }
+        d.strokeCount = w.statistics(for: HKQuantityType(.swimmingStrokeCount))?
+            .sumQuantity()?.doubleValue(for: .count())
+
+        // The lap events, mapped to plain values — every rule about what they mean
+        // belongs to SwimLapReducer, the way SleepReducer owns the sleep rules.
+        let laps = (w.workoutEvents ?? [])
+            .filter { $0.type == .lap }
+            .map { e in
+                SwimLap(start: e.dateInterval.start,
+                        end: e.dateInterval.end,
+                        strokeStyleRawValue: metaNumber(e.metadata,
+                                                        HKMetadataKeySwimmingStrokeStyle).map { Int($0) },
+                        swolf: metaNumber(e.metadata, HKMetadataKeySWOLFScore))
+            }
+        if let r = SwimLapReducer.reduce(laps) {
+            d.lapCount = r.lapCount
+            d.swimSeconds = r.swimSeconds
+            d.averageSWOLF = r.averageSWOLF
+            d.lapsByStroke = r.lapsByStroke
+        }
+        return d.isEmpty ? nil : d
+    }
+
+    // MARK: Metadata accessors
+
+    /// An `HKQuantity`-valued metadata entry in `unit`. The compatibility check is
+    /// load-bearing: `doubleValue(for:)` raises an ObjC exception (which Swift
+    /// cannot catch) on a mismatched unit, so a writer storing, say, a temperature
+    /// under a length key would take the app down rather than render nothing.
+    private static func metaQuantity(_ metadata: [String: Any]?, _ key: String,
+                                     _ unit: HKUnit) -> Double? {
+        guard let q = metadata?[key] as? HKQuantity, q.is(compatibleWith: unit) else { return nil }
+        return q.doubleValue(for: unit)
+    }
+
+    private static func metaNumber(_ metadata: [String: Any]?, _ key: String) -> Double? {
+        (metadata?[key] as? NSNumber)?.doubleValue
+    }
+
+    private static func metaBool(_ metadata: [String: Any]?, _ key: String) -> Bool? {
+        (metadata?[key] as? NSNumber)?.boolValue
     }
 
     /// Add average running-dynamics (power / GCT / vertical oscillation / stride) to
     /// a run's summary, each read as a discrete-average statistic over the workout
     /// window. A missing series stays nil and its field is omitted downstream.
-    private static func addingRunningDynamics(to s: WorkoutSummary, workout w: HKWorkout,
-                                              store: HKHealthStore) async -> WorkoutSummary {
+    private static func addingRunningDynamics(to s: WorkoutSummary,
+                                              workout w: HKWorkout) async -> WorkoutSummary {
+        let store = HKHealthStore()
         var s = s
         s.averageRunningPowerW = (try? await avg(.runningPower, unit: .watt(),
                                                  from: w.startDate, to: w.endDate, store: store)) ?? nil
@@ -352,6 +569,7 @@ nonisolated struct HealthContextProvider: HealthContextProviding {
         let map: [(HKCategoryTypeIdentifier, HREventKind)] = [
             (.lowHeartRateEvent, .low), (.highHeartRateEvent, .high),
             (.irregularHeartRhythmEvent, .irregular),
+            (.sleepApneaEvent, .sleepApnea), (.hypertensionEvent, .hypertension),
         ]
         for (id, kind) in map {
             if let e = try await eventSummary(id, kind: kind) { out.append(e) }
@@ -385,9 +603,14 @@ nonisolated struct HealthContextProvider: HealthContextProviding {
         let spo2 = try? await latest(.oxygenSaturation, unit: .percent(), within: 24 * 3600)?.value
         let temp = try? await latest(.appleSleepingWristTemperature,
                                      unit: .degreeCelsius(), within: 24 * 3600)?.value
+        // Hardware dependent — absent on a watch that does not measure it, which
+        // simply leaves the segment off the line.
+        let breathing = try? await latest(.appleSleepingBreathingDisturbances,
+                                          unit: .count(), within: 24 * 3600)?.value
         let v = OvernightVitals(respiratoryRate: resp ?? nil,
                                 oxygenSaturation: spo2 ?? nil,
-                                wristTemperatureDeviation: temp ?? nil)
+                                wristTemperatureDeviation: temp ?? nil,
+                                breathingDisturbances: breathing ?? nil)
         return v.isEmpty ? nil : v
     }
 
@@ -444,6 +667,38 @@ nonisolated struct HealthContextProvider: HealthContextProviding {
         return stats?.sumQuantity()?.doubleValue(for: unit)
     }
 
+    /// Cumulative sum of a quantity type over one workout's window.
+    private static func sumOverWorkout(_ id: HKQuantityTypeIdentifier, unit: HKUnit,
+                                       workout w: HKWorkout) async throws -> Double? {
+        try await stat(id, unit: unit, workout: w, options: .cumulativeSum)
+    }
+
+    /// Discrete average of a quantity type over one workout's window.
+    private static func avgOverWorkout(_ id: HKQuantityTypeIdentifier, unit: HKUnit,
+                                       workout w: HKWorkout) async throws -> Double? {
+        try await stat(id, unit: unit, workout: w, options: .discreteAverage)
+    }
+
+    private static func stat(_ id: HKQuantityTypeIdentifier, unit: HKUnit, workout w: HKWorkout,
+                             options: HKStatisticsOptions) async throws -> Double? {
+        guard HKHealthStore.isHealthDataAvailable() else { return nil }
+        let store = HKHealthStore()
+        let predicate = HKQuery.predicateForSamples(withStart: w.startDate, end: w.endDate,
+                                                    options: [])
+        let stats: HKStatistics? = try await withCheckedThrowingContinuation { cont in
+            let q = HKStatisticsQuery(quantityType: HKQuantityType(id),
+                                      quantitySamplePredicate: predicate,
+                                      options: options) { _, stats, error in
+                if let error { cont.resume(throwing: error); return }
+                cont.resume(returning: stats)
+            }
+            store.execute(q)
+        }
+        guard let stats else { return nil }
+        let q = options.contains(.cumulativeSum) ? stats.sumQuantity() : stats.averageQuantity()
+        return q?.doubleValue(for: unit)
+    }
+
     /// Discrete average of a quantity type over a window (for running dynamics).
     private static func avg(_ id: HKQuantityTypeIdentifier, unit: HKUnit,
                             from: Date, to: Date, store: HKHealthStore) async throws -> Double? {
@@ -475,7 +730,13 @@ nonisolated struct HealthContextProvider: HealthContextProviding {
         return nil
     }
 
-    /// A short, stable name for the common activity types; anything else → "Workout".
+    /// A short, stable name for every activity type a person plausibly records on a
+    /// watch. `Workout` is the true default only — an unnamed type used to swallow
+    /// `.other`, `.mixedCardio` and `.coreTraining` alike, so three different
+    /// sessions read identically in the block.
+    ///
+    /// "Swim" is load-bearing beyond display: the pure formatter reads it to decide
+    /// the whole-meter distance format and the swim detail segments.
     private static func activityName(_ t: HKWorkoutActivityType) -> String {
         switch t {
         case .swimming: return "Swim"
@@ -488,6 +749,65 @@ nonisolated struct HealthContextProvider: HealthContextProviding {
         case .traditionalStrengthTraining, .functionalStrengthTraining: return "Strength"
         case .rowing: return "Row"
         case .elliptical: return "Elliptical"
+        case .other: return "Other"
+        case .mixedCardio: return "Mixed cardio"
+        case .crossTraining: return "Cross training"
+        case .coreTraining: return "Core"
+        case .cooldown: return "Cooldown"
+        case .flexibility: return "Flexibility"
+        case .pilates: return "Pilates"
+        case .barre: return "Barre"
+        case .stairClimbing, .stairs: return "Stairs"
+        case .stepTraining: return "Step"
+        case .jumpRope: return "Jump rope"
+        case .paddleSports: return "Paddle"
+        case .swimBikeRun: return "Triathlon"
+        case .transition: return "Transition"
+        case .cardioDance: return "Cardio dance"
+        case .socialDance: return "Dance"
+        case .mindAndBody: return "Mind and body"
+        case .preparationAndRecovery: return "Recovery"
+        case .taiChi: return "Tai chi"
+        case .martialArts: return "Martial arts"
+        case .kickboxing: return "Kickboxing"
+        case .boxing: return "Boxing"
+        case .climbing: return "Climbing"
+        case .golf: return "Golf"
+        case .tennis: return "Tennis"
+        case .pickleball: return "Pickleball"
+        case .tableTennis: return "Table tennis"
+        case .badminton: return "Badminton"
+        case .squash: return "Squash"
+        case .racquetball: return "Racquetball"
+        case .basketball: return "Basketball"
+        case .soccer: return "Soccer"
+        case .volleyball: return "Volleyball"
+        case .baseball: return "Baseball"
+        case .americanFootball: return "Football"
+        case .rugby: return "Rugby"
+        case .hockey: return "Hockey"
+        case .crossCountrySkiing: return "XC ski"
+        case .downhillSkiing: return "Downhill ski"
+        case .snowboarding: return "Snowboard"
+        case .skatingSports: return "Skating"
+        case .surfingSports: return "Surfing"
+        case .sailing: return "Sailing"
+        case .equestrianSports: return "Equestrian"
+        case .fishing: return "Fishing"
+        case .archery: return "Archery"
+        case .bowling: return "Bowling"
+        case .discSports: return "Disc sports"
+        case .fitnessGaming: return "Fitness gaming"
+        case .gymnastics: return "Gymnastics"
+        case .handCycling: return "Hand cycling"
+        case .underwaterDiving: return "Diving"
+        case .waterFitness: return "Water fitness"
+        case .waterPolo: return "Water polo"
+        case .waterSports: return "Water sports"
+        case .wheelchairWalkPace: return "Wheelchair walk"
+        case .wheelchairRunPace: return "Wheelchair run"
+        case .play: return "Play"
+        case .trackAndField: return "Track and field"
         default: return "Workout"
         }
     }
