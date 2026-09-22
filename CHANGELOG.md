@@ -14,6 +14,137 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [Bridge 0.146.0] - 2026-09-22
+
+**The cluster existed, the identity existed, and the agent could not reach either.** A
+single-node k3s cluster (`ks1.pozza`, v1.36.4+k3s1) has been running for a while, with Flux
+reconciling a private repository into it and a `cluster-admin` ServiceAccount named `jesse`
+already applied and waiting. Nothing in the bridge could use it. Asked why a pod was
+crash-looping, a turn's honest answer was that it had no route to the cluster at all — and its
+less honest answer was to reason from the last thing it had read about Kubernetes.
+
+**And the one repository the agent is meant to CHANGE was governed by a rule written for
+repositories it is meant to READ.** `prompt::REVIEW_CAPABILITY` says every checkout under
+`Code/` is review-only: clone and read, never push, never edit. That is exactly right for
+somebody else's source, which is what `Code/` is for. It is exactly wrong for the cluster's
+own configuration, where the useful thing an agent can do is open a pull request. The posture
+was never argued for that repo; it was simply the only posture there was.
+
+This release adds both halves: an MCP server that reads and operates the cluster, and a second
+checkout root in which the agent may propose changes. Merging stays with Jeremy, and Flux still
+does the applying.
+
+### Added
+
+- **`kubernetes` — an eighteenth MCP server on every Claude Code main turn, and a fifteenth on
+  every Codex one.** `containers/kubernetes-mcp-server` v0.0.67, a Go binary that speaks to the
+  API server directly rather than shelling out to `kubectl`. Declared as `mcp_kubernetes!` with
+  `--toolsets core,config`, the server's own default, spelled anyway: a launcher is invisible to
+  the containment record, so anything that decides which tools REGISTER has to live in the const
+  where a test asserts it and a change to it moves the row label.
+
+- **All twenty tools the server registers are granted, by name.** Fourteen read; six write, of
+  which the server itself annotates five `destructiveHint=true` —
+  `resources_create_or_update`, `resources_delete`, `resources_scale`, `pods_delete` and
+  `pods_exec`. `pods_exec` runs an arbitrary command inside any container on the cluster;
+  `resources_delete` deletes a namespace. The list was taken from a live `tools/list` against
+  the pinned binary on 2026-09-22, not from its README, and it is enumerated rather than
+  wildcarded because upstream ships roughly monthly.
+
+  **Full control is the decision, not the default.** The server offers `--read-only` (register
+  only the fourteen readers) and `--disable-destructive` (drop the five annotated ones), and
+  neither is used. The operator's call of 2026-09-21, on the same footing as the full-control
+  UniFi and Proxmox decision of 0.69.0, and for a reason specific to this server: the changes
+  that matter are commits, not tool calls. Flux applies what lands on `main`; these tools exist
+  to see what the cluster is doing and to debug it when it is wrong, which is the work that
+  needs write. SECURITY.md carries what would falsify that decision and how to narrow it —
+  including that the strongest narrowing is RBAC, not a flag.
+
+- **`Repos/<host>/<owner>/<repo>` — a managed-repos root with a write path.** Same path
+  derivation as `Code/`, gitignored the same way, and one repository registered:
+  `github.com/jeremyandrews/k3s`. `prompt::MANAGED_REPO_CAPABILITY` is appended to every turn
+  right after the review note: in a registered repo the agent may edit, commit, push a branch
+  named `jesse/<slug>`, and open a pull request against `main`; it must never push to `main`,
+  never merge, never force push, never rewrite history. The registry is a const, so a checkout
+  appearing under `Repos/` by any other route does not inherit the grant.
+
+  **The prohibitions are instruction; the boundary is GitHub.** `Bash(git:*)` permits a push to
+  any ref, so nothing in this process stops one — exactly the caveat the review-only section has
+  always carried, and it matters more here because the agent is now being told to push. What
+  holds the line is branch protection on `main` and a deploy key scoped to that one repository,
+  both configured by hand and both listed in SECURITY.md. The acceptance test for this feature
+  is therefore a push to `main` that GitHub **rejects**, not a push the agent declines to make.
+
+### Changed
+
+- **`Code/` is unchanged and is now the only root of which that is true.** A new test,
+  `prompt::review_capability_is_unchanged_byte_for_byte`, pins `REVIEW_CAPABILITY` as a whole
+  string. The risk a write path next door creates is not deletion — that would break a dozen
+  tests — but a one-word softening of "never push" while writing the note beside it, which
+  nothing else would have noticed.
+
+- **No tool grant was added for the write path, and a test now says so.** `Bash(git:*)` and
+  `Bash(gh pr create:*)` were both already granted, so the correct allowlist diff for this
+  feature is empty. `config::the_bash_surface_is_exactly_this_and_the_write_path_added_nothing`
+  pins all twenty-nine `Bash(...)` entries as a set, and separately refuses `gh pr merge`,
+  `gh pr close`, `gh pr edit`, `gh pr review`, `gh issue close`, `gh issue edit`,
+  `gh repo delete`, `gh release create`, `gh workflow run` and a blanket `Bash(gh api:*)`. The
+  `github` MCP server was not widened and no second, write-capable GitHub server was added.
+
+- **The exact server count on the main path moves 17 → 18**, with the assertion message naming
+  the eighteenth. `kubernetes` is additionally asserted by name, its `--toolsets` argv pinned
+  exactly, and `--read-only` asserted **absent** — so narrowing the posture is as test-breaking
+  as widening it, and cannot happen silently.
+
+- **`jesse-k8s-mcp` is the first `jesse-*` command that is a host launcher rather than a binary
+  this repo builds.** `sentinel::deploy`'s manifest test used the `jesse-` prefix as a proxy for
+  "we build this", which would have failed here. Rather than weaken the rule — skipping any
+  command with no matching `src/bin/*.rs` would restore exactly the 0.100.0 failure the test
+  exists to catch — the exception is enumerated by name, with a second test asserting that a
+  host launcher never shadows a real binary and that a shipped set actually spawns it. The test
+  also now reads Codex's CURRENT main set rather than the retired `MESSAGES_MCP_CONFIG`.
+
+- **Two new `McpSet` rows and two retired labels.** `MessagesKubernetes` (Codex, fifteen) and
+  `MessagesBuildPlacesInboundKubernetes` (Claude Code, eighteen). `MESSAGES_LABEL` and
+  `MESSAGES_BUILD_PLACES_INBOUND_LABEL` are retained and still round-trip, because a record
+  written before this version names them and `McpSet::parse` returning `None` for a row a
+  startup gate is resolving is indistinguishable from a posture nobody probed.
+
+### Operator note
+
+**THIS IS THE SIXTH TIME A WIDENING HAS ORPHANED THE TWO CODEX `[[accepted]]` BLOCKS, AND THE
+FIRST TIME IT WAS WORTH IT.** `build` (0.86.0), `places` (0.100.0) and `inbound` (0.115.0) were
+each kept off Codex purely to avoid this: acceptances in `containment-codex.toml` are keyed by
+`ContainmentRow::label`, so moving Codex's main set from `…+google-perseido` to
+`…+google-perseido+kubernetes` leaves every known-open at both levels unsigned, and nothing at
+boot or in CI notices — the record simply stops vouching for the posture Codex runs at.
+
+`kubernetes` was put on both harnesses anyway, on the owner's decision of 2026-09-22, because a
+cluster capability that exists on one harness and not the other is a posture that changes with
+model routing. **The two blocks must be re-signed against a fresh live Codex battery before a
+Codex-backed turn is served**, and the three withheld servers stay withheld — this release pays
+the label cost once, for one server.
+
+**Host setup this release depends on, none of it repo content:**
+
+1. ~~`jesse-k8s-mcp` on the bridge's `PATH`~~ — **done**: installed, `exec`ing a version-pinned
+   `kubernetes-mcp-server` v0.0.67 and setting `KUBECONFIG`, handshaked from a bare
+   `env -i` (twenty tools). Handshake it after any bump — a server that registers zero tools
+   looks identical to one that works.
+2. ~~A kubeconfig for ServiceAccount `jesse` at `~/.kube/ks-jesse.yaml`, mode `600`~~ — **done**;
+   the server returned `ks1.pozza` `Ready`, k3s v1.36.4+k3s1.
+3. Branch protection on `jeremyandrews/k3s` `main`: pull request required, no direct pushes, no
+   force pushes, applied to administrators too.
+4. A deploy key with write access to that repository, private key on the host at mode `600`,
+   path exported in the LaunchAgent environment; the clone sets `core.sshCommand` for that repo
+   so git uses that key and nothing else.
+5. **NOT a scoped `gh` token.** `gh pr create` runs on `gh`'s existing keyring credential. A
+   repo-scoped `GH_TOKEN` in the plist would apply to EVERY `gh` call the bridge makes,
+   including the overnight `tag1consulting` reads, and a fine-grained token cannot reach org
+   repos at all (measured 2026-08-09). The boundary on this step is the enumerated verb, not
+   the credential — SECURITY.md carries the launcher-wrapper shape that would fix it.
+6. ~~`/Repos/` in the vault's `.gitignore`~~ — **done**, vault commit `ff0e7f81`.
+
 ## [App 1.0 (145)] - 2026-09-22
 
 **Workout humidity printed 100 times too high.** Two Apple Workout app sessions rendered

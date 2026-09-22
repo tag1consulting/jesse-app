@@ -2094,23 +2094,33 @@ impl SpawnedHarness for Codex {
         Box::new(Codex)
     }
 
-    /// The fourteen-server set, `MESSAGES_MCP_CONFIG`: every server Claude Code's main turn carries
-    /// EXCEPT the three named in [`CODEX_WITHHELD_MCP_SERVERS`] — `build` (0.86.0), `places`
-    /// (0.100.0) and `inbound` (0.115.0). Each server's entry is the same one Claude Code spawns,
-    /// spelled once and assembled into both sets, and the per-server tool lists come from the
-    /// same `DEFAULT_ALLOWED_TOOLS` (see [`codex_mcp_args`]); the agreement test in
+    /// The fifteen-server set, `MESSAGES_KUBERNETES_MCP_CONFIG`: every server Claude Code's main
+    /// turn carries EXCEPT the three named in [`CODEX_WITHHELD_MCP_SERVERS`] — `build` (0.86.0),
+    /// `places` (0.100.0) and `inbound` (0.115.0). Each server's entry is the same one Claude
+    /// Code spawns, spelled once and assembled into both sets, and the per-server tool lists come
+    /// from the same `DEFAULT_ALLOWED_TOOLS` (see [`codex_mcp_args`]); the agreement test in
     /// `claude_code.rs` fails the build if the two harnesses ever differ by anything but that
     /// named list.
     ///
-    /// **WHY THE THREE ARE STILL WITHHELD, AND IT IS NOT ABOUT THE SERVERS.** Giving Codex any of
-    /// them moves its row labels from `…+google-perseido` to a new string. Both operator
-    /// `[[accepted]]` blocks in `containment-codex.toml` — the `read` acceptance and the signed
-    /// `write` acceptance this deployment's `codex-write` model runs on — are keyed by those
-    /// labels, and `containment-probe --write` carries acceptances across BY LABEL, so a re-record
-    /// would leave every known-open at both levels unsigned. Nothing at boot or in CI would notice;
-    /// the record would simply stop vouching for the posture Codex runs at. Closing the gap is
-    /// therefore the owner re-signing those blocks against a fresh live battery, then emptying the
-    /// list and pointing [`CODEX_SHIPPED_ROWS`] at the full set — a decision, not a code change.
+    /// # 0.146.0 PAID THE LABEL COST RATHER THAN AVOIDING IT
+    ///
+    /// Giving Codex a server moves its row labels, and both operator `[[accepted]]` blocks in
+    /// `containment-codex.toml` — the `read` acceptance and the signed `write` acceptance this
+    /// deployment's `codex-write` model runs on — are keyed by those labels. That is the whole
+    /// reason `build`, `places` and `inbound` were each withheld: nothing at boot or in CI would
+    /// notice the orphaning, and the record would simply stop vouching for the posture Codex runs
+    /// at.
+    ///
+    /// `kubernetes` was nonetheless added to BOTH harnesses in 0.146.0, on the owner's decision of
+    /// 2026-09-22, because a cluster capability that exists on one harness only is a posture that
+    /// changes with model routing. The labels moved from `…+google-perseido` to
+    /// `…+google-perseido+kubernetes` and both blocks were orphaned, for the sixth time since
+    /// 0.66.0. **They must be re-signed against a fresh live Codex battery before a Codex-backed
+    /// turn is served**; see [`CODEX_SHIPPED_ROWS`].
+    ///
+    /// The three servers above stay withheld. This release pays the cost once, for one server;
+    /// emptying [`CODEX_WITHHELD_MCP_SERVERS`] is still a separate decision, and it is now cheaper
+    /// than it was — the signatures are already being re-taken.
     ///
     /// **WHAT A SHARED SERVER LIST DOES NOT MAKE SHARED.** Codex's `workspace-write` sandbox scopes
     /// WRITES only; it has no readable-roots equivalent, so a Codex child can read anything the
@@ -2118,7 +2128,7 @@ impl SpawnedHarness for Codex {
     /// `Read(./**)` allowlist. Same tools, different read boundary. The only remedy is unix-user
     /// isolation — a dedicated, sandboxed user for the child — which is not implemented.
     fn main_mcp_config(&self) -> &'static str {
-        MESSAGES_MCP_CONFIG
+        MESSAGES_KUBERNETES_MCP_CONFIG
     }
 
     /// Codex names nothing directly — see [`apply_patch_targets`].

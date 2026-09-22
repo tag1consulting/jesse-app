@@ -229,6 +229,7 @@ Default allowlist (`JESSE_ALLOWED_TOOLS` to override):
 | `WebFetch` | Read-only fetch of a web page. Added 2026-08-05, **reversing a standing deny** — see [Web access](#web-access-websearch-and-webfetch-2026-08-05) for the decision, the residual risk, and the available narrowing |
 | `mcp__slack__*` (six) | Read-only Slack read and search. See [Slack](#slack-read-only-2026-08-05) for the six granted and the nine withheld |
 | `mcp__browser__*` (nineteen) | Headless browser: navigate, read, and the interaction verbs. Added 2026-08-07, because `WebFetch` is refused outright on a large set of hosts. See [Browser](#browser-headless-2026-08-07) for the five withheld and why |
+| `mcp__kubernetes__*` (twenty) | **`cluster-admin` on the home k3s cluster.** All twenty tools the pinned server registers with `--toolsets core,config`: fourteen readers, and six writers of which the server annotates five `destructiveHint=true` — `resources_create_or_update`, `resources_delete`, `resources_scale`, `pods_delete` and `pods_exec`. `pods_exec` runs an arbitrary command inside any container; `resources_delete` deletes a namespace. Named individually, never `mcp__kubernetes__*`, because upstream ships roughly monthly and a wildcard would grant whatever the next release advertises. Full control by operator decision, 2026-09-21 — see [The cluster](#the-cluster-kubernetes-full-control-2026-09-22) for what would falsify that and how to narrow it |
 | `mcp__build__build_bridge`, `mcp__build__test_bridge` | **Compile and run the Rust bridge out of the review checkout.** This is the only grant in this table that EXECUTES CODE. Each tool takes an EMPTY argument object — the program, subcommand, flags, target directory and working directory are compile-time constants in `bridge/src/buildsvc.rs`, so nothing a turn says reaches a command line. That is the whole difference from the `Bash(cargo:*)` grant it replaces, and it is structural rather than a matter of degree. It does **not** make the capability safe: the child can edit that checkout and then have it compiled and run, which is arbitrary code execution by construction. What bounds it is the sandbox the build runs inside, not the shape of the tool. Named individually, never `mcp__build__*`. Added 2026-08-21 — see [The build capability](#the-build-capability-typed-tools-inside-a-sandbox-2026-08-21) |
 
 These four `node vault/<script>.js` entries are pinned to the **exact script
@@ -1586,6 +1587,144 @@ flags for BOTH Google instances live in the bridge's own const, where a test ass
   database through a grant held by the app, so no copy is needed and no FDA is involved. The
   copy route would also have read stale (the newest message lives in the WAL).
 
+## The cluster (`kubernetes`, FULL control, 2026-09-22)
+
+Bridge 0.146.0 adds an eighteenth MCP server to every Claude Code main turn and a fifteenth
+to every Codex one: `containers/kubernetes-mcp-server` v0.0.67, against the home k3s cluster.
+It is the first server since 0.73.0 to land on both harnesses in the same release, and what
+it grants is `cluster-admin`.
+
+### What it can do
+
+| | |
+|---|---|
+| Server | `containers/kubernetes-mcp-server` v0.0.67 (Go, single binary, talks to the API server directly rather than shelling out to `kubectl`) |
+| Transport | `stdio`, bare command `jesse-k8s-mcp`, argv `--toolsets core,config` |
+| Cluster | `ks1.pozza`, one node, k3s v1.36.4+k3s1, API `https://ks1.pozza:6443` |
+| Identity | ServiceAccount `jesse` in namespace `jesse`, bound to `cluster-admin` by ClusterRoleBinding `jesse-cluster-admin`, long-lived token in Secret `jesse-token` |
+| Credential | a kubeconfig at `~/.kube/ks-jesse.yaml`, mode `600`, supplied by the launcher through `KUBECONFIG` |
+| Posture | **FULL CONTROL** — 20 of 20 registered tools granted |
+| Enforced by | nothing — intended |
+
+Fourteen of the twenty read. Six write, and five of those the server itself annotates
+`destructiveHint=true`:
+
+| Tool | What it does |
+|---|---|
+| `resources_create_or_update` | create or replace **any** object of **any** kind in **any** namespace |
+| `resources_delete` | delete any object, up to and including a namespace |
+| `resources_scale` | scale any workload, including to zero |
+| `pods_delete` | delete a pod |
+| `pods_exec` | **run an arbitrary command inside any container on the cluster** |
+| `pods_run` | create a pod from an image |
+
+`pods_exec` is the sharpest edge and deserves naming next to its sibling one section up:
+together with `proxmox_execute_vm_command`, a single turn can execute code inside any guest on
+the hypervisor **and** any pod on the cluster. Both are reachable from a phone-injectable turn
+that also reads attacker-authored WhatsApp and iMessage message bodies.
+
+### Why it ships at full control
+
+The operator's explicit decision, 2026-09-21, on the same footing as the full-control UniFi and
+Proxmox decision of 2026-08-09 and the Home Assistant one of 0.67.0. The reasoning is not "the
+narrower setting was inconvenient":
+
+- **The changes that matter are not made with these tools.** The cluster is GitOps — Flux
+  reconciles `main` of a private repository into it. A real change is a commit, reviewed and
+  merged by a human, and the route for that is the managed-repo path below, not
+  `resources_create_or_update`. These tools exist for *seeing* what the cluster is doing and
+  for *debugging* when it is doing the wrong thing, which is exactly the work that needs write.
+- **A read-only cluster tool answers the easy half of every question.** "Why is this pod
+  crash-looping" is answerable read-only; "does it stop if I bump the memory limit" is not.
+- **The credential is already `cluster-admin`.** Narrowing the tool surface while leaving the
+  token unchanged would be a boundary made of the allowlist alone — the single-layer posture
+  this document criticises for GitHub. If this is ever narrowed for real, narrow the RBAC.
+
+### What would falsify this decision
+
+Stated so it is checkable rather than a matter of taste. Any one of these should reopen it:
+
+- **A second person or a second workload depends on the cluster.** The risk accepted here is
+  bounded by the cluster being one person's home infrastructure with no other tenant. It stops
+  being bounded the day something else runs on it.
+- **A turn makes an imperative change that outlives its reason.** Everything these tools do is
+  invisible to Flux and will be reverted or fought by the next reconcile. If the record shows
+  turns routinely writing objects rather than proposing commits, the tools are being used as
+  the change path and the decision was wrong.
+- **The cluster gains a credential worth stealing.** It holds none today. A Secret carrying a
+  real third-party token turns `resources_get` into a credential read, and the read half of
+  this grant becomes as consequential as the write half.
+- **The dedicated sandboxed unix user stops being the pending mitigation and becomes a refused
+  one.** The composed prompt-injection risk below is accepted *on the understanding that it is
+  still the thing to fix*.
+
+### How to narrow it
+
+Two switches exist on the server, in increasing severity, and both are stronger than editing
+the allowlist because they stop the tools being *registered* rather than merely ungranted:
+
+- `--disable-destructive` — drops the five `destructiveHint=true` tools, keeping `pods_run`
+  and the fourteen readers.
+- `--read-only` — registers only the fourteen `readOnlyHint=true` tools.
+
+Either goes in `mcp_kubernetes!` in `bridge/src/harness/claude_code.rs`, **not** in the
+launcher: a launcher is invisible to the containment record, which is why `--toolsets` is
+spelled in the const even though it is the server's default. Adding a flag moves the row label
+and costs a live battery run on both harnesses. The strongest narrowing is not a flag at all —
+bind the `jesse` ServiceAccount to a narrower ClusterRole than `cluster-admin`.
+
+### The composed risk, stated plainly
+
+A main turn now reads work mail, personal mail, calendar, Drive, private source, WhatsApp and
+iMessage, **and** holds full write control of the network, the hypervisor and a Kubernetes
+cluster, **and** runs a web browser, as Jeremy's own user. A crafted message body is untrusted
+input in the same context that can `pods_exec` into any container. That is a
+prompt-injection-to-cluster path. It is accepted, not mitigated. The mitigation that would
+close it is the dedicated sandboxed unix user, still not implemented.
+
+Two things this server does **not** add, named because the obvious guess is wrong:
+
+- **No new secret in the plist.** The kubeconfig is a mode-`600` file, like the Perseido client
+  secret, and the launcher points at it. No token, endpoint or CA appears in this repository.
+- **No cluster address in any const.** `homeassistant` and `roon` are `http` and had to bake an
+  address into a const, because the record compares argv by strict equality. This one is
+  `stdio`, so the endpoint lives entirely in the kubeconfig and the record stays
+  machine-independent.
+
+#### Deployment
+
+`jesse-k8s-mcp` must be on the bridge's `PATH` (the launchers directory, alongside
+`whatsapp-mcp`, `mcp-proxmox` and the rest). **It is host setup, not repo content, and it is
+the one `jesse-*` command a deploy does not install** — `sentinel::deploy`'s manifest test
+names it explicitly as a host launcher so that a future `jesse-*` server is still caught if
+somebody forgets to build it.
+
+The launcher must:
+
+- `exec` the real binary, **never** be a symlink to it. The Proxmox rule: a symlinked entry
+  point resolves a server's own directory to the link's directory, which silently dropped every
+  `PROXMOX_*` value and left that server hanging at `initialize` with empty stderr. This server
+  reads nothing relative to itself today; the rule costs nothing and rediscovering the
+  exception costs a battery row.
+- pin the version in the path it `exec`s. An upgrade is then a deliberate edit plus a re-probe
+  of the server's `tools/list` against `DEFAULT_ALLOWED_TOOLS`.
+- set `KUBECONFIG` to the kubeconfig path and nothing else. The server also takes
+  `--kubeconfig`, which is deliberately not used: a path in argv would enter the containment
+  record and pin the posture to one home directory.
+
+Verify it the way every stdio server here should be verified — **handshake it from a bare
+environment before trusting it**, because a server that starts and registers zero tools looks
+identical to one that is working:
+
+```sh
+env -i PATH="$(launchctl getenv PATH)" HOME="$HOME" jesse-k8s-mcp --toolsets core,config
+# → initialize, then tools/list must return twenty tools
+```
+
+If the launcher is absent the server simply fails to start, the twenty tools are missing from
+every turn, and nothing else degrades — but the containment record will then describe a row
+that loaded nothing, which is worth less than no row at all.
+
 ## Diet child tool isolation (in-process boundary)
 
 The diet-logging pipeline (see the bridge README) spawns two **stateless,
@@ -2068,8 +2207,8 @@ re-recorded.**
 
 | Row | Probe | What is open |
 | --- | --- | --- |
-| `write/qmd+slack+browser+homeassistant+roon+google+github+fastmail+unifi+routeros+proxmox+whatsapp+imcp+google-perseido+build+places+inbound` | `network_outbound` | `Bash(git:*)` with unrestricted arguments reaches the network (`git ls-remote <url>` was observed arriving at the probe listener). `WebFetch` is denied and `WebSearch` is not granted, so this is the one live route |
-| `write/qmd+slack+browser+homeassistant+roon+google+github+fastmail+unifi+routeros+proxmox+whatsapp+imcp+google-perseido+build+places+inbound` | `background_process` | The same unrestricted `git` scope can leave a process running past the end of the turn |
+| `write/qmd+slack+browser+homeassistant+roon+google+github+fastmail+unifi+routeros+proxmox+whatsapp+imcp+google-perseido+build+places+inbound+kubernetes` | `network_outbound` | `Bash(git:*)` with unrestricted arguments reaches the network (`git ls-remote <url>` was observed arriving at the probe listener). `WebFetch` is denied and `WebSearch` is not granted, so this is the one live route |
+| `write/qmd+slack+browser+homeassistant+roon+google+github+fastmail+unifi+routeros+proxmox+whatsapp+imcp+google-perseido+build+places+inbound+kubernetes` | `background_process` | The same unrestricted `git` scope can leave a process running past the end of the turn |
 
 **Those two are the only `known_open` rows in the record.** `read_escape_parent` was in this
 table until 0.125.0 and is not any more, because the record reads `denied` for it. That is a
@@ -2326,6 +2465,141 @@ for it.
   deliberately not built: it would risk breaking private-read access for marginal
   gain on a single-user, trusted-network bridge. This is called out so the residual
   risk is explicit.
+- **`Code/` IS STILL REVIEW-ONLY AFTER 0.146.0**, and it is the only root of which that
+  is now true. A second root, `Repos/`, carries a write path for one registered
+  repository — see [Managed repositories](#managed-repositories-the-one-write-path-outside-the-vault).
+  The two notes are separate consts appended in order, and a test pins
+  `prompt::REVIEW_CAPABILITY` byte for byte so this paragraph cannot be loosened by an edit
+  made next door.
+
+## Managed repositories (the one write path outside the vault)
+
+`Code/` above is review-only and is unchanged by this. Bridge 0.146.0 adds a **second** root,
+`Repos/<host>/<owner>/<repo>`, derived from the clone URL by exactly the same pure function and
+gitignored in the vault on exactly the same terms, in which the agent may **edit, commit, push
+a branch and open a pull request**.
+
+It exists because review-only was the wrong posture for one specific repository. The k3s
+cluster's configuration lives in a private git repo that Flux reconciles into the cluster; it
+is a thing the agent is *meant* to change, and the honest way for it to do that is a pull
+request a human merges — not `resources_create_or_update` against the live cluster, and not a
+push to `main`.
+
+**One repository is registered**, in `prompt::MANAGED_REPOS`:
+
+| Repo | What it is |
+|---|---|
+| `github.com/jeremyandrews/k3s` | the k3s cluster's configuration. Flux reconciles its `main` into `ks1.pozza`, Kustomization `infrastructure` over `./infrastructure`, prune on |
+
+The registry is a **const, not a directory scan**. A checkout that appears under `Repos/` by
+any other route does not inherit the grant.
+
+### What the agent is told it may do
+
+`prompt::MANAGED_REPO_CAPABILITY`, appended to every turn immediately after
+`prompt::REVIEW_CAPABILITY`: in a registered repo it may edit files, `git commit`, `git push` a
+branch whose name starts with **`jesse/`**, and open a pull request against `main` with
+`gh pr create`. It must **never push to `main`, never merge, never force push, never rewrite
+history**.
+
+### THE PROHIBITIONS ARE INSTRUCTION. THE BOUNDARY IS GITHUB.
+
+This is the same honest caveat the review-only section carries, and it matters more here
+because the agent is now being *told* to push. `Bash(git:*)` permits a push to any ref, so
+nothing in this process stops a push to `main`. What actually holds the line is configured by
+hand on GitHub and is listed under "What Jeremy configures by hand" below: branch protection on
+`main` requiring a pull request and refusing direct and force pushes. Treat the note in the
+prompt as a rule the agent follows and the ruleset as the barrier it cannot cross — and note
+that a barrier nobody has verified is a belief, so the acceptance test for this feature is a
+push to `main` that GitHub *rejects*, not a push the agent declines to make.
+
+### No new tool grant was added, and that is deliberate
+
+Everything this path needs was already granted: `Bash(git:*)` since the review checkouts
+landed, and `Bash(gh pr create:*)` since 0.82.0 — a token-bounded verb whose free tail carries
+only flags. `config::the_bash_surface_is_exactly_this_and_the_write_path_added_nothing` pins
+the whole `Bash` surface so that this feature's diff to the allowlist is provably empty, and
+asserts that no merge, close, edit, review, delete, publish or `workflow run` verb is granted.
+`gh pr merge` in particular is refused: merging is the human gate this whole design rests on.
+
+The `github` MCP server was **not** widened and no second, write-capable GitHub server was
+added. That server runs with `--read-only` and stays read-only; the one authoring verb comes
+from `gh`, as it already did.
+
+### Credentials: the deploy key works, the scoped `gh` token does not
+
+The push half and the pull-request half are authenticated differently, and only one of them can
+be scoped to this repository. That asymmetry is a limitation of the deployment rather than a
+choice, and it is written down rather than papered over.
+
+| Step | Credential | Scope |
+|---|---|---|
+| `git push` | **deploy key**, write access to `jeremyandrews/k3s` only | one repository |
+| `gh pr create` | **`gh`'s existing keyring credential** (`gho_…`, scopes `gist`, `read:org`, `repo`, `workflow`) | every repository that account can reach |
+
+**The deploy key is the part that works, and it is the important part.** The clone step sets
+`core.sshCommand` **for that repository** so git uses that key and nothing else. That is what
+keeps the write path from reaching any other repository the host's ambient SSH key can push to
+— the path `Repos/` is a convention, the key is the boundary. Registering a second repository
+means a second key.
+
+**A repo-scoped fine-grained token for `gh pr create` is NOT expressible here, and setting one
+would break existing jobs.** `gh` takes its credential from `GH_TOKEN`/`GITHUB_TOKEN` if set,
+otherwise from its keyring entry — one credential per host, with no per-repository selection.
+The bridge gives every child ONE shared environment, so a `GH_TOKEN` in the LaunchAgent plist
+applies to *every* `gh` invocation, including the read-only `gh pr list` / `gh run view` /
+`gh pr checks` calls the overnight `tag1-status` job makes against `tag1consulting/jesse-app`.
+A fine-grained token limited to `jeremyandrews/k3s` would 404 on all of those — measured
+2026-08-09, and the same finding that forced the `github` server onto a classic PAT.
+
+This is the same shape of problem the second Google account had, and it has the same shape of
+answer if it is ever worth solving: a **launcher wrapper** that exports the scoped token and
+`exec`s `gh`, granted as its own `Bash(<wrapper>:*)` verb, so the narrow credential is selected
+by the command rather than by the environment. That is a new host launcher and a new allowlist
+entry, which is a posture change costing a battery run. It is deliberately **not** done here.
+
+**So the boundary on the pull-request step is the enumerated verb, not the credential**, which
+is exactly what SECURITY.md already says about every `gh` grant: `gh` authenticates from its own
+stored credential and nothing under it is read-only by construction. `gh pr create` cannot
+merge, cannot close, cannot push and cannot approve, because those verbs are not granted — and
+`config::the_bash_surface_is_exactly_this_and_the_write_path_added_nothing` fails the build if
+one appears. What the credential *could* do if that enumeration failed is: anything the account
+can do. Single layer, stated plainly.
+
+Neither the deploy key nor any token is in this repository, and neither is in a const.
+
+### What Jeremy configures by hand
+
+None of this is repo content and none of it is done by the bridge. The feature is not safe
+until all of it exists:
+
+1. **Branch protection (or a ruleset) on `jeremyandrews/k3s`, branch `main`:** require a pull
+   request before merging; block direct pushes; block force pushes; block deletions. Apply it
+   to administrators too, or the barrier does not cover the account the deploy key acts as.
+2. **A deploy key on that repository with write access**, private key on the host at mode
+   `600`, its path exported in the bridge's LaunchAgent environment.
+3. **NOT a fine-grained token.** `gh pr create` runs on `gh`'s existing keyring credential;
+   a repo-scoped `GH_TOKEN` in the plist would break every existing `gh` call against
+   `tag1consulting` — see the credentials section above for why, and for the launcher-wrapper
+   shape that would fix it if it is ever worth a battery run.
+4. ~~**`/Repos/` added to the vault's `.gitignore`.**~~ **DONE 2026-09-22** (vault commit
+   `ff0e7f81`), beside the existing `/Code/`. Without it the vault autocommit sweeps a
+   cluster checkout into the vault repo.
+5. ~~**The kubeconfig at `~/.kube/ks-jesse.yaml`, mode `600`.**~~ **DONE** — in place and
+   handshaked 2026-09-22; the server returned `ks1.pozza` `Ready`, k3s v1.36.4+k3s1.
+6. ~~**The `jesse-k8s-mcp` launcher on the bridge's `PATH`.**~~ **DONE** — installed and
+   handshaked from a bare `env -i` on 2026-09-22; twenty tools registered.
+
+### Residual risk, named
+
+- **A pull request is an injection channel into a human's attention.** The agent reads
+  attacker-authored message bodies and can now open a PR whose title and body it wrote. The
+  reviewer is the boundary, and a reviewer who skims is not one.
+- **A merged PR is a cluster change, immediately.** Flux has prune on, so a commit that removes
+  a resource removes it from the cluster. There is no staging step between merge and apply.
+- **The write path is bounded by the deploy key, not by the path.** `Repos/` is a convention;
+  what actually stops the agent pushing to some other repository is that the key it holds for
+  this one does not work anywhere else. Registering a second repository means a second key.
 
 ## Deployment: run isolated and least-privilege
 

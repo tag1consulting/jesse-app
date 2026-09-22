@@ -2483,6 +2483,15 @@ shipped child config is in the manifest, an error line per unresolvable server a
 bridge startup, and the `restart` phase's `mcp_servers_unresolved` gate, which
 rolls the deploy back.
 
+**One `jesse-*` command is deliberately NOT in the manifest**, since 0.146.0:
+`jesse-k8s-mcp` is a host launcher that pins a third-party binary's version and supplies
+its `KUBECONFIG`, on the same terms as `whatsapp-mcp` and `workspace-mcp-perseido`. It
+carries the prefix because it is this deployment's wrapper, not because it is this
+crate's target. The manifest test names it by hand in a `HOST_LAUNCHERS` list rather
+than weakening its rule — skipping any command with no matching `src/bin/*.rs` would
+restore exactly the `jesse-places-mcp` failure above — so a new `jesse-*` server still
+fails the test until somebody states which of the two it is.
+
 **The version check is the point.** "It answered `/health`" is not "the new
 binary is running" — a symlink swap that silently did nothing looks identical at
 a heartbeat, and without this a deploy that changed nothing would report

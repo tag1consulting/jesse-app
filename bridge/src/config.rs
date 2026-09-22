@@ -796,6 +796,42 @@ pub const DEFAULT_MAX_ATTACHMENTS_TOTAL_BYTES: usize = 20 * 1024 * 1024;
 // — a confident wrong answer from attacker-editable data is the failure mode worth avoiding.
 // The second source's records are third-party business content rather than wiki text, which
 // is a different provenance but not a more trusted one.
+//
+// KUBERNETES: ALL TWENTY OF TWENTY, AND THAT IS THE DECISION RATHER THAN A DEFAULT.
+//
+// `containers/kubernetes-mcp-server` v0.0.67 with `--toolsets core,config` registers exactly
+// twenty tools, and every one is granted. Fourteen read (`*_list`, `*_get`, `*_log`, `*_top`,
+// `configuration_view`, `events_list`, `nodes_stats_summary`, `projects_list`); six do not,
+// and five of those the server itself annotates `destructiveHint=true`:
+// `resources_create_or_update`, `resources_scale`, `resources_delete`, `pods_delete` and
+// `pods_exec`, with `pods_run` the sixth writer. The list was taken from a live
+// `tools/list` against the pinned binary on 2026-09-22, not from its README — the same rule
+// every other server here follows, because a server that registers something the record did
+// not expect is exactly what a battery row is for.
+//
+// THE SERVER OFFERS TWO NARROWING SWITCHES AND NEITHER IS USED. `--read-only` would register
+// only the fourteen readers, so the six writers would be absent at the root rather than
+// merely ungranted — a strictly stronger boundary than this list, of the kind `--read-only`
+// gives both Google instances. `--disable-destructive` would drop the five annotated ones.
+// Full control was chosen instead, by the operator on 2026-09-21, on the same reasoning that
+// made UniFi and Proxmox full control in 0.69.0: the credential is a `cluster-admin`
+// ServiceAccount token because debugging a cluster requires writing to it, and the
+// declarative changes that matter arrive as reviewable commits through the managed-repo path
+// rather than through these tools at all.
+//
+// WHAT THAT COSTS, NAMED RATHER THAN BURIED. `pods_exec` is arbitrary command execution
+// inside any container on the cluster, and it is the sibling of
+// `proxmox_execute_vm_command` one list above — between them a single turn can execute code
+// in any guest on the hypervisor AND any pod on the cluster. `resources_delete` will delete a
+// namespace. Both are reachable from a phone-injectable turn that also reads
+// attacker-authored WhatsApp and iMessage bodies. The mitigation that would close that is the
+// dedicated sandboxed unix user, which is still not implemented; see SECURITY.md.
+//
+// NAMED INDIVIDUALLY, NEVER AS `mcp__kubernetes__*`, for the reason the build tools are: a
+// wildcard grants whatever the server advertises next, and upstream ships roughly monthly.
+// A new tool in a future version must be a decision, and moving this list moves
+// `toolset_args`, which costs a live battery re-run — which is the correct price for
+// widening what a turn can do to a cluster.
 pub const DEFAULT_ALLOWED_TOOLS: &str = "\
 Read(//${WORKSPACE}/**),Edit(//${WORKSPACE}/**),\
 Grep(//${WORKSPACE}/**),Glob(//${WORKSPACE}/**),\
@@ -926,7 +962,17 @@ mcp__google-perseido__check_drive_file_public_access,\
 mcp__google-perseido__get_drive_shareable_link,\
 mcp__build__build_bridge,mcp__build__test_bridge,\
 mcp__places__places_search,mcp__places__place_details,\
-mcp__inbound__list_attachments,mcp__inbound__fetch_attachment";
+mcp__inbound__list_attachments,mcp__inbound__fetch_attachment,\
+mcp__kubernetes__configuration_view,mcp__kubernetes__namespaces_list,\
+mcp__kubernetes__events_list,mcp__kubernetes__projects_list,\
+mcp__kubernetes__nodes_log,mcp__kubernetes__nodes_top,\
+mcp__kubernetes__nodes_stats_summary,\
+mcp__kubernetes__pods_list,mcp__kubernetes__pods_list_in_namespace,\
+mcp__kubernetes__pods_get,mcp__kubernetes__pods_log,mcp__kubernetes__pods_top,\
+mcp__kubernetes__pods_run,mcp__kubernetes__pods_exec,mcp__kubernetes__pods_delete,\
+mcp__kubernetes__resources_list,mcp__kubernetes__resources_get,\
+mcp__kubernetes__resources_create_or_update,mcp__kubernetes__resources_scale,\
+mcp__kubernetes__resources_delete";
 
 // Defense-in-depth: tools that must never run from the bridge even if they slip
 // into the allowlist. Override with JESSE_DISALLOWED_TOOLS.
@@ -4688,6 +4734,190 @@ mod tests {
     fn the_vault_links_grant_is_recorded_not_left_to_vault_settings() {
         assert!(DEFAULT_ALLOWED_TOOLS.contains("Bash(bin/vault-links:*)"));
         assert!(DEFAULT_ALLOWED_TOOLS.contains("Bash(./bin/vault-links:*)"));
+    }
+
+    /// THE KUBERNETES GRANT IS EXACTLY THE TWENTY TOOLS THE PINNED SERVER REGISTERS.
+    ///
+    /// Taken from a live `tools/list` against `kubernetes-mcp-server` v0.0.67 run with the
+    /// argv `MAIN_CHILD_MCP_CONFIG` declares (`--toolsets core,config`) on 2026-09-22, not
+    /// from its README. Two directions both matter and the equality checks both:
+    ///
+    ///   * A tool MISSING here is a capability the operator decided to grant and did not.
+    ///   * A tool EXTRA here is a grant for a name the server does not register, which is
+    ///     the shape of a typo that looks granted and silently is not — and, after an
+    ///     upstream bump, the shape of a grant nobody decided on.
+    ///
+    /// Pinned as a literal list rather than a count so a failure names WHICH tool moved.
+    #[test]
+    fn the_kubernetes_grant_is_the_servers_twenty_tools_and_nothing_else() {
+        let mut granted: Vec<&str> = DEFAULT_ALLOWED_TOOLS
+            .split(',')
+            .filter(|e| e.starts_with("mcp__kubernetes__"))
+            .collect();
+        let mut expected = vec![
+            // Read: fourteen, every one `readOnlyHint=true`.
+            "mcp__kubernetes__configuration_view",
+            "mcp__kubernetes__namespaces_list",
+            "mcp__kubernetes__events_list",
+            "mcp__kubernetes__projects_list",
+            "mcp__kubernetes__nodes_log",
+            "mcp__kubernetes__nodes_top",
+            "mcp__kubernetes__nodes_stats_summary",
+            "mcp__kubernetes__pods_list",
+            "mcp__kubernetes__pods_list_in_namespace",
+            "mcp__kubernetes__pods_get",
+            "mcp__kubernetes__pods_log",
+            "mcp__kubernetes__pods_top",
+            "mcp__kubernetes__resources_list",
+            "mcp__kubernetes__resources_get",
+            // Write: six, of which the server annotates five `destructiveHint=true`.
+            "mcp__kubernetes__pods_run",
+            "mcp__kubernetes__pods_exec",
+            "mcp__kubernetes__pods_delete",
+            "mcp__kubernetes__resources_create_or_update",
+            "mcp__kubernetes__resources_scale",
+            "mcp__kubernetes__resources_delete",
+        ];
+        granted.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(
+            granted, expected,
+            "the kubernetes grant moved — re-probe the pinned server's tools/list and record \
+             the decision before changing this list; it moves `toolset_args`, which costs a \
+             live battery run"
+        );
+
+        // NO WILDCARD. A `mcp__kubernetes__*` entry would grant whatever a future release
+        // advertises, on a server whose tools delete namespaces.
+        assert!(
+            !DEFAULT_ALLOWED_TOOLS.contains("mcp__kubernetes__*"),
+            "a wildcard grant on the cluster server is never acceptable"
+        );
+
+        // THE FIVE DESTRUCTIVE ONES ARE GRANTED ON PURPOSE, asserted by name so that removing
+        // one is a deliberate narrowing recorded here rather than an edit that quietly changes
+        // what the operator signed for. If this ever SHOULD be narrowed, the server's
+        // `--disable-destructive` flag is the stronger tool — it deregisters them.
+        for destructive in [
+            "mcp__kubernetes__pods_delete",
+            "mcp__kubernetes__pods_exec",
+            "mcp__kubernetes__resources_create_or_update",
+            "mcp__kubernetes__resources_scale",
+            "mcp__kubernetes__resources_delete",
+        ] {
+            assert!(
+                granted.contains(&destructive),
+                "{destructive} is part of the full-control decision of 2026-09-21"
+            );
+        }
+    }
+
+    /// THE `Bash` SURFACE IS PINNED WHOLE, so the cluster-repo write path cannot widen it.
+    ///
+    /// 0.146.0 gave the agent a push-and-open-a-PR path on one repository. Everything that
+    /// path needs was ALREADY granted — `Bash(git:*)` since the review-only checkouts landed,
+    /// and `Bash(gh pr create:*)` since 0.82.0 — so the correct diff to this const for that
+    /// feature is EMPTY, and this test is what says so in a way a future change has to argue
+    /// with.
+    ///
+    /// # Why the whole list rather than "nothing but git and gh pr create"
+    ///
+    /// Stated that way the assertion would be false the day it was written: the allowlist has
+    /// carried `mv`, `date`, `cal`, four `node vault/*.js` scripts, five skill scripts,
+    /// `shasum`, ten read-only `gh` subcommands and one scoped `gh api` path for many
+    /// versions, each for a reason recorded above. A test asserting an aspiration instead of
+    /// reality is red from birth and gets deleted, which is the failure mode this file's
+    /// battery documentation names explicitly.
+    ///
+    /// So the property actually enforced is the one that matters: the set is EXACTLY this,
+    /// and growing it by any entry — for a cluster repo or anything else — is a deliberate,
+    /// test-breaking act. The two entries the managed-repo path rides on are asserted by name
+    /// inside it, so removing either fails here rather than silently leaving the agent unable
+    /// to push a branch it was told to push.
+    #[test]
+    fn the_bash_surface_is_exactly_this_and_the_write_path_added_nothing() {
+        let mut bash: Vec<&str> = DEFAULT_ALLOWED_TOOLS
+            .split(',')
+            .filter(|e| e.starts_with("Bash("))
+            .collect();
+        let expected = vec![
+            "Bash(git:*)",
+            "Bash(mv:*)",
+            "Bash(date:*)",
+            "Bash(cal:*)",
+            "Bash(node vault/generate-diet-today.js:*)",
+            "Bash(node vault/validate-diet-today.js:*)",
+            "Bash(node vault/verify-diet-consistency.js:*)",
+            "Bash(node vault/rotate-currency-summary.js:*)",
+            "Bash(./.claude/skills/archive-processing/find-checked-archive-boxes.sh:*)",
+            "Bash(bin/vault-links:*)",
+            "Bash(./bin/vault-links:*)",
+            "Bash(./.claude/skills/draft-lint/lint-draft.sh:*)",
+            "Bash(./.claude/skills/diet-query/run-week-query.sh:*)",
+            "Bash(./.claude/skills/currency-stats/currency-stats.py:*)",
+            "Bash(./.claude/skills/gh-review/create-pending-review.sh:*)",
+            "Bash(shasum:*)",
+            "Bash(gh pr list:*)",
+            "Bash(gh pr view:*)",
+            "Bash(gh pr checks:*)",
+            "Bash(gh issue list:*)",
+            "Bash(gh issue view:*)",
+            "Bash(gh run list:*)",
+            "Bash(gh run view:*)",
+            "Bash(gh release list:*)",
+            "Bash(gh release view:*)",
+            "Bash(gh repo view:*)",
+            "Bash(gh issue create:*)",
+            "Bash(gh pr create:*)",
+            "Bash(gh api repos/tag1consulting/jesse-app/pulls:*)",
+        ];
+        let mut sorted_expected = expected.clone();
+        sorted_expected.sort_unstable();
+        bash.sort_unstable();
+        assert_eq!(
+            bash, sorted_expected,
+            "the Bash surface moved. Adding a verb is a posture change — it costs a battery \
+             run and a SECURITY.md entry, not an edit"
+        );
+
+        // THE TWO THE MANAGED-REPO PATH RIDES ON, by name. Neither was added for it; both
+        // must survive, or the agent is told to push a branch it has no verb to push.
+        assert!(expected.contains(&"Bash(git:*)"));
+        assert!(expected.contains(&"Bash(gh pr create:*)"));
+
+        // A BLANKET `gh api` IS STILL REFUSED. `--method` turns it into a general write
+        // client for the whole API, which would make the `gh` boundary meaningless — the one
+        // granted `gh api` entry is scoped to a single repository's pulls endpoint.
+        assert!(
+            !DEFAULT_ALLOWED_TOOLS.contains("Bash(gh api:*)"),
+            "a blanket `gh api` grant is a general write client: {DEFAULT_ALLOWED_TOOLS}"
+        );
+        // …and no merge, close, delete or edit verb on any `gh` object. `gh pr merge` is the
+        // sharpest of these: the whole point of the managed-repo path is that merging stays
+        // with a human, and a grant here would route straight around that.
+        for forbidden in [
+            "Bash(gh pr merge",
+            "Bash(gh pr close",
+            "Bash(gh pr edit",
+            "Bash(gh pr review",
+            "Bash(gh issue close",
+            "Bash(gh issue edit",
+            "Bash(gh repo delete",
+            "Bash(gh release create",
+            "Bash(gh workflow run",
+        ] {
+            assert!(
+                !DEFAULT_ALLOWED_TOOLS.contains(forbidden),
+                "`{forbidden}…` must never be granted: merging and publishing stay with the \
+                 owner"
+            );
+        }
+        // BARE `Bash` IS NOT A GRANT. Every entry is scoped; an unscoped one would make the
+        // whole enumeration above decorative.
+        assert!(
+            !DEFAULT_ALLOWED_TOOLS.split(',').any(|e| e == "Bash"),
+            "an unscoped Bash grant makes every scope above meaningless"
+        );
     }
 
     /// A shipped const must never name one operator's home directory: the containment
