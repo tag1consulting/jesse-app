@@ -1,5 +1,6 @@
 import Foundation
 import JesseCore
+import JesseVault
 
 // Pure, SwiftUI-free search matching for the thread list. Kept Foundation-only so
 // the predicates are unit-testable without a view host, mirroring ThreadSectioning.
@@ -20,8 +21,14 @@ import JesseCore
 
 /// Tokens (length >= 2) of a trimmed query, lowercased for length checks only —
 /// matching itself stays diacritic/case-insensitive via `localizedStandardContains`.
+///
+/// ONE LINE, and it forwards, because the vault search now tokenizes queries too and two
+/// tokenizers would mean one query meaning two things. The implementation moved to
+/// `SearchQueryRules.significantTokens` in JesseVault — a target that depends on nothing,
+/// which is the only kind of target all three searches can share a rule from. Behaviour
+/// is unchanged; this remains the name every existing caller uses.
 public func significantTokens(_ trimmed: String) -> [Substring] {
-    trimmed.split(whereSeparator: \.isWhitespace).filter { $0.count >= 2 }
+    SearchQueryRules.significantTokens(trimmed)
 }
 
 /// Whether `thread` matches the search `query`, over its title and turn bodies.

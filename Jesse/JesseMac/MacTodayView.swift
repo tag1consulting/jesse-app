@@ -3,6 +3,7 @@ import SwiftData
 import JesseCore
 import JesseNetworking
 import JesseTodayDisplay
+import JesseVault
 
 // The Mac's Today tab: the SAME day-file screen the iPhone shows, rendered from the
 // shared `TodayListView` (JesseTodayDisplay) with Mac chrome around it. The division is
@@ -58,6 +59,14 @@ struct MacTodayView: View {
     /// The outstanding Process-updates batch, if any.
     @State private var processRun = MacTodayProcessRun()
 
+    /// Whether the local copy of `Today.md` is open as a plain note.
+    @State private var openedDayFile = false
+
+    /// Whether this Mac holds the vault folder. Read per body for the reason the iPhone's
+    /// equivalent is: `VaultFolder` caches nothing, and the folder can be picked in Settings
+    /// while this screen is up.
+    static var hasVaultFolder: Bool { VaultFolder().resolve().isReady }
+
     /// Per-device view state for this screen. The badge filter is remembered on this
     /// Mac and never sent to the bridge, exactly as the iPhone remembers its own:
     /// which view of the day a device is showing is a fact about the device.
@@ -91,9 +100,12 @@ struct MacTodayView: View {
         _model = State(initialValue: TodayDashboardModel(makeClient: {
             JesseBridgeClient(config: configStore.config, snapshotCache: SnapshotCache.shared)
         }, cache: SnapshotCache.shared))
+        // `localNotes` is the offline half, the same one the iPhone passes: with the bridge
+        // unreachable the item's own wiki link is resolved against the Obsidian copy of the
+        // vault on THIS Mac and the note is read from there.
         _detailModel = State(initialValue: TodayDetailModel(makeClient: {
             JesseBridgeClient(config: configStore.config)
-        }))
+        }, localNotes: VaultLocalNoteProvider()))
     }
 
     var body: some View {
@@ -109,7 +121,8 @@ struct MacTodayView: View {
                           onOpenDetail: { openedItem = $0 },
                           onDiscuss: { discuss(.discuss(item: $0)) },
                           onPropagate: { execute(.propagate(item: $0, evidence: $1)) },
-                          onProcessUpdates: processUpdates)
+                          onProcessUpdates: processUpdates,
+                          onOpenLocalDayFile: Self.hasVaultFolder ? { openedDayFile = true } : nil)
                 // DECLARATION ORDER IS LEFT-TO-RIGHT, ordered by clicks per day: Settings
                 // is opened least often, Refresh far more, so Refresh sits to its right.
                 // These two are the shell's half of this screen's toolbar and always
@@ -134,10 +147,20 @@ struct MacTodayView: View {
                     }
                 }
                 .navigationDestination(item: $openedItem) { item in
-                    TodayDetailView(model: detailModel, item: item, onOpenLink: openLink,
+                    TodayDetailView(model: detailModel, item: item,
+                                    isReadOnly: model.isReadOnly,
+                                    onOpenLink: openLink,
                                     onCloseAsStale: closeAsStale)
                         .navigationTitle("Item")
                 }
+        }
+        .sheet(isPresented: $openedDayFile) {
+            // Its own stack inside the sheet, so a wiki link inside the day file pushes
+            // rather than replacing what is on screen. The Done button is the stack's own,
+            // for the reason written where it is declared: a second `NavigationStack` around
+            // it just to hang a toolbar is how a toolbar stops rendering.
+            VaultNoteStack(path: "Today.md") { openedDayFile = false }
+                .frame(width: 620, height: 640)
         }
         .sheet(item: $openedThread, onDismiss: dropUnsentContext) { thread in
             MacTodayConversationSheet(thread: thread) { openedThread = nil }

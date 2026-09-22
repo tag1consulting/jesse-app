@@ -4,6 +4,7 @@ import SwiftData
 import JesseCore
 import JesseConversations
 import JesseSearch
+import JesseVault
 
 // The Mac shell: a NavigationSplitView with the thread list on the left and the
 // selected conversation on the right — the big-screen affordance the plan calls for
@@ -31,8 +32,16 @@ import JesseSearch
 // tab's toolbar is live — the Health tab has worked that way since it landed.
 struct MacShellView: View {
     @Environment(MacCoordinator.self) private var coordinator
+    @Environment(\.scenePhase) private var scenePhase
     /// Store-open failure banner, threaded down to the Chats tab.
     var storeError: Error?
+
+    /// The Vault tab's model, and with it this Mac's index. Built HERE rather than in the
+    /// tab because the indexer is driven by the WINDOW becoming active, which is a fact
+    /// about the app and not about which tab is showing. The real on-device expander is
+    /// injected at this one point, exactly as the sidebar's search does below.
+    @State private var vaultModel = VaultBrowserModel(
+        expander: VaultModelExpansion(FoundationModelExpander()))
 
     var body: some View {
         TabView {
@@ -51,6 +60,18 @@ struct MacShellView: View {
                 .tabItem { Label("Today", systemImage: "sunrise") }
             MacHealthView(configStore: coordinator.configStore)
                 .tabItem { Label("Health", systemImage: "heart.text.square") }
+            // FOURTH, and last, mirroring the iPhone's bar (`RootTabView.Tab.allCases`):
+            // every note on this Mac, searchable with the Studio asleep.
+            VaultBrowserView(model: vaultModel)
+                .tabItem { Label("Vault", systemImage: "text.book.closed") }
+        }
+        // The vault index's one automatic trigger, the same one the iPhone uses: the window
+        // becoming active is when the synced folder may have changed behind the app's back.
+        // Debounced to once per 30 seconds inside the indexer, and never on a timer.
+        .onChange(of: scenePhase, initial: true) { _, phase in
+            guard phase == .active else { return }
+            vaultModel.refresh()
+            vaultModel.indexer.reindexIfDue()
         }
     }
 }

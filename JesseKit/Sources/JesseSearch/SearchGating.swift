@@ -1,4 +1,5 @@
 import Foundation
+import JesseVault
 
 // The Tier-2 expansion GATING decision: pure, deterministic, view-free, so both
 // the orchestration model and its tests can reason about WHEN the on-device query
@@ -12,8 +13,11 @@ import Foundation
 /// threads (so a plentiful result set is never widened). Pure and deterministic.
 // `nonisolated` explicitly, for the reason given on `filterExpansionTerms`: a pure decision
 // in a MainActor-default target, asserted directly from a nonisolated test.
+///
+/// ONE LINE, and it forwards, for the reason `significantTokens` does: the vault search
+/// gates its own expansion tier and must gate it identically. The implementation moved to
+/// `SearchQueryRules.shouldExpand` in JesseVault, the one target both searches can reach.
 public nonisolated func shouldExpand(query: String, baseMatchCount: Int, threshold: Int) -> Bool {
-    let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard trimmed.count >= 3 else { return false }
-    return baseMatchCount < threshold
+    SearchQueryRules.shouldExpand(query: query, baseMatchCount: baseMatchCount,
+                                 threshold: threshold)
 }

@@ -18,14 +18,19 @@ final class TodayTabTests: XCTestCase {
 
     // MARK: - The tab
 
-    /// The root tab bar has three tabs, Chats FIRST and Today second. The tab set is
-    /// a `CaseIterable` enum that `RootTabView` renders by iterating, so this is an
-    /// assertion about what the shell actually builds rather than about a constant
-    /// kept next to it — including the order, which is the enum's case order and
-    /// nothing else. The Mac's `MacShellView` is a hand-written list that mirrors it.
+    /// The root tab bar has four tabs, Chats FIRST, Today second and the vault LAST. The
+    /// tab set is a `CaseIterable` enum that `RootTabView` renders by iterating, so this is
+    /// an assertion about what the shell actually builds rather than about a constant kept
+    /// next to it — including the order, which is the enum's case order and nothing else.
+    /// The Mac's `MacShellView` is a hand-written list that mirrors it.
+    ///
+    /// Vault is last on purpose: it is the tab a person opens deliberately, to look
+    /// something up, rather than one of the three they open by reflex.
     func testTheRootTabBarLeadsWithChatsAndPutsTodaySecond() {
-        XCTAssertEqual(RootTabView.Tab.allCases, [.chats, .today, .health])
+        XCTAssertEqual(RootTabView.Tab.allCases, [.chats, .today, .health, .vault])
         XCTAssertEqual(RootTabView.Tab.today.title, "Today")
+        XCTAssertEqual(RootTabView.Tab.allCases.last, .vault)
+        XCTAssertEqual(RootTabView.Tab.vault.title, "Vault")
     }
 
     /// The Today tab is a SUNRISE, not the flat midday sun it used to be: the tab is
