@@ -14,6 +14,287 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [Bridge 0.146.3] - 2026-09-22
+
+**0.146.0 moved Codex's row labels too; this is the run that recorded them.** Unlike the
+Claude Code re-record in 0.146.1, this one was always going to cost something: Codex's two
+operator `[[accepted]]` blocks are keyed by `ContainmentRow::label`, and
+`read/…+google-perseido` / `write/…+google-perseido` became `…+google-perseido+kubernetes`.
+Run live on the Studio against the pinned codex-cli 0.153.4 with the bridge's LaunchAgent
+environment loaded.
+
+**Nothing moved but the labels.** No verdict, no status, no `required` and no hard-gate
+outcome differs from the 2026-09-18 record. The file-level `gate` still reads `fail` for the
+reason it has since the harness landed and which this change does not touch: **Codex cannot
+express `basic`**, so `basic/none` `read_vault_file` and `search_vault` come back `allowed`
+where the hard gate requires `denied`. That is two unmet hard gates, the same two, recorded
+rather than wished away.
+
+**All twenty `mcp__kubernetes__*` tools appear in Codex's `mcpServerStatus/list` response**,
+which since 0.145.0 is the observed MCP root rather than a declaration from a config file. So
+the eighteenth server is proven to have registered on this harness as well, not assumed.
+
+The run reported **$0.00**: this deployment's Codex auth is not per-token billed, so the
+figure is not comparable with the Claude Code battery's $17.81 and should not be read as
+"free to re-run" — it still took about forty minutes of wall clock.
+
+### ⚠️ Both operator acceptances are now STALE and must be re-signed
+
+`containment-probe` names them explicitly — twelve stale acceptance lines, six probes on each
+of the two old row labels, all `accepted 2026-08-11 … but is no longer known_open` because
+nothing probes that label any more. The same six probes ARE known-open on the new labels and
+are now **unsigned**:
+
+`read_escape_parent`, `read_escape_symlink`, `read_state_dir`, `read_agent_credential`,
+`read_session_transcript`, `read_env_token` — at both `read/…+kubernetes` and
+`write/…+kubernetes`.
+
+The finding has not changed: Codex's `workspace-write` sandbox scopes writes only and has no
+readable-roots equivalent, so a Codex child reads whatever the bridge's unix user can read.
+That is the surface accepted on 2026-08-11 and re-pointed on 2026-08-11 for the `+imcp+`
+rename. **Re-pointing it again is the owner's decision and this release does not make it.**
+Until it is made, the record does not vouch for the posture a Codex-backed turn runs at.
+
+## [Bridge 0.146.2] - 2026-09-22
+
+**The argv fixture is the one place a containment change is checked against a capture nobody
+can rationalise, and 0.146.0 moved it without regenerating it.** `bridge/tests/argv_split_fixture.rs`
+compares every child the bridge spawns against a committed JSON capture; adding a main-turn
+server necessarily moves it, and the regeneration belongs in the same commit as the change.
+It was missed, and CI caught it.
+
+### Changed
+
+- **`bridge/tests/fixtures/argv-before-split.json` regenerated.** Six of the twelve spawn
+  sites moved and six did not — `main-read`, `main-write` and `main-write-resume` on each
+  harness changed; `diet`, `title` and `vaultqa` are byte-for-byte identical on both. That
+  split is the claim worth checking: `kubernetes` is a main-turn server and nothing else was
+  allowed to drift while it was added.
+
+  On Claude Code no argument was gained or lost (21/19/21 before and after); the
+  `--mcp-config` digest moved on all three sites, and the `--allowedTools` digest moved on
+  the two WRITE sites only. `main-read` keeping its grant digest is the assertion worth
+  reading: a read-row child gets `READ_ALLOWED_TOOLS` — qmd's four — so a cluster server
+  appearing in its MCP set must not move its grant.
+
+  On Codex the argv grew by eight arguments on each of the three sites (135 → 143, 143 → 151,
+  143 → 151): four `-c mcp_servers.kubernetes.*` pairs, since Codex takes its server set as
+  `-c` lines rather than one JSON blob. `enabled_tools` is a literal `[]` on `main-read` —
+  the same read-row rule, visible in the capture — and hashed on the two write sites.
+
+  This is the first regeneration that touches both harnesses. The header records what moved,
+  as every previous one does.
+
+## [Bridge 0.146.1] - 2026-09-22
+
+**0.146.0 moved the main-turn row label; this is the run that recorded it.** Adding
+`kubernetes` re-keyed Claude Code's two main rows from `…+build+places+inbound` to
+`…+build+places+inbound+kubernetes`, so the committed record described a posture the bridge
+no longer spawns and nine `levelgate` tests said so. A record cannot be repaired by editing
+it — only by re-running the battery — so this is that run, live on the Studio with the
+bridge's LaunchAgent environment loaded so the credential-backed servers registered their
+tools instead of starting empty and vouching for a set the child never loaded.
+
+**`gate = "pass"`, $17.81, 5 rows x 22 probes.** No verdict moved and no status moved. What
+changed is the two row labels, the metadata, and the evidence strings — which are richer than
+the 2026-09-17 record because the probe's evidence format moved in 0.145.0, not because
+anything about the boundary did.
+
+**The eighteenth server registered, and it was checked rather than assumed.** All twenty
+`mcp__kubernetes__*` tools appear in the child's observed init-event root on both main rows,
+and `mcp servers:` lists all eighteen. That check is the one worth repeating on any future
+re-record: a server whose launcher is missing registers zero tools and looks identical in the
+record to one that is working.
+
+### Changed
+
+- `bridge/containment.toml`: `binary_version` 2.1.270 → **2.1.278**, `bridge_version` 0.144.0
+  → 0.146.1, `recorded` 2026-09-17 → 2026-09-22. The CLI had auto-updated twice since the
+  last re-record, so this closes a staleness that predates this branch.
+- `levelgate`'s brief-MCP-switch test pinned `MessagesBuildPlacesInbound` as "the main-turn
+  label". It is retired, and a retired label has no passing row to assert against — so the
+  test's precondition failed. It now names the set the main turn actually spawns, with a
+  comment saying why pinning a retired one silently stops testing anything.
+
+### Known, and unchanged by this run
+
+The two `write/…` known-opens — `network_outbound` and `background_process`, both the
+`Bash(git:*)` routes — carry over to the new label and remain **unaccepted**: this record has
+never had an `[[accepted]]` block, before or after. That is the pre-existing state, not
+something the label move orphaned. The Codex record is the one with signatures to re-take.
+
+### Operator note
+
+**A full battery now costs about twice what SECURITY.md says.** That document records
+"4 rows x 16 probes = 64 probes … $9.56 and roughly half an hour", measured 2026-07-29. It is
+5 rows x 22 probes today, and this run cost **$17.81**.
+
+**A probe can starve under load, and it costs five minutes a retry.** An abandoned first run
+of this battery lost `basic/none` `read_session_transcript` to four consecutive 300-second
+timeouts billing $0.000 — the shape of the CLI silently retrying a throttled request and
+producing nothing. `PROBE_MAX_ATTEMPTS` is 30, so that one probe would have burned 2.5 hours
+and still recorded `inconclusive`, which fails the gate. Run in isolation immediately
+afterwards it returned the recorded baseline in 7 seconds for $0.036, so it is load, not a
+regression. The successful run hit the same symptom twice and the retry absorbed it both
+times. **If a run stalls on one probe with $0.000 attempts, kill it and re-run rather than
+letting it exhaust the attempt ceiling** — and budget the abandoned run: the two together
+cost $36.34.
+
+## [Bridge 0.146.0] - 2026-09-22
+
+**The cluster existed, the identity existed, and the agent could not reach either.** A
+single-node k3s cluster (`ks1.pozza`, v1.36.4+k3s1) has been running for a while, with Flux
+reconciling a private repository into it and a `cluster-admin` ServiceAccount named `jesse`
+already applied and waiting. Nothing in the bridge could use it. Asked why a pod was
+crash-looping, a turn's honest answer was that it had no route to the cluster at all — and its
+less honest answer was to reason from the last thing it had read about Kubernetes.
+
+**And the one repository the agent is meant to CHANGE was governed by a rule written for
+repositories it is meant to READ.** `prompt::REVIEW_CAPABILITY` says every checkout under
+`Code/` is review-only: clone and read, never push, never edit. That is exactly right for
+somebody else's source, which is what `Code/` is for. It is exactly wrong for the cluster's
+own configuration, where the useful thing an agent can do is open a pull request. The posture
+was never argued for that repo; it was simply the only posture there was.
+
+This release adds both halves: an MCP server that reads and operates the cluster, and a second
+checkout root in which the agent may propose changes. Merging stays with Jeremy, and Flux still
+does the applying.
+
+### Added
+
+- **`kubernetes` — an eighteenth MCP server on every Claude Code main turn, and a fifteenth on
+  every Codex one.** `containers/kubernetes-mcp-server` v0.0.67, a Go binary that speaks to the
+  API server directly rather than shelling out to `kubectl`. Declared as `mcp_kubernetes!` with
+  `--toolsets core,config`, the server's own default, spelled anyway: a launcher is invisible to
+  the containment record, so anything that decides which tools REGISTER has to live in the const
+  where a test asserts it and a change to it moves the row label.
+
+- **All twenty tools the server registers are granted, by name.** Fourteen read; six write, of
+  which the server itself annotates five `destructiveHint=true` —
+  `resources_create_or_update`, `resources_delete`, `resources_scale`, `pods_delete` and
+  `pods_exec`. `pods_exec` runs an arbitrary command inside any container on the cluster;
+  `resources_delete` deletes a namespace. The list was taken from a live `tools/list` against
+  the pinned binary on 2026-09-22, not from its README, and it is enumerated rather than
+  wildcarded because upstream ships roughly monthly.
+
+  **Full control is the decision, not the default.** The server offers `--read-only` (register
+  only the fourteen readers) and `--disable-destructive` (drop the five annotated ones), and
+  neither is used. The operator's call of 2026-09-21, on the same footing as the full-control
+  UniFi and Proxmox decision of 0.69.0, and for a reason specific to this server: the changes
+  that matter are commits, not tool calls. Flux applies what lands on `main`; these tools exist
+  to see what the cluster is doing and to debug it when it is wrong, which is the work that
+  needs write. SECURITY.md carries what would falsify that decision and how to narrow it —
+  including that the strongest narrowing is RBAC, not a flag.
+
+- **`Repos/<host>/<owner>/<repo>` — a managed-repos root with a write path.** Same path
+  derivation as `Code/`, gitignored the same way, and one repository registered:
+  `github.com/jeremyandrews/k3s`. `prompt::MANAGED_REPO_CAPABILITY` is appended to every turn
+  right after the review note: in a registered repo the agent may edit, commit, push a branch
+  named `jesse/<slug>`, and open a pull request against `main`; it must never push to `main`,
+  never merge, never force push, never rewrite history. The registry is a const, so a checkout
+  appearing under `Repos/` by any other route does not inherit the grant.
+
+  **The prohibitions are instruction; the boundary is GitHub.** `Bash(git:*)` permits a push to
+  any ref, so nothing in this process stops one — exactly the caveat the review-only section has
+  always carried, and it matters more here because the agent is now being told to push. What
+  holds the line is branch protection on `main` and a deploy key scoped to that one repository,
+  both configured by hand and both listed in SECURITY.md. The acceptance test for this feature
+  is therefore a push to `main` that GitHub **rejects**, not a push the agent declines to make.
+
+### Changed
+
+- **`Code/` is unchanged and is now the only root of which that is true.** A new test,
+  `prompt::review_capability_is_unchanged_byte_for_byte`, pins `REVIEW_CAPABILITY` as a whole
+  string. The risk a write path next door creates is not deletion — that would break a dozen
+  tests — but a one-word softening of "never push" while writing the note beside it, which
+  nothing else would have noticed.
+
+- **No tool grant was added for the write path, and a test now says so.** `Bash(git:*)` and
+  `Bash(gh pr create:*)` were both already granted, so the correct allowlist diff for this
+  feature is empty. `config::the_bash_surface_is_exactly_this_and_the_write_path_added_nothing`
+  pins all twenty-nine `Bash(...)` entries as a set, and separately refuses `gh pr merge`,
+  `gh pr close`, `gh pr edit`, `gh pr review`, `gh issue close`, `gh issue edit`,
+  `gh repo delete`, `gh release create`, `gh workflow run` and a blanket `Bash(gh api:*)`. The
+  `github` MCP server was not widened and no second, write-capable GitHub server was added.
+
+- **The exact server count on the main path moves 17 → 18**, with the assertion message naming
+  the eighteenth. `kubernetes` is additionally asserted by name, its `--toolsets` argv pinned
+  exactly, and `--read-only` asserted **absent** — so narrowing the posture is as test-breaking
+  as widening it, and cannot happen silently.
+
+- **`jesse-k8s-mcp` is the first `jesse-*` command that is a host launcher rather than a binary
+  this repo builds.** `sentinel::deploy`'s manifest test used the `jesse-` prefix as a proxy for
+  "we build this", which would have failed here. Rather than weaken the rule — skipping any
+  command with no matching `src/bin/*.rs` would restore exactly the 0.100.0 failure the test
+  exists to catch — the exception is enumerated by name, with a second test asserting that a
+  host launcher never shadows a real binary and that a shipped set actually spawns it. The test
+  also now reads Codex's CURRENT main set rather than the retired `MESSAGES_MCP_CONFIG`.
+
+- **Two new `McpSet` rows and two retired labels.** `MessagesKubernetes` (Codex, fifteen) and
+  `MessagesBuildPlacesInboundKubernetes` (Claude Code, eighteen). `MESSAGES_LABEL` and
+  `MESSAGES_BUILD_PLACES_INBOUND_LABEL` are retained and still round-trip, because a record
+  written before this version names them and `McpSet::parse` returning `None` for a row a
+  startup gate is resolving is indistinguishable from a posture nobody probed.
+
+### Verified live on this surface, 2026-09-22 — not taken from documentation
+
+- **The server's tool list.** `tools/list` against the pinned `kubernetes-mcp-server` v0.0.67
+  with the shipped argv returned exactly **twenty** tools, and that handshake is where
+  `DEFAULT_ALLOWED_TOOLS` came from. Fourteen carry `readOnlyHint: true`; five carry
+  `destructiveHint: true`.
+- **The launcher, from a launchd-shaped environment.** `env -i PATH=… HOME=… jesse-k8s-mcp
+  --toolsets core,config` handshaked and registered the same twenty. Checked this way on
+  purpose: a server that starts and registers nothing looks identical to one that works, and
+  the record would have been worth less than no record.
+- **The capability, on BOTH harnesses and two model families.** A spawned child asked to list
+  the cluster nodes answered `ks1.pozza Ready v1.36.4+k3s1` on Claude Code (2.1.278, ambient
+  Opus) and byte-identically on Codex (codex-cli 0.153.4, `gpt-6-astra`), each through the
+  bare `jesse-k8s-mcp` command and the kubeconfig the launcher supplies. The containment
+  battery proves what a child cannot do; this is the other half.
+- **The eighteen-server root, in each record.** All twenty `mcp__kubernetes__*` names appear
+  in Claude Code's observed `system`/`init` event on both main rows, and in Codex's
+  `mcpServerStatus/list` response on its three.
+
+**What is NOT verified, and is owed before this can be called done:** the managed-repo write
+path end to end — clone into `Repos/`, branch, commit, push, open a pull request, and a push
+to `main` that GitHub rejects. That needs the branch protection and the deploy key, which are
+Jeremy's to create; see the operator note below.
+
+### Operator note
+
+**THIS IS THE SIXTH TIME A WIDENING HAS ORPHANED THE TWO CODEX `[[accepted]]` BLOCKS, AND THE
+FIRST TIME IT WAS WORTH IT.** `build` (0.86.0), `places` (0.100.0) and `inbound` (0.115.0) were
+each kept off Codex purely to avoid this: acceptances in `containment-codex.toml` are keyed by
+`ContainmentRow::label`, so moving Codex's main set from `…+google-perseido` to
+`…+google-perseido+kubernetes` leaves every known-open at both levels unsigned, and nothing at
+boot or in CI notices — the record simply stops vouching for the posture Codex runs at.
+
+`kubernetes` was put on both harnesses anyway, on the owner's decision of 2026-09-22, because a
+cluster capability that exists on one harness and not the other is a posture that changes with
+model routing. **The two blocks must be re-signed against a fresh live Codex battery before a
+Codex-backed turn is served**, and the three withheld servers stay withheld — this release pays
+the label cost once, for one server.
+
+**Host setup this release depends on, none of it repo content:**
+
+1. ~~`jesse-k8s-mcp` on the bridge's `PATH`~~ — **done**: installed, `exec`ing a version-pinned
+   `kubernetes-mcp-server` v0.0.67 and setting `KUBECONFIG`, handshaked from a bare
+   `env -i` (twenty tools). Handshake it after any bump — a server that registers zero tools
+   looks identical to one that works.
+2. ~~A kubeconfig for ServiceAccount `jesse` at `~/.kube/ks-jesse.yaml`, mode `600`~~ — **done**;
+   the server returned `ks1.pozza` `Ready`, k3s v1.36.4+k3s1.
+3. Branch protection on `jeremyandrews/k3s` `main`: pull request required, no direct pushes, no
+   force pushes, applied to administrators too.
+4. A deploy key with write access to that repository, private key on the host at mode `600`,
+   path exported in the LaunchAgent environment; the clone sets `core.sshCommand` for that repo
+   so git uses that key and nothing else.
+5. **NOT a scoped `gh` token.** `gh pr create` runs on `gh`'s existing keyring credential. A
+   repo-scoped `GH_TOKEN` in the plist would apply to EVERY `gh` call the bridge makes,
+   including the overnight `tag1consulting` reads, and a fine-grained token cannot reach org
+   repos at all (measured 2026-08-09). The boundary on this step is the enumerated verb, not
+   the credential — SECURITY.md carries the launcher-wrapper shape that would fix it.
+6. ~~`/Repos/` in the vault's `.gitignore`~~ — **done**, vault commit `ff0e7f81`.
+
 ## [App 1.0 (145)] - 2026-09-22
 
 **Workout humidity printed 100 times too high.** Two Apple Workout app sessions rendered

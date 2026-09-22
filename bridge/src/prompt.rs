@@ -138,6 +138,72 @@ like `https://host/owner/repo`, drop any port — then Read/Grep/Glob it and upd
 `Code/README.md` index. REVIEW-ONLY: never `git push` and never edit checked-out code. \
 `Code/` is gitignored, so checkouts never touch the vault repo.)";
 
+// ---- Managed repositories (the ONE write path outside the vault) ---------
+//
+// `Code/` above is review-only and stays that way. This note adds a SECOND root,
+// `Repos/<host>/<owner>/<repo>`, derived from the clone URL by exactly the same
+// pure function, in which the agent may edit, commit, push a branch and open a
+// pull request. It exists because review-only was the wrong posture for one
+// specific repository: the k3s cluster's git repo is a thing the agent is meant
+// to CHANGE, and Flux applies whatever lands on `main`.
+//
+// THE PROHIBITIONS HERE ARE INSTRUCTION; THE BOUNDARY IS GITHUB. `Bash(git:*)`
+// permits a push to any ref, so "never push to main" is a rule the agent follows,
+// not a barrier it cannot cross — the same honest caveat `REVIEW_CAPABILITY`
+// carries. What actually holds the line is server side and configured by hand:
+// branch protection on `main` (pull request required, no direct pushes, no force
+// pushes) plus a deploy key scoped to that one repository. The clone step sets
+// `core.sshCommand` for the repo so git uses that key and nothing else, which is
+// also what keeps this path from reaching any OTHER repository the host's ambient
+// SSH key can write. See SECURITY.md.
+//
+// THE REGISTRY IS A CONST, NOT A DIRECTORY SCAN. A repo is writable because it is
+// named here, so a checkout appearing under `Repos/` by any other route — a turn
+// that cloned something else there, a leftover — does not inherit the grant. One
+// entry today.
+//
+// It is a SEPARATE const appended after `REVIEW_CAPABILITY` rather than folded
+// into it, and that is load-bearing for two reasons. `REVIEW_CAPABILITY_MARKER`
+// is a leading slice of the review note and is how `strip_bridge_wrapper` finds
+// the right edge of the user's utterance; growing that const risks moving what
+// the marker anchors. And a test asserts `REVIEW_CAPABILITY` is byte-for-byte
+// unchanged, so the review-only posture cannot be edited by accident while
+// somebody is adding a write path next to it.
+
+/// The one repository the agent may propose changes to, as `<host>/<owner>/<repo>`.
+///
+/// The k3s cluster's configuration. Flux reconciles `main` of this repo into the
+/// cluster, so a merged commit here IS a cluster change — which is the whole reason
+/// the agent opens a pull request rather than pushing: the review step is the gate,
+/// and it is Jeremy's.
+pub const MANAGED_REPOS: [&str; 1] = ["github.com/jeremyandrews/k3s"];
+
+/// The branch-name prefix every branch the agent pushes must carry. A fixed prefix
+/// is what makes the agent's branches identifiable at a glance in the repo's branch
+/// list and, more usefully, what a branch-protection or ruleset pattern can be
+/// written against on the server side.
+pub const MANAGED_REPO_BRANCH_PREFIX: &str = "jesse/";
+
+/// The managed-repos root, relative to the workspace. Gitignored in the vault on the
+/// same terms as `Code/`, so checkouts never enter the vault repo or its autocommit.
+pub const MANAGED_REPOS_ROOT: &str = "Repos/";
+
+/// Appended to every turn immediately after [`REVIEW_CAPABILITY`], which it
+/// deliberately does not modify: `Code/` is review-only, unchanged, and this note says
+/// so in as many words so the two cannot be read as one loosened rule.
+pub const MANAGED_REPO_CAPABILITY: &str = "\n\n(Managed repositories: one repo is \
+yours to change, and it is NOT under `Code/`. `Repos/<host>/<owner>/<repo>` — same \
+path derivation as `Code/`, and gitignored the same way — holds repos you may propose \
+changes to. Registered: `github.com/jeremyandrews/k3s` (the k3s cluster config; Flux \
+reconciles its `main` into the cluster). In a REGISTERED repo you may edit files, \
+`git commit`, and `git push` a branch whose name starts with `jesse/`, then open a \
+pull request against `main` with `gh pr create`. NEVER push to `main`, NEVER merge a \
+pull request, NEVER force push, and NEVER rewrite history. The repo owner reviews and merges. \
+GitHub rejects a push to `main` and a force push outright; merging is simply not a verb you \
+have. A repo under `Repos/` that is not on \
+the registered list is review-only like `Code/`. `Code/` itself is unchanged and stays \
+REVIEW-ONLY: clone and read, never push, never edit.)";
+
 // ---- Optional recent-workouts context (health_context) --------------------
 //
 // The phone may attach a compact "recent workouts" block from Apple Health so
@@ -1172,6 +1238,11 @@ pub fn build_prompt_at(
     // voice `SPOKEN:` line stays the final instruction. Always present (like the
     // floor), so it is not something a wrapper override can drop.
     p.push_str(REVIEW_CAPABILITY);
+    // …and the managed-repos note, immediately after it. Appended as a SECOND string
+    // rather than folded into the first so `REVIEW_CAPABILITY_MARKER` still anchors the
+    // review note it names, and so the review-only posture stays byte-for-byte pinned by
+    // its own test while a write path is added beside it.
+    p.push_str(MANAGED_REPO_CAPABILITY);
     // Device-channel notes, ONE per channel. Within a channel exactly one of three
     // states applies, checked in priority order so the agent is never told two
     // contradictory things about it:
@@ -2605,6 +2676,117 @@ day, scanners, currency, or cheatsheets, and do not rebuild Today.md."
         assert!(!is_title_mint_prompt(&turn));
         // A bare user message is not a mint.
         assert!(!is_title_mint_prompt("Produce a report on Q3 sales"));
+    }
+
+    /// THE REVIEW-ONLY POSTURE IS PINNED BYTE FOR BYTE, and this test is the reason it can be
+    /// stated that plainly.
+    ///
+    /// 0.146.0 added a WRITE path to one repository, as a separate const appended next to this
+    /// one. The risk that creates is not that somebody deletes `REVIEW_CAPABILITY` — that would
+    /// break a dozen tests — but that somebody SOFTENS it while writing the note beside it:
+    /// "never push" becoming "do not push without reason" is a one-word edit that no other
+    /// assertion in this file would notice, and it would silently make every checkout under
+    /// `Code/` writable by instruction.
+    ///
+    /// So the whole string is compared, not a substring of it. A literal rather than a hash,
+    /// because a failure should show WHAT moved.
+    #[test]
+    fn review_capability_is_unchanged_byte_for_byte() {
+        assert_eq!(
+            REVIEW_CAPABILITY,
+            "\n\n(Capability: you are running on the Mac Studio \
+via the Jesse bridge, which DOES grant scoped shell here — `Bash(git:*)` plus read-only \
+verbs. Any note that \"phone sessions have no Bash\" applies to Cowork, not this session; \
+do not refuse benign git/read work on that basis. To review source, clone or fetch a \
+repo (public or already-access-configured) into `Code/<host>/<owner>/<repo>` — derived \
+from the clone URL: lowercase the host, strip a trailing `.git`, treat `git@host:owner/repo` \
+like `https://host/owner/repo`, drop any port — then Read/Grep/Glob it and update the \
+`Code/README.md` index. REVIEW-ONLY: never `git push` and never edit checked-out code. \
+`Code/` is gitignored, so checkouts never touch the vault repo.)",
+            "REVIEW_CAPABILITY moved. `Code/` is review-only and adding a write path elsewhere \
+             must not loosen it — if this change is deliberate, say so in SECURITY.md and \
+             update this literal in the same commit"
+        );
+    }
+
+    /// The managed-repo note must NAME the three things a reader of the record needs: where the
+    /// writable checkouts live, what a pushable branch is called, and the three prohibitions.
+    ///
+    /// Asserted on the substrings rather than the whole string, unlike the test above, and the
+    /// difference is deliberate: this note is expected to grow as repositories are registered,
+    /// while the review note is expected never to move. What must not drift is the shape of the
+    /// grant.
+    #[test]
+    fn managed_repo_capability_names_the_root_the_prefix_and_the_prohibitions() {
+        let cap = MANAGED_REPO_CAPABILITY;
+        // The root, in the form the agent will construct a path in.
+        assert!(
+            cap.contains("`Repos/<host>/<owner>/<repo>`"),
+            "the managed-repos root must be named: {cap}"
+        );
+        assert!(
+            cap.contains(MANAGED_REPOS_ROOT.trim_end_matches('/')),
+            "…and it must agree with MANAGED_REPOS_ROOT: {cap}"
+        );
+        // The branch prefix, and it must be the const rather than a second spelling.
+        assert!(
+            cap.contains(MANAGED_REPO_BRANCH_PREFIX),
+            "the branch prefix `{MANAGED_REPO_BRANCH_PREFIX}` must be named: {cap}"
+        );
+        // Every registered repo is named, so a repo added to the list and not to the note
+        // would be one the agent never learns it may change.
+        for repo in MANAGED_REPOS {
+            assert!(
+                cap.contains(repo),
+                "registered repo `{repo}` is not named in the capability note: {cap}"
+            );
+        }
+        // THE THREE PROHIBITIONS, each asserted separately so a failure says which one went.
+        for prohibition in [
+            "NEVER push to `main`",
+            "NEVER force push",
+            "NEVER rewrite history",
+        ] {
+            assert!(
+                cap.contains(prohibition),
+                "the prohibition \"{prohibition}\" is missing: {cap}"
+            );
+        }
+        // …and `Code/` must be restated as review-only IN THIS NOTE, because this is the note
+        // that introduces a write path and a reader stopping here must not infer the two roots
+        // now behave alike.
+        assert!(
+            cap.contains("`Code/` itself is unchanged and stays REVIEW-ONLY"),
+            "the note must restate that `Code/` is review-only: {cap}"
+        );
+    }
+
+    /// Both notes reach every turn, in order, and the review one still comes first — which is
+    /// what makes "Code/ is unchanged" readable as a restatement rather than a contradiction.
+    #[test]
+    fn every_turn_carries_the_review_note_then_the_managed_repo_note() {
+        let p = bp(
+            "ask",
+            "what changed on the cluster?",
+            false,
+            false,
+            None,
+            None,
+        );
+        let review = p.find(REVIEW_CAPABILITY).expect("review note present");
+        let managed = p
+            .find(MANAGED_REPO_CAPABILITY)
+            .expect("managed-repo note present");
+        assert!(
+            review < managed,
+            "the review note must precede the managed-repo note"
+        );
+        assert_eq!(
+            managed,
+            review + REVIEW_CAPABILITY.len(),
+            "the managed-repo note must be appended immediately after the review note, so \
+             REVIEW_CAPABILITY_MARKER still bounds the user's utterance"
+        );
     }
 
     #[test]

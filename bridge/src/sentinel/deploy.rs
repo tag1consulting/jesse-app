@@ -3236,12 +3236,33 @@ serde = { version = "1", features = ["derive"] }
     /// Only `jesse-*` commands are in scope: they are the ones a deploy is responsible for
     /// installing. `qmd`, `npx` and the rest are host setup, and their absence is caught at
     /// startup and by the deploy's health gate rather than here.
+    ///
+    /// # The prefix stopped being sufficient in 0.146.0, and the exception is EXPLICIT
+    ///
+    /// `jesse-k8s-mcp` is a `jesse-` command this repository does NOT build: it is a host
+    /// launcher that pins a third-party binary's version and supplies its `KUBECONFIG`, on
+    /// the same terms as `whatsapp-mcp` and `workspace-mcp-perseido`. It carries the prefix
+    /// because it is this deployment's wrapper, not because it is this crate's target.
+    ///
+    /// It is listed here BY NAME rather than handled by weakening the rule (say, skipping any
+    /// command with no matching `src/bin/*.rs`). Weakening it would restore exactly the
+    /// 0.100.0 failure this test exists to catch — `places` was added as a bare
+    /// `jesse-places-mcp` and to no binary list, and every deploy afterwards installed a
+    /// config naming a binary it did not build, invisibly. With the exception enumerated, a
+    /// new `jesse-*` server still fails this test until someone states which of the two it is.
+    const HOST_LAUNCHERS: [&str; 1] = ["jesse-k8s-mcp"];
+
     #[test]
     fn every_mcp_server_this_repo_builds_is_in_the_deploy_manifest() {
         let bins = embedded_deploy_bins();
-        for config in [crate::MAIN_CHILD_MCP_CONFIG, crate::MESSAGES_MCP_CONFIG] {
+        // BOTH harnesses' CURRENT main sets. `MESSAGES_MCP_CONFIG` was Codex's until 0.146.0
+        // and is now a retired label; checking it would stop covering what Codex spawns.
+        for config in [
+            crate::MAIN_CHILD_MCP_CONFIG,
+            crate::MESSAGES_KUBERNETES_MCP_CONFIG,
+        ] {
             for (server, command) in crate::stdio_commands(config) {
-                if !command.starts_with("jesse-") {
+                if !command.starts_with("jesse-") || HOST_LAUNCHERS.contains(&command.as_str()) {
                     continue;
                 }
                 assert!(
@@ -3250,6 +3271,33 @@ serde = { version = "1", features = ["derive"] }
                      to bridge/{DEPLOY_BINS_MANIFEST} in the same change"
                 );
             }
+        }
+    }
+
+    /// A HOST LAUNCHER MUST NOT SHADOW A BINARY THIS REPO BUILDS, and vice versa. The
+    /// exception list above is the one place a `jesse-*` command escapes the deploy manifest,
+    /// so it is exactly where a typo would silently disarm the check for a real server.
+    #[test]
+    fn no_host_launcher_names_a_binary_this_repo_builds() {
+        let bins = embedded_deploy_bins();
+        for launcher in HOST_LAUNCHERS {
+            assert!(
+                !bins.iter().any(|b| b == launcher),
+                "`{launcher}` is listed as host setup AND built by this repo — it cannot be both"
+            );
+            // It must also actually be a server this deployment spawns, so a name that stops
+            // being used is caught here rather than sitting as a permanent hole.
+            let spawned = [
+                crate::MAIN_CHILD_MCP_CONFIG,
+                crate::MESSAGES_KUBERNETES_MCP_CONFIG,
+            ]
+            .iter()
+            .flat_map(|c| crate::stdio_commands(c))
+            .any(|(_, command)| command == launcher);
+            assert!(
+                spawned,
+                "`{launcher}` is excepted from the deploy manifest but no shipped set spawns it"
+            );
         }
     }
 

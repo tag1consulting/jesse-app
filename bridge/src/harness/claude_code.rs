@@ -674,6 +674,37 @@ macro_rules! mcp_inbound {
     };
 }
 
+/// **The Kubernetes server, and the ONE place this deployment's cluster identity is named
+/// indirectly.** `containers/kubernetes-mcp-server`, pinned to **v0.0.67** by the launcher.
+///
+/// It is a bare name with a SHORT, EXPLICIT argv, and both halves of that are deliberate.
+/// The bare name is the rule every stdio entry here follows — the record commits this argv
+/// verbatim and compares it by strict equality at boot, so an absolute path would pin the
+/// posture to one home directory and fail `scripts/ci-guards.sh`. The `jesse-k8s-mcp` launcher
+/// is what supplies `KUBECONFIG`; it is host setup, documented in SECURITY.md, not repo
+/// content.
+///
+/// `--toolsets core,config` is the server's own default and is SPELLED ANYWAY, for the reason
+/// both `workspace-mcp` instances spell `--read-only` here rather than in their launcher: a
+/// launcher is invisible to the containment record, so anything that decides WHICH TOOLS
+/// REGISTER has to live in this const, where a test asserts it and a change to it moves the
+/// row label. Left implicit, a launcher edit or a stray `--config` drop-in could add the
+/// `helm`, `kubevirt`, `tekton`, `kiali` or `netobserv` toolsets to the child's root with
+/// nothing in this repository changing. Measured 2026-09-22 against v0.0.67: with this argv
+/// the server registers exactly the twenty tools named in [`crate::DEFAULT_ALLOWED_TOOLS`].
+///
+/// **`--read-only` IS NOT SET, AND THAT IS THE DECISION RATHER THAN AN OMISSION.** The server
+/// offers two narrowing switches — `--read-only` (only `readOnlyHint=true` tools register,
+/// which would be fourteen of the twenty) and `--disable-destructive` (drops the five
+/// `destructiveHint=true` ones). Neither is used. The bridge holds `cluster-admin` on this
+/// cluster by the operator's decision of 2026-09-21, the same posture UniFi and Proxmox have
+/// carried since 0.69.0. Read SECURITY.md before narrowing or widening this.
+macro_rules! mcp_kubernetes {
+    () => {
+        r#""kubernetes":{"type":"stdio","command":"jesse-k8s-mcp","args":["--toolsets","core,config"]}"#
+    };
+}
+
 /// The five house servers, in order.
 macro_rules! house_servers {
     () => {
@@ -710,8 +741,12 @@ macro_rules! morning_servers {
         )
     };
 }
-/// The fourteen servers BOTH harnesses' main turns carry: the morning set plus the two message
-/// sources and the second Google account.
+/// The fourteen servers that were the COMMON CORE of both harnesses' main turns from 0.73.0:
+/// the morning set plus the two message sources and the second Google account. Both main sets
+/// are still assembled from this — Codex adds `kubernetes` and Claude Code adds `build`,
+/// `places`, `inbound` and `kubernetes` — so it is no longer what either turn carries on its
+/// own. It stays a macro rather than being folded into its two callers because
+/// `MESSAGES_MCP_CONFIG` is a RETIRED ROW LABEL that must keep meaning what it meant.
 macro_rules! messages_servers {
     () => {
         concat!(
@@ -1027,6 +1062,94 @@ pub const MESSAGES_BUILD_PLACES_MCP_CONFIG: &str = concat!(
 /// `inbound` would move ITS row labels, orphan the two operator `[[accepted]]` blocks in
 /// `containment-codex.toml` that are keyed by those labels, and demand a live Codex battery
 /// this change does not run.
+///
+/// **RETIRED AS THE MAIN SET IN 0.146.0**, when `kubernetes` landed — see
+/// [`MAIN_CHILD_MCP_CONFIG`]. Split out rather than grown in place for the reason every one
+/// of its predecessors was: [`crate::McpSet::MessagesBuildPlacesInbound`] still names it, and
+/// folding it into the current main set would silently re-point the
+/// `…+build+places+inbound` row label at a set that also holds `cluster-admin` on a
+/// Kubernetes cluster.
+pub const MESSAGES_BUILD_PLACES_INBOUND_MCP_CONFIG: &str = concat!(
+    r#"{"mcpServers":{"#,
+    messages_servers!(),
+    ",",
+    mcp_build!(),
+    ",",
+    mcp_places!(),
+    ",",
+    mcp_inbound!(),
+    "}}"
+);
+
+/// The fourteen-server set PLUS **`kubernetes`** — every **Codex** main turn from bridge
+/// 0.146.0. Fifteen servers.
+///
+/// # This is the FIRST server the two harnesses gained in the same release since 0.73.0
+///
+/// `build` (0.86.0), `places` (0.100.0) and `inbound` (0.115.0) each landed on Claude Code
+/// alone and are still withheld from Codex by [`CODEX_WITHHELD_MCP_SERVERS`], for a reason
+/// that was never about the servers: adding one moves Codex's row labels, and both operator
+/// `[[accepted]]` blocks in `containment-codex.toml` are keyed by those labels.
+///
+/// **THAT COST IS PAID HERE RATHER THAN AVOIDED.** Adding `kubernetes` to Codex's main set
+/// moves `read/…+google-perseido` and `write/…+google-perseido` to
+/// `read/…+google-perseido+kubernetes` and `write/…+google-perseido+kubernetes`, which
+/// orphans both blocks exactly as 0.66.0, 0.67.0, 0.69.0, 0.73.0 and 0.76.0 did. The owner
+/// took that decision on 2026-09-22 rather than accept a cluster capability that exists on
+/// one harness only; the blocks must be re-signed against a fresh live Codex battery before
+/// a Codex-backed turn is served. See [`CODEX_SHIPPED_ROWS`].
+///
+/// The three servers above stay withheld: this release pays the label cost once, for one
+/// server, and closing the rest of the gap is still a separate decision.
+pub const MESSAGES_KUBERNETES_MCP_CONFIG: &str = concat!(
+    r#"{"mcpServers":{"#,
+    messages_servers!(),
+    ",",
+    mcp_kubernetes!(),
+    "}}"
+);
+
+/// The seventeen-server set PLUS **`kubernetes`** — every **Claude Code** main turn from
+/// bridge 0.146.0. Eighteen servers.
+///
+/// # What it adds: `cluster-admin` on the home k3s cluster
+///
+/// The cluster is one node, `ks1.pozza`, running k3s v1.36.4+k3s1, reconciled by Flux from a
+/// private git repository. The bridge reaches it as ServiceAccount `jesse` in namespace
+/// `jesse`, bound to `cluster-admin` by ClusterRoleBinding `jesse-cluster-admin` — so the
+/// twenty granted tools can read and write any object in any namespace, `pods_exec` into any
+/// pod, and `resources_delete` a namespace. That is the widest single grant in this set after
+/// `proxmox_execute_vm_command`, and it is the operator's explicit decision of 2026-09-21,
+/// on the same footing as the full-control UniFi and Proxmox grants of 0.69.0: every
+/// DECLARATIVE change still arrives as a reviewable commit on the cluster repository, and the
+/// imperative path exists for debugging rather than for routine change.
+///
+/// # The server and how it is reached
+///
+/// `containers/kubernetes-mcp-server`, a Go binary that speaks to the Kubernetes API directly
+/// rather than shelling out to `kubectl`. It is `stdio` with a BARE NAME, like every other
+/// stdio command here, so this const reads identically on every deployment; the
+/// `jesse-k8s-mcp` launcher pins the version, sets `KUBECONFIG` and `exec`s the binary, and
+/// is host setup documented in SECURITY.md rather than repo content.
+///
+/// **NO CLUSTER ADDRESS APPEARS IN THIS FILE**, which is the one way this server differs from
+/// `homeassistant` and `roon`. Those two are `http` and had to bake a LAN or tailnet address
+/// into a const, because the record compares argv by strict equality and the environment is
+/// refused by the startup gate. This one is `stdio`: the endpoint, the CA and the token all
+/// live in the kubeconfig the launcher points at, so the deployment's cluster identity never
+/// enters the record at all.
+///
+/// # What is NOT new here
+///
+/// No new credential in the plist (the kubeconfig is a mode-`600` file, like the Perseido
+/// client secret), no new attacker-authored text source, and no new public host. What IS new
+/// is that a phone-injectable turn — one that already reads WhatsApp and iMessage bodies —
+/// can now delete a namespace. The mitigation that would close that is the dedicated
+/// sandboxed unix user, which is still not implemented; the exposure is recorded and accepted
+/// rather than fixed.
+///
+/// **UNLIKE ITS THREE PREDECESSORS THIS SET IS NOT CLAUDE CODE'S ALONE.** Codex gets the same
+/// server on [`MESSAGES_KUBERNETES_MCP_CONFIG`], at the cost of its two operator signatures.
 pub const MAIN_CHILD_MCP_CONFIG: &str = concat!(
     r#"{"mcpServers":{"#,
     messages_servers!(),
@@ -1036,6 +1159,8 @@ pub const MAIN_CHILD_MCP_CONFIG: &str = concat!(
     mcp_places!(),
     ",",
     mcp_inbound!(),
+    ",",
+    mcp_kubernetes!(),
     "}}"
 );
 
@@ -1349,7 +1474,9 @@ pub fn read_allowed_tools(mcp: McpSet) -> &'static str {
         | McpSet::Messages
         | McpSet::MessagesBuild
         | McpSet::MessagesBuildPlaces
-        | McpSet::MessagesBuildPlacesInbound => READ_ALLOWED_TOOLS,
+        | McpSet::MessagesBuildPlacesInbound
+        | McpSet::MessagesKubernetes
+        | McpSet::MessagesBuildPlacesInboundKubernetes => READ_ALLOWED_TOOLS,
         // THE ONE SET WHOSE READ GRANT IS NOT THE QMD-ONLY ONE. This is the line the whole
         // row-keyed argv exists for; see [`REPLIES_ALLOWED_TOOLS`].
         McpSet::Replies => REPLIES_ALLOWED_TOOLS,
@@ -2663,10 +2790,11 @@ mod tests {
             // loads the new set.
             assert_eq!(
                 servers.len(),
-                17,
+                18,
                 "{label}: the main path must declare qmd, slack, browser, homeassistant, roon, \
                  google, github, fastmail, unifi, routeros, proxmox, whatsapp, imessage, \
-                 google-perseido, build, places and inbound and nothing else: {mcp:?}"
+                 google-perseido, build, places, inbound and kubernetes and nothing else: \
+                 {mcp:?}"
             );
             // THE BUILD SERVER IS THE ONE THAT RUNS CODE, so it is asserted BY NAME on top of
             // the count above. The count alone would be satisfied by any fifteenth server;
@@ -2706,6 +2834,38 @@ mod tests {
                     .expect("args")
                     .is_empty(),
                 "{label}: the places server is configured by environment, not argv: {mcp:?}"
+            );
+            // THE KUBERNETES SERVER IS ASSERTED BY NAME for the reason `build` and `places`
+            // are: the count above would be satisfied by any eighteenth server, and this is
+            // the one whose presence means the turn holds `cluster-admin`.
+            assert!(
+                servers.contains_key("kubernetes"),
+                "{label}: the main path declares the kubernetes server: {mcp:?}"
+            );
+            // ITS TOOLSET IS PINNED IN ARGV, NOT LEFT TO THE SERVER'S DEFAULT. `--toolsets`
+            // is what decides which tools REGISTER, and the launcher that supplies
+            // `KUBECONFIG` is invisible to the containment record — so if this moved into
+            // the launcher, the `helm`, `kubevirt`, `tekton`, `kiali` and `netobserv`
+            // toolsets could be added to the child's root with nothing in this repository
+            // changing. Same reasoning as the two `--read-only` Google flags below.
+            let k8s_args = servers["kubernetes"]["args"].as_array().expect("args");
+            assert_eq!(
+                k8s_args,
+                &vec![
+                    serde_json::Value::from("--toolsets"),
+                    serde_json::Value::from("core,config"),
+                ],
+                "{label}: the kubernetes server pins its toolsets in argv: {mcp:?}"
+            );
+            // `--read-only` IS DELIBERATELY ABSENT and is asserted absent, so that adding it
+            // is a deliberate, test-breaking act in the same way removing it would be for
+            // the Google servers. Full control is the operator's decision of 2026-09-21; a
+            // silent appearance of this flag would narrow the posture the record vouches for
+            // without moving the row label.
+            assert!(
+                !k8s_args.iter().any(|a| a == "--read-only"),
+                "{label}: the kubernetes server ships at FULL control by decision — \
+                 narrowing it is a posture change, not an edit: {mcp:?}"
             );
             // BOTH GOOGLE SERVERS MUST STAY READ-ONLY AT THE SERVER LAYER. `--read-only` is
             // what deregisters their write tools (event create, send, Drive mutate) so they
@@ -2783,7 +2943,7 @@ mod tests {
             // red build green.
             // Stated as "never anything BUT the permitted set" rather than "always exactly
             // it", because the sites this loop covers do not all grant the message servers:
-            // the read-only main turn loads all fourteen servers and grants only qmd's four
+            // the read-only main turn loads all eighteen servers and grants only qmd's four
             // tools. An equality check would therefore assert a toolset that site does not
             // have. A subset check still fails on every addition, which is the property
             // being bought.
@@ -3504,7 +3664,7 @@ mod tests {
     const GOLDEN_QMD_MCP: &str = concat!(
         r#"{"mcpServers":{"qmd":{"type":"stdio","command":"qmd","args":["mcp"]},"slack":{"type":"stdio","command":"npx","args":["-y","slack-mcp-server@latest","--transport","stdio"]},"browser":{"type":"stdio","command":"npx","args":["-y","@playwright/mcp@latest","--headless","--isolated","--output-dir","/tmp/jesse-browser","--output-max-size","104857600"]},"homeassistant":{"type":"http","url":""#,
         home_assistant_mcp_url!(),
-        r#"","headers":{"Authorization":"Bearer ${HA_MCP_TOKEN}"}},"roon":{"type":"http","url":"http://10.40.0.2:8088/mcp"},"google":{"type":"stdio","command":"workspace-mcp","args":["--single-user","--read-only","--tools","calendar","gmail","drive"]},"github":{"type":"stdio","command":"github-mcp-server","args":["stdio","--read-only","--toolsets","repos,actions,issues,pull_requests"]},"fastmail":{"type":"stdio","command":"npx","args":["-y","github:jeremyandrews/jmap-mcp-server"]},"unifi":{"type":"stdio","command":"unifi-network-mcp","args":[]},"routeros":{"type":"stdio","command":"routeros-mcp","args":[]},"proxmox":{"type":"stdio","command":"mcp-proxmox","args":[]},"whatsapp":{"type":"stdio","command":"whatsapp-mcp","args":[]},"imcp":{"type":"stdio","command":"/Applications/iMCP.app/Contents/MacOS/imcp-server","args":[]},"google-perseido":{"type":"stdio","command":"workspace-mcp-perseido","args":["--single-user","--read-only","--tools","calendar","gmail","drive"]},"build":{"type":"stdio","command":"jesse-build-mcp","args":[]},"places":{"type":"stdio","command":"jesse-places-mcp","args":[]},"inbound":{"type":"stdio","command":"jesse-inbound-mcp","args":[]}}}"#
+        r#"","headers":{"Authorization":"Bearer ${HA_MCP_TOKEN}"}},"roon":{"type":"http","url":"http://10.40.0.2:8088/mcp"},"google":{"type":"stdio","command":"workspace-mcp","args":["--single-user","--read-only","--tools","calendar","gmail","drive"]},"github":{"type":"stdio","command":"github-mcp-server","args":["stdio","--read-only","--toolsets","repos,actions,issues,pull_requests"]},"fastmail":{"type":"stdio","command":"npx","args":["-y","github:jeremyandrews/jmap-mcp-server"]},"unifi":{"type":"stdio","command":"unifi-network-mcp","args":[]},"routeros":{"type":"stdio","command":"routeros-mcp","args":[]},"proxmox":{"type":"stdio","command":"mcp-proxmox","args":[]},"whatsapp":{"type":"stdio","command":"whatsapp-mcp","args":[]},"imcp":{"type":"stdio","command":"/Applications/iMCP.app/Contents/MacOS/imcp-server","args":[]},"google-perseido":{"type":"stdio","command":"workspace-mcp-perseido","args":["--single-user","--read-only","--tools","calendar","gmail","drive"]},"build":{"type":"stdio","command":"jesse-build-mcp","args":[]},"places":{"type":"stdio","command":"jesse-places-mcp","args":[]},"inbound":{"type":"stdio","command":"jesse-inbound-mcp","args":[]},"kubernetes":{"type":"stdio","command":"jesse-k8s-mcp","args":["--toolsets","core,config"]}}}"#
     );
     const GOLDEN_EMPTY_MCP: &str = r#"{"mcpServers":{}}"#;
 
@@ -3545,18 +3705,32 @@ mod tests {
         let main = servers(MAIN_CHILD_MCP_CONFIG);
         for (label, older, added) in [
             (
+                "MESSAGES_BUILD_PLACES_INBOUND_MCP_CONFIG",
+                MESSAGES_BUILD_PLACES_INBOUND_MCP_CONFIG,
+                vec!["kubernetes"],
+            ),
+            (
                 "MESSAGES_BUILD_PLACES_MCP_CONFIG",
                 MESSAGES_BUILD_PLACES_MCP_CONFIG,
-                vec!["inbound"],
+                vec!["kubernetes", "inbound"],
             ),
             (
                 "MESSAGES_BUILD_MCP_CONFIG",
                 MESSAGES_BUILD_MCP_CONFIG,
-                vec!["inbound", "places"],
+                vec!["kubernetes", "inbound", "places"],
             ),
+            ("MESSAGES_MCP_CONFIG", MESSAGES_MCP_CONFIG, {
+                let mut v = CODEX_WITHHELD_MCP_SERVERS.to_vec();
+                v.push("kubernetes");
+                v
+            }),
+            // Codex's CURRENT set, which is the main set minus exactly the withheld three.
+            // Listed here rather than only in the harness-level form below because this loop
+            // also asserts every shared server is declared BYTE-IDENTICALLY, and Codex's set
+            // is now the one place `kubernetes` is spelled a second time.
             (
-                "MESSAGES_MCP_CONFIG",
-                MESSAGES_MCP_CONFIG,
+                "MESSAGES_KUBERNETES_MCP_CONFIG",
+                MESSAGES_KUBERNETES_MCP_CONFIG,
                 CODEX_WITHHELD_MCP_SERVERS.to_vec(),
             ),
         ] {

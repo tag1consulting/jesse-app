@@ -95,6 +95,31 @@
 //! Everything else is byte-for-byte: every Claude Code row, `codex/main-write`,
 //! `codex/main-write-resume`, and the diet, title and vault-QA children.
 //!
+//! **REGENERATED AGAIN, in bridge 0.146.0, and this one touches BOTH harnesses — the first
+//! regeneration that does.** Six sites moved and six did not: `main-read`, `main-write` and
+//! `main-write-resume` on each harness changed; `diet`, `title` and `vaultqa` are byte-for-byte
+//! identical on both. That split is the claim: `kubernetes` is a MAIN-TURN server and nothing
+//! else was allowed to drift while it was added.
+//!
+//! On Claude Code, no argument was gained or lost — 21/19/21 arguments before and after. Two
+//! digests moved:
+//!
+//!   * the `--mcp-config` digest on all three, because the set gained `kubernetes` (17 → 18).
+//!   * the `--allowedTools` digest on the two WRITE sites, because twenty tool names were
+//!     granted. `main-read` keeps its digest, and that is the assertion worth reading: a
+//!     read-row child gets `READ_ALLOWED_TOOLS` — qmd's four — so a cluster server appearing in
+//!     its MCP set must NOT move its grant.
+//!
+//! On Codex the argv GREW by eight arguments on each of the three sites (135 → 143, 143 → 151,
+//! 143 → 151): four `-c mcp_servers.kubernetes.*` pairs, since Codex takes its server set as
+//! `-c` lines rather than one JSON blob. `command`, `args` and `default_tools_approval_mode`
+//! are verbatim and readable; `enabled_tools` is `[]` on `main-read` — the same read-row rule
+//! as above, visible here as a literal empty list — and hashed on the two write sites.
+//!
+//! Codex gaining a server is the part that cost something, and it cost it outside this file:
+//! it moved Codex's row labels and orphaned both operator `[[accepted]]` blocks in
+//! `containment-codex.toml`. See the 0.146.0 changelog entry.
+//!
 //! To regenerate — which should only ever happen alongside a DELIBERATE argv change, in the
 //! same commit as its changelog entry: `JESSE_ARGV_FIXTURE_WRITE=1 cargo test --test
 //! argv_split_fixture`.
