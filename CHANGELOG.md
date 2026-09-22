@@ -14,6 +14,36 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [Bridge 0.146.2] - 2026-09-22
+
+**The argv fixture is the one place a containment change is checked against a capture nobody
+can rationalise, and 0.146.0 moved it without regenerating it.** `bridge/tests/argv_split_fixture.rs`
+compares every child the bridge spawns against a committed JSON capture; adding a main-turn
+server necessarily moves it, and the regeneration belongs in the same commit as the change.
+It was missed, and CI caught it.
+
+### Changed
+
+- **`bridge/tests/fixtures/argv-before-split.json` regenerated.** Six of the twelve spawn
+  sites moved and six did not — `main-read`, `main-write` and `main-write-resume` on each
+  harness changed; `diet`, `title` and `vaultqa` are byte-for-byte identical on both. That
+  split is the claim worth checking: `kubernetes` is a main-turn server and nothing else was
+  allowed to drift while it was added.
+
+  On Claude Code no argument was gained or lost (21/19/21 before and after); the
+  `--mcp-config` digest moved on all three sites, and the `--allowedTools` digest moved on
+  the two WRITE sites only. `main-read` keeping its grant digest is the assertion worth
+  reading: a read-row child gets `READ_ALLOWED_TOOLS` — qmd's four — so a cluster server
+  appearing in its MCP set must not move its grant.
+
+  On Codex the argv grew by eight arguments on each of the three sites (135 → 143, 143 → 151,
+  143 → 151): four `-c mcp_servers.kubernetes.*` pairs, since Codex takes its server set as
+  `-c` lines rather than one JSON blob. `enabled_tools` is a literal `[]` on `main-read` —
+  the same read-row rule, visible in the capture — and hashed on the two write sites.
+
+  This is the first regeneration that touches both harnesses. The header records what moved,
+  as every previous one does.
+
 ## [Bridge 0.146.1] - 2026-09-22
 
 **0.146.0 moved the main-turn row label; this is the run that recorded it.** Adding
