@@ -363,6 +363,54 @@ final class WorkoutContextTests: XCTestCase {
         XCTAssertFalse(detail.contains("ascent 84 m (computed)"), "a read value is unmarked")
     }
 
+    // MARK: - Humidity normalization
+
+    /// The provider assumed `HKUnit.percent()` humidity metadata was the documented
+    /// 0…1 fraction and multiplied it by 100, so Apple's Workout app — which stores
+    /// it as 0…100 — rendered `humidity 6700%` on a real device. The normalizer takes
+    /// both conventions, with 1.0 as the boundary, and rejects what cannot be a
+    /// humidity so the segment is omitted rather than printed wrong.
+    func testHumidityAcceptsBothPercentAndFractionConventionsAndRejectsTheRest() {
+        // Apple's Workout app: already a percent.
+        XCTAssertEqual(WorkoutContextFormatter.humidityPercent(fromRaw: 67), 67)
+        // The documented unit: a fraction.
+        XCTAssertEqual(WorkoutContextFormatter.humidityPercent(fromRaw: 0.67), 67)
+        // The boundary itself reads as a saturated fraction, not 1%.
+        XCTAssertEqual(WorkoutContextFormatter.humidityPercent(fromRaw: 1.0), 100)
+        // Both ends of the range survive.
+        XCTAssertEqual(WorkoutContextFormatter.humidityPercent(fromRaw: 0), 0)
+        XCTAssertEqual(WorkoutContextFormatter.humidityPercent(fromRaw: 100), 100)
+        // The bug's own output: a percent that was multiplied by 100 again.
+        XCTAssertNil(WorkoutContextFormatter.humidityPercent(fromRaw: 6700))
+        XCTAssertNil(WorkoutContextFormatter.humidityPercent(fromRaw: -1))
+        XCTAssertNil(WorkoutContextFormatter.humidityPercent(fromRaw: .nan))
+        XCTAssertNil(WorkoutContextFormatter.humidityPercent(fromRaw: .infinity))
+    }
+
+    /// End to end through the renderer: whichever convention the recording app used,
+    /// the workout line carries the same real humidity, in the existing format.
+    func testNormalizedHumidityRendersTheSameFromEitherConvention() {
+        var asPercent = run(dynamics: false)
+        asPercent.stepCount = nil
+        asPercent.weatherTemperatureC = 21
+        asPercent.weatherHumidityPercent =
+            WorkoutContextFormatter.humidityPercent(fromRaw: 67)
+        var asFraction = asPercent
+        asFraction.weatherHumidityPercent =
+            WorkoutContextFormatter.humidityPercent(fromRaw: 0.67)
+
+        let detail = WorkoutContextFormatter.detailSuffix(for: asPercent)
+        XCTAssertEqual(detail, ", temp 21 C, humidity 67%, pace 5:38/km (computed)")
+        XCTAssertEqual(WorkoutContextFormatter.detailSuffix(for: asFraction), detail)
+
+        // Implausible data renders nothing at all, never a placeholder.
+        var rejected = asPercent
+        rejected.weatherHumidityPercent =
+            WorkoutContextFormatter.humidityPercent(fromRaw: 6700)
+        XCTAssertEqual(WorkoutContextFormatter.detailSuffix(for: rejected),
+                       ", temp 21 C, pace 5:38/km (computed)")
+    }
+
     /// A cycle is neither a swim nor a foot distance, so it gets no pace, no cadence
     /// and — deliberately, per the rendering spec, which scopes ascent/descent to
     /// runs, walks and hikes — no elevation either, even when HealthKit recorded it.
