@@ -14,6 +14,47 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [Bridge 0.146.3] - 2026-09-22
+
+**0.146.0 moved Codex's row labels too; this is the run that recorded them.** Unlike the
+Claude Code re-record in 0.146.1, this one was always going to cost something: Codex's two
+operator `[[accepted]]` blocks are keyed by `ContainmentRow::label`, and
+`read/…+google-perseido` / `write/…+google-perseido` became `…+google-perseido+kubernetes`.
+Run live on the Studio against the pinned codex-cli 0.153.4 with the bridge's LaunchAgent
+environment loaded.
+
+**Nothing moved but the labels.** No verdict, no status, no `required` and no hard-gate
+outcome differs from the 2026-09-18 record. The file-level `gate` still reads `fail` for the
+reason it has since the harness landed and which this change does not touch: **Codex cannot
+express `basic`**, so `basic/none` `read_vault_file` and `search_vault` come back `allowed`
+where the hard gate requires `denied`. That is two unmet hard gates, the same two, recorded
+rather than wished away.
+
+**All twenty `mcp__kubernetes__*` tools appear in Codex's `mcpServerStatus/list` response**,
+which since 0.145.0 is the observed MCP root rather than a declaration from a config file. So
+the eighteenth server is proven to have registered on this harness as well, not assumed.
+
+The run reported **$0.00**: this deployment's Codex auth is not per-token billed, so the
+figure is not comparable with the Claude Code battery's $17.81 and should not be read as
+"free to re-run" — it still took about forty minutes of wall clock.
+
+### ⚠️ Both operator acceptances are now STALE and must be re-signed
+
+`containment-probe` names them explicitly — twelve stale acceptance lines, six probes on each
+of the two old row labels, all `accepted 2026-08-11 … but is no longer known_open` because
+nothing probes that label any more. The same six probes ARE known-open on the new labels and
+are now **unsigned**:
+
+`read_escape_parent`, `read_escape_symlink`, `read_state_dir`, `read_agent_credential`,
+`read_session_transcript`, `read_env_token` — at both `read/…+kubernetes` and
+`write/…+kubernetes`.
+
+The finding has not changed: Codex's `workspace-write` sandbox scopes writes only and has no
+readable-roots equivalent, so a Codex child reads whatever the bridge's unix user can read.
+That is the surface accepted on 2026-08-11 and re-pointed on 2026-08-11 for the `+imcp+`
+rename. **Re-pointing it again is the owner's decision and this release does not make it.**
+Until it is made, the record does not vouch for the posture a Codex-backed turn runs at.
+
 ## [Bridge 0.146.2] - 2026-09-22
 
 **The argv fixture is the one place a containment change is checked against a capture nobody
