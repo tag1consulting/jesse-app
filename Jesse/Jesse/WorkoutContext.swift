@@ -460,6 +460,30 @@ nonisolated enum WorkoutContextFormatter {
         return d
     }
 
+    // MARK: Unit normalization
+
+    /// A relative humidity read from workout metadata with `HKUnit.percent()`,
+    /// normalized to a percent in 0…100, or nil when the value cannot be one.
+    ///
+    /// The two conventions in the wild disagree, so the number itself has to decide.
+    /// `HKUnit.percent()` is documented as a 0…1 fraction, and a third-party app that
+    /// follows the documentation writes `0.67` for 67% humidity; Apple's own Workout
+    /// app does not, and stores the value so this read returns `67`. The boundary is
+    /// therefore 1.0: at or below it the value is read as a fraction and multiplied by
+    /// 100, above it the value is already a percent and passes through. The one case
+    /// the rule cannot call is a raw `1.0`, which is 100% as a fraction and 1% as a
+    /// percent; it renders 100%, the likelier reading of a saturated recording.
+    ///
+    /// Anything that cannot be a humidity — negative, NaN, infinite, or a percent
+    /// above 100 (a 0…100 value that was multiplied by 100 as well, the bug this
+    /// replaces) — returns nil, and the caller omits the segment rather than printing
+    /// a placeholder.
+    static func humidityPercent(fromRaw raw: Double) -> Double? {
+        guard raw.isFinite, raw >= 0 else { return nil }
+        let percent = raw <= 1 ? raw * 100 : raw
+        return percent <= 100 ? percent : nil
+    }
+
     // MARK: Field formatting (all locale-fixed / C-locale numeric)
 
     /// `yyyy-MM-dd HH:mm` in en_US_POSIX so the string never shifts by host locale.

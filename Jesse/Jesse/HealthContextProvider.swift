@@ -440,10 +440,15 @@ nonisolated struct HealthContextProvider: HealthContextProviding {
             elevationDescendedM: metaQuantity(w.metadata, HKMetadataKeyElevationDescended, .meter()),
             weatherTemperatureC: metaQuantity(w.metadata, HKMetadataKeyWeatherTemperature,
                                               .degreeCelsius()),
-            // HKUnit.percent() is a 0…1 fraction (see HKUnit.h), as the existing
-            // SpO2 read already assumes; the block renders a percent.
+            // Apple's Workout app stores the weather humidity so that reading it in
+            // HKUnit.percent() returns 0…100, while the unit is DOCUMENTED as a 0…1
+            // fraction and a third-party app may write it that way. Neither reading
+            // can be assumed, so the raw value goes to the pure normalizer, which
+            // accepts both and rejects what cannot be a humidity. The provider
+            // decides nothing.
             weatherHumidityPercent: metaQuantity(w.metadata, HKMetadataKeyWeatherHumidity,
-                                                 .percent()).map { $0 * 100 },
+                                                 .percent())
+                .flatMap { WorkoutContextFormatter.humidityPercent(fromRaw: $0) },
             swim: swimDetail(for: w))
     }
 

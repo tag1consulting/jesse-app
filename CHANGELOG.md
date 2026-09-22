@@ -14,6 +14,36 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [App 1.0 (145)] - 2026-09-22
+
+**Workout humidity printed 100 times too high.** Two Apple Workout app sessions rendered
+`temp 21 C, humidity 6700%` and `humidity 7500%` on a real device; the true values were
+67% and 75%.
+
+### Fixed
+
+- **`HealthContextProvider.summary(for:)` assumed the weather humidity metadata was the
+  documented 0…1 fraction and multiplied it by 100.** `HKUnit.percent()` is a fraction as
+  a unit, and body fat and SpO2 samples are stored that way, but Apple's own Workout app
+  does not write `HKMetadataKeyWeatherHumidity` that way: the quantity is stored so that
+  `doubleValue(for: .percent())` already returns `67` for 67% humidity. A third-party app
+  may still write `0.67`, so neither convention can be assumed.
+
+- **The conversion moved into a pure normalizer, `WorkoutContextFormatter.humidityPercent(fromRaw:)`,
+  that takes both.** The boundary is 1.0: at or below it the raw value is a fraction and is
+  multiplied by 100, above it the value is already a percent and passes through. A negative,
+  NaN or infinite value, or a result above 100 (the bug's own `6700`), returns nil and the
+  segment is omitted, because implausible data renders nothing rather than a placeholder.
+  The provider now flat-maps its read through it and decides nothing itself. Body fat and
+  SpO2 are untouched; both are verified correct on the same device.
+
+- **No test covered the conversion because it sat in the one file that imports HealthKit,
+  which has no tests by design.** The existing workout tests set `weatherHumidityPercent`
+  directly on the pure value type and could never have caught it. The normalizer is pure
+  Foundation and is now pinned by `WorkoutContextTests` at both conventions, both ends of
+  the range, the 1.0 boundary and every rejected input, plus a rendered line asserting that
+  `67` and `0.67` produce the same `humidity 67%`.
+
 ## [App 1.0 (144)] - 2026-09-20
 
 ### Added
