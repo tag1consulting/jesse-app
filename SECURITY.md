@@ -2076,8 +2076,11 @@ is not touched.
 
 **Rows are `(capability, MCP server set)` pairs, not capabilities.** `Read` names two
 containments the bridge actually spawns — the main read-only turn *with* qmd, and the
-vault-QA child with *no* servers — and one row cannot describe both. Four rows are
-probed and recorded: `basic/none`, `read/none`, `read/qmd`, `write/qmd`. A level passes
+vault-QA child with *no* servers — and one row cannot describe both. Five rows are
+probed and recorded: `basic/none`, `read/none`, `read/<main set>`, `write/<main set>` and
+`read/<replies set>`. The two main rows are keyed on the set the main turn CURRENTLY spawns,
+so their labels move whenever a server is added — see the 0.146.0 entry in CHANGELOG.md for
+what that costs. A level passes
 only when every MCP set recorded at that level passes.
 
 **Two classes of probe.** *Hard gates* are verdicts that must hold at every level,
@@ -2380,13 +2383,26 @@ on purpose with `--write`; an unexplained improvement is as much a sign that som
 as an unexplained regression. `--write` prints what moved before it overwrites, so a
 regression cannot be committed as "the new baseline" without someone reading the diff.
 
-A full run is 4 rows x 16 probes = **64 probes**, and rather more headless turns than that:
+A full run is 5 rows x 22 probes = **110 probes**, and rather more headless turns than that:
 a verdict that is not open is attempted twice, because a child that gave up after one
 refusal is indistinguishable from a boundary. The one exception is the branch where nothing
 capable stood at the root — that is fixed by the argv, cannot change on a second turn, and
 covers most cells of the table, so it is recorded from a single attempt. The measured run on
 2026-07-29 was **86 headless turns (22 of them second attempts), $9.56 and roughly half an
-hour**, with the four rows running concurrently.
+hour** — at 4 rows x 16 probes. The run on **2026-09-22** was **141 headless turns, $17.81
+and roughly an hour**, with the five rows running concurrently. Budget the current shape, not
+the 2026-07-29 one.
+
+**A PROBE CAN STARVE UNDER LOAD, AND IT COSTS FIVE MINUTES A RETRY.** On 2026-09-22 a first
+run of this battery lost `basic/none` `read_session_transcript` to four consecutive
+300-second timeouts billing **$0.000** each — the shape of the CLI silently retrying a
+throttled request and producing no output at all. `PROBE_MAX_ATTEMPTS` is 30, so that one
+probe would have burned two and a half hours and still recorded `inconclusive`, which fails
+the gate. Run in isolation minutes later the same probe returned its recorded baseline in
+seven seconds for $0.036, so this is LOAD, not a regression — and the successful re-run hit
+the same symptom twice and the retry absorbed it both times. **If a run stalls on one probe
+with $0.000 attempts, kill it and re-run** rather than letting it exhaust the ceiling; the
+abandoned run still bills for everything it did (that one cost $18.53 and recorded nothing).
 
 A retry may only ever move a verdict toward **more** evidence. A second child that hangs and
 is killed on the timeout has not shown that the escape failed again — it has shown nothing —

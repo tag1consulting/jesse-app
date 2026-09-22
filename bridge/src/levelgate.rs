@@ -1921,7 +1921,12 @@ mod tests {
         // THE MAIN-TURN LABEL, which has a PASSING `read` row in the committed record — so a
         // rule that only asked "is there a passing row" would accept it and hand an
         // unattended, self-closing turn the network and the hypervisor.
-        let main_turn = McpSet::MessagesBuildPlacesInbound.label();
+        // The CURRENT main-turn set, not a retired one: the point of the assertion is that
+        // this label has a PASSING `read` row in the committed record, and only the set the
+        // main turn actually spawns is re-probed on every battery. Pinning a retired label
+        // here would quietly stop testing anything the moment the main set moved — which is
+        // exactly what 0.146.0 did to `MessagesBuildPlacesInbound`.
+        let main_turn = McpSet::MessagesBuildPlacesInboundKubernetes.label();
         assert!(
             read_row_passes(&record(), &format!("read/{main_turn}")),
             "precondition: the main-turn read row passes, which is why the rule cannot be \

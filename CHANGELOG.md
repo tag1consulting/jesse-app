@@ -14,6 +14,61 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [Bridge 0.146.1] - 2026-09-22
+
+**0.146.0 moved the main-turn row label; this is the run that recorded it.** Adding
+`kubernetes` re-keyed Claude Code's two main rows from `…+build+places+inbound` to
+`…+build+places+inbound+kubernetes`, so the committed record described a posture the bridge
+no longer spawns and nine `levelgate` tests said so. A record cannot be repaired by editing
+it — only by re-running the battery — so this is that run, live on the Studio with the
+bridge's LaunchAgent environment loaded so the credential-backed servers registered their
+tools instead of starting empty and vouching for a set the child never loaded.
+
+**`gate = "pass"`, $17.81, 5 rows x 22 probes.** No verdict moved and no status moved. What
+changed is the two row labels, the metadata, and the evidence strings — which are richer than
+the 2026-09-17 record because the probe's evidence format moved in 0.145.0, not because
+anything about the boundary did.
+
+**The eighteenth server registered, and it was checked rather than assumed.** All twenty
+`mcp__kubernetes__*` tools appear in the child's observed init-event root on both main rows,
+and `mcp servers:` lists all eighteen. That check is the one worth repeating on any future
+re-record: a server whose launcher is missing registers zero tools and looks identical in the
+record to one that is working.
+
+### Changed
+
+- `bridge/containment.toml`: `binary_version` 2.1.270 → **2.1.278**, `bridge_version` 0.144.0
+  → 0.146.1, `recorded` 2026-09-17 → 2026-09-22. The CLI had auto-updated twice since the
+  last re-record, so this closes a staleness that predates this branch.
+- `levelgate`'s brief-MCP-switch test pinned `MessagesBuildPlacesInbound` as "the main-turn
+  label". It is retired, and a retired label has no passing row to assert against — so the
+  test's precondition failed. It now names the set the main turn actually spawns, with a
+  comment saying why pinning a retired one silently stops testing anything.
+
+### Known, and unchanged by this run
+
+The two `write/…` known-opens — `network_outbound` and `background_process`, both the
+`Bash(git:*)` routes — carry over to the new label and remain **unaccepted**: this record has
+never had an `[[accepted]]` block, before or after. That is the pre-existing state, not
+something the label move orphaned. The Codex record is the one with signatures to re-take.
+
+### Operator note
+
+**A full battery now costs about twice what SECURITY.md says.** That document records
+"4 rows x 16 probes = 64 probes … $9.56 and roughly half an hour", measured 2026-07-29. It is
+5 rows x 22 probes today, and this run cost **$17.81**.
+
+**A probe can starve under load, and it costs five minutes a retry.** An abandoned first run
+of this battery lost `basic/none` `read_session_transcript` to four consecutive 300-second
+timeouts billing $0.000 — the shape of the CLI silently retrying a throttled request and
+producing nothing. `PROBE_MAX_ATTEMPTS` is 30, so that one probe would have burned 2.5 hours
+and still recorded `inconclusive`, which fails the gate. Run in isolation immediately
+afterwards it returned the recorded baseline in 7 seconds for $0.036, so it is load, not a
+regression. The successful run hit the same symptom twice and the retry absorbed it both
+times. **If a run stalls on one probe with $0.000 attempts, kill it and re-run rather than
+letting it exhaust the attempt ceiling** — and budget the abandoned run: the two together
+cost $36.34.
+
 ## [Bridge 0.146.0] - 2026-09-22
 
 **The cluster existed, the identity existed, and the agent could not reach either.** A
