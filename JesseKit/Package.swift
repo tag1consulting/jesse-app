@@ -31,6 +31,7 @@ let package = Package(
         .library(name: "JesseTodayDisplay", targets: ["JesseTodayDisplay"]),
         .library(name: "JesseOps", targets: ["JesseOps"]),
         .library(name: "JesseSpeech", targets: ["JesseSpeech"]),
+        .library(name: "JesseVault", targets: ["JesseVault"]),
     ],
     targets: [
         .target(
@@ -313,6 +314,52 @@ let package = Package(
         .testTarget(
             name: "JesseSpeechTests",
             dependencies: ["JesseSpeech"],
+            swiftSettings: [
+                .swiftLanguageMode(.v6),
+            ]
+        ),
+        // The OBSIDIAN COPY OF THE VAULT as a first-class thing this device can hold:
+        // the persistent security-scoped folder bookmark, the markdown scan over it, the
+        // two coordinated file operations (read one note, append one line), the on-device
+        // model's measured capacity, and the diagnostics screen that shows all four.
+        //
+        // It exists because the app could reach the vault only through the bridge. With
+        // the bridge unreachable `SnapshotCache` still renders the last day and the
+        // capture queue still holds ticks, but not one note could be opened or searched —
+        // while Obsidian kept a complete synced copy of the same vault on the very same
+        // device, reachable through a document picker and a bookmark nothing in the app
+        // knew how to take. This target is that missing piece, and nothing more: no
+        // index, no embedding, no question answering.
+        //
+        // It depends on NO other target in this package and on nothing but Foundation,
+        // plus SwiftUI for its one screen and FoundationModels in the single file that
+        // probes the model. The dependency runs one way and the arrow points nowhere:
+        // nothing here knows about a thread, a turn, a bridge config or a day file, so
+        // the search index built on top of it later cannot drag the chat layer in with it.
+        //
+        // Isolation: default (nonisolated), matching JesseNetworking and the display
+        // targets rather than the app targets' MainActor default. `VaultFolder`,
+        // `VaultScanner` and `VaultFile` are `Sendable` value types with no cached state,
+        // called from the MainActor Settings row AND from a background scan, so a
+        // MainActor default would put a full walk of the vault on the same actor as the
+        // UI. The one class here is the screen's `@MainActor` model.
+        //
+        // GOTCHA, carried over from JesseSearch verbatim because it applies to any class
+        // in this package: an explicitly `@MainActor` class's synthesized deinit is
+        // MainActor-isolated, so releasing an instance off the main actor (a unit-test
+        // host tears objects down off-actor) routes through the isolated-deinit executor
+        // hop, which aborts. `VaultDiagnosticsModel` therefore carries an explicit
+        // `nonisolated deinit {}`, the same one `ThreadSearchModel` and
+        // `FoundationModelExpander` carry.
+        .target(
+            name: "JesseVault",
+            swiftSettings: [
+                .swiftLanguageMode(.v6),
+            ]
+        ),
+        .testTarget(
+            name: "JesseVaultTests",
+            dependencies: ["JesseVault"],
             swiftSettings: [
                 .swiftLanguageMode(.v6),
             ]

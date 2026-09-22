@@ -295,6 +295,92 @@ the label cost once, for one server.
    the credential — SECURITY.md carries the launcher-wrapper shape that would fix it.
 6. ~~`/Repos/` in the vault's `.gitignore`~~ — **done**, vault commit `ff0e7f81`.
 
+## [App 1.0 (146)] - 2026-09-22
+
+**The app could only reach the vault through the bridge.** With the bridge unreachable
+`SnapshotCache` still rendered the last day and the capture queue still held ticks and quick
+logs, but not one note could be opened or searched — while Obsidian kept a complete synced
+copy of the same vault on the very same device, reachable through a document picker and a
+persistent security-scoped bookmark that nothing in the app knew how to take. That missing
+bookmark is the root cause: every vault-shaped feature was built on a network hop because
+there was no other way to name a file.
+
+This is the first of four steps toward an offline mode, and it deliberately ships only the
+plumbing and the measurements that decide whether the other three are worth building. There
+is no index, no embedding, no question answering and no offline Today tab here.
+
+### Added
+
+- **`JesseVault`, a new JesseKit library target** depending on no other target and on nothing
+  but Foundation, plus SwiftUI for its one screen. `VaultFolder` takes, stores, refreshes and
+  hands out the folder bookmark (`.withSecurityScope` on macOS, default options on iOS — the
+  asymmetry is real and is the classic way a bookmark resolves to a URL that cannot be
+  opened). It holds no cached state, which is what lets the same value be used from the
+  MainActor Settings row and from a background scan without a lock or an actor hop.
+
+- **`VaultScanner`**, which walks every markdown file under the root and reports the count,
+  the bytes, the per-file modification times and **its own wall clock**. Timing itself rather
+  than being timed from outside is the point: the number is the go/no-go for the whole
+  offline plan, and a caller's overhead must not be folded into it. It REFUSES to descend
+  into dot directories rather than filtering their contents afterwards — `.obsidian` alone is
+  thousands of files that are not notes, and that refusal is most of the difference between a
+  fast scan and a slow one. `.obsidian`, `.trash` and `.fuse_hidden*` are all instances of
+  one leading-dot rule rather than a list of three that would go stale.
+
+- **`VaultFile`**, the two file operations, both through `NSFileCoordinator`: the folder is
+  actively synced, so an uncoordinated read can see a half-written file and an uncoordinated
+  write can lose against one. **Append never rewrites a byte that is already there** — it
+  seeks to the end or creates the file — which is the property that makes it safe to point at
+  a real vault, and it is asserted by comparing the file's bytes before and after rather than
+  assumed. Every path is refused unless it is relative, free of `..`, outside every dot
+  directory, and still inside the root once the symlinks that actually exist are resolved.
+
+- **`ModelProbe`**, which measures what the on-device model will take by growing a prompt
+  until the session refuses it and then bisecting to the nearest 500 characters, and times one
+  2,000-character round trip. It reports CHARACTERS because a snippet budget is spent in
+  characters, and it uses plain English filler because a tokenizer packs repeated characters
+  very differently from prose. A fresh session per attempt: a reused one would measure its own
+  growing transcript. `FoundationModelProbeSession` is the single file in the target that
+  imports FoundationModels, the same containment `FoundationModelExpander` gives JesseSearch,
+  so the bisection is asserted against a fake and the real model is never called from a test.
+
+- **A "Vault folder" row in Settings on both platforms and a shared "Vault diagnostics"
+  screen** with four buttons — Scan, Read, Append, Model probe — and selectable result lines.
+  Nothing runs on appear but reading the folder's status; the model probe in particular is
+  minutes of on-device inference and never speculative. The iPhone contributes a
+  `.folder`-only `UIDocumentPickerViewController`, the Mac an `NSOpenPanel` that can only
+  choose directories, and neither owns a line of the logic.
+
+- **61 tests in `JesseVaultTests`**: the scanner over a temporary tree, the bookmark round
+  trip through a second independently constructed `VaultFolder` (which is what the next launch
+  is), every path refusal including a symlink that leaves the root with nothing in its name to
+  say so, the append's byte-for-byte growth, and the bisection against a session that refuses
+  above a known size.
+
+### Two platform facts found by building this, both now pinned by a test
+
+- **`FileManager.enumerator(at:)` does not follow a symlinked ROOT directory.** Pointed at
+  one it yields nothing at all and reports no error, so a vault reached through a link would
+  have scanned perfectly clean at zero files. The scan now resolves the root once, before the
+  walk — one syscall, not one per file, which matters because the per-file work is what the
+  reported duration is measuring.
+
+- **A macOS security-scoped bookmark is bound to the creating app's CODE IDENTITY**, and a
+  build signed differently cannot resolve the bookmark an earlier build left behind: it comes
+  back as `NSFileReadCorruptFileError`, "the file couldn't be opened because it isn't in the
+  correct format". Observed directly here — rebuilding an unsigned probe binary turned a
+  working bookmark into that error. It is not corruption and the user's action is the same as
+  for a stale bookmark, so every failing status now says **"pick the folder again"** instead
+  of quoting a Foundation error and leaving the reader to infer what to do.
+
+### Known limits
+
+- **Nothing here proves the one thing only a device can**: that a document-picker bookmark
+  survives a reboot on the phone. The pull request carries a checklist for that, and prompt 1
+  is gated on it.
+- The append writes to `Inbox/<today>-phone-probe.md` and nowhere else. It is the only write
+  in the target.
+
 ## [App 1.0 (145)] - 2026-09-22
 
 **Workout humidity printed 100 times too high.** Two Apple Workout app sessions rendered
