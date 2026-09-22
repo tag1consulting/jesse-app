@@ -1,6 +1,8 @@
 import SwiftUI
 import JesseNetworking
 import JesseOps
+import JesseVault
+import UniformTypeIdentifiers
 
 // Bridge connection settings. MVP pairing is the manual field (host + token) the plan
 // puts first; a paste-able `jesse://pair?...` link and camera QR are later polish. The
@@ -44,6 +46,14 @@ struct MacSettingsView: View {
     // The Usage section's Refresh in flight; the usage itself lives in `UsageStore.shared`.
     @State private var refreshingUsage = false
     // Phase 2: the model awaiting write-enable confirmation (granting writes is gated).
+
+    // THE OBSIDIAN COPY OF THE VAULT on this Mac. Same `VaultFolder` the iPhone uses,
+    // same single UserDefaults key, same bookmark — only the picker differs, because
+    // AppKit's open panel is what this platform has instead of a document picker.
+    private let vaultFolder = VaultFolder()
+    @State private var vaultStatus: VaultFolderStatus = .notSet
+    @State private var showVaultDiagnostics = false
+    @State private var vaultError: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -112,6 +122,7 @@ struct MacSettingsView: View {
                         .font(.caption).foregroundStyle(.secondary)
                 }
 
+                vaultFolderSection
                 modelSwitchSection
                 usageSection
                 writeAccessSection
@@ -138,6 +149,73 @@ struct MacSettingsView: View {
             sentinelHost = sentinel.host
             sentinelPort = sentinel.port == SentinelConfig.defaultPort ? "" : String(sentinel.port)
             sentinelToken = sentinel.token
+            vaultStatus = vaultFolder.resolve()
+        }
+        .sheet(isPresented: $showVaultDiagnostics) {
+            // A SHEET rather than a new `Window` scene: the two Ops screens earn their
+            // own windows because they are opened from the menu bar as well, and this
+            // one is reachable from exactly one place. A window scene for it would be a
+            // scene to register, wire and close for no gain.
+            NavigationStack {
+                VaultDiagnosticsView()
+                    .toolbar {
+                        ToolbarItem(placement: .confirmationAction) {
+                            Button("Done") { showVaultDiagnostics = false }
+                        }
+                    }
+            }
+            .frame(width: 560, height: 620)
+        }
+    }
+
+    /// Point this Mac at the Obsidian copy of the vault, and lead to the diagnostics.
+    ///
+    /// `NSOpenPanel` with `canChooseDirectories` on and `canChooseFiles` OFF — the same
+    /// `.folder`-only constraint the iPhone's picker carries, for the same reason: a
+    /// mis-tap must not be able to point the whole offline layer at a single note.
+    @ViewBuilder
+    private var vaultFolderSection: some View {
+        Section {
+            LabeledContent("Status", value: vaultStatus.display)
+            HStack {
+                Button(vaultStatus.isReady ? "Pick a different folder…" : "Pick the vault folder…") {
+                    pickVaultFolder()
+                }
+                if vaultFolder.hasBookmark {
+                    Button("Forget") {
+                        vaultFolder.forget()
+                        vaultStatus = vaultFolder.resolve()
+                    }
+                }
+                Spacer()
+                Button("Diagnostics") { showVaultDiagnostics = true }
+            }
+            if let vaultError {
+                Text(vaultError).font(.callout).foregroundStyle(.red)
+            }
+        } header: {
+            Text("Vault folder")
+        } footer: {
+            Text("Points Jesse at the Obsidian copy of your vault on this Mac, so notes can be read when the bridge can't be reached. Jesse keeps the folder across restarts, reads your notes, and writes nothing except the one line the diagnostics screen's Append button adds under Inbox/.")
+                .font(.caption).foregroundStyle(.secondary)
+        }
+    }
+
+    private func pickVaultFolder() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.allowedContentTypes = [.folder]
+        panel.prompt = "Use this folder"
+        panel.message = "Choose the Obsidian vault folder."
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            try vaultFolder.adopt(url: url)
+            vaultError = nil
+            vaultStatus = vaultFolder.resolve()
+        } catch {
+            vaultError = "That folder couldn't be saved: \(error.localizedDescription)"
         }
     }
 

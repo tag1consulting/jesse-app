@@ -4,6 +4,7 @@ import JesseAsk
 import JesseCore
 import JesseOps
 import JesseSpeech
+import JesseVault
 
 // Root of the app: a NavigationStack hosting the thread list. Cross-cutting
 // concerns live here — re-attaching to backgrounded runs on foreground, draining
@@ -446,6 +447,15 @@ struct SettingsView: View {
     @AppStorage(WriteMealsToHealthSettings.enabledKey) private var writeMealsToHealth = false
     @State private var mealWriteDenied = false
 
+    // THE OBSIDIAN COPY OF THE VAULT on this iPhone. `VaultFolder` holds nothing in
+    // memory — the bookmark lives in UserDefaults and every call reads it back — so
+    // this is a value, not a store, and `vaultStatus` is the only thing that has to
+    // be refreshed when it changes.
+    private let vaultFolder = VaultFolder()
+    @State private var vaultStatus: VaultFolderStatus = .notSet
+    @State private var showVaultPicker = false
+    @State private var vaultError: String?
+
     var body: some View {
         NavigationStack {
             Form {
@@ -507,6 +517,40 @@ struct SettingsView: View {
                 } footer: {
                     Text("Ops shows the laptop's health and the buttons that act on it, and leads to the schedule. Away mode tells the bridge which zone to derive dates in while you're travelling.")
                 }
+
+                Section {
+                    LabeledContent("Status", value: vaultStatus.display)
+                    Button {
+                        vaultError = nil
+                        showVaultPicker = true
+                    } label: {
+                        Label(vaultStatus.isReady ? "Pick a different folder" : "Pick the vault folder",
+                              systemImage: "folder.badge.gearshape")
+                    }
+                    if vaultFolder.hasBookmark {
+                        Button(role: .destructive) {
+                            vaultFolder.forget()
+                            vaultStatus = vaultFolder.resolve()
+                        } label: {
+                            Label("Forget this folder", systemImage: "folder.badge.minus")
+                        }
+                    }
+                    NavigationLink {
+                        VaultDiagnosticsView()
+                    } label: {
+                        Label("Vault diagnostics", systemImage: "ruler")
+                    }
+                    if let vaultError {
+                        Text(vaultError)
+                            .font(.callout)
+                            .foregroundStyle(.red)
+                    }
+                } header: {
+                    Text("Vault folder")
+                } footer: {
+                    Text("Points Jesse at the Obsidian copy of your vault on this iPhone, so notes can be read when the bridge can't be reached. Pick On My iPhone › Obsidian › your vault. Jesse keeps the folder across restarts, reads your notes, and writes nothing except the one line the diagnostics screen's Append button adds under Inbox/.")
+                }
+                .onAppear { vaultStatus = vaultFolder.resolve() }
 
                 Section {
                     Button {
@@ -737,6 +781,18 @@ struct SettingsView: View {
             .task { await refreshBridgeVersion() }
             .sheet(isPresented: $showScanner) {
                 scannerSheet
+            }
+            .sheet(isPresented: $showVaultPicker) {
+                VaultFolderPicker { url in
+                    showVaultPicker = false
+                    do {
+                        try vaultFolder.adopt(url: url)
+                        vaultStatus = vaultFolder.resolve()
+                    } catch {
+                        vaultError = "That folder couldn't be saved: \(error.localizedDescription)"
+                    }
+                }
+                .ignoresSafeArea()
             }
         }
         // ON THE STACK, not on the Form inside it: the Ops screens are PUSHED by
