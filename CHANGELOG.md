@@ -236,6 +236,30 @@ does the applying.
   written before this version names them and `McpSet::parse` returning `None` for a row a
   startup gate is resolving is indistinguishable from a posture nobody probed.
 
+### Verified live on this surface, 2026-09-22 — not taken from documentation
+
+- **The server's tool list.** `tools/list` against the pinned `kubernetes-mcp-server` v0.0.67
+  with the shipped argv returned exactly **twenty** tools, and that handshake is where
+  `DEFAULT_ALLOWED_TOOLS` came from. Fourteen carry `readOnlyHint: true`; five carry
+  `destructiveHint: true`.
+- **The launcher, from a launchd-shaped environment.** `env -i PATH=… HOME=… jesse-k8s-mcp
+  --toolsets core,config` handshaked and registered the same twenty. Checked this way on
+  purpose: a server that starts and registers nothing looks identical to one that works, and
+  the record would have been worth less than no record.
+- **The capability, on BOTH harnesses and two model families.** A spawned child asked to list
+  the cluster nodes answered `ks1.pozza Ready v1.36.4+k3s1` on Claude Code (2.1.278, ambient
+  Opus) and byte-identically on Codex (codex-cli 0.153.4, `gpt-6-astra`), each through the
+  bare `jesse-k8s-mcp` command and the kubeconfig the launcher supplies. The containment
+  battery proves what a child cannot do; this is the other half.
+- **The eighteen-server root, in each record.** All twenty `mcp__kubernetes__*` names appear
+  in Claude Code's observed `system`/`init` event on both main rows, and in Codex's
+  `mcpServerStatus/list` response on its three.
+
+**What is NOT verified, and is owed before this can be called done:** the managed-repo write
+path end to end — clone into `Repos/`, branch, commit, push, open a pull request, and a push
+to `main` that GitHub rejects. That needs the branch protection and the deploy key, which are
+Jeremy's to create; see the operator note below.
+
 ### Operator note
 
 **THIS IS THE SIXTH TIME A WIDENING HAS ORPHANED THE TWO CODEX `[[accepted]]` BLOCKS, AND THE
