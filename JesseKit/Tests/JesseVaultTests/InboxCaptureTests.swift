@@ -148,6 +148,21 @@ final class InboxCaptureTests: XCTestCase {
         XCTAssertEqual(entry, "- 09:05 (phone): first\n\n  second\n")
     }
 
+    /// "Blank" means whitespace-only, not merely empty. A pasted line of spaces indented by
+    /// two more would be trailing whitespace in somebody's vault — exactly the litter the
+    /// empty-line rule exists to avoid.
+    func testAWhitespaceONLYLineInsideACaptureIsWrittenEmptyToo() throws {
+        let entry = try InboxCapture.entry(text: "first\n   \t \nsecond", device: "phone",
+                                           now: instant("2026-09-23T09:05:00+02:00"),
+                                           timeZone: rome)
+        XCTAssertEqual(entry, "- 09:05 (phone): first\n\n  second\n")
+        for line in entry.components(separatedBy: "\n") {
+            XCTAssertEqual(line, line.replacingOccurrences(of: " +$", with: "",
+                                                           options: .regularExpression),
+                           "no line ends in whitespace")
+        }
+    }
+
     func testWindowsLineEndingsAreNormalized() throws {
         let entry = try InboxCapture.entry(text: "first\r\nsecond", device: "phone",
                                            now: instant("2026-09-23T09:05:00+02:00"),

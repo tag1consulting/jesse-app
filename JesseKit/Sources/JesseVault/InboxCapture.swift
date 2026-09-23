@@ -224,10 +224,13 @@ public struct InboxCapture: Sendable {
             .components(separatedBy: "\n")
         var out = head + (lines.first ?? "")
         for line in lines.dropFirst() {
-            // A blank line inside a capture stays blank rather than becoming two spaces:
-            // trailing whitespace in someone's vault is litter, and the indented line
-            // after it is what keeps the list item together.
-            out += "\n" + (line.isEmpty ? "" : "  " + line)
+            // A blank line inside a capture is written as a TRULY empty line, never as two
+            // spaces: trailing whitespace in someone's vault is litter, and the indented
+            // line after it is what keeps the list item together anyway. "Blank" means
+            // whitespace-only, not just empty — a pasted line of spaces would otherwise
+            // land as five spaces and be exactly the litter this avoids.
+            let blank = line.trimmingCharacters(in: .whitespaces).isEmpty
+            out += "\n" + (blank ? "" : "  " + line)
         }
         return out + "\n"
     }
