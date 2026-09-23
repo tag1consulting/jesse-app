@@ -14,6 +14,84 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [App 1.0 (150)] - 2026-09-23
+
+**The reader's block model was one block per line, and it knew nothing about tables,
+numbered lists, callouts or highlights — so a real note read worse in the app than it did
+in Obsidian, and a long one opened slowly.** Both halves of that are the same root cause:
+the model was built to prove a reader could exist, and it did that. Opened against the
+vault's actual notes it showed what it had never been asked to do. A soft-wrapped
+paragraph came out as a stack of short lines, because every non-blank line was its own
+block. A numbered list came out as bullets, because there was no ordered kind. A table
+came out as rows of pipe characters. A callout came out as a quote with `[!note]` showing.
+`==highlight==`, `~~struck~~` and `#tag` showed their own markers. An image and an embed
+came out as bracket soup. A fence lost its language and became one boxed line per line of
+code. And the reader drew every block eagerly into a `VStack`, so a 2,400-line note built
+a couple of thousand `Text` views before it could show the first frame.
+
+The rules a note is written in were also about to be written twice: the iOS reply renderer
+has parsed GFM pipe tables since the day replies learned to draw one, in the iOS app
+target, which no package target can import. This adds `JesseMarkdown` — Foundation only,
+depends on nothing — and MOVES the table primitives there rather than copying them, so
+there is one answer to "what is a delimiter row" instead of two that can drift.
+
+### Added
+
+- **`JesseMarkdown`: the markdown grammar, with no opinions about whose markdown it is.**
+  The GFM pipe-table primitives (moved, not copied, out of `Jesse/Jesse/MarkdownText.swift`
+  and now called from there), the inline span scanner, and the block grammar. Nothing in it
+  knows what a vault is — no wiki link, no frontmatter, no task box — which is what makes
+  it safe for the reply renderers to adopt later without inheriting a vault's conventions.
+
+- **A full block model for a note.** Paragraphs join their soft-wrapped lines (a line
+  ending in two spaces or a backslash still breaks). Ordered lists keep their depth and
+  their numbers, with markdown's own convention: a list written `1. 1. 1.` counts up, a
+  list a writer numbered themselves keeps what they wrote. Quotes span their whole run and
+  nested quotes flatten with their text kept. Callouts carry a type, a title and a body,
+  with a symbol and a tint per type and the note style for a type nobody wrote down. A
+  fence is one block carrying its language. Tables carry headers, rows and per-column
+  alignment, with ragged rows padded in BOTH directions so an extra cell widens the table
+  rather than being dropped. Images are named and linked, never fetched.
+
+- **Highlights, tags, embeds and bare URLs, inline.** `==highlight==` renders with a
+  yellow background; `#tag` renders in the secondary colour and is deliberately not
+  tappable (there is no tag index on this device to send anybody to); `![[embed]]` resolves
+  and opens exactly as a wiki link does, with an embed glyph before its label; a bare
+  `http`/`https` URL becomes tappable. A code span is opaque: `` `[[not a link]]` `` stays
+  four bracket characters somebody typed.
+
+- **A Raw toggle, formatted by default.** One toolbar button, one `UserDefaults` key
+  (`vault.reader.showsRaw`), remembered across notes and launches on that device. Raw shows
+  the file with line numbers in a monospaced gutter, frontmatter included, drawn one `Text`
+  per line inside the lazy stack — a single `Text` holding a quarter of a megabyte is the
+  slow path this change exists to avoid.
+
+- **A Render benchmark row on the Vault diagnostics screen.** Parses and renders the
+  largest note in the vault, twenty times after three warm-ups, and reports the medians —
+  the same two numbers the performance budget is written against, measured on the device
+  that actually matters rather than on a Mac.
+
+### Changed
+
+- **The reader draws lazily and lands on the hit's line.** A `LazyVStack` inside a
+  `ScrollViewReader`, so the cost of opening a note stops depending on how long the note
+  is, and the `line` a search hit already carried is finally used: the reader scrolls to
+  the first block at or after it and tints that block briefly so the eye lands. A table is
+  the one thing a lazy list cannot cover — a `Grid` builds every cell it is given — so a
+  table past sixty rows shows its first sixty and a button.
+
+### Fixed
+
+- **A wiki link inside a table cell is a link,** and an unresolved one is named in the same
+  "not in this copy of the vault" caption every other block gets.
+
+- **An ordinary `[text](url)` link keeps its shape.** The new bare-URL rule matched the
+  target inside a markdown link's parentheses and cut the link in half before
+  `AttributedString(markdown:)` could see it, so the reader drew the brackets and the
+  parentheses as literal text. A bare URL is now only recognised at a line start or after
+  whitespace. Found by rendering a fixture note that uses every construct and looking at
+  it, which is why that pass exists.
+
 ## [App 1.0 (149)] - 2026-09-23
 
 **Every write the app made went through the bridge, so a captured thought was only as

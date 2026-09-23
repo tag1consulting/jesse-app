@@ -32,6 +32,7 @@ let package = Package(
         .library(name: "JesseOps", targets: ["JesseOps"]),
         .library(name: "JesseSpeech", targets: ["JesseSpeech"]),
         .library(name: "JesseVault", targets: ["JesseVault"]),
+        .library(name: "JesseMarkdown", targets: ["JesseMarkdown"]),
     ],
     targets: [
         .target(
@@ -334,6 +335,42 @@ let package = Package(
                 .swiftLanguageMode(.v6),
             ]
         ),
+        // MARKDOWN ITSELF, WITH NO OPINIONS ABOUT WHOSE MARKDOWN IT IS.
+        //
+        // The bottom of the package: Foundation only, no SwiftUI, no UIKit, no AppKit, and
+        // a dependency list that is empty and is meant to stay empty. It holds the GFM
+        // pipe-table primitives, the inline span scanner, and the block grammar.
+        //
+        // It exists because the same rules were about to be written twice. The iOS reply
+        // renderer (`Jesse/Jesse/MarkdownText.swift`) has parsed GFM tables since the day
+        // replies learned to draw one, and it lives in the iOS app target, which no
+        // package target can import. The vault reader needs the same rules — this vault
+        // has hundreds of notes with tables in them and over five hundred with nested
+        // lists — so the choice was a second implementation of "what is a delimiter row"
+        // or a place both could reach. The table code MOVED here; it was not copied, and
+        // the iOS renderer now calls it.
+        //
+        // NOTHING HERE KNOWS WHAT A VAULT IS. There is no wiki link, no frontmatter and no
+        // task box in this target: `JesseVault` adds those on top. That line is what makes
+        // this safe for the reply renderers to adopt later — a reply is not a note, and a
+        // shared parser that had absorbed a vault's conventions would be a parser that
+        // quietly imposed them on chat.
+        //
+        // Isolation: default (nonisolated). Every declaration is a pure function over
+        // value types, called from MainActor views and from off-main parses alike.
+        .target(
+            name: "JesseMarkdown",
+            swiftSettings: [
+                .swiftLanguageMode(.v6),
+            ]
+        ),
+        .testTarget(
+            name: "JesseMarkdownTests",
+            dependencies: ["JesseMarkdown"],
+            swiftSettings: [
+                .swiftLanguageMode(.v6),
+            ]
+        ),
         // THE OBSIDIAN COPY OF THE VAULT as a first-class thing this device can hold, and
         // now as something it can READ: the persistent security-scoped folder bookmark, the
         // markdown scan over it, the two coordinated file operations (read one note, append
@@ -381,13 +418,20 @@ let package = Package(
         // `FoundationModelExpander` carry.
         .target(
             name: "JesseVault",
+            // The ONE dependency, and it points DOWNWARD at a target that depends on
+            // nothing: the markdown grammar a note is written in. The reader's block model
+            // used to be one block per line and knew nothing of tables, numbered lists or
+            // callouts; the grammar that replaced it is generic, so it lives one level
+            // below the concepts — wiki links, frontmatter, task boxes — that only a vault
+            // has.
+            dependencies: ["JesseMarkdown"],
             swiftSettings: [
                 .swiftLanguageMode(.v6),
             ]
         ),
         .testTarget(
             name: "JesseVaultTests",
-            dependencies: ["JesseVault"],
+            dependencies: ["JesseVault", "JesseMarkdown"],
             swiftSettings: [
                 .swiftLanguageMode(.v6),
             ]
