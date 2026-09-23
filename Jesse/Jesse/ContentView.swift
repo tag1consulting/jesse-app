@@ -18,6 +18,8 @@ struct ContentView: View {
     @StateObject private var pushRouter = PushRouter.shared
     @StateObject private var voice = VoiceCaptureModel()
     @State private var path: [JesseThread] = []
+    /// The note a citation link in an offline answer asked for, presented as a sheet.
+    @State private var citedNote: VaultNoteRoute?
     @State private var config = ConfigStore.load()
     @State private var showSettings = false
     // Raised with `showSettings` by the first-run pairing CTA so Settings opens
@@ -151,8 +153,20 @@ struct ContentView: View {
         // URL carries nothing: the hand-off is a file in the app group, and a URL that
         // named it would be a second source of truth that could disagree with the
         // directory. Foregrounding is the whole message.
-        .onOpenURL { _ in
-            drainSharedRecording()
+        .onOpenURL { url in
+            // TWO users of the `jesse` scheme now. A citation in an offline answer opens
+            // the note it came from; everything else is still the share extension
+            // bringing the app forward, whose URL carries nothing.
+            if let route = VaultNoteRoute.parse(url) {
+                citedNote = route
+            } else {
+                drainSharedRecording()
+            }
+        }
+        .sheet(item: $citedNote) { route in
+            // The same reader the vault browser pushes, in the same stack, so a citation
+            // and a search hit open one screen and not two.
+            VaultNoteStack(path: route.path, line: route.line) { citedNote = nil }
         }
         .onChange(of: pushRouter.pendingTap) { _, tap in
             guard let tap else { return }
@@ -455,6 +469,11 @@ struct SettingsView: View {
     @State private var vaultStatus: VaultFolderStatus = .notSet
     @State private var showVaultPicker = false
     @State private var vaultError: String?
+    /// The on-device answer toggle. The value LIVES in `UserDefaults` (the composer's
+    /// routing reads it from a non-view context); this is the view's mirror of it, read
+    /// on appear and written on change.
+    private let offlineLookupSettings = OfflineLookupSettings()
+    @State private var offlineLookupEnabled = true
 
     var body: some View {
         NavigationStack {
@@ -535,6 +554,16 @@ struct SettingsView: View {
                             Label("Forget this folder", systemImage: "folder.badge.minus")
                         }
                     }
+                    Toggle(isOn: $offlineLookupEnabled) {
+                        Label("Answer lookups on the device when offline",
+                              systemImage: "bolt.horizontal")
+                    }
+                    .onChange(of: offlineLookupEnabled) { _, value in
+                        offlineLookupSettings.isEnabled = value
+                    }
+                    Text(offlineLookupSettings.description)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
                     NavigationLink {
                         VaultDiagnosticsView()
                     } label: {
@@ -550,7 +579,10 @@ struct SettingsView: View {
                 } footer: {
                     Text("Points Jesse at the Obsidian copy of your vault on this iPhone, so notes can be read when the bridge can't be reached. Pick On My iPhone › Obsidian › your vault. Jesse keeps the folder across restarts, reads your notes, and writes nothing except the one line the diagnostics screen's Append button adds under Inbox/.")
                 }
-                .onAppear { vaultStatus = vaultFolder.resolve() }
+                .onAppear {
+                    vaultStatus = vaultFolder.resolve()
+                    offlineLookupEnabled = offlineLookupSettings.isEnabled
+                }
 
                 Section {
                     Button {

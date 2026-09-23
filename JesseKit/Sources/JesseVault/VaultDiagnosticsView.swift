@@ -38,6 +38,11 @@ public final class VaultDiagnosticsModel {
 
     private let folder: VaultFolder
     private let probeSession: any ProbeSessioning
+    /// Where the probe's measured prompt size is persisted, and where the offline
+    /// answer path reads it from.
+    private let settings: OfflineLookupSettings
+    /// The last few offline questions. Held, not owned — the composer writes to it.
+    public let offline: OfflineLookupDiagnostics
     /// The index's own state, shown here rather than re-derived: one object owns "is a
     /// reindex running", and a screen that kept its own copy of that would be a second
     /// answer to the same question.
@@ -45,10 +50,22 @@ public final class VaultDiagnosticsModel {
 
     public init(folder: VaultFolder = VaultFolder(),
                 probeSession: any ProbeSessioning = FoundationModelProbeSession(),
-                indexer: VaultIndexer = VaultIndexer()) {
+                indexer: VaultIndexer = VaultIndexer(),
+                settings: OfflineLookupSettings = OfflineLookupSettings(),
+                offline: OfflineLookupDiagnostics = .shared) {
         self.folder = folder
         self.probeSession = probeSession
         self.indexer = indexer
+        self.settings = settings
+        self.offline = offline
+    }
+
+    /// The offline answer rows, newest first, or the one line that says there are none.
+    public var offlineLines: [String] {
+        guard !offline.records.isEmpty else {
+            return ["No questions have been answered on this device yet."]
+        }
+        return offline.records.map(\.line)
     }
 
     /// What the index holds, as lines.
@@ -160,7 +177,13 @@ public final class VaultDiagnosticsModel {
     public func probeModel() async {
         busy = "Probing the on-device model — this takes a while…"
         defer { busy = nil }
-        modelLines = await ModelProbe(session: probeSession).run().lines
+        let report = await ModelProbe(session: probeSession).run()
+        // PERSISTED, and this is the only place it is written. The offline answer path
+        // spends a share of this number on every question, and the report it used to
+        // live in existed for as long as this screen did. A measurement made once, on
+        // this device, is exactly the kind of fact that belongs in `UserDefaults`.
+        settings.measuredPromptCharacters = report.largestPromptCharacters
+        modelLines = report.lines + [VaultRetrievalBudget.describe(report.largestPromptCharacters)]
     }
 
     // MARK: - Pure formatting, assertable without a device
@@ -277,6 +300,19 @@ public struct VaultDiagnosticsView: View {
                 }
             } header: {
                 Text("Index")
+            }
+
+            Section {
+                Text("The last \(OfflineLookupDiagnostics.capacity) questions this device answered from the vault on its own, with the bridge unreachable. Held in memory only — it is empty again after a relaunch, and nothing here is written anywhere.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                ForEach(Array(model.offlineLines.enumerated()), id: \.offset) { _, line in
+                    Text(line)
+                        .font(.system(.footnote, design: .monospaced))
+                        .textSelection(.enabled)
+                }
+            } header: {
+                Text("Offline answers")
             }
 
             probeSection(title: "On-device model",

@@ -4,6 +4,7 @@ import JesseCore
 import JesseOps
 import JesseConversations
 import JesseSpeech
+import JesseVault
 
 // The macOS Jesse client — a thin native client that talks to the SAME bridge on the
 // Studio the iPhone uses (see the JESSE-WRAP B3 plan). A SEPARATE app target from the
@@ -17,6 +18,8 @@ struct JesseMacApp: App {
     @State private var configStore: MacConfigStore
     @State private var coordinator: MacCoordinator
     @State private var notifier = MacNotifier()
+    /// The note a citation link in an offline answer asked for, shown as a sheet.
+    @State private var citedNote: VaultNoteRoute?
     @Environment(\.scenePhase) private var scenePhase
 
     /// Opened once at launch; `openFailure` is non-nil only on the in-memory fallback.
@@ -64,6 +67,13 @@ struct JesseMacApp: App {
                     // wired there, beside the other three.
                 }
                 .onOpenURL { url in
+                    // A citation in an offline answer opens the note it came from. Checked
+                    // FIRST because it is the narrow shape (`jesse://note?path=…`) and the
+                    // pairing parsers below are the broad ones.
+                    if let route = VaultNoteRoute.parse(url) {
+                        citedNote = route
+                        return
+                    }
                     // One payload, both halves. The three sentinel keys are ADDITIVE, so a
                     // link from a bridge with no sentinel pairs the bridge and leaves any
                     // sentinel this Mac already has alone.
@@ -75,6 +85,14 @@ struct JesseMacApp: App {
                         let (host, port) = JesseConfig.sanitize(p.host)
                         configStore.save(host: host, port: port ?? p.port, token: p.token)
                     }
+                }
+                .sheet(item: $citedNote) { route in
+                    NavigationStack {
+                        VaultNoteStack(path: route.path, line: route.line) {
+                            citedNote = nil
+                        }
+                    }
+                    .frame(width: 620, height: 680)
                 }
         }
         .defaultSize(width: 1000, height: 700)

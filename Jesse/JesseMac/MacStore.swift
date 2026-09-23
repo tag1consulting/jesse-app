@@ -3,6 +3,7 @@ import SwiftData
 import Observation
 import JesseCore
 import JesseNetworking
+import JesseVault
 
 // The Mac client's local store + sync + turn runner. Cache-first (locked 2026-07-13):
 // the UI always renders from this local SwiftData store; the bridge is the sync
@@ -198,6 +199,11 @@ final class MacCoordinator {
     /// state offers. The shared type lives in JesseCore, so the phone and this Mac cannot
     /// grow two ideas of what a screen attached.
     private var attachedContexts: [UUID: AttachedContext] = [:]
+    // ── THE OFFLINE ANSWER PATH, the phone's shape exactly. Both answer "no" on a Mac
+    //    with no vault folder and no usable model, which is what keeps this invisible
+    //    until a folder is picked.
+    let offline: OfflineAnswerService
+    let offlineLedger: OfflineAnswerLedger
 
     /// Hold `context` against a thread opened without firing; its first send carries it.
     func attach(context: String, to threadID: UUID) {
@@ -275,7 +281,13 @@ final class MacCoordinator {
          makeClient: @escaping @MainActor (JesseConfig) -> any BridgeClientProtocol
             = { JesseBridgeClient(config: $0) },
          sessionDeletionStore: PendingSessionDeletionStore = PendingSessionDeletionStore(),
+         offline: OfflineAnswerService? = nil,
+         offlineLedger: OfflineAnswerLedger = .shared,
          save: @escaping @MainActor (ModelContext) throws -> Void = { try $0.save() }) {
+        // Resolved in the body, not in a default argument: the service's default is
+        // main-actor-isolated and a default argument is evaluated off the actor.
+        self.offline = offline ?? OfflineAnswerService.shared
+        self.offlineLedger = offlineLedger
         self.configStore = configStore
         self.makeClient = makeClient
         self.sessionDeletionStore = sessionDeletionStore
@@ -322,11 +334,117 @@ final class MacCoordinator {
     @discardableResult
     func stageAndSend(text: String, mode: JesseMode, thread: JesseThread,
                       context: ModelContext) -> Bool {
+        // ── OFFLINE: this Mac may be able to answer the question from the vault folder
+        //    it holds. Only from the COMPOSER — `send(text:mode:thread:context:)` above
+        //    is what the morning routine and the Today actions fire, and those are turns
+        //    the bridge owes an answer to, not questions.
+        // ONE route call per send, for the reason the phone's carries: reachable is the
+        // common case and must not pay for a bookmark resolution twice.
+        if offlineRoute() == .onDevice {
+            return stageAndAnswerOnDevice(text: text, mode: mode, thread: thread,
+                                          context: context)
+        }
+        // ── CARRY, with the same two guards the phone's has. It is composed only when
+        //    there is a message to compose it onto — a thread holding offline answers and
+        //    an empty composer is not a turn — and the PRE-carry attachment is what goes
+        //    back if the stage refuses or fails, because the pairs are not marked carried
+        //    until the stage succeeds and restoring the combined value would double them.
+        let existing = attachedContexts[thread.id]
+        let hasSomethingToSend =
+            !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || existing != nil
+        let carried = hasSomethingToSend ? carryOfflineAnswers(threadID: thread.id) : false
+        guard let composed = stage(text: text, thread: thread, context: context) else {
+            if carried { attachedContexts[thread.id] = existing }
+            return false
+        }
+        // Spent only on a durable stage, exactly as on the phone.
+        if carried { offlineLedger.markCarried(threadID: thread.id) }
+        Task { await deliver(composed, mode: mode, thread: thread, context: context) }
+        return true
+    }
+
+    // MARK: - Answering on this Mac
+
+    /// This Mac's reachability, as `JesseVault` states it.
+    private func offlineRoute() -> OfflineSendRoute {
+        let state: BridgeReachabilityState
+        switch BridgeReachabilityModel.shared.state {
+        case .unknown: state = .unknown
+        case .reachable: state = .reachable
+        case .unreachable: state = .unreachable
+        }
+        return offline.route(reachability: state)
+    }
+
+    /// Stage this thread's uncarried offline answers onto its next online turn.
+    private func carryOfflineAnswers(threadID: UUID) -> Bool {
+        guard let carry = offlineLedger.carryBody(threadID: threadID) else { return false }
+        let existing = attachedContexts[threadID]
+        attachedContexts[threadID] = AttachedContext(
+            body: existing.map { carry + "\n\n" + $0.body } ?? carry,
+            title: existing?.title ?? OfflineAnswerCarry.title,
+            starters: existing?.starters ?? [])
+        return true
+    }
+
+    /// Stage the user's turn, then answer it from the copy of the vault on this Mac.
+    ///
+    /// `stage` is the ordinary one, so the optimistic turn, the draft release, the run
+    /// gate and the spinner all behave exactly as they do for a bridge turn; only what
+    /// happens after it differs.
+    private func stageAndAnswerOnDevice(text: String, mode: JesseMode, thread: JesseThread,
+                                        context: ModelContext) -> Bool {
         guard let composed = stage(text: text, thread: thread, context: context) else {
             return false
         }
-        Task { await deliver(composed, mode: mode, thread: thread, context: context) }
+        Task { [weak self] in
+            guard let self else { return }
+            let outcome = await self.offline.answer(composed)
+            await self.finishOnDevice(outcome, question: composed, mode: mode,
+                                      thread: thread, context: context)
+        }
         return true
+    }
+
+    /// Put this Mac's answer in the transcript, or hand the question to the ordinary send.
+    ///
+    /// THE MAC HAS NO SEND OUTBOX — the phone's `OutboxItem` is an iOS-only entity and
+    /// this store's schema deliberately does not carry it. So "queued for the bridge" is
+    /// not available here and is not claimed: a question this Mac cannot answer takes the
+    /// ordinary send path, which reaches an unreachable bridge and surfaces its own error,
+    /// which is precisely what it did before this feature existed.
+    private func finishOnDevice(_ outcome: VaultAnswerOutcome, question: String,
+                                mode: JesseMode, thread: JesseThread,
+                                context: ModelContext) async {
+        if case .answered(let answer) = outcome {
+            isRunning = false
+            activeThreadID = nil
+            let reply = Turn(role: .jesse,
+                             text: OfflineLookupReply.body(.answered(answer), queued: false))
+            reply.thread = thread
+            context.insert(reply)
+            thread.updatedAt = Date()
+            try? save(context)
+            offlineLedger.record(threadID: thread.id, pair: OfflineAnswerPair(
+                question: question, answer: answer.text,
+                paths: answer.citations.map(\.path)))
+            return
+        }
+        // An ABSTAIN says so before the ordinary send takes over, because "this device
+        // looked and did not find it" is a different fact from "the bridge is down" and a
+        // person who asked a lookup deserves both. A NOT-A-LOOKUP says nothing at all: the
+        // device never looked, so there is nothing to report.
+        if case .unanswered(.gateRefused) = outcome {
+            // Nothing to say.
+        } else {
+            let note = Turn(role: .jesse,
+                            text: OfflineLookupReply.body(.abstained, queued: false))
+            note.thread = thread
+            context.insert(note)
+            thread.updatedAt = Date()
+            try? save(context)
+        }
+        await deliver(question, mode: mode, thread: thread, context: context)
     }
 
     /// Persist the optimistic user turn (and spend the attachment and the draft) for a send,

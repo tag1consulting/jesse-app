@@ -344,6 +344,30 @@ public final class VaultIndex: @unchecked Sendable {
         }
     }
 
+    /// One chunk's FULL body, by the file and line that identify it.
+    ///
+    /// A `VaultSearchHit` carries an fts5 `snippet()` — fifteen words around the match,
+    /// with the match markers in it — which is the right thing to draw a result row with
+    /// and the wrong thing to put in front of a model: the answer to "when is the school
+    /// concert" is routinely the sentence AFTER the one the query matched. This is the
+    /// read that turns a hit back into the paragraph it came from.
+    ///
+    /// `line_start` rather than the chunk's rowid because that is what a hit carries and
+    /// what survives a reindex as a stable name for the same passage; the pair is unique
+    /// by construction (the chunker emits one chunk per start line per file).
+    public func chunkText(path: String, line: Int) -> String? {
+        locked {
+            guard let stmt = try? prepare(
+                "SELECT body FROM chunks WHERE path = ? AND line_start = ? LIMIT 1;")
+            else { return nil }
+            defer { sqlite3_finalize(stmt) }
+            bind(stmt, 1, path)
+            sqlite3_bind_int64(stmt, 2, Int64(line))
+            guard sqlite3_step(stmt) == SQLITE_ROW else { return nil }
+            return text(stmt, 0)
+        }
+    }
+
     /// The wiki targets one file links to, in the order they were found.
     public func outgoingTargets(fromPath path: String) -> [String] {
         locked {

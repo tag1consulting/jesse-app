@@ -25,6 +25,11 @@ struct MacSettingsView: View {
     @State private var sentinelPort: String = ""
     @State private var sentinelToken: String = ""
 
+    /// The on-device answer toggle. The value lives in `UserDefaults`, because the
+    /// composer's routing reads it from outside any view; this is the window's mirror.
+    private let offlineLookupSettings = OfflineLookupSettings()
+    @State private var offlineLookupEnabled = true
+
     /// Opens the two Ops windows (see the "Ops" menu in `JesseMacApp`), so the same two
     /// screens are reachable from the settings window and from the menu bar.
     @Environment(\.openWindow) private var openWindow
@@ -150,6 +155,7 @@ struct MacSettingsView: View {
             sentinelPort = sentinel.port == SentinelConfig.defaultPort ? "" : String(sentinel.port)
             sentinelToken = sentinel.token
             vaultStatus = vaultFolder.resolve()
+            offlineLookupEnabled = offlineLookupSettings.isEnabled
         }
         .sheet(isPresented: $showVaultDiagnostics) {
             // A SHEET rather than a new `Window` scene: the two Ops screens earn their
@@ -190,6 +196,15 @@ struct MacSettingsView: View {
                 Spacer()
                 Button("Diagnostics") { showVaultDiagnostics = true }
             }
+            Toggle("Answer lookups on the device when offline",
+                   isOn: $offlineLookupEnabled)
+                .onChange(of: offlineLookupEnabled) { _, value in
+                    offlineLookupSettings.isEnabled = value
+                }
+            // A ROW, not a `footer:` — a long footer ellipsises to one line on macOS, and
+            // what it would eat here is the number the budget is derived from.
+            Text(offlineLookupSettings.description)
+                .font(.caption).foregroundStyle(.secondary)
             if let vaultError {
                 Text(vaultError).font(.callout).foregroundStyle(.red)
             }
