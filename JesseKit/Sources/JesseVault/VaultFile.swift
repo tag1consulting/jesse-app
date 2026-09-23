@@ -25,6 +25,9 @@ public enum VaultFileError: Error, CustomStringConvertible, Equatable {
     case notUTF8(String)
     case unreadable(String, String)
     case unwritable(String, String)
+    /// The bytes on disk are not the bytes the caller read, so the write did not happen.
+    case changedSinceRead(String)
+    case missing(String)
 
     public var description: String {
         switch self {
@@ -35,6 +38,8 @@ public enum VaultFileError: Error, CustomStringConvertible, Equatable {
         case .notUTF8(let p): return "“\(p)” is not UTF-8 text."
         case .unreadable(let p, let why): return "Could not read “\(p)”: \(why)"
         case .unwritable(let p, let why): return "Could not write “\(p)”: \(why)"
+        case .changedSinceRead(let p): return "“\(p)” changed on disk since it was read; nothing was written."
+        case .missing(let p): return "“\(p)” is not in this copy of the vault."
         }
     }
 }
@@ -83,6 +88,111 @@ public struct VaultFile: Sendable {
             throw VaultFileError.unreadable(relativePath, "the coordinated read never ran")
         }
         return try result.get()
+    }
+
+    /// The whole file as text AND the stamp of the bytes it was read from, taken inside
+    /// ONE coordination bracket.
+    ///
+    /// One bracket is the entire point. `read` followed by a separate stamping read is two
+    /// chances for Obsidian's sync to land between them, and the stamp would then describe
+    /// bytes the caller never saw — a guard that certifies the wrong thing is worse than
+    /// no guard, because it is trusted.
+    public func readStamped(relativePath: String) throws -> (text: String, stamp: VaultFileStamp) {
+        let url = try resolved(relativePath)
+        var coordinationError: NSError?
+        var result: Result<(String, VaultFileStamp), Error>?
+        NSFileCoordinator().coordinate(readingItemAt: url, options: [], error: &coordinationError) { readURL in
+            do {
+                let data = try Data(contentsOf: readURL)
+                guard let text = String(data: data, encoding: .utf8) else {
+                    result = .failure(VaultFileError.notUTF8(relativePath))
+                    return
+                }
+                result = .success((text, VaultFileStamp(data: data)))
+            } catch {
+                result = .failure(VaultFileError.unreadable(relativePath, error.localizedDescription))
+            }
+        }
+        if let coordinationError {
+            throw VaultFileError.unreadable(relativePath, coordinationError.localizedDescription)
+        }
+        guard let result else {
+            throw VaultFileError.unreadable(relativePath, "the coordinated read never ran")
+        }
+        return try result.get()
+    }
+
+    /// Write `text` over the file, but ONLY if its bytes are still the ones `expected`
+    /// describes. Returns the stamp of what was written.
+    ///
+    /// THE ONLY OPERATION IN THIS TYPE THAT CAN CHANGE AN EXISTING BYTE, and every part of
+    /// its shape is there to bound that:
+    ///
+    ///   * THE CHECK AND THE WRITE ARE IN ONE `.forReplacing` BRACKET. Re-reading outside
+    ///     it and writing inside would be the check-then-act race spelled out longhand: an
+    ///     Obsidian sync landing between the two would be overwritten by a write that had
+    ///     just certified it was safe.
+    ///   * THE COMPARISON IS THE STAMP, not the modification date. Sync can land bytes
+    ///     whose mtime is older than the read, and a same-length edit (`[ ]` becoming
+    ///     `[x]` on the Studio) changes no size at all.
+    ///   * TEMPORARY FILE THEN `replaceItemAt`. A write straight over the original that
+    ///     fails part way through leaves a truncated note, which is the one outcome worse
+    ///     than refusing to write. The temporary lives in the SAME DIRECTORY so the
+    ///     replacement is a rename within one filesystem rather than a copy across two.
+    ///   * THE FILE MUST ALREADY EXIST. This prompt edits notes that exist; creating one
+    ///     from here would be a second way to make a file, competing with `append`'s.
+    ///
+    /// `.forReplacing` is what tells the file provider that the item's identity survives
+    /// even though its inode will not, which is the difference between Obsidian seeing an
+    /// edit and Obsidian seeing a delete followed by an unrelated create.
+    @discardableResult
+    public func replace(relativePath: String, expected: VaultFileStamp,
+                        with text: String) throws -> VaultFileStamp {
+        let url = try resolved(relativePath)
+        guard let payload = text.data(using: .utf8) else {
+            throw VaultFileError.notUTF8(relativePath)
+        }
+        let written = VaultFileStamp(data: payload)
+        var coordinationError: NSError?
+        var thrown: Error?
+        NSFileCoordinator().coordinate(writingItemAt: url, options: .forReplacing,
+                                       error: &coordinationError) { writeURL in
+            do {
+                let manager = FileManager.default
+                guard manager.fileExists(atPath: writeURL.path) else {
+                    thrown = VaultFileError.missing(relativePath)
+                    return
+                }
+                // THE GUARD, inside the bracket, against the bytes as they are right now.
+                let current = try Data(contentsOf: writeURL)
+                guard VaultFileStamp(data: current) == expected else {
+                    thrown = VaultFileError.changedSinceRead(relativePath)
+                    return
+                }
+                let temporary = writeURL.deletingLastPathComponent()
+                    .appendingPathComponent(".jesse-write-\(UUID().uuidString)")
+                try payload.write(to: temporary, options: .atomic)
+                do {
+                    _ = try manager.replaceItemAt(writeURL, withItemAt: temporary,
+                                                  backupItemName: nil,
+                                                  options: [.usingNewMetadataOnly])
+                } catch {
+                    // The replacement failed, so the original is still the original. The
+                    // temporary is ours and must not be left behind in somebody's vault.
+                    try? manager.removeItem(at: temporary)
+                    throw error
+                }
+            } catch let error as VaultFileError {
+                thrown = error
+            } catch {
+                thrown = VaultFileError.unwritable(relativePath, error.localizedDescription)
+            }
+        }
+        if let coordinationError {
+            throw VaultFileError.unwritable(relativePath, coordinationError.localizedDescription)
+        }
+        if let thrown { throw thrown }
+        return written
     }
 
     /// Append `text` to the file, creating it (and any missing parent directory)

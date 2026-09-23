@@ -144,6 +144,34 @@ public final class VaultIndexer {
         await task?.value
     }
 
+    /// Bring ONE file's rows into line, debounce ignored, without walking the vault.
+    ///
+    /// What the app calls after it writes a note. It is not `reindexNow`: a whole-vault
+    /// reindex after every tick would be a second of walking per tap, and the debounce
+    /// that exists to prevent that would also mean the tap's own words are not findable
+    /// for thirty seconds. One file is milliseconds and is always right.
+    ///
+    /// Deliberately cannot throw and does not touch `lastError`. It runs AFTER a write
+    /// that has already landed on disk, and a failure here means "the search index is a
+    /// little behind", which the next activation fixes on its own — not something to put
+    /// on a screen next to an edit that succeeded. Returns whether it worked, for the test.
+    @discardableResult
+    public func reindex(path: String) async -> Bool {
+        let source = self.source
+        return await Task.detached {
+            guard let index = try? source.index() else { return false }
+            let done = try? source.vaultFolder.withAccess { root -> Bool in
+                do {
+                    try index.reindex(file: path, root: root)
+                    return true
+                } catch {
+                    return false
+                }
+            }
+            return done ?? false
+        }.value
+    }
+
     /// Throw the index away and build it again from nothing.
     public func rebuild() async {
         guard !isIndexing else { return }

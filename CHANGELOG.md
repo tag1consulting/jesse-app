@@ -14,6 +14,90 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [App 1.0 (151)] - 2026-09-23
+
+**The vault writer could only append, so the app had no way to change a byte inside a note
+— and a checkbox, which is how a draft gets filed, could only be ticked in Obsidian, even
+though the synced copy on the device was writable all along.** `VaultFile` had exactly two
+operations, a coordinated read and a coordinated append that opens the file and writes at
+its end. That was the right shape for the first probe line and it is the wrong shape for
+everything else: ticking a box is changing one character in the middle of a file, and
+there was no operation that could. So the reader drew every checkbox as a glyph, with a
+comment saying a tappable box would promise a write the screen did not do. The cost landed
+on the archive footer at the bottom of every draft: a checked box there is the instruction
+that tells the Studio's archive processor to file the draft, and from the phone the only
+way to check one was to leave the app and open Obsidian.
+
+Nothing about the transport needed inventing. The vault folder on the device IS Obsidian's
+own synced copy, so a byte written into it reaches the Studio the same way an edit made in
+Obsidian on the phone already does. The bridge has no note-write endpoint and this adds
+none, which is why editing behaves identically whether or not the bridge is reachable:
+there is no second path to keep consistent.
+
+### Added
+
+- **`VaultFile.replace(relativePath:expected:with:)`, the only write that can change an
+  existing byte, and it is guarded by a stamp every time.** A `VaultFileStamp` is the byte
+  count plus a SHA-256, taken by `readStamped` in the SAME coordination bracket as the read
+  it describes. `replace` re-reads inside one `.forReplacing` bracket, compares, and throws
+  `changedSinceRead` without writing if the bytes have moved — then writes through a
+  temporary file in the same directory and `replaceItemAt`, so a failure part way leaves
+  the original intact. A modification date would have been cheaper and is not good enough:
+  a sync can land bytes with an older mtime, and ticking a box on the Studio changes no
+  size at all. There is no unguarded overwrite anywhere, including behind the editor's
+  "Overwrite" button, which re-reads and writes against the fresh stamp.
+
+- **Checkboxes are controls.** A tap flips the glyph at once, runs a pure one-character
+  edit over the text the reader is holding, and writes. A stale stamp reloads, re-applies
+  the tick if that line is still the box the tap meant, and tries ONCE more; a second
+  failure puts the glyph back and says so under the block. The retry checks what it is
+  about to change, so a tap never undoes a tick somebody else just made. Tap targets are 44
+  points.
+
+- **An editor.** The note's raw text, monospaced, with autocorrect, autocapitalisation and
+  smart quotes, dashes and text replacement all off — all four silently change characters,
+  and in markdown the character is the meaning. Save is enabled only for a real difference.
+  A conflict offers Reload or Overwrite (the second behind its own confirmation). Cancel
+  with changes asks once. Backgrounding keeps the unsaved text in Application Support and
+  offers it back next time that note opens; it is offered, never applied on its own, and
+  cleared on save or discard.
+
+- **A single-file reindex**, `VaultIndexer.reindex(path:)`, called after every successful
+  write with the 30-second debounce bypassed, so a search for the words just typed finds
+  them. It also removes the rows of a file that has gone.
+
+### Changed
+
+- **`OfflineWriteLog` records in-place writes as well as captures**, rather than a second
+  log: it grew a `kind` (capture, tick, untick, edit) and the file's size before the write.
+  Rows written by earlier builds decode as captures — by hand, because a synthesized
+  decoder treats a missing key as a failure of the whole array and the loader turns a
+  decode failure into an empty log, which would have erased every capture on the device the
+  first time this build ran. The verification pass and the Captures section now consider
+  captures only; "is my line still in the file" means nothing about a write that replaced
+  the file. The diagnostics screen gained a Note writes section.
+
+### Fixed
+
+- **A CRLF note's lines were one line.** `VaultCheckboxEdit` splits on the LF scalar, not
+  on `Character`: Swift's `Character` is a grapheme cluster and `"\r\n"` is ONE of them, so
+  `split(separator: "\n")` cannot see the break inside a CRLF line ending at all, and
+  `"a\r\n".hasSuffix("\n")` is false. A tick on a Windows-written note would silently have
+  done nothing. `VaultTextShape` reads line endings and the final newline over the UTF-8
+  view for the same reason, and gives the file its own back on save.
+
+### Not done
+
+- **`Today.md` is never written by this app**, and the rule is a pure function on the path
+  enforced in the writer rather than a caption in a screen. The bridge rewrites that file
+  and mints the ids the Today tab's ticks carry; those ticks keep their own queue and
+  replay, untouched here. Every other note, the five Dashboard topic files included, is
+  editable, because the Studio processes a tick from this app exactly as it processes one
+  from Obsidian.
+
+- Creating, renaming, moving and deleting notes; rich text editing; and telling the bridge
+  anything about these writes.
+
 ## [App 1.0 (150)] - 2026-09-23
 
 **The reader's block model was one block per line, and it knew nothing about tables,

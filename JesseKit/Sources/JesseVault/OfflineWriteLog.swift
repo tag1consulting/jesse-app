@@ -43,13 +43,20 @@ public enum OfflineWriteStatus: String, Codable, Sendable, CaseIterable {
     public var needsAttention: Bool { self == .notFound }
 }
 
-/// One capture, as the log holds it.
+/// One write, as the log holds it.
+///
+/// It began as a record of CAPTURES — appends into `Inbox/`, which is all this device could
+/// do to a vault. Note editing added two more ways to write, so the record grew a `kind`
+/// and the two numbers an in-place write has that an append does not (the size before, and
+/// the stamp of the whole file after). One log rather than two, because "what has this
+/// device written into the vault" is one question a person asks, and answering it from two
+/// screens that each know half would be the reason the half nobody opened went unnoticed.
 public struct OfflineWriteRecord: Codable, Equatable, Sendable, Identifiable {
     public let id: UUID
     public let written: Date
-    /// The vault-relative file it was appended to.
+    /// The vault-relative file it was appended to, or written over.
     public let file: String
-    /// Bytes this capture appended, the file's heading included when it created the file.
+    /// For a capture, the bytes appended. For an in-place write, the file's size AFTER it.
     public let bytes: Int
     /// SHA-256 of `text`, taken at write time.
     public let checksum: String
@@ -63,10 +70,19 @@ public struct OfflineWriteRecord: Codable, Equatable, Sendable, Identifiable {
     /// The note the capture was about, when it was about one.
     public let about: String?
     public var status: OfflineWriteStatus
+    /// How this write changed the file. Absent from every record written before note
+    /// editing existed, and those are all captures — see `init(from:)`.
+    public let kind: VaultEditKind
+    /// The file's size BEFORE an in-place write, so a row can say "4,812 B → 4,813 B" and
+    /// a tick that somehow rewrote a note is visible as a number rather than a suspicion.
+    /// Nil for a capture, which grew the file by `bytes` and has nothing else to say.
+    public let bytesBefore: Int?
 
     public init(id: UUID = UUID(), written: Date, file: String, bytes: Int,
                 checksum: String, text: String, about: String? = nil,
-                status: OfflineWriteStatus = .written) {
+                status: OfflineWriteStatus = .written,
+                kind: VaultEditKind = .capture,
+                bytesBefore: Int? = nil) {
         self.id = id
         self.written = written
         self.file = file
@@ -75,6 +91,28 @@ public struct OfflineWriteRecord: Codable, Equatable, Sendable, Identifiable {
         self.text = text
         self.about = about
         self.status = status
+        self.kind = kind
+        self.bytesBefore = bytesBefore
+    }
+
+    /// Decoded by hand for ONE reason: the two new keys are absent from every row already
+    /// on disk, and a synthesized decoder treats a missing key for a non-optional property
+    /// as a failure of the whole array. The log's loader turns a decode failure into an
+    /// empty log, so the synthesized version would have silently erased every capture this
+    /// device had ever recorded the first time the new build ran. A row without a `kind`
+    /// is a capture, because when it was written that is the only thing this app could do.
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        written = try container.decode(Date.self, forKey: .written)
+        file = try container.decode(String.self, forKey: .file)
+        bytes = try container.decode(Int.self, forKey: .bytes)
+        checksum = try container.decode(String.self, forKey: .checksum)
+        text = try container.decode(String.self, forKey: .text)
+        about = try container.decodeIfPresent(String.self, forKey: .about)
+        status = try container.decodeIfPresent(OfflineWriteStatus.self, forKey: .status) ?? .written
+        kind = try container.decodeIfPresent(VaultEditKind.self, forKey: .kind) ?? .capture
+        bytesBefore = try container.decodeIfPresent(Int.self, forKey: .bytesBefore)
     }
 
     /// The same record with a different status. The log rewrites rows this way rather than
@@ -82,8 +120,14 @@ public struct OfflineWriteRecord: Codable, Equatable, Sendable, Identifiable {
     /// mutated one in place could not be a pure function.
     public func with(status: OfflineWriteStatus) -> OfflineWriteRecord {
         OfflineWriteRecord(id: id, written: written, file: file, bytes: bytes,
-                           checksum: checksum, text: text, about: about, status: status)
+                           checksum: checksum, text: text, about: about, status: status,
+                           kind: kind, bytesBefore: bytesBefore)
     }
+
+    /// True for the appends into `Inbox/`. The verification pass and the Captures section
+    /// both ask, because neither means anything for an in-place write: a capture is "is my
+    /// line still in the file", and an edit IS the file.
+    public var isCapture: Bool { kind == .capture }
 
     /// What the capture said, on one line, for a diagnostics row.
     public var summary: String {
@@ -97,8 +141,18 @@ public struct OfflineWriteRecord: Codable, Equatable, Sendable, Identifiable {
     }
 
     /// The monospaced line the diagnostics screen draws.
+    ///
+    /// Two shapes, because the two kinds of write have different things worth showing. A
+    /// capture's interesting part is WHAT IT SAID, so the line ends with its text. An
+    /// edit's interesting part is WHAT IT DID TO THE FILE, so the line carries the size
+    /// either side and the stamp of the result — and never the text, which for an edit is
+    /// the whole note and is not going on a diagnostics row.
     public var line: String {
-        "\(file) · \(bytes) B · \(status.display) · \(summary)"
+        guard isCapture else {
+            let before = bytesBefore.map { "\($0) B → " } ?? ""
+            return "\(file) · \(kind.display) · \(before)\(bytes) B · \(String(checksum.prefix(8)))"
+        }
+        return "\(file) · \(bytes) B · \(status.display) · \(summary)"
     }
 }
 
@@ -147,6 +201,18 @@ public final class OfflineWriteLog: @unchecked Sendable {
     /// The rows a screen shows.
     public var recent: [OfflineWriteRecord] {
         Array(records.prefix(Self.displayCount))
+    }
+
+    /// The last `displayCount` captures, and the last `displayCount` in-place writes.
+    ///
+    /// Filtered THEN cut, never cut then filtered: twenty ticks in an afternoon would
+    /// otherwise push every capture off a screen whose whole job is to show them.
+    public var recentCaptures: [OfflineWriteRecord] {
+        Array(records.filter(\.isCapture).prefix(Self.displayCount))
+    }
+
+    public var recentEdits: [OfflineWriteRecord] {
+        Array(records.filter { !$0.isCapture }.prefix(Self.displayCount))
     }
 
     /// Log one capture, dropping the oldest if the cap is reached.
@@ -235,7 +301,12 @@ public enum OfflineWriteVerifier {
                                 read: (String) throws -> String) -> [UUID: OfflineWriteStatus] {
         var contents: [String: String?] = [:]
         var verdicts: [UUID: OfflineWriteStatus] = [:]
-        for record in records {
+        // CAPTURES ONLY. "Is the line still in the file" is a question about an append; an
+        // in-place write replaced the file, so its logged checksum is of the whole note and
+        // `contains` would be asking whether a file contains itself — via a record whose
+        // `text` is empty, which every file trivially contains. Left in, every edit would
+        // have been reported `not found` the moment somebody pressed Check.
+        for record in records where record.isCapture {
             let text: String?
             if let cached = contents[record.file] {
                 text = cached
