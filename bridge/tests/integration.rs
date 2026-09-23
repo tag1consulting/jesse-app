@@ -10231,3 +10231,209 @@ async fn persona_endpoint_returns_the_pack_without_its_content() {
         "the free text must never leave this endpoint: {raw}"
     );
 }
+
+// ---- GET /jesse/things and /jesse/things/:slug ----------------------------------------
+//
+// Driven through the real router against a temporary copy of the fixture vault. The
+// route reads the scheduler's live clock, so these assert status, shape and the ETag
+// contract, never a date-dependent finding: those are pinned by the unit tests in
+// `things.rs`, which pass the date in.
+
+/// Copy `tests/fixtures/things/vault` into a fresh temp vault repo's `vault/`.
+fn things_state() -> (AppState, std::path::PathBuf) {
+    fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for entry in std::fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            let dest = to.join(entry.file_name());
+            if entry.path().is_dir() {
+                copy_tree(&entry.path(), &dest);
+            } else {
+                std::fs::copy(entry.path(), dest).unwrap();
+            }
+        }
+    }
+    let root = make_diet_vault();
+    copy_tree(
+        &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/things/vault"),
+        &root.join("vault"),
+    );
+    let cfg = Config {
+        vault: root.to_string_lossy().into_owned(),
+        ..test_config()
+    };
+    (AppState::new(cfg), root)
+}
+
+fn things_request(path: &str, auth: Option<&str>, if_none_match: Option<&str>) -> Request<Body> {
+    let mut b = Request::builder().method("GET").uri(path);
+    if let Some(a) = auth {
+        b = b.header("authorization", a);
+    }
+    if let Some(inm) = if_none_match {
+        b = b.header("if-none-match", inm);
+    }
+    b.body(Body::empty()).unwrap()
+}
+
+fn etag_of(resp: &axum::response::Response) -> String {
+    resp.headers()
+        .get("etag")
+        .and_then(|v| v.to_str().ok())
+        .unwrap()
+        .to_string()
+}
+
+fn keys(v: &Value) -> Vec<&str> {
+    v.as_object().unwrap().keys().map(|k| k.as_str()).collect()
+}
+
+#[tokio::test]
+async fn things_no_auth_is_401() {
+    let (st, _root) = things_state();
+    for path in ["/jesse/things", "/jesse/things/Clean-Thing"] {
+        let resp = app(st.clone())
+            .oneshot(things_request(path, None, None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{path}");
+    }
+}
+
+#[tokio::test]
+async fn things_list_serves_the_contract_json() {
+    let (st, _root) = things_state();
+    let resp = app(st)
+        .oneshot(things_request(
+            "/jesse/things",
+            Some("Bearer test-token"),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(!etag_of(&resp).is_empty());
+    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+
+    assert_eq!(
+        keys(&body),
+        vec!["counts", "generated_at", "global_findings", "things"]
+    );
+    // An RFC 3339 instant with the scheduler zone's offset.
+    assert!(body["generated_at"].as_str().unwrap().len() >= 20);
+    assert_eq!(keys(&body["counts"]), vec!["active", "dormant", "waiting"]);
+
+    let things = body["things"].as_array().unwrap();
+    assert!(
+        !things.iter().any(|t| t["state"] == "done"),
+        "a done note is off the board"
+    );
+    let clean = things.iter().find(|t| t["slug"] == "Clean-Thing").unwrap();
+    assert_eq!(
+        keys(clean),
+        vec![
+            "counts", "findings", "group", "next", "now", "repos", "slug", "state", "title",
+            "updated", "waiting",
+        ]
+    );
+    assert_eq!(clean["title"], "Clean Thing");
+    assert_eq!(clean["group"], "personal");
+    assert_eq!(clean["state"], "active");
+    assert_eq!(clean["updated"], "2026-09-23");
+    assert_eq!(clean["repos"], serde_json::json!(["jeremyandrews/argus"]));
+    assert_eq!(clean["waiting"]["jeremy"], true);
+    assert_eq!(
+        clean["next"],
+        serde_json::json!({
+            "id": "A1d",
+            "text": "Guest budget probe on the fixed kernel.",
+            "link": "todo-list/Projects/drafts/2026-09-23-guest-budget",
+            "waits_on": "provider key",
+        })
+    );
+    assert_eq!(
+        clean["counts"],
+        serde_json::json!({ "queue": 2, "later": 1, "running": 1, "done": 2 })
+    );
+    let broken = things.iter().find(|t| t["slug"] == "Broken-Thing").unwrap();
+    assert!(broken["waiting"].is_null() && broken["next"].is_null());
+    assert!(!body["global_findings"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn things_slug_serves_markdown_beside_the_parsed_thing() {
+    let (st, root) = things_state();
+    let resp = app(st)
+        .oneshot(things_request(
+            "/jesse/things/Clean-Thing",
+            Some("Bearer test-token"),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(keys(&body), vec!["generated_at", "markdown", "thing"]);
+    assert_eq!(
+        body["markdown"].as_str().unwrap(),
+        std::fs::read_to_string(root.join("vault/Things/Clean-Thing.md")).unwrap()
+    );
+    assert_eq!(body["thing"]["slug"], "Clean-Thing");
+    assert_eq!(body["thing"]["next"]["id"], "A1d");
+}
+
+#[tokio::test]
+async fn things_slug_is_404_when_unknown_or_carrying_a_path() {
+    let (st, _root) = things_state();
+    for path in [
+        "/jesse/things/No-Such-Thing",
+        "/jesse/things/..",
+        "/jesse/things/a%2Fb",
+        "/jesse/things/..%2FToday",
+        "/jesse/things/archive%2FRetired-Thing",
+        "/jesse/things/a/b",
+    ] {
+        let resp = app(st.clone())
+            .oneshot(things_request(path, Some("Bearer test-token"), None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{path}");
+    }
+}
+
+#[tokio::test]
+async fn things_etag_moves_with_a_note_and_not_otherwise() {
+    let (st, root) = things_state();
+    for path in ["/jesse/things", "/jesse/things/Alpha-Thing"] {
+        let first = app(st.clone())
+            .oneshot(things_request(path, Some("Bearer test-token"), None))
+            .await
+            .unwrap();
+        let tag = etag_of(&first);
+        let again = app(st.clone())
+            .oneshot(things_request(path, Some("Bearer test-token"), None))
+            .await
+            .unwrap();
+        assert_eq!(etag_of(&again), tag, "{path}: nothing changed, same tag");
+        let cached = app(st.clone())
+            .oneshot(things_request(path, Some("Bearer test-token"), Some(&tag)))
+            .await
+            .unwrap();
+        assert_eq!(cached.status(), StatusCode::NOT_MODIFIED, "{path}");
+
+        let note = root.join("vault/Things/Alpha-Thing.md");
+        let src = std::fs::read_to_string(&note).unwrap();
+        std::fs::write(
+            &note,
+            src.replace("Rack the switch.", "Rack the new switch."),
+        )
+        .unwrap();
+        let changed = app(st.clone())
+            .oneshot(things_request(path, Some("Bearer test-token"), Some(&tag)))
+            .await
+            .unwrap();
+        assert_eq!(changed.status(), StatusCode::OK, "{path}");
+        assert_ne!(etag_of(&changed), tag, "{path}: a note edit moves the tag");
+        std::fs::write(&note, src).unwrap();
+    }
+}

@@ -96,6 +96,7 @@ change lives in one focused module:
 | `startup` | pairing-QR payload + the `binary_exists`/bind startup checks |
 | `schedule` | the `[[schedule]]` config: parse, validate (per-entry disable vs. startup error), and DST-correct next-fire / catch-up resolution. Pure — no clock of its own |
 | `schedstate` | the scheduler's persisted per-job record (`<state-dir>/schedule.json`): last due/fire/completion, outcome, reason, duration, job id |
+| `things` (namespaced) | the `Things/` status notes: the line based parser, the one audit function (every finding code), the sort, the nightly report renderer and writer, and the two `/jesse/things` routes. See "The Things board" below |
 | `scheduler` | the tick task, the `SchedulerClock` (the one instant + zone every calendar decision reads), chain execution under the one-scheduled-turn-at-a-time lock, single flight, the `expect_output` contract, the pushes, hot reload, and the `/jesse/schedule` routes |
 | `containment` | the containment RECORD: the `(capability, MCP set)` rows, the verdict/scoring rules, and the committed file's TOML shape (`bridge/containment.toml`). Always compiled — the startup gate reads it |
 | `probe` | the LIVE battery behind it: the adversarial probes, their ground-truth checks, the scratch worlds and the runner. Behind the `containment-probe` feature, so none of it is compiled into the serving binary; run by the `containment-probe` bin |
@@ -2050,6 +2051,39 @@ The `at` on a replayed request is the moment the **user** acted, and the
 bridge's clock (`stamp_from_iso`; a missing or malformed `at` is a `400`, never a
 substituted server time). That is what lets a check made at 07:05 and sent at
 noon still read `07:05` in the vault.
+
+## The Things board (`GET /jesse/things`, the nightly audit)
+
+The vault keeps one status note per piece of work under `vault/Things/`
+(`vault/Things/archive/` is ignored). The bridge parses them, read only, and
+checks that they are still true. One audit function feeds both outputs below, so
+the screen and the nightly file can never disagree.
+
+| Route | Returns |
+| --- | --- |
+| `GET /jesse/things` | `{ generated_at, things: [...], global_findings: [...], counts: { active, waiting, dormant } }`. Every note whose state is not `done`, sorted by `updated` descending, then title. Each thing carries `slug`, `title`, `group`, `state`, `updated`, `repos`, `now`, `waiting` (`{ text, jeremy }` or null), `next` (`{ id, text, link, waits_on }` or null), `counts` (`queue`, `later`, `running`, `done`) and its `findings` (`{ code, message, line }`). |
+| `GET /jesse/things/:slug` | `{ generated_at, markdown, thing }` for one note. `404` for an unknown slug, and for any slug carrying `/`, `\` or `..`, before a path is built. |
+
+Both take the bearer token and the shared limiter, and both carry a strong
+`ETag` computed without `generated_at` (the `/jesse/today` posture), so a poll
+that changes nothing costs a `304`. A missing `Things/` is `200` with empty lists.
+
+**The nightly file.** `vault/Inbox/YYYY-MM-DD-things-audit.md`, written at
+**03:20 in the scheduler's zone** (an away profile moves it), and at startup when
+today's file is missing and 03:20 has passed. It never overwrites an existing file
+for the day, never touches a Things note, and never calls the network. No
+`Things/` directory: nothing is written and one warning is logged.
+
+**Finding codes:** `PARSE`, `GROUP`, `STATE`, `UPDATED-INVALID`,
+`UPDATED-BEHIND`, `UPDATED-STALE` (active, over 14 days), `DORMANT-CANDIDATE`
+(active, over 90 days), `LINK-DEAD`, `QUEUE-ARCHIVED`, `RUNNING-SILENT` (over 3
+days, or undated), `CHECKED-NOT-MOVED`, `NO-NEXT`, `DUP-ID`, and the global
+`ORPHAN-DRAFT`, `UNOWNED-PROMPT` (both over `Projects/drafts/` and
+`Projects/Research/`, not their `archive/`), `TOO-MANY` (over 20 active) and
+`DONE-NOT-ARCHIVED`. The grammar is documented on `things::parse_thing`.
+
+**Dry run.** `cargo run --example things_audit -- ~/jesse/vault` prints the
+report the nightly writer would write, and writes nothing.
 
 ## Scheduled turns (`[[schedule]]`, `GET /jesse/schedule`)
 

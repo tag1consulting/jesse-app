@@ -538,6 +538,10 @@ async fn main() {
     // takes. A deploy with no `[[schedule]]` entries starts no task at all; entries that
     // failed validation are logged here, by name, and their neighbours still run.
     spawn_scheduler(state.clone());
+    // THE NIGHTLY THINGS AUDIT, beside the scheduler and on its clock: once a day at 03:20
+    // in the scheduler's zone (an away profile moves it), and at startup when today's file
+    // is missing and the hour has passed. It writes one Inbox file and nothing else.
+    jesse_bridge::things::spawn_things_audit(state.clone());
     axum::serve(listener, app(state))
         .await
         .expect("server error");
