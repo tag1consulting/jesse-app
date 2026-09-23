@@ -171,6 +171,12 @@ public struct TodayDetailView: View {
     private static let headings = ["What it is", "Where it came from", "Due", "Priority",
                                    "Done so far", "Done means", "Who knows more"]
 
+    /// What stands in for the spinner when the bridge is not reachable. A plain caption
+    /// and nothing else: no timer, no retry button, because this view does not own the
+    /// refresh and a button that cannot promise anything is worse than a sentence that
+    /// tells the truth.
+    static let pausedBrief = "Summary paused: the bridge is not reachable."
+
     @ViewBuilder
     private var briefBody: some View {
         switch model.brief?.status {
@@ -191,14 +197,26 @@ public struct TodayDetailView: View {
             // The headings with a spinner, not a spinner alone: the page keeps its shape
             // while it fills in, and the note below stays reachable the whole time.
             VStack(alignment: .leading, spacing: 14) {
-                HStack(spacing: 6) {
-                    ProgressView().controlSize(.small)
-                    Text("Writing the summary…")
+                // …AND ONLY WHILE THE BRIDGE IS ACTUALLY WRITING IT. `pending` is the
+                // bridge's word from whenever this answer was cached; re-shown offline it
+                // is a spinner over a dead network, turning indefinitely for work nobody
+                // is doing. Same headings either way, so the page does not change shape
+                // when the network comes back — only the line above them does.
+                if model.briefIsLive {
+                    HStack(spacing: 6) {
+                        ProgressView().controlSize(.small)
+                        Text("Writing the summary…")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .accessibilityElement(children: .combine)
+                    .accessibilityLabel("Writing the summary")
+                } else {
+                    Text(Self.pausedBrief)
                         .font(.caption)
                         .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
-                .accessibilityElement(children: .combine)
-                .accessibilityLabel("Writing the summary")
                 ForEach(Self.headings, id: \.self) { heading in
                     VStack(alignment: .leading, spacing: 2) {
                         Text(heading)

@@ -141,16 +141,14 @@ public final class OfflineAnswerService {
     /// See the GOTCHA in this target's `Package.swift` comment.
     nonisolated deinit {}
 
-    /// The app's one service. Built around a SINGLE `FoundationVaultAnswerSession`, so
-    /// the gate's classifier and the answer's generator share one model and one warm-up
-    /// rather than opening two sessions for the same question.
+    /// The app's one service. One `FoundationVaultAnswerSession`, which is now the only
+    /// thing on this path that talks to a model at all: the gate is rules, so a refused
+    /// question never opens a session.
     public static let shared: OfflineAnswerService = {
-        let model = FoundationVaultAnswerSession()
-        return OfflineAnswerService(classifier: model, generator: model)
+        OfflineAnswerService(generator: FoundationVaultAnswerSession())
     }()
 
     private let source: VaultIndexSource
-    private let classifier: any LookupClassifying
     private let generator: any VaultAnswerGenerating
     private let embedding: any ChunkEmbedding
     private let expander: any VaultQueryExpanding
@@ -160,7 +158,6 @@ public final class OfflineAnswerService {
     private let now: @Sendable () -> Date
 
     public init(source: VaultIndexSource = .shared,
-                classifier: any LookupClassifying,
                 generator: any VaultAnswerGenerating,
                 embedding: any ChunkEmbedding = NaturalLanguageChunkEmbedding(),
                 expander: any VaultQueryExpanding = NoVaultExpansion(),
@@ -169,7 +166,6 @@ public final class OfflineAnswerService {
                 timeLimit: TimeInterval = VaultAnswerer.defaultTimeLimit,
                 now: @escaping @Sendable () -> Date = { Date() }) {
         self.source = source
-        self.classifier = classifier
         self.generator = generator
         self.embedding = embedding
         self.expander = expander
@@ -223,31 +219,25 @@ public final class OfflineAnswerService {
             return outcome
         }
 
-        // 1. The free tier.
-        if case .refused(let why) = LookupGate.rule(question) {
-            return finish(.unanswered(.gateRefused), gate: "rule: \(why)")
+        // 1. The gate, which is the whole gate: rules, free, deterministic.
+        if case .refused(let refusal) = LookupGate.rule(question) {
+            return finish(.unanswered(.gateRefused(refusal)), gate: refusal.rule)
         }
-        // 2. The model tier. A model that is not there refuses, which is also what the
-        //    route check upstream already concluded — this is the second gate on the
-        //    same fact and it is cheap.
-        guard await classifier.isLookup(question) else {
-            return finish(.unanswered(.gateRefused), gate: "model: not a lookup")
-        }
-        // 3. The index. No folder, or an index that will not open, is "no hits" rather
+        // 2. The index. No folder, or an index that will not open, is "no hits" rather
         //    than an error: from the composer's side the two are one outcome.
         guard let index = (try? source.index()) ?? nil else {
-            return finish(.unanswered(.noHits), gate: "lookup")
+            return finish(.unanswered(.noHits), gate: "passed")
         }
 
         let retriever = VaultRetriever(index: index, expander: expander, embedding: embedding)
         let retrieved = await retriever.retrieve(question: question, budget: settings.budget)
         guard !retrieved.chunks.isEmpty else {
-            return finish(.unanswered(.noHits), gate: "lookup", hits: retrieved.hitCount)
+            return finish(.unanswered(.noHits), gate: "passed", hits: retrieved.hitCount)
         }
 
         let outcome = await VaultAnswerer(generator: generator, timeLimit: timeLimit)
             .answer(question: question, chunks: retrieved.chunks)
-        return finish(outcome, gate: "lookup", hits: retrieved.hitCount,
+        return finish(outcome, gate: "passed", hits: retrieved.hitCount,
                       chunks: retrieved.chunks.count, characters: retrieved.characters)
     }
 

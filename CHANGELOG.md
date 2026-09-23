@@ -14,6 +14,71 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [App 1.0 (153)] - 2026-09-24
+
+**Offline, a question the device could have answered was refused by a coin flip, the
+refusal said nothing about why, a summary the bridge had stopped writing kept its spinner
+turning, and the Mac opened a Today item on a gesture nothing on screen advertised.** Four
+things, one theme: every one of them is the app claiming or withholding something it had
+no basis for.
+
+The gate was the load-bearing one. It had two tiers — rules, then a yes/no verdict from
+the on-device model — and the second tier was measured on the phone in airplane mode
+refusing "What is Aurora's birthday?" while answering "When was I born?" from the same
+vault in the same minute. A 3B model given a bare yes/no about an abstract category is a
+coin flip, and the coin flip sat in FRONT of a pipeline that already refuses what it
+cannot answer: retrieval returns no chunks, or the answerer's validation turns a bad
+answer into an honest abstain. So it bought nothing and cost real lookups. It is gone.
+
+### Changed
+
+- **The gate is rules and only rules.** Over forty words, a request verb, empty after
+  trimming — plus one new rule, a lone link or text with no letters in it, which is a
+  paste rather than a question. Everything the rules pass is tried against the vault.
+  `LookupClassifying`, its two fakes, the classifier prompt and the Foundation Models
+  classifier session are deleted; the answering session is untouched. A refusal now
+  carries two strings instead of one, because two readers need it: `rule` for the
+  diagnostics row ("request verb: draft"), `because` for the transcript ("it asks for a
+  draft"). The verb list and its clauses are one table, so a verb cannot be added without
+  the words that explain its refusal.
+
+- **Three outcomes, three sentences.** An offline reply says which of three things
+  happened: it answered (unchanged, with citations), it looked and did not find
+  ("Not found in the vault on this device."), or it never looked ("Not tried on the
+  device: it asks for a draft."). Each adds " Queued for the bridge." only on a device
+  that has a queue. Before, the third case was the bare four words "Queued for the
+  bridge." — indistinguishable from a send that failed, and read as the feature being
+  broken. The Mac, which used to say nothing at all in that case, now says it too, without
+  claiming the outbox it does not have.
+
+- **A visible Open on the row.** "Open" is the first entry of the row's action list, so it
+  appears in the ellipsis menu and the right-click menu on both platforms. On the Mac each
+  row also carries a "Double-click to open" tooltip and reveals a trailing chevron under
+  the pointer that opens it in one click. The double click is unchanged; it is merely no
+  longer the only way in. Both menus are now built from ONE `TodayItemActions`, so they
+  cannot disagree.
+
+### Fixed
+
+- **A summary the bridge was not writing kept its spinner.** `TodayBriefEnvelope.status` is
+  the bridge's word from the moment the answer was cached, and a `pending` cached at that
+  moment stays `pending`. Offline, the detail sheet re-shows that cached note (deliberately
+  — a cached bridge note beats a local copy with no brief) and spun "Writing the summary…"
+  over a dead network for as long as it stayed open. The view now asks
+  `TodayDetailModel.briefIsLive`, which is false whenever the last detail request failed,
+  and renders the same seven headings under one plain caption: "Summary paused: the bridge
+  is not reachable." No timer, no retry button — this view does not own the refresh. A
+  `304` or a `200` makes it live again.
+
+### Not done
+
+- The `ModelPickerMenuUITests` failures that already make the local macOS gate red are
+  untouched, as is retrieval, the answerer, its validation, the offline answer carry and
+  the settings toggle. Nothing under `bridge/`, `agent/` or `eval/` changes, and nothing
+  here writes to the vault. (The `BGTaskScheduler.submit` deprecation this entry
+  originally also listed here is gone: the gate no longer builds the app at the
+  simulator's iOS version, so a 27.0 deprecation cannot fail a 26.5 product.)
+
 ## [App 1.0 (152)] - 2026-09-24
 
 **Work state had no surface in the app.** The bridge learned to parse and serve the

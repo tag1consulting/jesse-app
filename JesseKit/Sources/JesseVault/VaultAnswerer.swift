@@ -69,8 +69,11 @@ public enum VaultAnswerFailure: Equatable, Sendable {
     /// No usable on-device model. The composer behaves exactly as it did before this
     /// path existed.
     case modelUnavailable
-    /// The gate said this is not a lookup.
-    case gateRefused
+    /// The gate's rules said this is not a lookup, and which rule said so. The reason
+    /// is CARRIED rather than looked up again by the caller, because the composer that
+    /// renders "Not tried on the device: …" must say the same thing the diagnostics row
+    /// says, and two readers deriving a reason from a question twice is how they drift.
+    case gateRefused(LookupGate.Refusal)
     /// The index found nothing outside `Inbox/`.
     case noHits
     /// Twenty seconds went by.

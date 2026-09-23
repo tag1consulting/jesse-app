@@ -41,6 +41,9 @@ public struct TodayListView: View {
     /// click on its checkbox (`toggle`), evidence sheet and all.
     private let selection: Binding<String?>?
     private let opensOnDoubleTap: Bool
+    /// Whether each row reveals an Open chevron under a pointer. The Mac window passes
+    /// true; see `TodayItemRow.revealsOpenOnHover`.
+    private let revealsOpenOnHover: Bool
     private let onOpenLink: (TodayLinkOrigin) -> Void
     private let onOpenDetail: (TodayItem) -> Void
     private let onDiscuss: (TodayItem) -> Void
@@ -91,6 +94,7 @@ public struct TodayListView: View {
                 isProcessing: Bool = false,
                 selection: Binding<String?>? = nil,
                 opensOnDoubleTap: Bool = false,
+                revealsOpenOnHover: Bool = false,
                 onOpenLink: @escaping (TodayLinkOrigin) -> Void = { _ in },
                 onOpenDetail: @escaping (TodayItem) -> Void = { _ in },
                 onDiscuss: @escaping (TodayItem) -> Void = { _ in },
@@ -107,6 +111,7 @@ public struct TodayListView: View {
         self.isProcessing = isProcessing
         self.selection = selection
         self.opensOnDoubleTap = opensOnDoubleTap
+        self.revealsOpenOnHover = revealsOpenOnHover
         self.onOpenLink = onOpenLink
         self.onOpenDetail = onOpenDetail
         self.onDiscuss = onDiscuss
@@ -450,6 +455,7 @@ public struct TodayListView: View {
             availableMoves: moves,
             focusActions: focusActions,
             opensOnDoubleTap: opensOnDoubleTap,
+            revealsOpenOnHover: revealsOpenOnHover,
             onToggle: { _ in toggle(item) },
             onMove: { op in Task { await model.move(id: item.id, op: op) } },
             onFocus: { focus in Task { await model.focus(id: item.id, focus) } },

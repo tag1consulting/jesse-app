@@ -306,4 +306,56 @@ final class TodayDetailModelTests: XCTestCase {
         await m.load(id: "aaaaaaaaaaaa")
         XCTAssertEqual(client.calls[1].ifNoneMatch, nil)
     }
+
+    // MARK: - Is the bridge still writing this brief?
+
+    /// A note whose brief the bridge said it was still writing.
+    private var pendingNote: TodayItemDetail {
+        TodayItemDetail(id: "aaaaaaaaaaaa", path: "Projects/Demo/Widget.md",
+                        markdown: "# Widget\n", etag: "\"note-1\"",
+                        brief: TodayBriefEnvelope(status: .pending))
+    }
+
+    /// THE SPINNER BUG. `pending` is the bridge's word from the moment the answer was
+    /// cached; re-shown after a failed refresh it is a promise nobody is keeping, and
+    /// the sheet turned a spinner over a dead network for as long as it stayed open.
+    func testACachedPendingBriefIsNotLiveAfterAFailedRefresh() async {
+        let client = FakeDetailClient()
+        client.outcomes = [.result(.detail(pendingNote)),
+                           .error(.cannotConnect("studio.local"))]
+        let m = model(client)
+
+        await m.load(id: "aaaaaaaaaaaa")
+        XCTAssertEqual(m.brief?.status, .pending)
+        XCTAssertTrue(m.briefIsLive, "the bridge just answered; it IS writing it")
+
+        await m.load(id: "aaaaaaaaaaaa")
+        XCTAssertEqual(m.brief?.status, .pending, "the cached note stays on screen")
+        XCTAssertFalse(m.briefIsLive, "…but nothing is writing it any more")
+    }
+
+    /// And it comes back. A `304` is a completed round trip, so the bridge IS there and
+    /// the same cached `pending` is live again; so is a fresh `200`.
+    func testABriefIsLiveAgainAfterA304OrA200() async {
+        let client = FakeDetailClient()
+        client.outcomes = [.result(.detail(pendingNote)),
+                           .error(.cannotConnect("studio.local")),
+                           .result(.notModified(etag: "\"note-1\"")),
+                           .error(.cannotConnect("studio.local")),
+                           .result(.detail(pendingNote))]
+        let m = model(client)
+
+        await m.load(id: "aaaaaaaaaaaa")
+        await m.load(id: "aaaaaaaaaaaa")
+        XCTAssertFalse(m.briefIsLive)
+
+        await m.load(id: "aaaaaaaaaaaa")
+        XCTAssertTrue(m.briefIsLive, "a 304 is a completed round trip")
+        XCTAssertEqual(m.brief?.status, .pending)
+
+        await m.load(id: "aaaaaaaaaaaa")
+        XCTAssertFalse(m.briefIsLive)
+        await m.load(id: "aaaaaaaaaaaa")
+        XCTAssertTrue(m.briefIsLive, "a 200 is too")
+    }
 }

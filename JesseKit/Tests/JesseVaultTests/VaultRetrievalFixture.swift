@@ -53,7 +53,8 @@ enum VaultRetrievalFixture {
             ## Birthdays
 
             Marta's birthday is 3 February. Alberto's is 19 September.
-            The dog was born on 2 November.
+            Aurora's birthday is 11 March. The dog was born on 2 November.
+            I was born on 4 September 1974.
             """, "Family/Birthdays.md")
 
         note("""
@@ -237,6 +238,14 @@ enum VaultRetrievalFixture {
         Case(question: "when is the school concert",
              expectedPath: "Family/School-Year.md"),
         Case(question: "when is Marta's birthday",
+             expectedPath: "Family/Birthdays.md"),
+        // The two questions the on-device run measured against this corpus, and the
+        // reason the birthday note carries an Aurora and a birth year: a gate the model
+        // no longer votes on has to be shown letting BOTH of them through to the note
+        // that answers them, not just the one it happened to like.
+        Case(question: "what is Aurora's birthday",
+             expectedPath: "Family/Birthdays.md"),
+        Case(question: "when was I born",
              expectedPath: "Family/Birthdays.md"),
         Case(question: "what did we decide about the fiber contract",
              expectedPath: "Projects/Fiber-Contract.md"),

@@ -210,6 +210,14 @@ public struct TodayItemRow: View {
     /// Where there is no selection, as on the phone, a single tap opens and this stays
     /// false. The shell knows which of those it built; this file must not guess.
     let opensOnDoubleTap: Bool
+    /// Whether a pointer hovering this row reveals a chevron that opens it.
+    ///
+    /// A parameter for the same reason `opensOnDoubleTap` is one, and it is the same
+    /// fact seen from the other side: where opening costs two clicks, nothing on screen
+    /// says so, and the gesture was undiscoverable — the person who wrote the spec could
+    /// not find it. The Mac shell passes true; the phone passes false, because a tap
+    /// already opens the row and a hover is not a gesture a finger has.
+    let revealsOpenOnHover: Bool
     let onToggle: (Bool) -> Void
     let onMove: (TodayMoveOp) -> Void
     let onFocus: (TodayFocus) -> Void
@@ -224,6 +232,7 @@ public struct TodayItemRow: View {
                 availableMoves: [TodayMoveOp] = [],
                 focusActions: [TodayFocus] = [],
                 opensOnDoubleTap: Bool = false,
+                revealsOpenOnHover: Bool = false,
                 onToggle: @escaping (Bool) -> Void,
                 onMove: @escaping (TodayMoveOp) -> Void = { _ in },
                 onFocus: @escaping (TodayFocus) -> Void = { _ in },
@@ -239,6 +248,7 @@ public struct TodayItemRow: View {
         self.availableMoves = availableMoves
         self.focusActions = focusActions
         self.opensOnDoubleTap = opensOnDoubleTap
+        self.revealsOpenOnHover = revealsOpenOnHover
         self.onToggle = onToggle
         self.onMove = onMove
         self.onFocus = onFocus
@@ -249,7 +259,36 @@ public struct TodayItemRow: View {
         self.onOpenLink = onOpenLink
     }
 
+    /// Whether a pointer is over this row. Only ever true where there IS a pointer, and
+    /// only ever read together with `revealsOpenOnHover`, so on a phone it is dead
+    /// weight rather than a behaviour.
+    @State private var isHovering = false
+
     private var parts: (lead: String, detail: String) { TodaySemantics.leadAndDetail(item) }
+
+    /// Whether the chevron is on screen right now. Pure, and the reason the rule is
+    /// assertable without a pointer: reveal only where the shell asked for it, and only
+    /// under a pointer.
+    static func showsOpenControl(reveals: Bool, hovering: Bool) -> Bool {
+        reveals && hovering
+    }
+
+    /// The tooltip, or nothing. A row that opens on a single tap needs no sentence about
+    /// how to open it, and `.help` on a phone would be a string nobody ever sees.
+    static func openHelp(reveals: Bool) -> String? {
+        reveals ? "Double-click to open" : nil
+    }
+
+    /// The row's complete action list, built ONCE and handed to both the ellipsis menu and
+    /// the context menu. Two constructions would be two places for an action to go
+    /// missing, and this one is also the seam a test reads to prove the row's own `onOpen`
+    /// is what the menu's Open entry calls.
+    var actions: TodayItemActions {
+        TodayItemActions(item: item, availableMoves: availableMoves,
+                         focusActions: focusActions, onOpen: onOpen, onMove: onMove,
+                         onFocus: onFocus, onPostpone: onPostpone, onDiscuss: onDiscuss,
+                         onPropagate: onPropagate)
+    }
 
     public var body: some View {
         HStack(alignment: .top, spacing: 10) {
@@ -275,12 +314,24 @@ public struct TodayItemRow: View {
                 caption
             }
             Spacer(minLength: 0)
-            TodayItemMenu(item: item, availableMoves: availableMoves,
-                          focusActions: focusActions, onMove: onMove, onFocus: onFocus,
-                          onPostpone: onPostpone, onDiscuss: onDiscuss,
-                          onPropagate: onPropagate)
+            // The chevron a pointer reveals: one click, no selection needed, and the
+            // only thing on the row that SAYS it opens. It sits before the ellipsis so
+            // the pair reads left to right as "open this" then "everything else", and it
+            // keeps its space when hidden — revealing it must not re-lay out the row
+            // under the pointer that is about to click it. Hidden from VoiceOver
+            // throughout: the row already publishes an "Open item" action, and a control
+            // no pointer-less user can reveal would be a second, unreachable copy of it.
+            let showsChevron = Self.showsOpenControl(reveals: revealsOpenOnHover,
+                                                     hovering: isHovering)
+            TodayOpenChevron(onOpen: onOpen)
+                .opacity(showsChevron ? 1 : 0)
+                .allowsHitTesting(showsChevron)
+                .accessibilityHidden(true)
+            TodayItemMenu(item: item, actions: actions)
         }
         .padding(.vertical, 4)
+        .onHover { isHovering = $0 }
+        .help(ifPresent: Self.openHelp(reveals: revealsOpenOnHover))
         // Tapping the row opens the item. A GESTURE rather than a `Button` or a
         // `NavigationLink` wrapping the row, because the row already contains three
         // controls — the checkbox, the link chips, the ellipsis — and a button wrapping
@@ -296,12 +347,7 @@ public struct TodayItemRow: View {
         // The same actions the ellipsis menu offers, on a long press. Two ways in
         // rather than two menus: `TodayItemActions` is the single list, so an action
         // added to it appears in both without either falling behind the other.
-        .contextMenu {
-            TodayItemActions(item: item, availableMoves: availableMoves,
-                             focusActions: focusActions, onMove: onMove, onFocus: onFocus,
-                             onPostpone: onPostpone, onDiscuss: onDiscuss,
-                             onPropagate: onPropagate)
-        }
+        .contextMenu { actions }
         .accessibilityElement(children: .contain)
         .accessibilityAction(named: "Open item", onOpen)
     }
@@ -421,6 +467,34 @@ public struct TodayItemRow: View {
     }
 }
 
+/// The trailing chevron a pointer reveals. A single click opens the row, whatever the
+/// row's own tap count is: a control is not a gesture and does not need the selection
+/// click that forced the double tap in the first place.
+struct TodayOpenChevron: View {
+    let onOpen: () -> Void
+
+    var body: some View {
+        Button(action: onOpen) {
+            Image(systemName: "chevron.right")
+                .font(.footnote.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .frame(width: 22, height: 28)
+                .contentShape(.rect)
+        }
+        .buttonStyle(.plain)
+        .help("Open this item")
+    }
+}
+
+extension View {
+    /// `.help` only when there is something to say, so a platform with no pointer never
+    /// carries a tooltip string it cannot show.
+    @ViewBuilder
+    func help(ifPresent text: String?) -> some View {
+        if let text { self.help(text) } else { self }
+    }
+}
+
 // MARK: - The per-item menu
 
 /// The row's overflow menu: the moves that would actually do something, plus the two
@@ -429,9 +503,15 @@ public struct TodayItemRow: View {
 /// The complete set of actions for one row, as menu buttons. Rendered by the
 /// ellipsis menu AND by the row's context menu, so the two can never disagree.
 struct TodayItemActions: View {
+    /// What the Open entry says. One constant, because the accessibility action, the
+    /// tooltip and this button are three ways of saying the same thing and a test reads
+    /// it rather than a literal.
+    static let openLabel = "Open"
+
     let item: TodayItem
     let availableMoves: [TodayMoveOp]
     let focusActions: [TodayFocus]
+    let onOpen: () -> Void
     let onMove: (TodayMoveOp) -> Void
     let onFocus: (TodayFocus) -> Void
     let onPostpone: () -> Void
@@ -439,10 +519,21 @@ struct TodayItemActions: View {
     let onPropagate: () -> Void
 
     var body: some View {
-        // Focus first, and above the divider: "work on this next" is what a user
-        // actually wants from a row, and it stays in the same place whatever the view
-        // sort is doing — unlike the relative moves below it, which the list withholds
-        // while a sort is on because their direction would be meaningless.
+        // OPEN FIRST, and it is the reason this list starts here rather than at Focus.
+        // The row's main action was the one thing the menu did not offer: the Mac opened
+        // on a double click nothing advertised, and a menu that lists move, focus,
+        // postpone, discuss and propagate but not "open" reads as though opening is not
+        // a thing a row does. On the phone it duplicates the tap, which costs a line and
+        // settles the question for anyone who goes looking.
+        Button { onOpen() } label: {
+            Label(Self.openLabel, systemImage: "doc.text.magnifyingglass")
+        }
+        Divider()
+        // Focus first among the WRITES, and above the second divider: "work on this
+        // next" is what a user actually wants from a row, and it stays in the same
+        // place whatever the view sort is doing — unlike the relative moves below it,
+        // which the list withholds while a sort is on because their direction would be
+        // meaningless.
         ForEach(focusActions) { focus in
             Button { onFocus(focus) } label: {
                 Label(focus.label, systemImage: focus.symbol)
@@ -510,20 +601,14 @@ struct TodayItemActions: View {
 
 struct TodayItemMenu: View {
     let item: TodayItem
-    let availableMoves: [TodayMoveOp]
-    let focusActions: [TodayFocus]
-    let onMove: (TodayMoveOp) -> Void
-    let onFocus: (TodayFocus) -> Void
-    let onPostpone: () -> Void
-    let onDiscuss: () -> Void
-    let onPropagate: () -> Void
+    /// The row's one action list, handed in rather than rebuilt: this menu and the
+    /// context menu must be the same list, and the only way to guarantee that is for
+    /// there to be one.
+    let actions: TodayItemActions
 
     var body: some View {
         Menu {
-            TodayItemActions(item: item, availableMoves: availableMoves,
-                             focusActions: focusActions, onMove: onMove, onFocus: onFocus,
-                             onPostpone: onPostpone, onDiscuss: onDiscuss,
-                             onPropagate: onPropagate)
+            actions
         } label: {
             Image(systemName: "ellipsis")
                 .font(.footnote)

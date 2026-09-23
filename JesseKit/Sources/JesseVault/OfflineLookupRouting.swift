@@ -75,8 +75,9 @@ public enum OfflineLookupReply {
         case answered(VaultAnswer)
         /// The notes on this device do not hold it.
         case abstained
-        /// Not a lookup: nothing was asked of the model.
-        case notALookup
+        /// Not a lookup: nothing was asked of the model, and this is the gate's own
+        /// clause saying which rule refused it.
+        case notALookup(because: String)
     }
 
     /// Render one reply.
@@ -94,11 +95,24 @@ public enum OfflineLookupReply {
                 .joined(separator: "\n")
             return out
         case .abstained:
-            let tail = queued ? " Queued for the bridge." : ""
-            return badge + "\n\nNot found in the vault on this device." + tail
-        case .notALookup:
-            return badge + "\n\nQueued for the bridge."
+            return badge + "\n\nNot found in the vault on this device." + queue(queued)
+        case .notALookup(let because):
+            // THE REASON IS THE WHOLE POINT OF THIS LINE. Before it, a gate refusal and a
+            // failed send were the same four words in the transcript ("Queued for the
+            // bridge."), so a question the device declined to try read as the feature
+            // being broken — which is how it was in fact read. Three outcomes, three
+            // sentences: it answered, it looked and did not find, or it never looked and
+            // here is why.
+            return badge + "\n\nNot tried on the device: \(because)." + queue(queued)
         }
+    }
+
+    /// The one sentence about the outbox, or nothing at all.
+    ///
+    /// Shared by the two unanswered kinds so neither can drift into claiming a queue the
+    /// other knows is not there.
+    static func queue(_ queued: Bool) -> String {
+        queued ? " Queued for the bridge." : ""
     }
 
     /// The link a citation renders as: the app's own `jesse://` scheme, already
