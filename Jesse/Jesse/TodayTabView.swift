@@ -4,6 +4,7 @@ import JesseCore
 import JesseNetworking
 import JesseTodayDisplay
 import JesseOps
+import JesseVault
 
 // The iOS Today tab: a thin shell around the SHARED day-file screen (`TodayListView`
 // in JesseTodayDisplay, which the Mac will render identically when it gets one).
@@ -52,8 +53,17 @@ struct TodayTabView: View {
     /// cache, and a fresh model per push would refetch a note the user read thirty
     /// seconds ago. Injected through the same narrow seam as the day itself — the
     /// shared client, rebuilt per call so a re-pairing is picked up.
+    /// `localNotes` is the offline half: when the bridge cannot answer, the item's own wiki
+    /// link is resolved against the Obsidian copy of the vault on this iPhone and the note is
+    /// read from there. Nil-by-default in the package, so passing it is what turns the
+    /// fallback on, and a device with no folder picked simply resolves nothing.
     @State private var detailModel = TodayDetailModel(
-        makeClient: { JesseBridgeClient(config: ConfigStore.load()) })
+        makeClient: { JesseBridgeClient(config: ConfigStore.load()) },
+        localNotes: VaultLocalNoteProvider())
+
+    /// The local copy of `Today.md`, opened as a plain note. Set only from the row at the
+    /// bottom of the day, which only appears while the bridge is out of reach.
+    @State private var openedDayFile = false
 
     /// The item whose detail is pushed. A PUSH rather than the sheet the two
     /// conversation actions use: this is navigation WITHIN the day (the note behind a
@@ -81,6 +91,13 @@ struct TodayTabView: View {
     /// binding before calling `onDismiss`, so the id has to be held separately.
     @State private var stagedThreadID: UUID?
 
+    /// Whether this iPhone holds the vault folder at all.
+    ///
+    /// Read once per body rather than held in state: `VaultFolder` caches nothing (every
+    /// call reads the bookmark back out of `UserDefaults`), and the answer can change while
+    /// this screen is up — somebody picks the folder in Settings and comes back.
+    static var hasVaultFolder: Bool { VaultFolder().resolve().isReady }
+
     var body: some View {
         let _ = RenderProbe.body("TodayTabView")
         NavigationStack {
@@ -92,7 +109,8 @@ struct TodayTabView: View {
                           onPropagate: { execute(.propagate(item: $0, evidence: $1)) },
                           onProcessUpdates: processUpdates,
                           onRetryPending: retryPending,
-                          onTellFallback: tellFallback)
+                          onTellFallback: tellFallback,
+                          onOpenLocalDayFile: Self.hasVaultFolder ? { openedDayFile = true } : nil)
                 // The day file's own title is a sentence ("Today: Monday, August 10,
                 // 2026"), which a large title truncates to "Today: Monday, Augus…" on
                 // a phone. Inline fits it and buys back the vertical space the list
@@ -110,7 +128,9 @@ struct TodayTabView: View {
                     ToolbarItem(placement: .topBarLeading) { EditButton() }
                 }
                 .navigationDestination(item: $openedItem) { item in
-                    TodayDetailView(model: detailModel, item: item, onOpenLink: openLink,
+                    TodayDetailView(model: detailModel, item: item,
+                                    isReadOnly: model.isReadOnly,
+                                    onOpenLink: openLink,
                                     onCloseAsStale: closeAsStale)
                         .navigationTitle("Item")
                         .navigationBarTitleDisplayMode(.inline)
@@ -122,6 +142,14 @@ struct TodayTabView: View {
                     AwayProfileBanner(configuration: ConfigStore.opsConfiguration(),
                                       alwaysShowName: true)
                 }
+        }
+        .sheet(isPresented: $openedDayFile) {
+            // A SHEET rather than a push, and the stack is INSIDE `VaultNoteStack`: the day
+            // file is not part of the day's navigation (it is the document the day was parsed
+            // from), and a reader that can follow wiki links needs a path of its own to push
+            // them onto. Wrapping it in a second `NavigationStack` here is exactly how a
+            // toolbar stops rendering, so the Done button is passed in instead.
+            VaultNoteStack(path: "Today.md") { openedDayFile = false }
         }
         .sheet(item: $openedThread, onDismiss: dropUnsentContext) { thread in
             // `hidesTabBar: false`: a sheet already covers the tab bar, and asking the

@@ -19,6 +19,11 @@ public struct TodayDetailView: View {
     /// wants its lead and its project, and the day file is the authority on both — the
     /// note does not know which item linked it.
     private let item: TodayItem
+    /// The day screen's own verdict on whether the bridge can be reached
+    /// (`TodayDashboardModel.isReadOnly`). Passed down so an item opened while the day is
+    /// already read-only goes STRAIGHT to the local copy of its note instead of spending a
+    /// timeout the screen has already paid once.
+    private let isReadOnly: Bool
     private let onOpenLink: (TodayLinkOrigin) -> Void
     private let onCloseAsStale: (TodayItem, String) -> Void
 
@@ -27,10 +32,12 @@ public struct TodayDetailView: View {
     @State private var isNoteExpanded = false
 
     public init(model: TodayDetailModel, item: TodayItem,
+                isReadOnly: Bool = false,
                 onOpenLink: @escaping (TodayLinkOrigin) -> Void = { _ in },
                 onCloseAsStale: @escaping (TodayItem, String) -> Void = { _, _ in }) {
         self.model = model
         self.item = item
+        self.isReadOnly = isReadOnly
         self.onOpenLink = onOpenLink
         self.onCloseAsStale = onCloseAsStale
     }
@@ -41,7 +48,15 @@ public struct TodayDetailView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 14) {
                 header
-                if model.isOffline {
+                if model.localNote != nil {
+                    // A DIFFERENT CLAIM from the one below, and the difference matters: this
+                    // note was not read from the bridge at all, it was read off this device.
+                    Label(Self.localCopyBadge(model.localNote?.modified),
+                          systemImage: "externaldrive")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                } else if model.isOffline {
                     Label(model.lastErrorMessage ?? "Showing the note as it was last read.",
                           systemImage: "wifi.exclamationmark")
                         .font(.caption)
@@ -52,8 +67,8 @@ public struct TodayDetailView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(16)
         }
-        .task(id: item.id) { await model.load(id: item.id) }
-        .refreshable { await model.load(id: item.id, force: true) }
+        .task(id: item.id) { await model.load(item: item, isReadOnly: isReadOnly) }
+        .refreshable { await model.load(item: item, force: true) }
     }
 
     // MARK: - Header
@@ -76,13 +91,13 @@ public struct TodayDetailView: View {
                     .fixedSize(horizontal: false, vertical: true)
                 HStack(spacing: 8) {
                     TodayProjectChip(project: item.project)
-                    if let note = model.note {
-                        Text(note.path)
+                    if let path = model.note?.path ?? model.localNote?.path {
+                        Text(path)
                             .font(.caption2)
                             .foregroundStyle(.tertiary)
                             .lineLimit(1)
                             .truncationMode(.head)
-                            .accessibilityLabel("From \(note.path)")
+                            .accessibilityLabel("From \(path)")
                     }
                 }
                 if model.note?.truncated == true {
@@ -116,6 +131,21 @@ public struct TodayDetailView: View {
             ProgressView()
                 .frame(maxWidth: .infinity, alignment: .center)
                 .padding(.top, 24)
+        case .localCopy(let note):
+            // NO BRIEF, and that is not an omission: a brief is written by an agent through
+            // the bridge, and there is no bridge here. The note is the whole answer, and it
+            // is shown OPEN rather than behind a disclosure for the same reason — with no
+            // answers above it, a closed note would be a page with nothing on it.
+            VStack(alignment: .leading, spacing: 10) {
+                if note.truncated {
+                    Label("This note is long; only the first part is shown.",
+                          systemImage: "text.append")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                TodayNoteView(markdown: note.markdown, onOpenLink: onOpenLink)
+            }
         case .loaded, .noDetail:
             // THE ORDER IS THE POINT. The answers about this item come first; the
             // document they were drawn from is below them, closed.
@@ -124,6 +154,15 @@ public struct TodayDetailView: View {
                 noteBody
             }
         }
+    }
+
+    /// What the badge says. The file's own modification time is the point of it: a synced
+    /// folder can be hours behind the Studio, and a reader is entitled to know how old the
+    /// copy in their hand is rather than being told only that it is local.
+    static func localCopyBadge(_ modified: Date?) -> String {
+        guard let modified else { return "Offline copy, read from this device" }
+        return "Offline copy from this device — the note as it was "
+            + modified.formatted(date: .abbreviated, time: .shortened)
     }
 
     // MARK: - The seven answers

@@ -55,6 +55,13 @@ public struct TodayListView: View {
     /// `nil` in a shell with no conversation to send into, where the button is not
     /// offered rather than offered and inert.
     private let onTellFallback: ((PendingIntentRecord) -> Void)?
+    /// Open the day file itself from the LOCAL copy of the vault, as a plain note.
+    ///
+    /// `nil` in a shell with no vault folder held, where the row is not offered at all
+    /// rather than offered and inert. It appears only while the day is read-only, because
+    /// with the bridge reachable the typed day above it is strictly better than the file it
+    /// was parsed from.
+    private let onOpenLocalDayFile: (() -> Void)?
 
     /// Which item's evidence sheet is up, if any. Held by id rather than by value so
     /// a refresh landing mid-sheet cannot leave a stale copy of the row on screen.
@@ -75,7 +82,8 @@ public struct TodayListView: View {
                 onPropagate: @escaping (TodayItem, String?) -> Void = { _, _ in },
                 onProcessUpdates: @escaping ([TodayItem]) -> Void = { _ in },
                 onRetryPending: ((PendingIntentRecord) -> Void)? = nil,
-                onTellFallback: ((PendingIntentRecord) -> Void)? = nil) {
+                onTellFallback: ((PendingIntentRecord) -> Void)? = nil,
+                onOpenLocalDayFile: (() -> Void)? = nil) {
         self.model = model
         self.isProcessing = isProcessing
         self.selection = selection
@@ -90,6 +98,7 @@ public struct TodayListView: View {
         // offer. iOS passes one that also runs the replay immediately.
         self.onRetryPending = onRetryPending ?? { [model] record in model.retryPending(id: record.id) }
         self.onTellFallback = onTellFallback
+        self.onOpenLocalDayFile = onOpenLocalDayFile
     }
 
     public var body: some View {
@@ -244,6 +253,18 @@ public struct TodayListView: View {
             }
             ForEach(snapshot.sections) { section in
                 sectionView(section, in: snapshot)
+            }
+            // AT THE BOTTOM, and only while the bridge is out of reach: the day file as a
+            // plain note, read from the copy on this device. It is the answer to "what did
+            // the morning routine actually write", which the cached snapshot above can no
+            // longer be asked once it is a day old.
+            if model.isReadOnly, let onOpenLocalDayFile {
+                Button(action: onOpenLocalDayFile) {
+                    Label("Open Today.md from this device", systemImage: "doc.text.magnifyingglass")
+                        .font(.callout)
+                }
+                .listRowSeparator(.hidden)
+                .accessibilityHint("Opens the local copy of the day file as a note")
             }
         }
         .listStyle(.plain)

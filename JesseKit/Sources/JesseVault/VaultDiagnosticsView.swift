@@ -38,11 +38,35 @@ public final class VaultDiagnosticsModel {
 
     private let folder: VaultFolder
     private let probeSession: any ProbeSessioning
+    /// The index's own state, shown here rather than re-derived: one object owns "is a
+    /// reindex running", and a screen that kept its own copy of that would be a second
+    /// answer to the same question.
+    public let indexer: VaultIndexer
 
     public init(folder: VaultFolder = VaultFolder(),
-                probeSession: any ProbeSessioning = FoundationModelProbeSession()) {
+                probeSession: any ProbeSessioning = FoundationModelProbeSession(),
+                indexer: VaultIndexer = VaultIndexer()) {
         self.folder = folder
         self.probeSession = probeSession
+        self.indexer = indexer
+    }
+
+    /// What the index holds, as lines.
+    public var indexLines: [String] {
+        var lines = [
+            "FTS5 available: \(VaultIndex.fts5IsAvailable ? "yes" : "NO — the index cannot be built")",
+            "Files indexed: \(indexer.counts.fileCount)",
+            "Chunks: \(indexer.counts.chunkCount)",
+            "Wiki links: \(indexer.counts.linkCount)",
+            "Database: \(Self.bytes(indexer.counts.databaseBytes))",
+        ]
+        if let report = indexer.lastReport {
+            lines.append("Last reindex: \(report.summary)")
+        }
+        if let error = indexer.lastError {
+            lines.append("Last error: \(error)")
+        }
+        return lines
     }
 
     public func refreshStatus() {
@@ -228,6 +252,33 @@ public struct VaultDiagnosticsView: View {
                          button: "Append a probe line",
                          lines: model.appendLines) { await model.appendProbe() }
 
+            Section {
+                Text("The search index over this vault: one SQLite database in Application Support, never inside the vault folder. Reindex reads only the files whose modification time or size changed; Rebuild throws the whole index away first.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                HStack {
+                    Button("Reindex") { Task { await model.indexer.reindexNow() } }
+                        .disabled(model.indexer.isIndexing || !model.status.isReady)
+                    Button("Rebuild") { Task { await model.indexer.rebuild() } }
+                        .disabled(model.indexer.isIndexing || !model.status.isReady)
+                }
+                if model.indexer.isIndexing {
+                    HStack {
+                        ProgressView(value: model.indexer.progress)
+                        Text("\(Int(model.indexer.progress * 100))%")
+                            .font(.footnote.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                ForEach(Array(model.indexLines.enumerated()), id: \.offset) { _, line in
+                    Text(line)
+                        .font(.system(.footnote, design: .monospaced))
+                        .textSelection(.enabled)
+                }
+            } header: {
+                Text("Index")
+            }
+
             probeSection(title: "On-device model",
                          explanation: "Grows a prompt until the on-device model refuses it, then narrows down to the nearest 500 characters. Takes a few minutes and runs entirely on this device.",
                          button: "Probe the model",
@@ -237,7 +288,10 @@ public struct VaultDiagnosticsView: View {
         .formStyle(.grouped)
         #endif
         .navigationTitle("Vault diagnostics")
-        .onAppear { model.refreshStatus() }
+        .onAppear {
+            model.refreshStatus()
+            model.indexer.refreshCounts()
+        }
     }
 
     @ViewBuilder

@@ -4,15 +4,17 @@ import UserNotifications
 import JesseCore
 import JesseDietDisplay
 import JesseNetworking
+import JesseSearch
 import JesseTodayDisplay
+import JesseVault
 
-// The app root: a three-tab shell. "Chats" leads and hosts the existing conversation
+// The app root: a four-tab shell. "Chats" leads and hosts the existing conversation
 // UI (`ContentView`) exactly as before — every Siri/push/voice entry point it owns
 // keeps working, because the whole view (and its scene-phase + onChange handlers)
 // lives inside the tab, which TabView keeps mounted. "Today" is the vault's day file,
-// one tap away. "Health" is the native diet dashboard. Wrapping (rather than
-// restructuring) `ContentView` is the non-invasive path: nothing about the old root's
-// behavior changes.
+// one tap away. "Health" is the native diet dashboard. "Vault" is every note on this
+// device, searchable with the bridge off. Wrapping (rather than restructuring)
+// `ContentView` is the non-invasive path: nothing about the old root's behavior changes.
 //
 // TWO tabs carry a badge, and they count different things: Today's is open Do Now work
 // plus unseen briefing rows, Chats' is conversations holding a reply nobody has seen.
@@ -20,14 +22,14 @@ import JesseTodayDisplay
 // it is the one that is true whether or not the app is open.
 struct RootTabView: View {
     /// The tabs, as data. A `CaseIterable` enum the body ITERATES rather than a
-    /// hand-written list of three `.tabItem`s: the set of tabs, their order, and
+    /// hand-written list of `.tabItem`s: the set of tabs, their order, and
     /// their labels then have exactly one definition, which is also the one a test
     /// can assert against.
     ///
     /// CASE ORDER IS BAR ORDER. The body iterates `allCases`, so moving a case moves
     /// the tab, and there is no second list to keep in step.
     enum Tab: String, Hashable, CaseIterable, Identifiable {
-        case chats, today, health
+        case chats, today, health, vault
 
         var id: String { rawValue }
 
@@ -36,6 +38,7 @@ struct RootTabView: View {
             case .chats: return "Chats"
             case .health: return "Health"
             case .today: return "Today"
+            case .vault: return "Vault"
             }
         }
 
@@ -58,6 +61,11 @@ struct RootTabView: View {
             case .chats: return "bubble.left.and.bubble.right"
             case .health: return "heart.text.square"
             case .today: return "sunrise"
+            // A CLOSED BOOK, and last on the bar. The vault is the thing the other three
+            // tabs are about rather than a fourth kind of work, and it is the tab a person
+            // goes to deliberately — to look something up — which is exactly the tab that
+            // should not be in the way of the three they open by reflex.
+            case .vault: return "text.book.closed"
             }
         }
     }
@@ -111,6 +119,16 @@ struct RootTabView: View {
     /// message, neither of which has a view hierarchy to read one from.
     @MainActor static let pendingStore = PendingIntentStore(
         context: ModelContext(AppModelContainer.shared.container))
+
+    /// The Vault tab's model, and with it the index.
+    ///
+    /// Built HERE rather than inside the tab for the reason `todayModel` is: the indexer it
+    /// owns is driven by app ACTIVATION, which is a fact about the app and not about
+    /// whichever tab happens to be on screen. The on-device expander is injected at this
+    /// one point, exactly as `MacRootView` does for the conversation list — the package's
+    /// own default is the inert one, and a real model must never be reachable from a test.
+    @State private var vaultModel = VaultBrowserModel(
+        expander: VaultModelExpansion(FoundationModelExpander()))
 
     /// The replayer, built once the two models exist and handed to the box the
     /// coordinator already holds.
@@ -179,6 +197,13 @@ struct RootTabView: View {
         .onChange(of: scenePhase) { _, phase in
             guard phase == .active else { return }
             Task { await HealthAutoTrigger.shared.settleWorkouts() }
+            // The vault index's ONE automatic trigger. Debounced to once per 30 seconds by
+            // the indexer itself, off the main actor, and never on a timer: an activation is
+            // the moment the local copy may have been resynced behind the app's back. The
+            // folder's status is re-read with it, because it may have been picked (or
+            // forgotten) in Settings while this app was in the background.
+            vaultModel.refresh()
+            vaultModel.indexer.reindexIfDue()
         }
         // EVERY successful fetch and every mutation lands a new server snapshot, and
         // each one is pushed. Not gated on the Today tab being selected: the wrist's
@@ -304,6 +329,8 @@ struct RootTabView: View {
             TodayTabView(isActive: selection == .today, model: todayModel,
                          onReplay: replayNow)
                 .equatable()
+        case .vault:
+            VaultBrowserView(model: vaultModel)
         }
     }
 
@@ -313,6 +340,7 @@ struct RootTabView: View {
         case .today: return todayModel.tabBadgeCount
         case .chats: return unreadCount
         case .health: return 0
+        case .vault: return 0
         }
     }
 

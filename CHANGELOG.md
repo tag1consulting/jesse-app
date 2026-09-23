@@ -14,6 +14,133 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [App 1.0 (147)] - 2026-09-22
+
+**Every vault read went through the bridge, so with the bridge unreachable the app could
+search nothing and open nothing — while a complete copy of the vault sat on the same
+device.** `GET /jesse/today/items/{id}/detail` is keyed by item id and deliberately has no
+path parameter, which is the right shape for a reader behind a token but means the
+reachable set was "notes linked from today's day file" even online, and nothing at all
+offline. App 1.0 (146) gave the device the folder; this is the half that makes it useful.
+
+This is the second of four steps toward an offline mode. It reads and it searches. It
+writes nothing into the vault and it asks the on-device model nothing except the search
+alternates the conversation list already asks it for.
+
+### Added
+
+- **`VaultIndex`, an FTS5 index over the local copy of the vault.** One SQLite database per
+  bookmarked folder, in Application Support and NEVER inside the vault — a 60 MB file
+  appearing in Obsidian's own tree would be synced to every device the user owns. Four
+  tables (`files`, `chunks`, an fts5 index over them, and `links`), the C API used directly
+  because a wrapper would be a third-party dependency for eighty lines of
+  `sqlite3_bind_text`. The fts5 table is EXTERNAL CONTENT over `chunks`, which keeps one
+  copy of the note text and still produces a `snippet()`; a contentless table cannot snippet
+  and a standalone one would double the database.
+
+- **FTS5 is measured, not assumed.** `sqlite3_compileoption_used("ENABLE_FTS5")` is checked
+  when the index is opened and `VaultIndexError.noFTS5` is thrown before a file is touched,
+  because the whole design rests on it. It is also asserted on BOTH platforms by a test —
+  the package's own on macOS, and a new `VaultIndexPlatformTests` in the iOS suite that
+  indexes and searches a real temporary folder inside the iOS runtime, where iOS's own
+  libsqlite3 is the one being linked.
+
+- **A chunker that makes hits answerable.** A note is cut at `##` and deeper headings (never
+  at `#` — that line is the title, and cutting there would produce one chunk per file), and
+  any section over 1,500 characters is cut again at a PARAGRAPH boundary. Every chunk
+  carries its heading and the 1-based line it starts on, so a hit says "this section, this
+  line" rather than "somewhere in these 900 lines". Frontmatter is the title source and
+  never a chunk.
+
+- **An incremental reindex that reads only what changed**, diffing the scanner's own
+  modification-time-and-size pair against the stored rows. It runs off the main actor, one
+  at a time, coalescing a request that arrives mid-run, debounced to once per 30 seconds,
+  triggered by app activation and by a button — and never on a timer. Writes are BATCHED
+  rather than wrapped in one transaction, which is what makes a first index resumable: iOS
+  can suspend the app halfway through a 7,600-file walk, and every batch that committed is
+  work the next run does not repeat. A run that stops early deletes nothing, because an
+  incomplete walk proves nothing about what is gone.
+
+- **Search that means what the conversation list means.** Every token required, order
+  irrelevant, each one a PREFIX term so a half-remembered word finds the whole one, ranked
+  by bm25 with the title weighted 4, the heading 2 and the body 1 — and then one rule SQL
+  cannot express: a note whose title or path contains every token outranks a passing
+  mention, because searching a surname in this vault means "their file". Results collapse to
+  one row per file so a long note cannot bury five others. The expansion tier is the SAME
+  on-device expander the conversation list uses, behind the same `shouldExpand` gate, and
+  strictly additive: alternates can only add rows, and a caption names the terms that
+  actually contributed one.
+
+- **A Vault tab on the iPhone and a fourth tab in the Mac window**, both driving one view
+  set in `JesseVault`. Empty query: the 30 most recently changed notes. With a query: title,
+  path, heading and an FTS5 snippet with the matched terms in bold. Tap opens the reader.
+
+- **A reader for one note**, with the frontmatter folded away, task boxes as read-only
+  GLYPHS (a tappable box would promise a write this screen does not do), `[[wiki links]]`
+  resolved through the three-step rule and pushed onto the same stack, unresolved ones drawn
+  as plain words with the missing file named underneath, Reveal in Finder / Show in Files,
+  and a header line that says LOCAL COPY with the file's own modification time. Notes over
+  256 KB render their first 256 KB and say so.
+
+- **Wiki-link resolution, as one rule in two places that a test holds together**: an exact
+  relative path, then a UNIQUE basename anywhere in the vault, then a unique case-folded
+  basename. Several matches resolves to NOTHING — two notes named `Overview.md` are two
+  notes, and quietly opening the alphabetically first one is the failure that costs a reader
+  an afternoon. The basename step is not a nicety: this vault writes links as full paths
+  from the workspace root while the synced folder starts one level in, so the exact-path
+  step misses almost every real link.
+
+- **Offline Today notes.** When the detail fetch fails with nothing cached, or when the day
+  screen is already read-only (in which case no request is made at all — the screen has
+  already paid that timeout once), the item's own wiki link is resolved against the local
+  copy and the note is shown in the same sheet with an "offline copy" badge carrying the
+  file's modification time, and with no brief: a brief is written by an agent through the
+  bridge, and inventing one offline would be a lie about provenance. A cached note from an
+  earlier online read still wins, because it is the bridge's own answer. With no folder
+  picked the behaviour is byte for byte what it was.
+
+- **One row at the bottom of the day, while read-only only**, that opens `Today.md` itself
+  as a plain note from the local copy.
+
+- **The diagnostics screen** grows the index's file, chunk and link counts, the database
+  size, the last reindex's summary, and Reindex and Rebuild buttons.
+
+### Changed
+
+- **`significantTokens` and `shouldExpand` now have one implementation, in
+  `SearchQueryRules`.** Both were public in JesseConversations and JesseSearch, and the vault
+  index cannot import either without dragging the SwiftData model layer into itself — so the
+  rules moved to the one target that depends on nothing and both old entry points became
+  one-line forwarders. Behaviour is unchanged and every existing caller still calls the name
+  it always called. `VaultModelExpansion` in JesseSearch is the matching adapter, so the
+  vault search reuses the app's one on-device model session rather than opening a second.
+
+### What this deliberately does not do
+
+- **It does not parse the day file.** The bridge mints the item ids the whole screen and the
+  capture queue are keyed by, and a second parser in Swift would drift from it inside a
+  month. Offline, the typed day stays the cached snapshot and the local `Today.md` is only
+  ever shown as a plain note.
+- **It writes nothing.** No vault write, no `?path=` reader on the bridge, no new wire call
+  at all; `bridge/`, `agent/` and `eval/` are untouched.
+- No embeddings and no question answering — both are later steps.
+
+### Tests
+
+- **152 tests in `JesseVaultTests`** (88 new, measured against 64 on `main`): the chunker's cuts, headings and line
+  numbers; link extraction and all three resolution steps including the ambiguous refusal;
+  an incremental reindex over a real temporary tree where "an unchanged file was not
+  rewritten" is proven by its chunk ROWIDS being the same ones; a stopped run that keeps its
+  progress and deletes nothing; a deleted note that stops answering searches; ranking (a
+  name match above a better-scoring body match), prefix matching, diacritic folding and the
+  all-tokens rule; the expansion gate at four hits and at five through a fake expander; and
+  the whole chain end to end through a real bookmark, a real index and the screen's own
+  model.
+- **15 new tests in `JesseTodayDisplayTests`** (254 to 269) for the offline detail: targets from the wire
+  item, targets parsed out of the raw text (NOT the lead, which is markdown-stripped and has
+  lost its brackets by the time the app sees it), the unresolved case, and the no-folder case
+  that must behave exactly as before.
+
 ## [Bridge 0.146.3] - 2026-09-22
 
 **0.146.0 moved Codex's row labels too; this is the run that recorded them.** Unlike the

@@ -116,7 +116,13 @@ let package = Package(
         // the iOS target with zero behavior change so iOS and macOS share one source.
         .target(
             name: "JesseConversations",
-            dependencies: ["JesseCore"],
+            // JesseVault for ONE thing, and the arrow's direction is the reason it is not
+            // the other way round: `significantTokens` is now
+            // `SearchQueryRules.significantTokens`, and that rule has to be reachable from
+            // the vault index too. JesseVault depends on nothing, so a leaf is the only
+            // place all three searches can share one copy of it — the vault target cannot
+            // import this one without dragging the SwiftData model layer into the index.
+            dependencies: ["JesseCore", "JesseVault"],
             swiftSettings: [
                 .defaultIsolation(MainActor.self),
                 .swiftLanguageMode(.v6),
@@ -150,7 +156,12 @@ let package = Package(
         // ThreadSearchModel and FoundationModelExpander).
         .target(
             name: "JesseSearch",
-            dependencies: ["JesseCore", "JesseConversations"],
+            // JesseVault for the same reason JesseConversations takes it, plus one more:
+            // `shouldExpand` moved to `SearchQueryRules` so the vault tier gates the
+            // on-device model exactly as this one does, and `VaultModelExpansion` is the
+            // one-line adapter that lets the vault search reuse THIS expander rather than
+            // opening a second model session.
+            dependencies: ["JesseCore", "JesseConversations", "JesseVault"],
             swiftSettings: [
                 .defaultIsolation(MainActor.self),
                 .swiftLanguageMode(.v6),
@@ -226,7 +237,11 @@ let package = Package(
         // routes through the isolated-deinit executor hop and aborts.
         .target(
             name: "JesseTodayDisplay",
-            dependencies: ["JesseCore", "JesseNetworking"],
+            // JesseVault so the day screen can fall back to the LOCAL copy of a note when
+            // the bridge cannot be reached. The arrow points one way — nothing in JesseVault
+            // knows a day file exists — and this is the target that legitimately knows both
+            // halves, which is why the offline resolver lives here rather than in an app.
+            dependencies: ["JesseCore", "JesseNetworking", "JesseVault"],
             swiftSettings: [
                 .swiftLanguageMode(.v6),
             ]
@@ -237,7 +252,8 @@ let package = Package(
             // `HealthDashboardModel` and replay through the real `IntentReplayer`: the
             // automatic health turns' offline guarantees span both, and a fake of either
             // half would assert the fake.
-            dependencies: ["JesseTodayDisplay", "JesseNetworking", "JesseDietDisplay"],
+            dependencies: ["JesseTodayDisplay", "JesseNetworking", "JesseDietDisplay",
+                           "JesseVault"],
             swiftSettings: [
                 .swiftLanguageMode(.v6),
             ]
@@ -318,24 +334,36 @@ let package = Package(
                 .swiftLanguageMode(.v6),
             ]
         ),
-        // The OBSIDIAN COPY OF THE VAULT as a first-class thing this device can hold:
-        // the persistent security-scoped folder bookmark, the markdown scan over it, the
-        // two coordinated file operations (read one note, append one line), the on-device
-        // model's measured capacity, and the diagnostics screen that shows all four.
+        // THE OBSIDIAN COPY OF THE VAULT as a first-class thing this device can hold, and
+        // now as something it can READ: the persistent security-scoped folder bookmark, the
+        // markdown scan over it, the two coordinated file operations (read one note, append
+        // one line), an FTS5 index over every note with its incremental reindex, the search
+        // and the reader built on it, the on-device model's measured capacity, and the
+        // diagnostics screen that shows all of it.
         //
         // It exists because the app could reach the vault only through the bridge. With
         // the bridge unreachable `SnapshotCache` still renders the last day and the
         // capture queue still holds ticks, but not one note could be opened or searched —
         // while Obsidian kept a complete synced copy of the same vault on the very same
         // device, reachable through a document picker and a bookmark nothing in the app
-        // knew how to take. This target is that missing piece, and nothing more: no
-        // index, no embedding, no question answering.
+        // knew how to take. Still NO embedding and no question answering: retrieval here is
+        // words in an inverted index, and nothing in this target asks a model anything
+        // except the search alternates the conversation list already asks it for.
         //
-        // It depends on NO other target in this package and on nothing but Foundation,
-        // plus SwiftUI for its one screen and FoundationModels in the single file that
-        // probes the model. The dependency runs one way and the arrow points nowhere:
-        // nothing here knows about a thread, a turn, a bridge config or a day file, so
-        // the search index built on top of it later cannot drag the chat layer in with it.
+        // It depends on NO other target in this package, and on nothing outside the system:
+        // Foundation, SwiftUI for its screens, SQLite3 for the index (libsqlite3 ships FTS5
+        // on both platforms — `VaultIndex` MEASURES that rather than trusting it), CryptoKit
+        // for the one hash that names a folder's database, and FoundationModels in the
+        // single file that probes the model. The dependency arrow points nowhere, which is
+        // load-bearing: nothing here knows about a thread, a turn, a bridge config or a day
+        // file, so the index cannot drag the chat layer in with it.
+        //
+        // TWO OTHER TARGETS NOW DEPEND ON IT, and both for a reason that only works in this
+        // direction. JesseConversations and JesseSearch take it for `SearchQueryRules` — the
+        // tokenizer and the expansion gate, which all three searches in the app must share
+        // and which therefore have to live in a leaf. JesseTodayDisplay takes it so the day
+        // screen can fall back to the local copy of a note; the vault half does not know a
+        // day file exists.
         //
         // Isolation: default (nonisolated), matching JesseNetworking and the display
         // targets rather than the app targets' MainActor default. `VaultFolder`,
