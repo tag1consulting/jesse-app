@@ -14,6 +14,122 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [App 1.0 (148)] - 2026-09-23
+
+**Offline, a question had nowhere to go but a failed send — although the vault and a
+model capable of reading four snippets of it were both already on the device.** App 1.0
+(146) gave the device the vault folder and (147) gave it an index, a search and a reader
+over it. Everything the app could still not do with the bridge unreachable came down to
+one thing: the composer had exactly one destination for a message, and it was the
+network.
+
+This is the third of four steps toward an offline mode. It answers a NARROW class of
+question — a lookup, from a few retrieved note extracts, by Apple's on-device model —
+and refuses everything else to the queue. It writes nothing into the vault and nothing
+leaves the device.
+
+### Added
+
+- **`LookupGate`: which questions this device is allowed to answer.** Two tiers, cheap
+  first. The rules refuse anything over 40 words, anything empty, and anything carrying a
+  request verb (draft, write, summarize/summarise, plan, compare, email, message,
+  rewrite, translate, log, schedule, remind — matched on whole words and their
+  inflections, so "drafting" refuses and "airplane" does not). What survives goes to a
+  one-boolean guided classifier. The gate is deliberately asymmetric: a refusal costs one
+  queued message the bridge answers properly a few minutes later, a wrong admission costs
+  a fabricated answer that reads exactly like a real one. A model failure counts as a
+  refusal.
+
+- **`VaultRetriever`: retrieval first, model last.** The index already knows where the
+  answer is. The retriever searches prompt 147's `VaultSearcher` for the question's
+  keywords, widens through the app's existing on-device expander on the same threshold
+  the conversation list uses, and — the pass that makes a spoken question work at all —
+  falls back to each keyword alone. `Inbox/` and everything under it is NEVER retrieved
+  from: it holds pasted mail and scan output, text other people wrote, which must not be
+  lifted into a model prompt. Hits are re-ranked by cosine similarity from
+  `NLEmbedding.sentenceEmbedding(for: .english)` and fused with bm25 by reciprocal rank
+  (k = 60); with no embedding on the device, bm25's order simply stands.
+
+- **`VaultIndex.chunkText(path:line:)`.** A search hit carries an fts5 `snippet()` —
+  fifteen words around the match — which is the right thing to draw a row with and the
+  wrong thing to put in front of a model, because the answer is routinely the sentence
+  AFTER the one that matched. This is the read that turns a hit back into its paragraph.
+
+- **A measured budget instead of a guessed one.** `ModelProbe` (147) measured the largest
+  accepted prompt on the real device — 33,500 characters on the phone, 21,000 on the Mac
+  — but kept the number only in its report. The diagnostics screen's probe now persists
+  it, and the budget is derived from it: four extracts, or two when the measured window
+  is under 6,000 characters, sharing 60 percent of the measured maximum, each clipped to
+  its own equal share on a word boundary. Unmeasured, the fallback is four extracts and
+  12,000 characters — deliberately under the smallest window measured so far, because a
+  prompt that is refused is not a degraded answer, it is no answer.
+
+- **`VaultAnswerer`, and the three checks that stop an answer being a lie.** The
+  instructions are 26 words ("Answer only from the notes given. If they do not contain
+  the answer, set abstain. Cite only the paths given. At most 60 words."), the generated
+  struct has an `abstain` field so "I don't know" is a value rather than a sentence the
+  model has to compose, every citation is checked against the paths actually supplied,
+  and **an answer whose every citation was invented becomes a visible abstain**. That
+  last one is the load-bearing check: dropping a fabricated path silently would leave a
+  confident answer with its evidence quietly deleted, which reads exactly like a
+  well-sourced one. Plus a 20-second wall clock and one retry with half the extracts when
+  the model refuses the prompt for size.
+
+- **A fourth check, added because the first three were measured and found short.** Run
+  against the real on-device model over a scratch corpus, two answers got through that
+  should not have. "What colour is the studio door", over notes that never mention a
+  door, came back **"white"** citing the studio note it had been handed — a real path, so
+  the citation check passed it: that check catches an invented SOURCE and cannot catch an
+  invented FACT. And "what is the name of the kiln repair company in Florence" came back
+  **"Kiln repair company in Florence"** citing the kiln note — every word of it present in
+  the extract, and nothing answered. So an answer must now carry at least one significant
+  word that is in an extract it cites AND was not already in the question. Both are
+  abstains now. It is a floor, not a proof: a wrong answer assembled out of words that
+  are in the extract still gets through, which is why the badge and the citations are on
+  every one of these replies.
+
+- **Composer routing on both platforms.** With the bridge probed unreachable, a vault
+  folder held, the toggle on and a usable model, a send is answered here instead. The
+  reply opens with `[on-device · offline]`, in the same shape as the bridge's own
+  `[local · vault · …]` badges, and ends with a "From:" list of citations that open the
+  147 reader at the cited line. An abstain reads "Not found in the vault on this device."
+  and the question goes to the send outbox as it always did; a not-a-lookup goes straight
+  there. A lookup that was answered is never re-sent. `.unknown` reachability — the
+  pre-probe state of a cold launch — is NOT offline, so a stale local answer can never
+  pre-empt a perfectly good network.
+
+- **Offline answers ride the thread's next online turn**, through the `AttachedContext`
+  mechanism a screen's "Ask about this" already uses, capped at 3,000 characters and
+  framed as a record rather than as instruction — a 3B model must not be able to quietly
+  instruct a large one. Carried once, then never again.
+
+- **One Settings toggle** ("Answer lookups on the device when offline", on by default
+  once a folder is set) with the measured prompt size and the extract count it implies,
+  and an **Offline answers** section in vault diagnostics: the last 10 questions with
+  their gate verdict, hit count, extract count, characters sent, elapsed time and
+  outcome, in memory only.
+
+### Fixed
+
+- **The lookup classifier no longer drifts over a run of questions.** It began with one
+  reused `LanguageModelSession`, like the answerer, and over a handful of questions the
+  transcript filled with its own verdicts and the model started answering the pattern
+  instead of the question — refusing "what is the tenmoku glaze recipe" as not a lookup a
+  few calls after accepting its twin, and refusing a third of ordinary lookups. Each
+  classification now gets a clean session, the same rule `ModelProbe` already states for
+  the same reason. The ANSWERING session is still reused, and that is not a
+  contradiction: its prompt is complete and self-contained, and the cold start it avoids
+  is the dominant cost of an answer.
+
+### Notes
+
+- Nothing under `bridge/`, `agent/` or `eval/` changed.
+- `FoundationModels` is imported in exactly one new file and `NaturalLanguage` in one
+  other; everything else, and every test, runs against a seam.
+- A retrieval floor runs in the suite: twelve questions over a twenty-note invented
+  corpus, each asserting that the note which answers it is among the extracts retrieved,
+  and that neither `Inbox/` trap note ever is.
+
 ## [App 1.0 (147)] - 2026-09-22
 
 **Every vault read went through the bridge, so with the bridge unreachable the app could
