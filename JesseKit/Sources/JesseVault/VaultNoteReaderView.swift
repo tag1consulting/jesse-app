@@ -68,10 +68,33 @@ public final class VaultNoteReaderModel {
     /// thing to run `==` over sixty times a second.
     public private(set) var generation: Int = 0
 
-    private let source: VaultIndexSource
+    /// The note's text as read, and the stamp of the bytes it came from.
+    ///
+    /// HELD, rather than re-read when a box is tapped, and that is the point of the pair:
+    /// a tick is an edit to the text this screen is showing, and the stamp is the proof
+    /// that the file still holds exactly that. Re-reading at tap time would tick whatever
+    /// arrived since, which is how a tap lands on the wrong line of a note that syncing
+    /// has shifted under it.
+    public private(set) var text: String = ""
+    public private(set) var stamp: VaultFileStamp?
+    /// A box that has been tapped and not yet agreed with by the document, by block id.
+    /// The glyph follows this while the write is in flight, so the tick is instant and the
+    /// truth catches up — or the entry is removed and the glyph goes back.
+    public private(set) var optimistic: [Int: Bool] = [:]
+    /// What to say under one block, by block id. Only ever set by a tick that failed.
+    public private(set) var messages: [Int: String] = [:]
 
-    public init(source: VaultIndexSource = .shared) {
+    /// The path this model is showing. Held because a tick and a reload both need it and
+    /// only `load` is handed it.
+    public private(set) var route: String = ""
+
+    private let source: VaultIndexSource
+    private let ticker: VaultNoteTicker
+
+    public init(source: VaultIndexSource = .shared,
+                writer: (any VaultNoteWriting)? = nil) {
         self.source = source
+        self.ticker = VaultNoteTicker(writer: writer ?? VaultNoteWriter(source: source))
     }
 
     public var document: VaultNoteDocument? {
@@ -85,40 +108,22 @@ public final class VaultNoteReaderModel {
     /// note is a few milliseconds of parsing, and a few milliseconds on the main actor is a
     /// dropped frame on a push animation.
     public func load(path: String) async {
+        route = path
         state = .loading
         let started = ContinuousClock.now
         let source = self.source
-        let outcome: Result<(VaultNoteDocument, [String: String], URL?), Error> =
-            await Task.detached {
-                do {
-                    let folder = source.vaultFolder
-                    let index = try? source.index()
-                    let loaded = try folder.withAccess { root -> (VaultNoteDocument, URL?) in
-                        let text = try VaultFile(root: root).read(relativePath: path)
-                        let url = root.appendingPathComponent(path)
-                        let attributes = try? FileManager.default
-                            .attributesOfItem(atPath: url.path)
-                        let modified = attributes?[.modificationDate] as? Date
-                        return (VaultNoteDocument.parse(path: path, text: text,
-                                                        modified: modified), url)
-                    }
-                    var map: [String: String] = [:]
-                    for target in loaded.0.wikiTargets {
-                        if let resolved = index?.resolve(target: target) {
-                            map[target] = resolved
-                        }
-                    }
-                    return .success((loaded.0, map, loaded.1))
-                } catch {
-                    return .failure(error)
-                }
-            }.value
+        let outcome = await Self.read(path: path, source: source)
 
         lastLoadMilliseconds = VaultRenderBenchmark.milliseconds(ContinuousClock.now - started)
         switch outcome {
-        case .success(let (document, map, url)):
+        case .success(let read):
+            let (document, map, url, text, stamp) = read
             resolved = map
             fileURL = url
+            self.text = text
+            self.stamp = stamp
+            optimistic = [:]
+            messages = [:]
             state = .loaded(document)
             generation &+= 1
             VaultReaderLog.loaded(path: path, blocks: document.blocks.count,
@@ -128,6 +133,108 @@ public final class VaultNoteReaderModel {
             state = .failed(VaultIndexer.describe(error))
             generation &+= 1
         }
+    }
+
+    /// One coordinated stamped read, parsed and resolved, entirely off the main actor.
+    ///
+    /// Factored out of `load` because `reload` needs exactly the same work and a second
+    /// copy of it is a second place for the parse to drift onto the main actor.
+    private static func read(
+        path: String, source: VaultIndexSource
+    ) async -> Result<(VaultNoteDocument, [String: String], URL?, String, VaultFileStamp), Error> {
+        await Task.detached {
+            do {
+                let folder = source.vaultFolder
+                let index = try? source.index()
+                let loaded = try folder.withAccess {
+                    root -> (VaultNoteDocument, URL?, String, VaultFileStamp) in
+                    let read = try VaultFile(root: root).readStamped(relativePath: path)
+                    let url = root.appendingPathComponent(path)
+                    let attributes = try? FileManager.default
+                        .attributesOfItem(atPath: url.path)
+                    let modified = attributes?[.modificationDate] as? Date
+                    return (VaultNoteDocument.parse(path: path, text: read.text,
+                                                    modified: modified),
+                            url, read.text, read.stamp)
+                }
+                var map: [String: String] = [:]
+                for target in loaded.0.wikiTargets {
+                    if let resolved = index?.resolve(target: target) {
+                        map[target] = resolved
+                    }
+                }
+                return .success((loaded.0, map, loaded.1, loaded.2, loaded.3))
+            } catch {
+                return .failure(error)
+            }
+        }.value
+    }
+
+    /// Read the note again WITHOUT going back to `.loading`.
+    ///
+    /// What the editor's Save calls on the way out. `load` would blank the screen to a
+    /// spinner and animate the whole note back in, which after saving an edit reads as the
+    /// app having lost the note for a moment.
+    public func reload() async {
+        guard case .loaded = state else {
+            await load(path: route)
+            return
+        }
+        if case .success(let read) = await Self.read(path: route, source: source) {
+            let (document, map, url, text, stamp) = read
+            resolved = map
+            fileURL = url
+            self.text = text
+            self.stamp = stamp
+            optimistic = [:]
+            messages = [:]
+            state = .loaded(document)
+        }
+    }
+
+    /// Tick or untick one box.
+    ///
+    /// OPTIMISTIC, then true. The glyph flips on the tap because a checkbox that waits for
+    /// a file write before it moves is a checkbox people tap twice; the write follows, and
+    /// either the document catches up with the glyph or the glyph goes back and says why.
+    public func tick(block: VaultNoteBlock, to checked: Bool) async {
+        guard case .checkbox = block.kind, let stamp else { return }
+        guard !VaultWriteExemption.isReadOnly(path: route) else { return }
+        optimistic[block.id] = checked
+        messages[block.id] = nil
+
+        let outcome = await ticker.tick(path: route, line: block.line, to: checked,
+                                        text: text, stamp: stamp)
+        switch outcome {
+        case .written(let newText, let newStamp):
+            text = newText
+            self.stamp = newStamp
+            // OFF THE MAIN ACTOR, like every other parse in this type. A 250 KB note is
+            // milliseconds, and milliseconds on the actor that draws is a dropped frame on
+            // the animation the tap itself started.
+            let modified = fileURL.flatMap {
+                (try? FileManager.default.attributesOfItem(atPath: $0.path))?[.modificationDate] as? Date
+            }
+            let path = route
+            let reparsed = await Task.detached {
+                VaultNoteDocument.parse(path: path, text: newText, modified: modified)
+            }.value
+            state = .loaded(reparsed)
+            // The document now says what the glyph has been saying, so the override goes.
+            // NOT bumping `generation`: that is the signal to scroll to a search hit, and
+            // re-landing on it because somebody ticked a box further down would throw the
+            // page away from under them.
+            optimistic[block.id] = nil
+        default:
+            optimistic[block.id] = nil
+            messages[block.id] = outcome.message
+        }
+    }
+
+    /// The state a checkbox block should DRAW as: the tap's, while one is in flight,
+    /// otherwise the document's.
+    public func isChecked(_ block: VaultNoteBlock, documentSays checked: Bool) -> Bool {
+        optimistic[block.id] ?? checked
     }
 
     /// Show the file in Finder (macOS) or in Files (iOS).
@@ -165,6 +272,8 @@ public struct VaultNoteReaderView: View {
     /// The capture sheet, and the one line that confirms a capture landed.
     @State private var isCapturing = false
     @State private var captured: String?
+    /// The editor, presented over this screen.
+    @State private var isEditing = false
     /// Formatted or raw, seeded from the remembered preference and written back on every
     /// change so the choice survives the next note and the next launch.
     @State private var mode: VaultReaderMode
@@ -256,6 +365,17 @@ public struct VaultNoteReaderView: View {
                     Label(mode.buttonLabel, systemImage: mode.buttonSymbol)
                 }
             }
+            // `.primaryAction` for the same reason the capture button is: an edit action in
+            // the overflow ellipsis is an edit action nobody finds.
+            ToolbarItem(placement: .primaryAction) {
+                Button {
+                    isEditing = true
+                } label: {
+                    Label("Edit", systemImage: "square.and.pencil")
+                }
+                .disabled(editRefusal != nil)
+                .help(editRefusal ?? "Edit this note")
+            }
             ToolbarItem {
                 Button {
                     reveal()
@@ -274,6 +394,21 @@ public struct VaultNoteReaderView: View {
             }
             #if os(macOS)
             .frame(minWidth: 420, minHeight: 260)
+            #endif
+        }
+        // A SHEET rather than a push, deliberately. The reader's stack carries
+        // `VaultNoteRoute`s and every one of them is a note to read; giving it a second
+        // destination type so the editor could be pushed would mean every shell that
+        // presents a reader learns about editing. A sheet is modal, which is what editing
+        // a file is, and "pops back to the reader" is its dismissal.
+        .sheet(isPresented: $isEditing) {
+            NavigationStack {
+                VaultNoteEditorView(path: route.path) {
+                    Task { await model.reload() }
+                }
+            }
+            #if os(macOS)
+            .frame(minWidth: 560, minHeight: 420)
             #endif
         }
         // EVERY link in this note arrives here. Ours is caught and pushed; anything else
@@ -349,6 +484,14 @@ public struct VaultNoteReaderView: View {
             Label(Self.provenance(model.document?.modified), systemImage: "externaldrive")
                 .font(.caption)
                 .foregroundStyle(.secondary)
+            // ONE note gets one extra line. Said where the boxes are about to look
+            // untappable, so the difference reads as a rule rather than as a bug.
+            if let caption = VaultWriteExemption.caption(path: route.path) {
+                Label(caption, systemImage: "info.circle")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
     }
 
@@ -424,12 +567,25 @@ public struct VaultNoteReaderView: View {
         }
     }
 
+    /// Why only part of the note is here, AND why Edit is off.
+    ///
+    /// The second half says itself here rather than only in the toolbar button's `.help`,
+    /// because `.help` is a hover tooltip: on the iPhone, which is the platform this
+    /// feature is mostly for, it renders nothing at all. A disabled button with an
+    /// invisible explanation is a button that looks broken.
     private var truncationNotice: some View {
-        Label("This note is long; only the first \(VaultNoteDocument.byteLimit / 1024) KB is shown.",
-              systemImage: "text.append")
-            .font(.caption)
-            .foregroundStyle(.secondary)
-            .fixedSize(horizontal: false, vertical: true)
+        VStack(alignment: .leading, spacing: 2) {
+            Label("This note is long; only the first \(VaultNoteDocument.byteLimit / 1024) KB is shown.",
+                  systemImage: "text.append")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Text(VaultNoteEditorModel.tooLongCaption)
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     // MARK: - Blocks
@@ -469,13 +625,10 @@ public struct VaultNoteReaderView: View {
                         .textSelection(.enabled)
                         .fixedSize(horizontal: false, vertical: true)
                 }
-            case .checkbox(let depth, let checked):
+            case .checkbox(let depth, let parsed):
+                let checked = model.isChecked(block, documentSays: parsed)
                 marker(depth: depth) {
-                    // A GLYPH, never a control: this note is open read-only, and a box
-                    // that looked tappable would promise a write this screen does not do.
-                    Image(systemName: checked ? "checkmark.square" : "square")
-                        .foregroundStyle(.secondary)
-                        .accessibilityLabel(checked ? "Done" : "Not done")
+                    checkboxControl(block, checked: checked)
                 } content: {
                     Text(inline(block.text))
                         .strikethrough(checked, color: .secondary)
@@ -510,9 +663,79 @@ public struct VaultNoteReaderView: View {
                     .foregroundStyle(.tertiary)
                     .fixedSize(horizontal: false, vertical: true)
             }
+            // WHY THE TICK DID NOT STICK, under the block it did not stick to. One line,
+            // where the tap was, rather than a banner at the top of the note: a person who
+            // tapped a box two screens down will never see a banner they cannot see.
+            if let message = model.messages[block.id] {
+                Text(message)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
+
+    /// A box that can be tapped — unless this is the one note the app does not write.
+    ///
+    /// THE TAP TARGET IS 44 POINTS, which is four times the glyph. A checkbox in a note is
+    /// a small square in a dense list of small squares, and a target the size of the
+    /// drawing is how a tap ticks the line below the one somebody meant.
+    ///
+    /// AND THE ROW GROWS TO MATCH, rather than the target being hung off a small row with
+    /// negative padding. That was the first shape and it is wrong in a way worth writing
+    /// down: a checkbox row is about 30 points tall, so 44-point targets held inside it
+    /// would overlap their neighbours by a dozen points, and a tap in the overlap goes to
+    /// whichever row SwiftUI drew last — reintroducing exactly the mis-tap the big target
+    /// exists to prevent, while looking like it had been fixed. Only the HORIZONTAL half
+    /// is pulled back in, because nothing beside the box in that column is tappable.
+    @ViewBuilder
+    private func checkboxControl(_ block: VaultNoteBlock, checked: Bool) -> some View {
+        if isReadOnly {
+            // `Today.md` only. A GLYPH, exactly as before this prompt, because the bridge
+            // rewrites that file and the caption at the top says where the real control is.
+            Image(systemName: checked ? "checkmark.square" : "square")
+                .foregroundStyle(.secondary)
+                .accessibilityLabel(checked ? "Done" : "Not done")
+        } else {
+            Button {
+                Task { await model.tick(block: block, to: !checked) }
+            } label: {
+                Image(systemName: checked ? "checkmark.square.fill" : "square")
+                    .foregroundStyle(checked ? AnyShapeStyle(Color.accentColor)
+                                             : AnyShapeStyle(.secondary))
+                    .frame(width: Self.tapTarget, height: Self.tapTarget)
+                    .contentShape(.rect)
+            }
+            .buttonStyle(.plain)
+            // The row is inside a scroll view that is itself inside a navigation stack;
+            // without this the whole block reads as one control to VoiceOver and the text
+            // stops being selectable.
+            .accessibilityLabel(checked ? "Done" : "Not done")
+            .accessibilityHint("Double tap to \(checked ? "untick" : "tick") this item")
+            .padding(.horizontal, -Self.tapTarget / 4)
+        }
+    }
+
+    /// Apple's minimum, and the number the prompt asks for.
+    static let tapTarget: CGFloat = 44
+
+    /// Why Edit is disabled, or nil when it is not.
+    ///
+    /// TWO reasons, and they are asked in this order: the exemption is a property of the
+    /// path and is known before anything is read, while the length is a property of the
+    /// note and is only known once it is. Both defer to the rules the editor itself
+    /// enforces — `VaultNoteEditorModel.refusal` and the same `byteLimit` the reader
+    /// truncates at — rather than restating them, so the button and the screen behind it
+    /// cannot come to disagree.
+    private var editRefusal: String? {
+        if let refused = VaultNoteEditorModel.refusal(path: route.path) { return refused }
+        if model.document?.truncated == true { return VaultNoteEditorModel.tooLongCaption }
+        return nil
+    }
+
+    /// True for the one note the reader shows but never writes.
+    private var isReadOnly: Bool { VaultWriteExemption.isReadOnly(path: route.path) }
 
     /// A list row: its marker, its text, and the indent its depth earns.
     @ViewBuilder

@@ -518,6 +518,35 @@ public final class VaultIndex: @unchecked Sendable {
                                   completed: completed)
     }
 
+    /// Re-read and re-chunk ONE file, whatever its modification time says.
+    ///
+    /// The debounce and the mtime/size diff that make a whole-vault reindex affordable are
+    /// both exactly wrong for a file this app has just written: the diff would frequently
+    /// skip it (a one-character tick changes no size, and on a filesystem with coarse
+    /// timestamps not always the mtime either), and the debounce would mean a search for
+    /// the sentence you just typed finds the version before it for the next half minute. A
+    /// search that cannot find what you just wrote is a search you stop trusting.
+    ///
+    /// A file that has GONE is removed from the index rather than left: the same call
+    /// serves "this note changed" and "this note is no longer there", and a stale row is
+    /// how a search offers a hit that opens onto nothing.
+    ///
+    /// One file, so one transaction: none of `reindex`'s resumable batching applies.
+    public func reindex(file relativePath: String, root: URL) throws {
+        let url = root.appendingPathComponent(relativePath)
+        let attributes = try? FileManager.default.attributesOfItem(atPath: url.path)
+        guard let attributes,
+              let modified = attributes[.modificationDate] as? Date,
+              let size = (attributes[.size] as? NSNumber)?.intValue else {
+            try remove(path: relativePath)
+            return
+        }
+        let text = try VaultFile(root: root).read(relativePath: relativePath)
+        let entry = VaultFileEntry(relativePath: relativePath, modified: modified, size: size)
+        try store(entry: entry,
+                  parsed: VaultChunker.parse(relativePath: relativePath, text: text))
+    }
+
     /// Throw every row away and recreate the schema — the Rebuild button.
     ///
     /// Not a `DELETE FROM`: a rebuild exists precisely for the case where what is stored

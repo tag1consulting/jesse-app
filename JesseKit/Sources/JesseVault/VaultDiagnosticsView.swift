@@ -48,8 +48,13 @@ public final class VaultDiagnosticsModel {
     /// log rather than mirrored: the composer and the reader both write captures, so a copy
     /// held here would be a second answer to "what did this device write".
     public private(set) var captures: [OfflineWriteRecord] = []
+    /// The in-place writes — ticked boxes and saved edits — newest first.
+    public private(set) var edits: [OfflineWriteRecord] = []
     /// The capture service, for the verification pass and Re-capture.
     private let capture: InboxCaptureService
+    /// The one write log both sections read. Injectable so the screen's own test drives it
+    /// from a temporary directory rather than from this Mac's Application Support.
+    private let writeLog: OfflineWriteLog
     /// The index's own state, shown here rather than re-derived: one object owns "is a
     /// reindex running", and a screen that kept its own copy of that would be a second
     /// answer to the same question.
@@ -60,13 +65,15 @@ public final class VaultDiagnosticsModel {
                 indexer: VaultIndexer = VaultIndexer(),
                 settings: OfflineLookupSettings = OfflineLookupSettings(),
                 offline: OfflineLookupDiagnostics = .shared,
-                capture: InboxCaptureService = .shared) {
+                capture: InboxCaptureService = .shared,
+                writeLog: OfflineWriteLog = .shared) {
         self.folder = folder
         self.probeSession = probeSession
         self.indexer = indexer
         self.settings = settings
         self.offline = offline
         self.capture = capture
+        self.writeLog = writeLog
     }
 
     /// The offline answer rows, newest first, or the one line that says there are none.
@@ -106,7 +113,20 @@ public final class VaultDiagnosticsModel {
     /// The captures the verification pass could not find. Each one keeps its text, so it
     /// can be written again.
     public var missingCaptures: [OfflineWriteRecord] {
-        captures.filter { $0.status.needsAttention }
+        captures.filter { $0.isCapture && $0.status.needsAttention }
+    }
+
+    /// The last twenty in-place writes — ticks and saved edits.
+    ///
+    /// A section of its own rather than more rows under Captures, because the two answer
+    /// different questions. A capture asks "is my line still in the file", which is why it
+    /// has a Check button and a status. An edit asks "did this app change a note, when, and
+    /// by how much", which a status cannot answer and a byte count can.
+    public var editLines: [String] {
+        guard !edits.isEmpty else {
+            return ["No note on this device has been edited from the app yet."]
+        }
+        return edits.map { "\(Self.time($0.written))  \($0.line)" }
     }
 
     public func refreshStatus() {
@@ -116,7 +136,8 @@ public final class VaultDiagnosticsModel {
     /// Read the log back. Cheap (one small JSON file) and called on appear and after every
     /// action, which is what keeps this screen agreeing with what the composer just wrote.
     public func refreshCaptures() {
-        captures = capture.recent
+        captures = writeLog.recentCaptures
+        edits = writeLog.recentEdits
     }
 
     /// Re-read the capture files and record what is still in them.
@@ -443,6 +464,20 @@ public struct VaultDiagnosticsView: View {
                 }
             } header: {
                 Text("Captures")
+            }
+
+            Section {
+                Text("Notes this device changed in place: a checkbox ticked in the reader, or a note saved from the editor. Each row shows the file's size before and after and the checksum of the result. Obsidian Sync carries these to the Studio; nothing here went through the bridge.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                ForEach(Array(model.editLines.enumerated()), id: \.offset) { _, line in
+                    Text(line)
+                        .font(.system(.footnote, design: .monospaced))
+                        .textSelection(.enabled)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            } header: {
+                Text("Note writes")
             }
 
             probeSection(title: "Render benchmark",
