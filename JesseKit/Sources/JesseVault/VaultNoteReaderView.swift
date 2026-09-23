@@ -136,6 +136,9 @@ public struct VaultNoteReaderView: View {
     private let route: VaultNoteRoute
     @State private var model: VaultNoteReaderModel
     @State private var isFrontmatterExpanded = false
+    /// The capture sheet, and the one line that confirms a capture landed.
+    @State private var isCapturing = false
+    @State private var captured: String?
     @Environment(\.openURL) private var openURL
     /// Pushing another note is the STACK's business, not this view's: it is handed a way to
     /// navigate so the same view works in a `NavigationStack`, in a Mac window and in a
@@ -154,6 +157,17 @@ public struct VaultNoteReaderView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 10) {
                 header
+                // WHERE THE CAPTURE WENT, in the same badge the composer's local turn uses.
+                // A sheet that simply closes is indistinguishable from a sheet that was
+                // cancelled, and a capture is exactly the thing a person needs to believe
+                // happened.
+                if let captured {
+                    Label(captured, systemImage: "tray.and.arrow.down")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
                 switch model.state {
                 case .loading:
                     ProgressView()
@@ -185,6 +199,16 @@ public struct VaultNoteReaderView: View {
         }
         .navigationTitle(model.document?.fileName ?? VaultWikiLink.basename(route.path))
         .toolbar {
+            // `.primaryAction`, explicitly. An item left to `.secondaryAction` collapses
+            // into the overflow "More" ellipsis on iOS, which is where a one-tap capture
+            // would go to be never used again — the trap PR #33 already paid for once.
+            ToolbarItem(placement: .primaryAction) {
+                Button {
+                    isCapturing = true
+                } label: {
+                    Label("Capture about this note", systemImage: "tray.and.arrow.down")
+                }
+            }
             ToolbarItem {
                 Button {
                     reveal()
@@ -193,6 +217,17 @@ public struct VaultNoteReaderView: View {
                 }
                 .disabled(model.fileURL == nil)
             }
+        }
+        // `about` is the OPEN note's path, so the captured line carries it in a code span
+        // and the morning triage can file the thought against the note without guessing.
+        .sheet(isPresented: $isCapturing) {
+            VaultCaptureSheet(about: route.path) { write in
+                isCapturing = false
+                if let write { captured = InboxCaptureReply.badge(path: write.relativePath) }
+            }
+            #if os(macOS)
+            .frame(minWidth: 420, minHeight: 260)
+            #endif
         }
         // EVERY link in this note arrives here. Ours is caught and pushed; anything else
         // (a real http link in a note) falls through to the system exactly as before.

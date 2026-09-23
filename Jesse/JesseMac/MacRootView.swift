@@ -72,6 +72,9 @@ struct MacShellView: View {
             guard phase == .active else { return }
             vaultModel.refresh()
             vaultModel.indexer.reindexIfDue()
+            // AND the captures, the same pass the phone runs on activation: re-read only the
+            // files the write log names, change a status, never re-append.
+            Task { await InboxCaptureService.shared.verifyRecent() }
         }
     }
 }

@@ -204,6 +204,12 @@ struct RootTabView: View {
             // forgotten) in Settings while this app was in the background.
             vaultModel.refresh()
             vaultModel.indexer.reindexIfDue()
+            // AND the captures. An activation is the moment the local copy may have been
+            // resynced behind the app's back, which is exactly when a capture written here
+            // either reached the Studio or quietly did not. It re-reads only the files the
+            // write log names, and it NEVER re-appends: a missing line becomes a row on the
+            // diagnostics screen, and a person decides.
+            Task { await InboxCaptureService.shared.verifyRecent() }
         }
         // EVERY successful fetch and every mutation lands a new server snapshot, and
         // each one is pushed. Not gated on the Today tab being selected: the wrist's

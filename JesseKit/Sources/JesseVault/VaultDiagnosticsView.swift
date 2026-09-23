@@ -43,6 +43,12 @@ public final class VaultDiagnosticsModel {
     private let settings: OfflineLookupSettings
     /// The last few offline questions. Held, not owned — the composer writes to it.
     public let offline: OfflineLookupDiagnostics
+    /// What this device has written into the vault's `Inbox/`, newest first. Read from the
+    /// log rather than mirrored: the composer and the reader both write captures, so a copy
+    /// held here would be a second answer to "what did this device write".
+    public private(set) var captures: [OfflineWriteRecord] = []
+    /// The capture service, for the verification pass and Re-capture.
+    private let capture: InboxCaptureService
     /// The index's own state, shown here rather than re-derived: one object owns "is a
     /// reindex running", and a screen that kept its own copy of that would be a second
     /// answer to the same question.
@@ -52,12 +58,14 @@ public final class VaultDiagnosticsModel {
                 probeSession: any ProbeSessioning = FoundationModelProbeSession(),
                 indexer: VaultIndexer = VaultIndexer(),
                 settings: OfflineLookupSettings = OfflineLookupSettings(),
-                offline: OfflineLookupDiagnostics = .shared) {
+                offline: OfflineLookupDiagnostics = .shared,
+                capture: InboxCaptureService = .shared) {
         self.folder = folder
         self.probeSession = probeSession
         self.indexer = indexer
         self.settings = settings
         self.offline = offline
+        self.capture = capture
     }
 
     /// The offline answer rows, newest first, or the one line that says there are none.
@@ -86,8 +94,56 @@ public final class VaultDiagnosticsModel {
         return lines
     }
 
+    /// The capture rows, or the one line that says there are none.
+    public var captureLines: [String] {
+        guard !captures.isEmpty else {
+            return ["Nothing has been captured into the vault from this device yet."]
+        }
+        return captures.map { "\(Self.time($0.written))  \($0.line)" }
+    }
+
+    /// The captures the verification pass could not find. Each one keeps its text, so it
+    /// can be written again.
+    public var missingCaptures: [OfflineWriteRecord] {
+        captures.filter { $0.status.needsAttention }
+    }
+
     public func refreshStatus() {
         status = folder.resolve()
+    }
+
+    /// Read the log back. Cheap (one small JSON file) and called on appear and after every
+    /// action, which is what keeps this screen agreeing with what the composer just wrote.
+    public func refreshCaptures() {
+        captures = capture.recent
+    }
+
+    /// Re-read the capture files and record what is still in them.
+    ///
+    /// The same pass app activation runs. It is here as a button too because "is my capture
+    /// really in the file" is a question a person asks at the moment they are worried, not
+    /// at the moment the scene phase changes.
+    public func verifyCaptures() async {
+        busy = "Checking the captures…"
+        defer { busy = nil }
+        await capture.verifyRecent()
+        refreshCaptures()
+    }
+
+    /// Write one missing capture's own line back into its own file.
+    ///
+    /// Only from a press. NOTHING here re-appends on its own — a background pass that kept
+    /// making captures good would be the mechanism by which one thought becomes four.
+    public func recapture(_ record: OfflineWriteRecord) async {
+        busy = "Writing it again…"
+        defer { busy = nil }
+        switch await capture.recapture(record) {
+        case .success:
+            await capture.verifyRecent()
+        case .failure(let failure):
+            appendLines = ["Re-capture failed: \(failure.description)"]
+        }
+        refreshCaptures()
     }
 
     /// The whole vault, counted and timed.
@@ -226,6 +282,10 @@ public final class VaultDiagnosticsModel {
         ByteCountFormatter.string(fromByteCount: Int64(count), countStyle: .file)
     }
 
+    nonisolated static func time(_ date: Date) -> String {
+        date.formatted(date: .abbreviated, time: .shortened)
+    }
+
     nonisolated static func stamp(_ date: Date) -> String {
         date.formatted(date: .abbreviated, time: .shortened)
     }
@@ -315,6 +375,35 @@ public struct VaultDiagnosticsView: View {
                 Text("Offline answers")
             }
 
+            Section {
+                Text("What this device wrote into the vault's Inbox/ on its own, without the Studio. Each row carries a checksum of the line it appended; Check re-reads the files and says whether the line is still there. Nothing here is ever re-written automatically.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                Button("Check the captures") { Task { await model.verifyCaptures() } }
+                    .disabled(model.busy != nil || !model.status.isReady)
+                ForEach(Array(model.captureLines.enumerated()), id: \.offset) { _, line in
+                    Text(line)
+                        .font(.system(.footnote, design: .monospaced))
+                        .textSelection(.enabled)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                // A row per missing capture rather than one "fix them all": each of these is
+                // a thought somebody wrote down, and writing four of them back at once is
+                // not a decision to take on somebody's behalf.
+                ForEach(model.missingCaptures) { record in
+                    HStack(alignment: .firstTextBaseline) {
+                        Text(record.summary)
+                            .font(.footnote)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Spacer(minLength: 8)
+                        Button("Re-capture") { Task { await model.recapture(record) } }
+                            .disabled(model.busy != nil || !model.status.isReady)
+                    }
+                }
+            } header: {
+                Text("Captures")
+            }
+
             probeSection(title: "On-device model",
                          explanation: "Grows a prompt until the on-device model refuses it, then narrows down to the nearest 500 characters. Takes a few minutes and runs entirely on this device.",
                          button: "Probe the model",
@@ -327,6 +416,7 @@ public struct VaultDiagnosticsView: View {
         .onAppear {
             model.refreshStatus()
             model.indexer.refreshCounts()
+            model.refreshCaptures()
         }
     }
 

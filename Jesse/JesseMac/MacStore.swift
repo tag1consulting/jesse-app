@@ -204,6 +204,10 @@ final class MacCoordinator {
     //    until a folder is picked.
     let offline: OfflineAnswerService
     let offlineLedger: OfflineAnswerLedger
+    // ── THE OFFLINE CAPTURE PATH, and its one asymmetry with the answer path above: it needs
+    //    no model at all. A capture is a coordinated append to one file under `Inbox/`, so the
+    //    only thing it asks of this Mac is the vault folder.
+    let capture: InboxCaptureService
 
     /// Hold `context` against a thread opened without firing; its first send carries it.
     func attach(context: String, to threadID: UUID) {
@@ -283,11 +287,13 @@ final class MacCoordinator {
          sessionDeletionStore: PendingSessionDeletionStore = PendingSessionDeletionStore(),
          offline: OfflineAnswerService? = nil,
          offlineLedger: OfflineAnswerLedger = .shared,
+         capture: InboxCaptureService? = nil,
          save: @escaping @MainActor (ModelContext) throws -> Void = { try $0.save() }) {
         // Resolved in the body, not in a default argument: the service's default is
         // main-actor-isolated and a default argument is evaluated off the actor.
         self.offline = offline ?? OfflineAnswerService.shared
         self.offlineLedger = offlineLedger
+        self.capture = capture ?? InboxCaptureService.shared
         self.configStore = configStore
         self.makeClient = makeClient
         self.sessionDeletionStore = sessionDeletionStore
@@ -363,17 +369,74 @@ final class MacCoordinator {
         return true
     }
 
+    // MARK: - Capturing into the vault's Inbox
+
+    /// Whether this composer offers a capture beside the ordinary send.
+    func captureOffer() -> InboxCaptureOffer {
+        capture.offer(reachability: Self.reachabilityState())
+    }
+
+    /// Write the composer's text into the vault's `Inbox/` on this Mac, and put it in the
+    /// transcript.
+    ///
+    /// The Mac has no send outbox, which makes this the MORE valuable of the two paths here:
+    /// an ordinary send with the Studio asleep reaches nothing and surfaces an error, while a
+    /// capture is on disk before the button finishes animating.
+    ///
+    /// Returns whether the capture is durably in the vault — what the composer clears itself
+    /// on. A refusal leaves the draft exactly where it was.
+    @discardableResult
+    func captureToInbox(text: String, thread: JesseThread,
+                        context: ModelContext) async -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, !isRunning else { return false }
+
+        let outcome = await capture.capture(trimmed)
+        guard case .success(let write) = outcome else {
+            if case .failure(let failure) = outcome { lastError = failure.description }
+            return false
+        }
+
+        // A staged thread is not in the store until its first send. A capture is one.
+        if thread.modelContext == nil { context.insert(thread) }
+        lastError = nil
+
+        // The user's own half, then the local turn that says where it went. Two turns rather
+        // than one: what they typed is theirs, and the badge is the app reporting back.
+        let userTurn = Turn(role: .user, text: trimmed)
+        userTurn.thread = thread
+        context.insert(userTurn)
+        let reply = Turn(role: .jesse, text: InboxCaptureReply.body(write))
+        reply.thread = thread
+        context.insert(reply)
+        thread.updatedAt = Date()
+        do {
+            try save(context)
+        } catch {
+            // THE FILE IS ALREADY WRITTEN. A failed save loses the transcript's record of the
+            // capture, not the capture — and the write log still holds it, which is why this
+            // says so rather than inviting a second attempt that would append a second
+            // identical line.
+            lastError = "Captured to \(write.relativePath), but this conversation couldn't be saved."
+            return true
+        }
+        return true
+    }
+
     // MARK: - Answering on this Mac
 
-    /// This Mac's reachability, as `JesseVault` states it.
-    private func offlineRoute() -> OfflineSendRoute {
-        let state: BridgeReachabilityState
+    /// This Mac's reachability, as `JesseVault` states it. One place, and the only place the
+    /// two enums meet.
+    static func reachabilityState() -> BridgeReachabilityState {
         switch BridgeReachabilityModel.shared.state {
-        case .unknown: state = .unknown
-        case .reachable: state = .reachable
-        case .unreachable: state = .unreachable
+        case .unknown: return .unknown
+        case .reachable: return .reachable
+        case .unreachable: return .unreachable
         }
-        return offline.route(reachability: state)
+    }
+
+    private func offlineRoute() -> OfflineSendRoute {
+        offline.route(reachability: Self.reachabilityState())
     }
 
     /// Stage this thread's uncarried offline answers onto its next online turn.

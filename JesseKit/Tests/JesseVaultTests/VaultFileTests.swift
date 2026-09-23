@@ -119,6 +119,47 @@ final class VaultFileTests: XCTestCase {
         XCTAssertEqual(try file.read(relativePath: "./Today.md"), "hello")
     }
 
+    // MARK: - Append with a prologue
+    //
+    // The "create it with a heading, otherwise just append" append. The property that
+    // matters is that the decision is made INSIDE the coordination bracket: `exists()`
+    // followed by `append()` leaves a window in which a synced folder grows the file and the
+    // heading lands in the middle of it.
+
+    func testAppendCreatingWritesThePrologueONLYOnTheCallThatCreatesTheFile() throws {
+        let first = try file.appendCreating(relativePath: "Inbox/day.md",
+                                           prologue: "# Heading\n\n", text: "- one\n")
+        XCTAssertTrue(first.created)
+        XCTAssertEqual(try file.read(relativePath: "Inbox/day.md"), "# Heading\n\n- one\n")
+        XCTAssertEqual(first.size, "# Heading\n\n- one\n".utf8.count)
+
+        let second = try file.appendCreating(relativePath: "Inbox/day.md",
+                                            prologue: "# Heading\n\n", text: "- two\n")
+        XCTAssertFalse(second.created)
+        XCTAssertEqual(try file.read(relativePath: "Inbox/day.md"),
+                       "# Heading\n\n- one\n- two\n")
+        XCTAssertGreaterThan(second.size, first.size)
+    }
+
+    func testAppendCreatingNeverRewritesAnEXISTINGFilesBytes() throws {
+        try stage("Inbox/day.md", "# Somebody else's heading\n\n- theirs\n")
+        let before = try Data(contentsOf: root.appendingPathComponent("Inbox/day.md"))
+        let result = try file.appendCreating(relativePath: "Inbox/day.md",
+                                            prologue: "# Ours\n\n", text: "- ours\n")
+        XCTAssertFalse(result.created)
+        let after = try Data(contentsOf: root.appendingPathComponent("Inbox/day.md"))
+        XCTAssertEqual(after.prefix(before.count), before)
+        XCTAssertFalse(try file.read(relativePath: "Inbox/day.md").contains("# Ours"))
+    }
+
+    func testAppendCreatingRefusesEveryPathAppendRefuses() {
+        for bad in ["/etc/passwd", "../outside.md", ".obsidian/workspace.md", "", "   "] {
+            XCTAssertThrowsError(try file.appendCreating(relativePath: bad,
+                                                        prologue: "# H\n\n", text: "x\n"),
+                                 bad)
+        }
+    }
+
     // MARK: - Append
 
     func testAppendCreatesTheFileWhenItIsAbsent() throws {

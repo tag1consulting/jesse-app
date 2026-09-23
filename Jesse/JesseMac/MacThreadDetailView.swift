@@ -5,6 +5,7 @@ import JesseCore
 import JesseNetworking
 import JesseConversations
 import JesseSpeech
+import JesseVault
 import UniformTypeIdentifiers
 
 // One conversation: the transcript (hydrated from the bridge on open, cache-first) plus
@@ -48,6 +49,13 @@ struct MacThreadDetailView: View {
     // `ComposerDrafts.capture` the phone uses. The only per-shell code is which hooks
     // count as a departure.
 
+    /// Whether this composer offers a capture into the vault's `Inbox/`.
+    ///
+    /// State rather than computed in `body`: the decision resolves a security-scoped bookmark
+    /// once reachability says it matters, and `body` re-runs as the draft changes.
+    @State private var captureOffer: InboxCaptureOffer = .hidden
+    /// True while the capture's coordinated append is in flight.
+    @State private var capturing = false
     /// Guards the restore so it happens once per composer; a second one would overwrite
     /// live typing with a stale value.
     @State private var didRestoreDraft = false
@@ -302,6 +310,16 @@ struct MacThreadDetailView: View {
                     Spacer(minLength: 0)
                 }
             }
+            // WHAT THE SECOND CONTROL IS FOR. The Mac has no send outbox, so this row is
+            // the difference between a thought that is on disk and one that is nowhere.
+            if captureOffer.isOffered {
+                Label("The Studio can't be reached. Capture to Inbox writes this straight into the vault on this Mac.",
+                      systemImage: "tray.and.arrow.down")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
             HStack(alignment: .bottom, spacing: 10) {
                 Picker("", selection: $mode) {
                     ForEach(JesseMode.allCases) { m in Text(m.label).tag(m) }
@@ -342,6 +360,24 @@ struct MacThreadDetailView: View {
                     .padding(8)
                     .background(.quaternary.opacity(0.4), in: .rect(cornerRadius: 8))
 
+                // On the Mac there IS room for the wording, so the button says what it
+                // does rather than relying on a glyph and a caption.
+                if captureOffer.isOffered {
+                    Button {
+                        captureToInbox()
+                    } label: {
+                        if capturing {
+                            ProgressView().controlSize(.small)
+                        } else {
+                            Label("Capture to Inbox", systemImage: "tray.and.arrow.down")
+                        }
+                    }
+                    .buttonStyle(.bordered)
+                    .help("Writes this straight into the vault's Inbox on this Mac, without the Studio")
+                    .disabled(capturing || running
+                              || draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+
                 Button(action: send) {
                     Image(systemName: "arrow.up.circle.fill").font(.title2)
                 }
@@ -365,6 +401,17 @@ struct MacThreadDetailView: View {
         .onChange(of: recording.completed) { _, value in
             guard value != nil, let done = recording.takeCompleted() else { return }
             draft = done.messageBody(typed: draft)
+        }
+        // The offer's ONE input. `initial: true` so a composer opened while the Studio is
+        // already unreachable shows it without waiting for a state change.
+        .onChange(of: BridgeReachabilityModel.shared.state, initial: true) { _, _ in
+            captureOffer = coordinator.captureOffer()
+        }
+        // AND on the window becoming active, because the OTHER input changes elsewhere: the
+        // folder is picked in the Settings scene, which reachability never notices.
+        .onChange(of: scenePhase) { _, phase in
+            guard phase == .active else { return }
+            captureOffer = coordinator.captureOffer()
         }
         // NO `onChange(of: draft)` and none for the recording stage. Typing changes this
         // view's own state and nothing else; what the composer holds is read off that
@@ -398,6 +445,27 @@ struct MacThreadDetailView: View {
     /// turn synchronously and returns whether that succeeded. A refused send and a staging
     /// save that threw both return false, leave the draft in place, and leave the text on
     /// screen — the release below is ORDERED AFTER the save and simply never runs.
+    /// Write the composer's text into the vault, then clear the composer — and only then.
+    ///
+    /// The same ownership rule `send` follows: the draft is released after the write has
+    /// landed, so a refusal or a failed write leaves the text exactly where it was.
+    private func captureToInbox() {
+        let text = draft
+        capturing = true
+        Task {
+            let landed = await coordinator.captureToInbox(text: text, thread: thread,
+                                                          context: context)
+            capturing = false
+            guard landed else {
+                captureDraft()
+                return
+            }
+            ComposerDrafts.release(for: thread)
+            draft = ""
+            draftNotice = nil
+        }
+    }
+
     private func send() {
         guard canSend else { return }
         guard coordinator.stageAndSend(text: draft, mode: mode, thread: thread,
