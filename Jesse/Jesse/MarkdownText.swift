@@ -1,6 +1,13 @@
 import SwiftUI
 import UIKit
 import JesseCore
+// RE-EXPORTED on purpose. `TableAlignment` and the three table functions below used to be
+// declared in this file; they now live in JesseMarkdown so the vault reader can use the
+// same rules instead of growing a second answer to "what is a delimiter row". Re-exporting
+// means every existing caller — `MarkdownDocument`, and this file's own tests — keeps
+// compiling unchanged, so the move is provably behaviour-preserving rather than
+// merely claimed to be.
+@_exported import JesseMarkdown
 
 // A small, dependency-free block renderer for Jesse's markdown replies.
 //
@@ -12,11 +19,6 @@ import JesseCore
 // *within* a block.
 //
 // Parsing is kept separate from rendering so the parser is unit-testable.
-
-/// Per-column horizontal alignment for a GFM pipe table.
-enum TableAlignment: Equatable {
-    case leading, center, trailing
-}
 
 /// One renderable block of a markdown reply.
 enum MarkdownBlock: Equatable {
@@ -186,47 +188,11 @@ private func parseNumbered(_ line: String) -> MarkdownBlock? {
     return .numbered(number: number, text: text)
 }
 
-/// True if `line` is a GFM table delimiter row: at least one cell, every cell
-/// made only of `-`, `:`, and spaces, and the row contains at least one `-`.
-private func isTableDelimiterRow(_ line: String) -> Bool {
-    let trimmed = line.trimmingCharacters(in: .whitespaces)
-    guard trimmed.contains("|"), trimmed.contains("-") else { return false }
-    let cells = splitTableRow(trimmed)
-    guard !cells.isEmpty else { return false }
-    for cell in cells {
-        let stripped = cell.trimmingCharacters(in: .whitespaces)
-        guard !stripped.isEmpty,
-              stripped.allSatisfy({ $0 == "-" || $0 == ":" }) else {
-            return false
-        }
-    }
-    return true
-}
-
-/// Per-column alignment from a delimiter row: `:---`=leading, `:--:`=center,
-/// `---:`=trailing, plain=leading.
-private func parseTableAlignments(_ line: String) -> [TableAlignment] {
-    splitTableRow(line.trimmingCharacters(in: .whitespaces)).map { cell in
-        let c = cell.trimmingCharacters(in: .whitespaces)
-        let left = c.hasPrefix(":")
-        let right = c.hasSuffix(":")
-        switch (left, right) {
-        case (true, true):  return .center
-        case (false, true): return .trailing
-        default:            return .leading
-        }
-    }
-}
-
-/// Split one pipe-table row into trimmed cells: drop one optional leading and
-/// trailing `|`, split on `|`, trim each cell. (Escaped `\|` is out of scope.)
-private func splitTableRow(_ line: String) -> [String] {
-    var s = Substring(line.trimmingCharacters(in: .whitespaces))
-    if s.hasPrefix("|") { s = s.dropFirst() }
-    if s.hasSuffix("|") { s = s.dropLast() }
-    return s.split(separator: "|", omittingEmptySubsequences: false)
-        .map { $0.trimmingCharacters(in: .whitespaces) }
-}
+// `isTableDelimiterRow`, `parseTableAlignments` and `splitTableRow` were here. They are
+// now `JesseMarkdown`'s, re-exported by the import at the top of this file, and the table
+// branch of `parseMarkdownBlocks` above calls them exactly as it always did. What did NOT
+// move is this parser's own assembly of a `.table` block — its ragged rows stay ragged and
+// its own tests still pin that.
 
 /// Coalesces the markdown parse of a *growing* string (a live stream's partial
 /// reply) to ~10 Hz. The naive `MarkdownText(partial)` re-parses the whole string

@@ -34,6 +34,7 @@ public final class VaultDiagnosticsModel {
     public private(set) var readLines: [String] = []
     public private(set) var appendLines: [String] = []
     public private(set) var modelLines: [String] = []
+    public private(set) var benchmarkLines: [String] = []
     public private(set) var busy: String?
 
     private let folder: VaultFolder
@@ -228,6 +229,46 @@ public final class VaultDiagnosticsModel {
         }
     }
 
+    /// Parse and render the LARGEST note in this vault, repeatedly, and report the
+    /// medians.
+    ///
+    /// The same two measurements the branch's performance budget was written against,
+    /// run here so the number can be compared on the device it actually matters on. A
+    /// Mac and a phone are different machines and the gap between them is exactly what a
+    /// number in a pull request cannot tell you.
+    ///
+    /// The largest note rather than a fixture, because the budget is about the worst
+    /// case this vault actually contains, not about a note somebody invented.
+    public func renderBenchmark() async {
+        busy = "Parsing and rendering the largest note…"
+        defer { busy = nil }
+        let folder = self.folder
+        // OFF THE MAIN ACTOR, and deliberately seconds of work: this is 23 parses and 23
+        // full render passes over a quarter of a megabyte.
+        let outcome: Result<VaultRenderBenchmarkReport, Error> = await Task.detached {
+            do {
+                return .success(try folder.withAccess { root in
+                    let scan = VaultScanner().scan(root: root)
+                    guard let biggest = scan.files.max(by: { $0.size < $1.size }) else {
+                        throw VaultFileError.unreadable("the vault", "it holds no markdown files")
+                    }
+                    let text = try VaultFile(root: root)
+                        .read(relativePath: biggest.relativePath)
+                    return VaultRenderBenchmark.run(path: biggest.relativePath, text: text)
+                })
+            } catch {
+                return .failure(error)
+            }
+        }.value
+
+        switch outcome {
+        case .failure(let error):
+            benchmarkLines = ["Benchmark failed: \(Self.describe(error))"]
+        case .success(let report):
+            benchmarkLines = report.displayLines
+        }
+    }
+
     /// The on-device model's availability and measured capacity. Minutes of
     /// inference, and only ever on an explicit press.
     public func probeModel() async {
@@ -403,6 +444,11 @@ public struct VaultDiagnosticsView: View {
             } header: {
                 Text("Captures")
             }
+
+            probeSection(title: "Render benchmark",
+                         explanation: "Parses the largest note in this vault and renders every one of its blocks, twenty times after three warm-ups, and reports the medians. The same two numbers the reader's performance budget is written against — measured here on this device rather than on a Mac.",
+                         button: "Run the render benchmark",
+                         lines: model.benchmarkLines) { await model.renderBenchmark() }
 
             probeSection(title: "On-device model",
                          explanation: "Grows a prompt until the on-device model refuses it, then narrows down to the nearest 500 characters. Takes a few minutes and runs entirely on this device.",
