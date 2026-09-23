@@ -113,6 +113,10 @@ final class RunCoordinator {
     //    makes this whole path invisible until a folder is picked.
     @ObservationIgnored let offline: OfflineAnswerService
     @ObservationIgnored let offlineLedger: OfflineAnswerLedger
+    // ── THE OFFLINE CAPTURE PATH, and its one asymmetry with the answer path above: this
+    //    one needs no model at all. A capture is a coordinated append to one file under
+    //    `Inbox/`, so the only thing it asks of the device is the vault folder.
+    @ObservationIgnored let capture: InboxCaptureService
 
     // A recording the share extension handed over, waiting for the conversation it was
     // opened into to pick it up.
@@ -325,12 +329,16 @@ final class RunCoordinator {
          intentReplayer: (any IntentReplaying)? = nil,
          offline: OfflineAnswerService? = nil,
          offlineLedger: OfflineAnswerLedger = .shared,
+         capture: InboxCaptureService? = nil,
          onFirstSuccess: @escaping @MainActor () -> Void = {}) {
         // Same rationale as the in-flight store and the Live Activity controller: the
         // service's default is main-actor-isolated and a default argument is evaluated
         // off the actor.
         self.offline = offline ?? OfflineAnswerService.shared
         self.offlineLedger = offlineLedger
+        // Same rationale: `.shared` is main-actor-isolated and a default argument is
+        // evaluated off the actor.
+        self.capture = capture ?? InboxCaptureService.shared
         // Resolve the default on the main actor (in the init body), not in the
         // default argument — a default arg is evaluated off the actor and the
         // store's init is main-actor-isolated under MainActor-default isolation.
@@ -785,18 +793,82 @@ final class RunCoordinator {
         return true
     }
 
+    // MARK: - Capturing into the vault's Inbox
+
+    /// Whether this composer offers a capture beside the queued send.
+    ///
+    /// The ordinary send is NEVER taken away: plenty of offline messages really do need
+    /// Jesse, and they still queue exactly as they did. This adds a destination for the ones
+    /// that only need to be written down.
+    func captureOffer() -> InboxCaptureOffer {
+        capture.offer(reachability: Self.reachabilityState())
+    }
+
+    /// Write the composer's text into the vault's `Inbox/` on this device, and put it in the
+    /// transcript.
+    ///
+    /// NO OUTBOX ITEM AND NO BRIDGE CALL. That is the whole difference from every other send
+    /// this class makes: the vault already has the text by the time this returns, so a
+    /// queued copy would be the same thought arriving twice — once now in `Inbox/`, once
+    /// again as a message the Studio is asked to write down minutes later.
+    ///
+    /// Returns whether the capture is DURABLY IN THE VAULT, which is what the composer
+    /// clears itself on. A refusal (empty text, no folder, a write that failed) returns
+    /// false, surfaces its reason on the thread, and leaves the text where the user left it.
+    @discardableResult
+    func captureToInbox(thread: JesseThread, text: String,
+                        context: ModelContext) async -> Bool {
+        let threadID = thread.id
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, !isRunning(threadID) else { return false }
+
+        let outcome = await capture.capture(trimmed)
+        guard case .success(let write) = outcome else {
+            if case .failure(let failure) = outcome { errors[threadID] = failure.description }
+            return false
+        }
+
+        // A new thread is not in the store until its first send. A capture IS a first send.
+        if thread.modelContext == nil { context.insert(thread) }
+        errors[threadID] = nil
+
+        // The user's own half, exactly as any other send stages it, and then the local turn
+        // that says where it went. Two turns rather than one: what they typed is theirs, and
+        // the badge is the app reporting back.
+        let userTurn = Turn(role: .user, text: trimmed)
+        thread.turns.append(userTurn)
+        thread.turns.append(Turn(role: .jesse, text: InboxCaptureReply.body(write)))
+        if thread.title.isEmpty { thread.title = JesseThread.deriveTitle(from: trimmed) }
+        thread.updatedAt = Date()
+        do {
+            try save(context)
+        } catch {
+            // THE FILE IS ALREADY WRITTEN. A failed save loses the transcript's record of
+            // the capture, not the capture — and the write log still holds it, which is why
+            // this says so rather than inviting a second attempt that would append a second
+            // identical line.
+            Log.run.error("capture turn save failed for thread \(threadID): \(error.localizedDescription)")
+            errors[threadID] =
+                "Captured to \(write.relativePath), but this conversation couldn't be saved."
+            return true
+        }
+        return true
+    }
+
     // MARK: - Answering on this device
 
     /// This device's reachability, as `JesseVault` states it. One line, and the only
     /// place the two enums meet.
-    private func offlineRoute() -> OfflineSendRoute {
-        let state: BridgeReachabilityState
+    static func reachabilityState() -> BridgeReachabilityState {
         switch BridgeReachabilityModel.shared.state {
-        case .unknown: state = .unknown
-        case .reachable: state = .reachable
-        case .unreachable: state = .unreachable
+        case .unknown: return .unknown
+        case .reachable: return .reachable
+        case .unreachable: return .unreachable
         }
-        return offline.route(reachability: state)
+    }
+
+    private func offlineRoute() -> OfflineSendRoute {
+        offline.route(reachability: Self.reachabilityState())
     }
 
     /// Stage this thread's uncarried offline answers onto its next online turn, and say

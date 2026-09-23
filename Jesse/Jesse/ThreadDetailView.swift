@@ -8,6 +8,7 @@ import JesseCore
 import JesseNetworking
 import JesseConversations
 import JesseSpeech
+import JesseVault
 
 // One conversation: the full turn transcript with the composer pinned at the
 // bottom. Being inside a thread *is* continuing it — every send auto-resumes the
@@ -62,6 +63,15 @@ struct ThreadDetailView: View {
             let config = ConfigStore.load()
             return StudioEndpoint(baseURL: config.endpoint("/"), token: config.token)
         })))
+    /// Whether the composer offers a capture into the vault's `Inbox/`.
+    ///
+    /// Held in state rather than computed in `body`, deliberately: the decision resolves a
+    /// security-scoped bookmark once reachability says it matters, and `body` re-runs on
+    /// every keystroke. It is refreshed when reachability changes, which is the only input
+    /// that can turn it on or off while this composer is on screen.
+    @State private var captureOffer: InboxCaptureOffer = .hidden
+    /// True while the capture's coordinated append is in flight.
+    @State private var capturing = false
     // Whether the composer's frugal glyph has been tapped for its explanation.
     @State private var showFrugalExplanation = false
 
@@ -601,9 +611,23 @@ struct ThreadDetailView: View {
                 maxLines: ComposerLayout.inputMaxLines,
                 onPasteMedia: stagePastedMedia)
 
+            // WHAT THE SECOND CONTROL IS FOR, said in words. The button beside Send is a
+            // tray glyph — there is no room for a label in that row on a phone — so the
+            // sentence that names it lives here, and only while the offer stands.
+            if captureOffer.isOffered {
+                Label("The Studio can't be reached. Capture to Inbox writes this straight into the vault on this device; Send queues it for Jesse.",
+                      systemImage: "tray.and.arrow.down")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityElement(children: .combine)
+            }
+
             HStack {
                 attachButton
                 if frugalPolicy.isActive { frugalGlyph }
+                if captureOffer.isOffered { captureButton }
                 SendButton(
                     running: running,
                     startDate: coordinator.startDate(for: thread.id),
@@ -633,6 +657,19 @@ struct ThreadDetailView: View {
         .sheet(isPresented: Binding(get: { recording.stage == .choosingLanguage },
                                     set: { if !$0 { recording.abandon() } })) {
             RecordingLanguageSheet(model: recording)
+        }
+        // The offer's ONE input. `initial: true` so a composer opened while the Studio is
+        // already unreachable shows it without waiting for a state change, and nothing here
+        // costs a bookmark resolution while the bridge is reachable (see `captureOffer()`).
+        .onChange(of: BridgeReachabilityModel.shared.state, initial: true) { _, _ in
+            captureOffer = coordinator.captureOffer()
+        }
+        // AND on coming back, because the OTHER input can change while this view is not
+        // being looked at: the vault folder is picked in Settings, and reachability need
+        // never move for that to turn the offer on.
+        .onChange(of: scenePhase) { _, phase in
+            guard phase == .active else { return }
+            captureOffer = coordinator.captureOffer()
         }
         // A pending share hand-off, picked up by the conversation that was opened for
         // it. `.task(id:)` rather than `.onAppear` so it also fires for a conversation
@@ -664,6 +701,60 @@ struct ThreadDetailView: View {
             CameraPicker(onCapture: handleCameraCapture,
                          onCancel: { showCamera = false })
                 .ignoresSafeArea()
+        }
+    }
+
+    /// Capture to Inbox — the second destination, beside the queued send.
+    ///
+    /// A glyph rather than a labelled button because the send row on a phone has room for
+    /// one label and Send already has it; the caption above the row is what names this one.
+    private var captureButton: some View {
+        Button {
+            captureToInbox()
+        } label: {
+            if capturing {
+                ProgressView().frame(width: 38, height: 40)
+            } else {
+                Image(systemName: "tray.and.arrow.down")
+                    .font(.title3)
+                    .frame(width: 38, height: 40)
+            }
+        }
+        .accessibilityLabel("Capture to Inbox")
+        .accessibilityHint("Writes this straight into the vault's Inbox on this device, without the Studio.")
+        .accessibilityIdentifier(Self.captureButtonIdentifier)
+        .disabled(capturing || running
+                  || input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+    }
+
+    /// The capture button's UI-test handle.
+    static let captureButtonIdentifier = "composer.captureToInbox"
+
+    /// Write the composer's text into the vault, then clear the composer — and only then.
+    ///
+    /// The same ownership rule the send path follows: the draft is released after the write
+    /// has landed, so a refusal or a failed write leaves the text exactly where it was.
+    ///
+    /// STAGED ATTACHMENTS ARE LEFT ALONE. A capture is one line of text in a markdown file;
+    /// a photo cannot go in one. So a staged photo stays staged, for the send that will carry
+    /// it, rather than being silently dropped by a button that could not take it anyway.
+    private func captureToInbox() {
+        inputFocused = false
+        let text = input
+        capturing = true
+        Task {
+            let landed = await coordinator.captureToInbox(thread: thread, text: text,
+                                                          context: context)
+            capturing = false
+            guard landed else {
+                captureDraft()
+                return
+            }
+            ComposerDrafts.release(for: thread)
+            input = ""
+            attachError = nil
+            draftNotice = nil
+            isAtBottom = true
         }
     }
 

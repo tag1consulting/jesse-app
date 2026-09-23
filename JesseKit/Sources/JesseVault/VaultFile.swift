@@ -39,6 +39,18 @@ public enum VaultFileError: Error, CustomStringConvertible, Equatable {
     }
 }
 
+/// What one append did: the file's size afterwards, and whether this call was the one
+/// that created it.
+public struct VaultAppendResult: Equatable, Sendable {
+    public let size: Int
+    public let created: Bool
+
+    public init(size: Int, created: Bool) {
+        self.size = size
+        self.created = created
+    }
+}
+
 /// One vault root, and the two things that may be done inside it.
 public struct VaultFile: Sendable {
     public let root: URL
@@ -116,6 +128,57 @@ public struct VaultFile: Sendable {
         // caller can check rather than something this function claims.
         let attributes = try? FileManager.default.attributesOfItem(atPath: url.path)
         return (attributes?[.size] as? NSNumber)?.intValue ?? 0
+    }
+
+    /// Append `text`, writing `prologue` first IF AND ONLY IF the file did not already
+    /// exist — with that decision made inside the same coordination bracket as the write.
+    ///
+    /// This exists because "create it with a heading, otherwise just append" cannot be
+    /// spelled as `exists()` followed by `append()`: the folder is Obsidian's and actively
+    /// synced, so between those two calls the file can appear, and the heading would land
+    /// in the middle of it. One bracket, one decision, and `created` reports which branch
+    /// was taken so the caller can count the bytes it actually wrote.
+    ///
+    /// Like `append`, it can only ever grow the file. `prologue` is written only to a file
+    /// this call is itself creating, so no existing byte is reachable from here either.
+    @discardableResult
+    public func appendCreating(relativePath: String,
+                               prologue: String,
+                               text: String) throws -> VaultAppendResult {
+        let url = try resolved(relativePath)
+        guard let body = text.data(using: .utf8), let head = prologue.data(using: .utf8) else {
+            throw VaultFileError.notUTF8(relativePath)
+        }
+        var coordinationError: NSError?
+        var thrown: Error?
+        var created = false
+        NSFileCoordinator().coordinate(writingItemAt: url, options: [], error: &coordinationError) { writeURL in
+            do {
+                let manager = FileManager.default
+                let parent = writeURL.deletingLastPathComponent()
+                if !manager.fileExists(atPath: parent.path) {
+                    try manager.createDirectory(at: parent, withIntermediateDirectories: true)
+                }
+                if !manager.fileExists(atPath: writeURL.path) {
+                    created = true
+                    try (head + body).write(to: writeURL, options: .atomic)
+                    return
+                }
+                let handle = try FileHandle(forWritingTo: writeURL)
+                defer { try? handle.close() }
+                try handle.seekToEnd()
+                try handle.write(contentsOf: body)
+            } catch {
+                thrown = VaultFileError.unwritable(relativePath, error.localizedDescription)
+            }
+        }
+        if let coordinationError {
+            throw VaultFileError.unwritable(relativePath, coordinationError.localizedDescription)
+        }
+        if let thrown { throw thrown }
+        let attributes = try? FileManager.default.attributesOfItem(atPath: url.path)
+        return VaultAppendResult(size: (attributes?[.size] as? NSNumber)?.intValue ?? 0,
+                                 created: created)
     }
 
     /// True when the file exists. Used by the diagnostics screen to say what it is

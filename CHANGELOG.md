@@ -14,6 +14,73 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [App 1.0 (149)] - 2026-09-23
+
+**Every write the app made went through the bridge, so a captured thought was only as
+durable as the queue — while the writable, synced vault sat on the same device.** A tick,
+a quick log, a note to self: all of them were composed here, put in the capture queue, and
+were worth exactly what the queue was worth until the Studio came back and spent a hosted
+turn landing them. That is the right shape for anything that needs the agent to *do*
+something, and the wrong shape for "remember this", because App 1.0 (146) had already put
+the Obsidian vault folder on this device, writable, and Obsidian syncs it independently of
+the bridge.
+
+This is the second of the four offline steps (it lands after 147 and 148 for ordering
+reasons, not dependency ones). A capture is a coordinated append to one file under
+`Inbox/`, it involves no model anywhere, and the morning routine already reads every file
+under `Inbox/` — so there is no new machinery on the Studio side and no new file shape for
+it to learn.
+
+### Added
+
+- **`InboxCapture`: one file, appended, and nothing else reachable.**
+  `Inbox/YYYY-MM-DD-phone.md` on the phone and `-mac` on the Mac, with the date in the
+  DEVICE's own time zone (an evening thought in Italy belongs in today's file, not
+  tomorrow's UTC one) and the suffix keeping two devices that capture on the same day out
+  of each other's file. The file is created with a `# Phone captures YYYY-MM-DD` heading
+  and a blank line; an entry is `- HH:MM (<device>): <text>` on one line, with a multi-line
+  capture indented two spaces under its own bullet. A capture about a note begins its text
+  with that note's path in a code span, so the triage can file it against the note. Text is
+  trimmed, empty text is refused, and text over 4,000 characters is refused with a message
+  that names its real length — the refusal happens BEFORE the file is touched, so it cannot
+  leave a heading-only file behind.
+
+- **`VaultFile.appendCreating`: the heading decision inside the coordination bracket.**
+  "Create it with a heading, otherwise just append" cannot be spelled as `exists()`
+  followed by `append()`: the folder is Obsidian's and actively synced, so between those
+  two calls the file can appear and the heading lands in the middle of it. One
+  `NSFileCoordinator` bracket, one decision, and it reports which branch it took.
+
+- **`OfflineWriteLog`: what this device wrote, and whether it is still there.** Two hundred
+  captures in Application Support (never in the vault — a JSON file inside the synced
+  folder would show up in the note tree on every device), each with the time, the file, the
+  bytes appended, a SHA-256 of those bytes and the text itself. A capture leaves the app's
+  world the instant the append returns, and a write nobody recorded is a write nobody can
+  notice the loss of.
+
+- **Two ways to reach it.** The composers offer "Capture to Inbox" beside the ordinary send
+  whenever the bridge is unreachable AND a vault folder is held — a tray glyph with a
+  caption on the phone, a labelled button on the Mac, where there is room. The ordinary
+  queued send is never taken away: plenty of offline messages really do need Jesse. The
+  reader gains "Capture about this note", a one-field sheet that files the thought against
+  the open note, online and offline alike — a capture is a capture.
+
+- **Verification on activation, and never a silent repair.** On every activation, beside the
+  index's own reindex, the capture files the log names are re-read and each logged checksum
+  is confirmed still present. A missing line shows on the Vault diagnostics screen as "not
+  found in file" with its original text intact and a per-row Re-capture button. NOTHING
+  re-appends on its own: the one failure worse than a lost capture is the same thought
+  appearing four times because a background pass kept fixing it.
+
+### Unchanged, deliberately
+
+- Ticks, moves, quick logs and Start new day keep the capture queue and its replay. This
+  touched neither `IntentReplayer` nor the outbox.
+- No language model is involved anywhere on this path, and `Inbox/` remains excluded from
+  retrieval (148), so a capture can never be lifted into a model prompt.
+- No vault path other than `Inbox/YYYY-MM-DD-<platform>.md` is ever written, nothing under
+  `.obsidian/` is touched, and how the Studio triages `Inbox/` did not change.
+
 ## [App 1.0 (148)] - 2026-09-23
 
 **Offline, a question had nowhere to go but a failed send — although the vault and a
