@@ -1405,7 +1405,10 @@ pub fn date_from_ms(ms: u64) -> String {
 /// caller gets back therefore carries a tag that is a pure function of the day
 /// file's content, and the same tag is echoed inside the body so a client that
 /// stored the payload can compare without keeping headers.
-fn today_response(headers: &HeaderMap, snapshot: &TodaySnapshot) -> Response {
+///
+/// `documentEtag` rides alongside it and is a different tag for a different job: the
+/// one a MUTATION must send back. See [`document_etag`] for why they had to be split.
+fn today_response(headers: &HeaderMap, snapshot: &TodaySnapshot, document: &str) -> Response {
     let mut value = serde_json::to_value(snapshot).unwrap_or_else(|_| json!({}));
     let etag = snapshot_etag(snapshot);
     if let Some(inm) = headers
@@ -1422,6 +1425,7 @@ fn today_response(headers: &HeaderMap, snapshot: &TodaySnapshot) -> Response {
             json!(rfc3339_utc(SystemTime::now())),
         );
         obj.insert("etag".to_string(), json!(etag.clone()));
+        obj.insert("documentEtag".to_string(), json!(document));
     }
     (
         StatusCode::OK,
@@ -1462,7 +1466,7 @@ pub async fn jesse_today(
     // contract, and accepting one silently without ever looking at it is how a client comes
     // to believe it is being honoured somewhere it is not.
     let _zone = request_zone(&st, q.client_tz.as_deref(), "GET /jesse/today");
-    let (raw, snapshot) = build_snapshot(&st.cfg);
+    let (raw, snapshot, document) = build_snapshot(&st.cfg);
     // THE BRIEF SWEEP'S TRIGGER. The bridge has no file watcher — every read re-parses
     // the day file — so the only signal that the document changed is somebody asking for
     // it. The sweep hashes the source and returns immediately when it matches the last
@@ -1470,7 +1474,7 @@ pub async fn jesse_today(
     // does not match, it queues the items whose inputs moved and returns. Nothing here
     // waits on a model.
     todaybrief::sweep(&st, raw.as_deref(), &snapshot);
-    Ok(today_response(&headers, &snapshot))
+    Ok(today_response(&headers, &snapshot, &document))
 }
 
 /// The `?client_tz=` query parameter, shared by the read endpoints that take nothing else.
@@ -1507,6 +1511,27 @@ pub fn snapshot_etag(snapshot: &TodaySnapshot) -> String {
     strong_etag(&serde_json::to_string(snapshot).unwrap_or_default())
 }
 
+/// The strong ETag for the DOCUMENT: a hash of the merged source, meaning the
+/// on-disk `Today.md` text with any journaled intents applied — exactly the text
+/// [`parse_today`] is handed on both the read and the write path.
+///
+/// **The write precondition tag, and deliberately not the cache tag.** One tag was
+/// serving two contracts and they pull in opposite directions: a cache tag must move
+/// whenever anything the screen renders changes, and [`snapshot_etag`] does that by
+/// hashing the hydrated snapshot. A write precondition must move only when the
+/// document a tap addresses changes — and hydration state is not that document. A
+/// background brief recording a verdict, a glance, a postponement or a re-filed
+/// project rollup all move `snapshot_etag` while `Today.md` sits unchanged, so a tap
+/// made a second earlier earned a `412` and the user watched the box spring back open
+/// with their evidence note gone (2026-09-23, several times in one morning).
+///
+/// Hydration state is therefore OUTSIDE this tag on purpose. Nothing hydrated can be
+/// changed by any of the mutations this tag guards, so leaving it out loses no
+/// protection: a tap still cannot land on a document it was not aimed at.
+pub fn document_etag(merged_source: &str) -> String {
+    strong_etag(merged_source)
+}
+
 /// Build the snapshot every reader and every precondition check sees: the file
 /// on disk, with pending intents merged in and glance state stamped on.
 ///
@@ -1517,17 +1542,29 @@ pub fn snapshot_etag(snapshot: &TodaySnapshot) -> String {
 /// The pending merge is what makes the app read its own writes: a tap parked
 /// behind a running turn is not in the file yet, and a screen that showed the box
 /// spring back open would be read as a failed tap.
-pub fn build_snapshot(cfg: &Config) -> (Option<String>, TodaySnapshot) {
+///
+/// The third return is the merged source's [`document_etag`], returned rather than
+/// left to the caller so no caller has to re-read the file to name the document it
+/// just parsed — and so the read path and the write path cannot compute it over two
+/// different strings.
+pub fn build_snapshot(cfg: &Config) -> (Option<String>, TodaySnapshot, String) {
     let raw = std::fs::read_to_string(day_file_path(cfg)).ok();
-    let mut snapshot = match &raw {
-        Some(src) => parse_today(&merge_pending(src, &pending_intents(cfg))),
-        None => TodaySnapshot {
-            missing: true,
-            ..TodaySnapshot::default()
-        },
+    let (mut snapshot, merged) = match &raw {
+        Some(src) => {
+            let merged = merge_pending(src, &pending_intents(cfg));
+            (parse_today(&merged), merged)
+        }
+        None => (
+            TodaySnapshot {
+                missing: true,
+                ..TodaySnapshot::default()
+            },
+            String::new(),
+        ),
     };
     hydrate(cfg, &mut snapshot);
-    (raw, snapshot)
+    let tag = document_etag(&merged);
+    (raw, snapshot, tag)
 }
 
 /// Everything that happens to a snapshot AFTER the parse: the project rollup,
@@ -2134,6 +2171,35 @@ mod tests {
             snapshot_etag(&unstamped),
             "stamping the rollup must invalidate a cached snapshot"
         );
+    }
+
+    /// The write precondition tag, and what it deliberately does NOT see.
+    ///
+    /// Hydration is the whole point: the project rollup, a brief's verdict, a glance
+    /// and a postponement all move `snapshot_etag` (the test above pins that for the
+    /// rollup, and it must keep being true or a client stops refreshing them), while
+    /// none of them is a change to the document a tap addresses. A tag that moved for
+    /// them refused taps aimed at a file nothing had touched.
+    #[test]
+    fn the_document_etag_ignores_hydration_and_notices_one_byte() {
+        let hydrated = projects_snapshot();
+        let plain = parse_today(PROJECTS);
+        assert_ne!(
+            snapshot_etag(&hydrated),
+            snapshot_etag(&plain),
+            "the cache tag sees the stamping pass"
+        );
+        assert_eq!(
+            document_etag(PROJECTS),
+            document_etag(PROJECTS),
+            "the document tag is a function of the source and of nothing else"
+        );
+
+        // …and it is not a blunt instrument: one byte of the source is a different
+        // document, and a tap aimed at the old one is still refused.
+        let reworded = PROJECTS.replacen("Added 2026-03-01", "Added 2026-03-02", 1);
+        assert_ne!(PROJECTS, reworded, "the fixture really did change");
+        assert_ne!(document_etag(PROJECTS), document_etag(&reworded));
     }
 
     #[test]

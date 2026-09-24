@@ -14,6 +14,74 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [Bridge 0.148.0] - 2026-09-24
+
+**One ETag was serving two contracts, and a ticked box paid for it.** On 2026-09-23 the
+owner ticked an item on the day screen, typed a note into the evidence sheet, tapped
+`Done with note` — and watched the box spring back open with the note gone. Several
+times in one morning, once immediately after a restart.
+
+Nothing had touched `Today.md`. The tag the app had to send as `If-Match` was
+`snapshot_etag`, a hash of the whole hydrated snapshot: the project rollup, the glance
+store, the postponements, and the per item briefs. A background brief recording its
+verdict moves that tag while the document sits byte for byte unchanged, and briefs run
+two at a time and are re-queued on every day read, so after a rebuild the tag keeps
+moving for minutes. Every tap made in that window was refused.
+
+A cache tag must move when anything the screen renders changes. A write precondition must
+move only when the document a tap addresses changes. Those pull in opposite directions,
+so there are now two tags. `etag` keeps its exact meaning and value and stays the cache
+tag, on the `ETag` header and under `If-None-Match`. `documentEtag` is new, is a hash of
+the merged source alone, and is what a mutation sends.
+
+### Added
+
+- **`today::document_etag`**, the write precondition tag: a strong ETag over the merged
+  source, meaning the on-disk `Today.md` text with any journaled intents applied — the
+  same string `parse_today` is handed on both the read and the write path. Hydration
+  state is outside it deliberately: nothing hydrated can be changed by any mutation the
+  tag guards, so leaving it out loses no protection.
+- **`documentEtag` on every response that carries a snapshot**: `GET /jesse/today` and
+  every mutation response. A mutation's is the tag of the document AFTER the write, so a
+  second tap from the same screen needs no round trip in between.
+
+### Changed
+
+- `build_snapshot` returns the merged source's document tag as a third value, so no
+  caller re-reads the file to name the document it just parsed, and the read path and the
+  write path cannot compute it over two different strings.
+- **The precondition accepts either tag.** `mutate_with_if_match`, the glance endpoint
+  and the defer endpoint pass an `If-Match` that matches the document tag OR the snapshot
+  tag. The snapshot tag is still honoured because an app that has not been updated has no
+  other tag to send; both are strong tags over content the client was handed, so
+  accepting either weakens nothing. A request carrying neither still gets its `412`.
+- `auto_close_item` now sends the document tag, which ends a race it had with itself: the
+  close is triggered by a brief verdict landing in the store, and recording that verdict
+  is exactly what used to move the tag out from under it.
+
+### Fixed
+
+- A tap on the day screen is no longer refused because a brief, a glance, a postponement
+  or a re-filed project rollup landed in the same second.
+
+### Tests
+
+- `a_brief_that_moved_the_snapshot_tag_still_lets_the_tap_land` records a real `done`
+  verdict against one item and taps another: the cache tag moves, the document tag does
+  not, and the tap applies with its evidence line. It was written first and failed on the
+  untouched write path with the bug's own words, `(412, "the day file changed since you
+  read it")`.
+- `a_reworded_item_still_refuses_the_tap_and_writes_nothing` and
+  `the_older_apps_snapshot_tag_is_still_accepted` pin the other two corners, and
+  `the_document_etag_ignores_hydration_and_notices_one_byte` pins the tag itself. The
+  existing snapshot etag test is untouched: it is still true and still wanted, because a
+  cache tag that stopped moving for a brief would stop the screen refreshing it.
+- `today_a_glance_moves_the_cache_tag_but_a_tap_under_the_document_tag_still_lands` runs
+  the whole thing through the router, so the bearer check and the `If-Match` header are
+  in the path too: a glance moves the cache tag and not the document tag, a tap carrying
+  the document tag applies with a 300 character note, and the response hands back the tag
+  of the document after the write.
+
 ## [App 1.0 (154)] - 2026-09-24
 
 **The Vault tab could look at 7,600 notes or at 7,600 notes.** The folder is the first

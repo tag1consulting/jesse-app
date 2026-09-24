@@ -843,6 +843,24 @@ fn if_match_matches(header: &str, etag: &str) -> bool {
     if_none_match_matches(header, etag)
 }
 
+/// Whether an `If-Match` satisfies the write precondition.
+///
+/// **Either tag is accepted, and that is the fix for a real bug.** The precondition
+/// wants [`document_etag`] — the tag that moves when, and only when, the document a
+/// tap addresses changes. Before it existed the only tag on the wire was
+/// [`snapshot_etag`], which also moves when a background brief records a verdict, a
+/// glance lands or a postponement is stored; a tap sent a second after any of those
+/// earned a `412`, and on 2026-09-23 that repeatedly threw away a ticked box and the
+/// evidence note typed with it.
+///
+/// The snapshot tag is still honoured because an app that has not been updated yet
+/// has no other tag to send, and refusing it would brick every older install. Both
+/// are strong tags over content the client was actually handed, so accepting either
+/// weakens nothing: a request carrying neither still gets its `412`.
+fn precondition_ok(if_match: &str, snapshot: &TodaySnapshot, document: &str) -> bool {
+    if_match_matches(if_match, document) || if_match_matches(if_match, &snapshot_etag(snapshot))
+}
+
 /// Whether any journaled intent is **not yet in the file**.
 ///
 /// This is what `pending` on a mutation response means, and it is deliberately a
@@ -873,7 +891,11 @@ fn anything_unlanded(cfg: &Config, on_disk: Option<&str>) -> bool {
 /// The snapshot is returned rather than a bare acknowledgement so one round trip
 /// both mutates and refreshes — including the new etag the next mutation must
 /// carry, which a client would otherwise have to re-`GET` to obtain.
-fn mutation_response(snapshot: &TodaySnapshot, pending: bool) -> Response {
+///
+/// `document` is the [`document_etag`] of the document AFTER this write, which is what
+/// makes a second tap from the same screen land: the client adopts it and sends it as
+/// the next `If-Match` without a round trip in between.
+fn mutation_response(snapshot: &TodaySnapshot, document: &str, pending: bool) -> Response {
     let mut value = serde_json::to_value(snapshot).unwrap_or_else(|_| json!({}));
     let etag = snapshot_etag(snapshot);
     if let Some(obj) = value.as_object_mut() {
@@ -882,6 +904,7 @@ fn mutation_response(snapshot: &TodaySnapshot, pending: bool) -> Response {
             json!(rfc3339_utc(SystemTime::now())),
         );
         obj.insert("etag".to_string(), json!(etag.clone()));
+        obj.insert("documentEtag".to_string(), json!(document));
         // `pending: true` means the change is journaled and visible here, but not
         // yet in the file — a turn is mid-write and replay will land it.
         obj.insert("pending".to_string(), json!(pending));
@@ -996,7 +1019,12 @@ fn mutate_with_if_match(
     // THE PRECONDITION, before anything is recorded or written. A `412` must
     // touch nothing at all — not the file, not the journal — so that a client
     // holding a stale view refetches instead of editing blind.
-    if !if_match_matches(if_match, &snapshot_etag(&snapshot)) {
+    //
+    // Against the DOCUMENT the tap addresses (or, for an app that knows no such tag,
+    // the snapshot). See `precondition_ok`: a tag that also moved when a brief,
+    // glance or postponement landed was refusing taps aimed at a file nothing had
+    // touched, and taking the evidence note with them.
+    if !precondition_ok(if_match, &snapshot, &document_etag(&merged)) {
         return Err((
             StatusCode::PRECONDITION_FAILED,
             "the day file changed since you read it — refetch GET /jesse/today".to_string(),
@@ -1010,6 +1038,7 @@ fn mutate_with_if_match(
         // journaled and nothing is written; the caller still gets the snapshot.
         return Ok(mutation_response(
             &snapshot,
+            &document_etag(&merged),
             anything_unlanded(&st.cfg, Some(&src)),
         ));
     };
@@ -1065,9 +1094,9 @@ fn mutate_with_if_match(
 
     // Re-read rather than reuse: after an apply the file is the truth, and after
     // a park the journal is. Both are covered by rebuilding from scratch.
-    let (raw, fresh) = build_snapshot(&st.cfg);
+    let (raw, fresh, document) = build_snapshot(&st.cfg);
     let unlanded = anything_unlanded(&st.cfg, raw.as_deref());
-    Ok(mutation_response(&fresh, unlanded))
+    Ok(mutation_response(&fresh, &document, unlanded))
 }
 
 /// `POST /jesse/today/items/{id}/check` — tick or untick one item, optionally
@@ -1133,8 +1162,11 @@ pub fn auto_close_item(st: &AppState, id: &str, evidence: &str) -> Result<bool, 
     };
     // Read the day file's tag and immediately use it as the precondition. Anything that
     // rewrites the file between these two lines wins, and this call does nothing.
-    let (_, snapshot) = build_snapshot(&st.cfg);
-    let if_match = snapshot_etag(&snapshot);
+    //
+    // The DOCUMENT tag, not the snapshot's: this close is itself triggered by a brief
+    // verdict landing in the store, and the snapshot tag moves when that is recorded —
+    // so the sweep was racing its own bookkeeping for the right to close an item.
+    let (_, _, if_match) = build_snapshot(&st.cfg);
     let evidence = evidence.to_string();
     let result = mutate_with_if_match(st, &if_match, id, &at, None, move |_, _| {
         Ok(Some(Effect::Check {
@@ -1216,8 +1248,8 @@ pub async fn jesse_today_glance(
         return Err((StatusCode::BAD_REQUEST, "`id` is required".to_string()));
     }
     let if_match = required_if_match(&headers)?;
-    let (_, mut snapshot) = build_snapshot(&st.cfg);
-    if !if_match_matches(&if_match, &snapshot_etag(&snapshot)) {
+    let (_, mut snapshot, document) = build_snapshot(&st.cfg);
+    if !precondition_ok(&if_match, &snapshot, &document) {
         return Err((
             StatusCode::PRECONDITION_FAILED,
             "the day file changed since you read it — refetch GET /jesse/today".to_string(),
@@ -1231,7 +1263,7 @@ pub async fn jesse_today_glance(
         .unwrap_or_else(|| date_from_ms(body.glanced_at));
     GlanceStore::record(st.cfg.state_dir.as_deref(), &date, id, body.glanced_at);
     GlanceStore::load(st.cfg.state_dir.as_deref()).merge_into(&mut snapshot);
-    Ok(mutation_response(&snapshot, false))
+    Ok(mutation_response(&snapshot, &document, false))
 }
 
 /// `POST /jesse/today/items/{id}/defer` — postpone one item for the day, or
@@ -1270,14 +1302,14 @@ pub async fn jesse_today_defer(
         ));
     }
     let if_match = required_if_match(&headers)?;
-    let (_, mut snapshot) = build_snapshot(&st.cfg);
+    let (_, mut snapshot, document) = build_snapshot(&st.cfg);
     // Asked before the etag, exactly as in `mutate` and for the same reason: a replayed
     // postponement that raced the morning rebuild needs "the day moved on", not "refetch
     // and try again". Neither answer touches the store.
     if let Some(refusal) = day_mismatch(body.day.as_deref(), snapshot.date.as_deref()) {
         return Ok(refusal);
     }
-    if !if_match_matches(&if_match, &snapshot_etag(&snapshot)) {
+    if !precondition_ok(&if_match, &snapshot, &document) {
         return Err((
             StatusCode::PRECONDITION_FAILED,
             "the day file changed since you read it — refetch GET /jesse/today".to_string(),
@@ -1307,7 +1339,7 @@ pub async fn jesse_today_defer(
         body.at_ms,
     );
     DeferStore::load(st.cfg.state_dir.as_deref()).merge_into(&mut snapshot);
-    Ok(mutation_response(&snapshot, false))
+    Ok(mutation_response(&snapshot, &document, false))
 }
 
 #[cfg(test)]
@@ -1364,6 +1396,10 @@ mod tests {
 
     struct AutoVault {
         root: PathBuf,
+        /// Set only by [`AutoVault::with_state`]. Persistence is off by default here
+        /// because turning it on turns the intent JOURNAL on with it, and the
+        /// auto-close tests below are about the splice, not about replay.
+        state: Option<PathBuf>,
     }
 
     impl AutoVault {
@@ -1372,7 +1408,17 @@ mod tests {
                 .join(format!("jesse-autoclose-{name}-{}", crate::random_hex()));
             let _ = std::fs::remove_dir_all(&root);
             std::fs::create_dir_all(root.join(crate::config::VAULT_SUBDIR)).unwrap();
-            Self { root }
+            Self { root, state: None }
+        }
+
+        /// The same vault with persistence on, which is what gives the brief store a
+        /// file to live in.
+        fn with_state(name: &str) -> Self {
+            let mut v = Self::new(name);
+            let state = v.root.join("state");
+            std::fs::create_dir_all(&state).unwrap();
+            v.state = Some(state);
+            v
         }
 
         fn day(&self) -> PathBuf {
@@ -1386,6 +1432,10 @@ mod tests {
         fn state(&self) -> AppState {
             AppState::new(Config {
                 vault: self.root.to_string_lossy().into_owned(),
+                state_dir: self
+                    .state
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().into_owned()),
                 ..testutil::test_config()
             })
         }
@@ -1406,7 +1456,7 @@ mod tests {
             "# Today\n\n## Do now\n\n* [ ] **Send Robin the figures.** (Added 2026-09-10)\n",
         );
         let st = v.state();
-        let (_, snapshot) = build_snapshot(&st.cfg);
+        let (_, snapshot, _) = build_snapshot(&st.cfg);
         let id = snapshot.sections[0].items[0].id.clone();
 
         let closed = auto_close_item(
@@ -1432,7 +1482,7 @@ mod tests {
         );
         // An auto-closed item is a CHECKED item, not a deleted one — it stays on screen
         // until `Process updates` takes it, so an unchecked mistake loses nothing.
-        let (_, fresh) = build_snapshot(&st.cfg);
+        let (_, fresh, _) = build_snapshot(&st.cfg);
         assert_eq!(fresh.counts.done, 1);
         assert_eq!(fresh.counts.open, 0);
     }
@@ -1463,7 +1513,7 @@ mod tests {
         let v = AutoVault::new("stale");
         v.write_day("# Today\n\n## Do now\n\n* [ ] **A thing.** (Added 2026-09-10)\n");
         let st = v.state();
-        let (_, snapshot) = build_snapshot(&st.cfg);
+        let (_, snapshot, _) = build_snapshot(&st.cfg);
         let id = snapshot.sections[0].items[0].id.clone();
 
         // Someone rewrites the day file after the brief was written against it.
@@ -1497,6 +1547,142 @@ mod tests {
             before,
             "a 412 touches nothing at all"
         );
+    }
+
+    // ---- The two tags ------------------------------------------------------
+
+    fn check_effect(
+        evidence: &str,
+    ) -> impl FnOnce(&TodaySnapshot, &Located) -> Result<Option<Effect>, ApiError> {
+        let evidence = evidence.to_string();
+        move |_, _| {
+            Ok(Some(Effect::Check {
+                checked: true,
+                evidence: Some(evidence),
+                stamp: "2026-09-23 09:30".to_string(),
+            }))
+        }
+    }
+
+    const TWO_ITEMS: &str = "# Today: Wednesday, September 23, 2026\n\n## Do now\n\n\
+        * [ ] **Send Robin the figures.** (Added 2026-09-10)\n\
+        * [ ] **Book the kickoff room.** (Added 2026-09-11)\n";
+
+    /// THE 2026-09-23 BUG, in one test.
+    ///
+    /// A background brief records its verdict. Nothing in `Today.md` changes — the
+    /// store is a sibling file — but the verdict is hydrated onto the snapshot, so
+    /// `snapshot_etag` moves. With one tag on the wire the phone had nothing else to
+    /// send, and the tap it had made a second earlier came back `412`: the box sprang
+    /// open and the evidence note typed with it was thrown away, several times in one
+    /// morning. The document tag is a tag for the document, so the tap lands.
+    #[test]
+    fn a_brief_that_moved_the_snapshot_tag_still_lets_the_tap_land() {
+        let v = AutoVault::with_state("brief-moved");
+        v.write_day(TWO_ITEMS);
+        let st = v.state();
+        let (_, snapshot, document) = build_snapshot(&st.cfg);
+        let briefed = snapshot.sections[0].items[0].id.clone();
+        let tapped = snapshot.sections[0].items[1].id.clone();
+
+        crate::todaybrief::BriefStore::record(
+            st.cfg.briefs_file(),
+            &briefed,
+            crate::todaybrief::done_verdict_record("You sent them on Friday"),
+        );
+
+        let (_, hydrated, after_brief) = build_snapshot(&st.cfg);
+        assert_ne!(
+            snapshot_etag(&snapshot),
+            snapshot_etag(&hydrated),
+            "the cache tag MUST move — the screen renders the verdict"
+        );
+        assert_eq!(
+            document, after_brief,
+            "and the document tag must not: no byte of Today.md changed"
+        );
+
+        let out = mutate_with_if_match(
+            &st,
+            &document,
+            &tapped,
+            "2026-09-23T09:30:00Z",
+            None,
+            check_effect("sent the figures on the thread"),
+        )
+        .expect("a tap against the unchanged document must not be refused");
+        assert_eq!(out.status(), StatusCode::OK);
+
+        let after = std::fs::read_to_string(v.day()).unwrap();
+        assert!(
+            after.contains("* [x] **Book the kickoff room.**"),
+            "the box is ticked: {after}"
+        );
+        assert!(
+            after.contains("app-completed") && after.contains("sent the figures on the thread"),
+            "and the note the user typed is in the file: {after}"
+        );
+    }
+
+    /// The other half of the contract, and the reason the precondition is still worth
+    /// having: a tap aimed at words that have since been rewritten is refused, and
+    /// refused without touching anything.
+    #[test]
+    fn a_reworded_item_still_refuses_the_tap_and_writes_nothing() {
+        let v = AutoVault::with_state("reworded");
+        v.write_day(TWO_ITEMS);
+        let st = v.state();
+        let (_, snapshot, document) = build_snapshot(&st.cfg);
+        let tapped = snapshot.sections[0].items[1].id.clone();
+
+        v.write_day(
+            &TWO_ITEMS.replace("Book the kickoff room.", "Book the kickoff room in Turin."),
+        );
+        let before = std::fs::read_to_string(v.day()).unwrap();
+
+        let refused = mutate_with_if_match(
+            &st,
+            &document,
+            &tapped,
+            "2026-09-23T09:30:00Z",
+            None,
+            check_effect("done"),
+        );
+
+        assert!(
+            matches!(refused, Err((StatusCode::PRECONDITION_FAILED, _))),
+            "the document moved under the tap, which is exactly what a 412 is for"
+        );
+        assert_eq!(
+            std::fs::read_to_string(v.day()).unwrap(),
+            before,
+            "a 412 touches nothing at all"
+        );
+    }
+
+    /// An app that has not been updated yet sends the only tag it knows. It must keep
+    /// working: refusing it would brick every install in the field.
+    #[test]
+    fn the_older_apps_snapshot_tag_is_still_accepted() {
+        let v = AutoVault::with_state("old-app");
+        v.write_day(TWO_ITEMS);
+        let st = v.state();
+        let (_, snapshot, _) = build_snapshot(&st.cfg);
+        let tapped = snapshot.sections[0].items[1].id.clone();
+
+        let out = mutate_with_if_match(
+            &st,
+            &snapshot_etag(&snapshot),
+            &tapped,
+            "2026-09-23T09:30:00Z",
+            None,
+            check_effect("done"),
+        )
+        .expect("the snapshot tag, with nothing moved, is still a good precondition");
+        assert_eq!(out.status(), StatusCode::OK);
+        assert!(std::fs::read_to_string(v.day())
+            .unwrap()
+            .contains("* [x] **Book the kickoff room.**"));
     }
 
     // ---- The check flip ----------------------------------------------------

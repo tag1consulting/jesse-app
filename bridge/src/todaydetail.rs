@@ -317,7 +317,7 @@ pub async fn jesse_today_detail(
             "rate limit exceeded".to_string(),
         ));
     }
-    let (_, snapshot) = build_snapshot(&st.cfg);
+    let (_, snapshot, _) = build_snapshot(&st.cfg);
     let located = locate_by_id(&snapshot, &id).ok_or_else(|| {
         (
             StatusCode::GONE,
@@ -623,7 +623,7 @@ mod tests {
         );
         v.write("Projects/Demo.md", "# Demo\n\nthe detail note\n");
         let cfg = v.cfg();
-        let (_, snapshot) = build_snapshot(&cfg);
+        let (_, snapshot, _) = build_snapshot(&cfg);
         let id = snapshot.sections[0].items[0].id.clone();
 
         let detail = detail_for(&notes_root(&cfg), &snapshot.sections[0].items[0]);
