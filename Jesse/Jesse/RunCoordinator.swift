@@ -965,8 +965,11 @@ final class RunCoordinator {
             // A voice send is answered OUT LOUD, as every other voice turn is. The badge
             // and the citation list are not spoken — they are the transcript's half.
             if voice { speak(answer.text) }
-        case .unanswered(.gateRefused):
-            kind = .notALookup
+        case .unanswered(.gateRefused(let refusal)):
+            // The gate's OWN words, carried from the rule that fired. The composer does
+            // not compose a reason of its own — a second wording is a second thing to
+            // keep true.
+            kind = .notALookup(because: refusal.because)
             queue = true
         default:
             kind = .abstained

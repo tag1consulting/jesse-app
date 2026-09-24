@@ -79,8 +79,7 @@ final class OfflineLookupRoutingTests: XCTestCase {
     func testAReachableDeviceIsRoutedWithoutAskingAboutTheFolderOrTheModel() throws {
         let defaults = try XCTUnwrap(UserDefaults(suiteName: "offline-lookup-\(UUID())"))
         let counting = CountingGeneration()
-        let service = OfflineAnswerService(classifier: NoLookupClassification(),
-                                           generator: counting,
+        let service = OfflineAnswerService(generator: counting,
                                            settings: OfflineLookupSettings(defaults: defaults),
                                            diagnostics: OfflineLookupDiagnostics())
         XCTAssertEqual(service.route(reachability: .reachable), .bridge)
@@ -92,6 +91,35 @@ final class OfflineLookupRoutingTests: XCTestCase {
         OfflineLookupSettings(defaults: defaults).isEnabled = false
         XCTAssertEqual(service.route(reachability: .unreachable), .bridge)
         XCTAssertEqual(counting.availabilityAsks, 0)
+    }
+
+    /// The diagnostics row's whole job is "why did it queue that?", so the gate verdict
+    /// has to name the RULE. It used to read "model: not a lookup", which named the tier
+    /// that no longer exists and explained nothing even when it did.
+    @MainActor
+    func testTheDiagnosticsRowNamesTheRuleThatRefused() async throws {
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: "offline-lookup-\(UUID())"))
+        let diagnostics = OfflineLookupDiagnostics()
+        // No vault folder on this test host, so a question that PASSES the gate reaches
+        // the index, finds none, and is recorded as "passed" with no hits — which is the
+        // other half of the contract.
+        let service = OfflineAnswerService(source: VaultIndexSource(
+                                               folder: VaultFolder(defaults: defaults,
+                                                                   key: "vault.test.\(UUID())")),
+                                           generator: CountingGeneration(),
+                                           settings: OfflineLookupSettings(defaults: defaults),
+                                           diagnostics: diagnostics)
+
+        _ = await service.answer("Draft an email to Jamie about the school concert")
+        XCTAssertEqual(diagnostics.records.first?.gateVerdict, "request verb: draft")
+
+        _ = await service.answer("https://terrasole.example/bricks")
+        XCTAssertEqual(diagnostics.records.first?.gateVerdict, "no words")
+
+        _ = await service.answer("What is Aurora's birthday?")
+        XCTAssertEqual(diagnostics.records.first?.gateVerdict, "passed",
+                       "an ordinary lookup is tried, whatever comes of it")
+        XCTAssertEqual(diagnostics.records.first?.outcome, "no hits")
     }
 
     // MARK: - The reply
@@ -120,9 +148,57 @@ final class OfflineLookupRoutingTests: XCTestCase {
                        "[on-device · offline]\n\nNot found in the vault on this device.")
     }
 
-    func testANotALookupIsJustQueued() {
-        XCTAssertEqual(OfflineLookupReply.body(.notALookup, queued: true),
-                       "[on-device · offline]\n\nQueued for the bridge.")
+    /// THE LINE THIS PROMPT EXISTS FOR. "Queued for the bridge." on its own was
+    /// indistinguishable from a failed send, and was read as the feature being broken.
+    func testANotALookupSaysWhichRuleRefusedIt() {
+        XCTAssertEqual(
+            OfflineLookupReply.body(.notALookup(because: "it asks for a draft"),
+                                    queued: true),
+            "[on-device · offline]\n\nNot tried on the device: it asks for a draft. "
+            + "Queued for the bridge.")
+    }
+
+    func testANotALookupOnADeviceWithNoQueueDoesNotClaimOne() {
+        XCTAssertEqual(
+            OfflineLookupReply.body(.notALookup(because: "it is empty"), queued: false),
+            "[on-device · offline]\n\nNot tried on the device: it is empty.")
+    }
+
+    /// The three outcomes have to be three SENTENCES, not three shades of one. A reader
+    /// who cannot tell "I looked and did not find it" from "I never looked" is exactly
+    /// the reader this change is for.
+    func testTheThreeOutcomesAreDistinguishableOnBothQueueSettings() {
+        for queued in [true, false] {
+            let bodies = [OfflineLookupReply.body(.answered(answer), queued: queued),
+                          OfflineLookupReply.body(.abstained, queued: queued),
+                          OfflineLookupReply.body(.notALookup(because: "it is empty"),
+                                                  queued: queued)]
+            XCTAssertEqual(Set(bodies).count, 3, "queued: \(queued)")
+            for body in bodies {
+                XCTAssertTrue(body.hasPrefix(OfflineLookupReply.badge),
+                              "every outcome wears the same badge")
+            }
+            // An ANSWER never mentions the outbox — nothing was queued, it was answered.
+            // The two unanswered outcomes mention it exactly when there is one.
+            XCTAssertFalse(bodies[0].contains("Queued for the bridge."))
+            for body in bodies.dropFirst() {
+                XCTAssertEqual(body.contains("Queued for the bridge."), queued,
+                               "a queue is claimed only where there is one")
+            }
+        }
+    }
+
+    /// The gate's own clause reaches the transcript unaltered — the composer must not
+    /// compose a second wording of its own.
+    func testTheGatesClauseIsTheOneTheReplyShows() {
+        guard case .refused(let refusal) =
+                LookupGate.rule("Draft an email to Jamie about the school concert") else {
+            return XCTFail("a draft request must be refused")
+        }
+        XCTAssertEqual(
+            OfflineLookupReply.body(.notALookup(because: refusal.because), queued: true),
+            "[on-device · offline]\n\nNot tried on the device: it asks for a draft. "
+            + "Queued for the bridge.")
     }
 
     /// The badge is the bridge's own local-route shape.

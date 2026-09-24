@@ -120,6 +120,21 @@ public final class TodayDetailModel {
     /// on a spinner and opening on the note it showed last time.
     public func isCached(_ id: String) -> Bool { cache[id] != nil }
 
+    /// Whether the brief on screen is one the bridge is still working on.
+    ///
+    /// `TodayBriefEnvelope.status` is the BRIDGE's word, captured at the moment the
+    /// response was written, and a `pending` status cached at that moment stays `pending`
+    /// for as long as the entry lives. Offline, the sheet re-shows that cached entry, and
+    /// a view that trusts the status alone spins "Writing the summary…" over a dead
+    /// network for as long as it is open — claiming work nobody is doing.
+    ///
+    /// The seam is the LAST REQUEST, not the status: a brief is live when the most recent
+    /// round trip for this item completed, which is exactly what `isOffline` already
+    /// tracks (it is raised by `fail`, by a local-copy fallback, and cleared by every
+    /// success including a `304`). A view asks this, never `isOffline` directly, so the
+    /// question it is really asking has a name.
+    public var briefIsLive: Bool { !isOffline }
+
     /// The wording for a no-detail answer. Public so every platform says the same thing
     /// about the same situation, and so the two reasons stay distinguishable: "nothing
     /// is linked" and "what is linked isn't there" are different facts about the vault

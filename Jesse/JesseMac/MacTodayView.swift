@@ -124,6 +124,10 @@ struct MacTodayView: View {
                           // opening the note is the second click — the Mac's own idiom,
                           // and the only way both gestures fit on one row.
                           opensOnDoubleTap: true,
+                          // …and because a double click is invisible, every row reveals
+                          // a chevron under the pointer that opens it in one. The
+                          // gesture is unchanged; it is merely no longer the only way in.
+                          revealsOpenOnHover: true,
                           onOpenLink: openLink,
                           onOpenDetail: { openedItem = $0 },
                           onDiscuss: { discuss(.discuss(item: $0)) },

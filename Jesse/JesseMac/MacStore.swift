@@ -493,20 +493,28 @@ final class MacCoordinator {
                 paths: answer.citations.map(\.path)))
             return
         }
-        // An ABSTAIN says so before the ordinary send takes over, because "this device
-        // looked and did not find it" is a different fact from "the bridge is down" and a
-        // person who asked a lookup deserves both. A NOT-A-LOOKUP says nothing at all: the
-        // device never looked, so there is nothing to report.
-        if case .unanswered(.gateRefused) = outcome {
-            // Nothing to say.
+        // Both unanswered outcomes say so before the ordinary send takes over, and they
+        // say DIFFERENT things, because "this device looked and did not find it" and
+        // "this device never looked, because the question asks for a draft" are different
+        // facts and a person who asked deserves the right one. Neither claims a queue:
+        // there is none here, and `body` is told so.
+        //
+        // A not-a-lookup used to say nothing at all on this platform, which left a gate
+        // refusal looking exactly like the bridge being down — the same confusion the
+        // phone's "Queued for the bridge." caused, arrived at by silence instead.
+        let note: Turn
+        if case .unanswered(.gateRefused(let refusal)) = outcome {
+            note = Turn(role: .jesse,
+                        text: OfflineLookupReply.body(.notALookup(because: refusal.because),
+                                                      queued: false))
         } else {
-            let note = Turn(role: .jesse,
-                            text: OfflineLookupReply.body(.abstained, queued: false))
-            note.thread = thread
-            context.insert(note)
-            thread.updatedAt = Date()
-            try? save(context)
+            note = Turn(role: .jesse,
+                        text: OfflineLookupReply.body(.abstained, queued: false))
         }
+        note.thread = thread
+        context.insert(note)
+        thread.updatedAt = Date()
+        try? save(context)
         await deliver(question, mode: mode, thread: thread, context: context)
     }
 

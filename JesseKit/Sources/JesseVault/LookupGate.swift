@@ -1,6 +1,6 @@
 import Foundation
 
-// WHAT THE DEVICE IS ALLOWED TO ANSWER BY ITSELF.
+// WHAT THE DEVICE IS ALLOWED TO TRY BY ITSELF.
 //
 // The on-device model is about 3B parameters. On the bridge side the same class of
 // workload was already measured with models forty times larger, and the finding was
@@ -9,50 +9,31 @@ import Foundation
 // the fiber contract" will produce an email. It will be a bad email, and nothing in
 // the answer will say so.
 //
-// So the gate is deliberately asymmetric. A refusal costs one queued message that the
-// bridge answers properly a few minutes later; a wrong admission costs a fabricated
-// answer in a transcript that reads exactly like a real one. Every ambiguous case
-// therefore refuses, INCLUDING the case where the classifier itself fails.
+// So the gate refuses the SHAPE of a request rather than judging the question, and it
+// is rules only — no model, no latency, no coin flip.
 //
-// Two tiers, and the cheap one runs first because it is free and because it is the
-// tier that cannot be talked out of its answer:
+// WHY THERE IS NO MODEL TIER ANY MORE. There was one: a second pass that asked the
+// on-device model "is this a question whose answer is a fact that could be found in one
+// or two personal notes? Yes or no." Measured on the phone in airplane mode it refused
+// "What is Aurora's birthday?" — a lookup with the answer sitting in the vault two
+// notes away — while answering "When was I born?" from the same corpus in the same
+// minute. A 3B model given a bare yes/no about an abstract category is a coin flip, and
+// a coin flip in FRONT of the pipeline buys nothing, because everything behind it
+// already refuses what it cannot answer: retrieval returns no chunks, or
+// `VaultAnswerer`'s validation (citations must be paths that were actually provided, an
+// answer must share a significant word with a cited extract, zero valid citations
+// forces an abstain) turns a bad answer into an honest "not found". A question the
+// rules let through therefore costs, at worst, a few seconds and an abstain — which is
+// exactly what a refusal cost, minus the lie that nothing was tried.
 //
-//   1. RULES — length, a request verb, emptiness. No model, no latency, deterministic.
-//   2. THE MODEL — one boolean, guided generation, asked only about questions the
-//      rules did not already refuse.
+// The asymmetry that remains is the one worth keeping: a refusal costs one queued
+// message the bridge answers properly a few minutes later, and every refusal now says
+// WHICH rule fired, in words, in the transcript.
 //
-// This file imports no model framework. `LookupClassifying` is the whole dependency
-// surface, exactly as `ProbeSessioning` is for the probe, so every rule below is
-// asserted against a fake and no test ever reaches a real model.
+// This file imports no model framework and has no dependency surface at all. Every rule
+// below is a pure function over a string.
 
-/// The model half of the gate: one question in, one boolean out.
-///
-/// NEVER THROWS. A model that is unavailable, refuses, times out or returns nonsense
-/// must all collapse to the same answer — `false`, not a lookup — because the caller
-/// has exactly one safe move in every one of those cases and it is to queue the
-/// question for the bridge.
-public protocol LookupClassifying: Sendable {
-    /// Whether the on-device model considers this a lookup. `false` on any failure.
-    func isLookup(_ question: String) async -> Bool
-}
-
-/// The inert classifier: nothing is ever a lookup. The default for previews and for
-/// any test that is not about the model tier, and the correct behaviour on a device
-/// with no usable model.
-public struct NoLookupClassification: LookupClassifying {
-    public init() {}
-    public func isLookup(_ question: String) async -> Bool { false }
-}
-
-/// A classifier that answers a fixed verdict. Exists so the composition of the two
-/// tiers can be asserted without a model.
-public struct FixedLookupClassification: LookupClassifying {
-    private let verdict: Bool
-    public init(_ verdict: Bool) { self.verdict = verdict }
-    public func isLookup(_ question: String) async -> Bool { verdict }
-}
-
-/// The gate: rules first, model second, refusal by default.
+/// The gate: rules, and nothing else.
 public enum LookupGate {
 
     /// Longer than this, in words, and it is not a lookup.
@@ -63,6 +44,24 @@ public enum LookupGate {
     /// letting a pasted paragraph through as a question.
     public static let maxWords = 40
 
+    /// A verb that means "make me something" rather than "tell me something", together
+    /// with the clause a refusal shows for it.
+    ///
+    /// The two travel as one value so a verb cannot be added without the words that
+    /// explain its refusal — the failure mode of a verb list beside a separate phrase
+    /// table is a verb that refuses with someone else's sentence.
+    public struct RequestVerb: Equatable, Sendable {
+        /// The infinitive. Inflections are derived, not listed.
+        public let verb: String
+        /// The clause that follows "Not tried on the device: ".
+        public let because: String
+
+        public init(verb: String, because: String) {
+            self.verb = verb
+            self.because = because
+        }
+    }
+
     /// The verbs that mean "make me something" rather than "tell me something".
     ///
     /// Every one of them names work this model cannot do well: composing prose,
@@ -70,35 +69,97 @@ public enum LookupGate {
     /// `schedule` and `remind` are in the list for that last reason and not for the
     /// first — nothing on this path writes anywhere, so a question that asks for a
     /// write must reach the bridge, which can actually perform it.
-    public static let requestVerbs = [
-        "draft", "write", "summarize", "summarise", "plan", "compare",
-        "email", "message", "rewrite", "translate", "log", "schedule", "remind",
+    public static let requestVerbs: [RequestVerb] = [
+        RequestVerb(verb: "draft", because: "it asks for a draft"),
+        RequestVerb(verb: "write", because: "it asks for something to be written"),
+        RequestVerb(verb: "summarize", because: "it asks for a summary"),
+        RequestVerb(verb: "summarise", because: "it asks for a summary"),
+        RequestVerb(verb: "plan", because: "it asks for a plan"),
+        RequestVerb(verb: "compare", because: "it asks for a comparison"),
+        RequestVerb(verb: "email", because: "it asks for an email"),
+        RequestVerb(verb: "message", because: "it asks for a message"),
+        RequestVerb(verb: "rewrite", because: "it asks for a rewrite"),
+        RequestVerb(verb: "translate", because: "it asks for a translation"),
+        RequestVerb(verb: "log", because: "it asks to log something"),
+        RequestVerb(verb: "schedule", because: "it asks to schedule something"),
+        RequestVerb(verb: "remind", because: "it asks for a reminder"),
     ]
 
-    /// Why the rule tier refused, or that it did not.
-    public enum RuleVerdict: Equatable, Sendable {
-        /// The rules alone settle it: not a lookup, for this reason.
-        case refused(String)
-        /// The rules have nothing to say; ask the model.
-        case undecided
+    /// A refusal, in the two registers the two readers need.
+    ///
+    /// `rule` is for the diagnostics list, where the question is "which rule fired";
+    /// `because` is for the transcript, where the question is "why did my phone not even
+    /// look". The same refusal, never two independently worded ones.
+    public struct Refusal: Equatable, Sendable {
+        /// The rule's name, as the diagnostics row prints it.
+        public let rule: String
+        /// The clause the reply puts after "Not tried on the device: ", with no
+        /// terminating full stop — the renderer adds it.
+        public let because: String
+
+        public init(rule: String, because: String) {
+            self.rule = rule
+            self.because = because
+        }
+
+        static let empty = Refusal(rule: "empty", because: "it is empty")
+        static let noWords = Refusal(rule: "no words",
+                                     because: "it has no words to look up")
+        static let tooLong = Refusal(rule: "too long",
+                                     because: "it is longer than a lookup")
+
+        static func request(_ verb: RequestVerb) -> Refusal {
+            Refusal(rule: "request verb: \(verb.verb)", because: verb.because)
+        }
     }
 
-    /// The deterministic tier. Pure, and the only tier that runs when there is no
-    /// model on the device.
+    /// What the rules decided.
+    public enum RuleVerdict: Equatable, Sendable {
+        /// Not a lookup, for this reason.
+        case refused(Refusal)
+        /// A lookup. There is no second opinion to ask.
+        case passed
+    }
+
+    /// The whole gate. Pure, deterministic, and the same on a device with no model as on
+    /// one with a warm session.
     public static func rule(_ question: String) -> RuleVerdict {
         let trimmed = question.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return .refused("empty") }
+        guard !trimmed.isEmpty else { return .refused(.empty) }
 
         let words = trimmed.split(whereSeparator: \.isWhitespace)
+        // A PASTED LINK is the common case here, and it is a send rather than a
+        // question: nothing in a URL is a word the index holds, so retrieval would
+        // return either nothing or whatever happens to share a slug with it. The same
+        // guard catches a bare number, an emoji, or a stray punctuation mark.
+        guard trimmed.contains(where: \.isLetter), !isSingleURL(words) else {
+            return .refused(.noWords)
+        }
         if words.count > maxWords {
-            return .refused("longer than \(maxWords) words")
+            return .refused(.tooLong)
         }
         for word in words {
             if let verb = requestVerb(in: word) {
-                return .refused("asks to \(verb)")
+                return .refused(.request(verb))
             }
         }
-        return .undecided
+        return .passed
+    }
+
+    /// Whether this send is a lookup at all.
+    public static func isLookup(_ question: String) -> Bool {
+        rule(question) == .passed
+    }
+
+    /// Whether the whole text is one bare link.
+    ///
+    /// Deliberately narrow: only a lone token with a scheme or a `www.` prefix. "where
+    /// is the router at 192.168.1.1" is a question about a note and must not be caught,
+    /// and neither must a one-word question like "Aurora?".
+    static func isSingleURL(_ words: [some StringProtocol]) -> Bool {
+        guard words.count == 1, let only = words.first?.lowercased() else { return false }
+        return only.hasPrefix("http://") || only.hasPrefix("https://")
+            || only.hasPrefix("www.")
     }
 
     /// The request verb a single word carries, or nil.
@@ -109,11 +170,11 @@ public enum LookupGate {
     /// apart. Common inflections count — "drafting", "summarised", "compares" are the
     /// same request — because a gate that a gerund walks straight through is not a
     /// gate.
-    static func requestVerb(in word: some StringProtocol) -> String? {
+    static func requestVerb(in word: some StringProtocol) -> RequestVerb? {
         let cleaned = word.trimmingCharacters(in: CharacterSet.alphanumerics.inverted)
             .lowercased()
         guard !cleaned.isEmpty else { return nil }
-        for verb in requestVerbs where inflections(of: verb).contains(cleaned) {
+        for verb in requestVerbs where inflections(of: verb.verb).contains(cleaned) {
             return verb
         }
         return nil
@@ -128,33 +189,5 @@ public enum LookupGate {
             forms.insert(stem + "ing")
         }
         return forms
-    }
-
-    /// The whole gate. Rules, then the model, then refuse.
-    ///
-    /// The classifier is asked ONLY about questions the rules let through, which is
-    /// what keeps the common refusals free: a pasted paragraph or a "draft me a…"
-    /// never costs a round trip.
-    public static func isLookup(_ question: String,
-                                classifier: any LookupClassifying) async -> Bool {
-        switch rule(question) {
-        case .refused:
-            return false
-        case .undecided:
-            return await classifier.isLookup(question)
-        }
-    }
-
-    /// The question put to the classifier, frozen here rather than in the file that
-    /// owns the model session — the same separation `AskDomain` makes for the hosted
-    /// prompts. A reword is a behaviour change to the gate, so it does not belong in
-    /// the layer that merely talks to the framework.
-    public static func classifierPrompt(_ question: String) -> String {
-        """
-        Is this a question whose answer is a fact that could be found in one or two \
-        personal notes? Yes or no.
-
-        Question: \(question.trimmingCharacters(in: .whitespacesAndNewlines))
-        """
     }
 }
