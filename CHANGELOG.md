@@ -14,6 +14,54 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [App 1.0 (156)] - 2026-09-24
+
+**On the Today tab, tapping a Jesse notification hid the tab bar behind Today, with no way
+back except a force quit.** The tap routed and the conversation was pushed — into the Chats
+tab's navigation stack, which was not the tab on screen. The pushed conversation view hides
+the root tab bar, and it hides it for the whole shell rather than for one tab, so the bar
+went away under a Today screen showing no conversation: nothing to tap to reach the thread
+that had just opened, and no back swipe to undo it, because the swipe belongs to a stack
+nobody could see. Restarting the app was the only recovery.
+
+Opening a conversation is now a pair of writes rather than one — select Chats, then push —
+and every entry point that lands on a conversation from outside the Chats tab goes through
+it: a tapped notification, a Siri or voice request, the hands-free wake capture, and a
+recording arriving from the share sheet. All four wrote the navigation path alone, and all
+four could land behind whichever tab happened to be up.
+
+Which tab a conversation hides the tab bar from is unchanged, deliberately. The conversation
+is still a full screen with no bar, on the phone and not in the iPad split view. The defect
+was never that the bar hides; it was which tab it hid from.
+
+### Added
+
+- **`ThreadLanding`**, the landing decision as a value rather than as two lines inside a
+  view: select Chats, then push the conversation. It lives outside the view so a test can
+  drive it, which a `@State`/`@Binding` pair inside a SwiftUI view cannot be.
+- **`ContentView.land(on:)`**, the one place the conversation stack is written. After this
+  change `path = [` appears in `ContentView` nowhere else.
+- **`ThreadLandingUITestSeam`**, armed only by `JESSE_UITEST_THREAD_LANDING` and compiled
+  out of Release: it seeds one local conversation, starts the app on the tab the variable
+  names, and posts the matching `PushRouter.pendingTap` once the shell is up. The launch
+  tab itself is unchanged — `RootTabView.defaultTab` is still Chats.
+- **`ThreadLandingTests`**, which pins the landing for every case of `RootTabView.Tab`, and
+  **`ThreadLandingUITests`**, which drives the real routing in the simulator from Today and
+  from Chats and asserts the conversation is the screen on show, then that backing out of it
+  lands on the thread list with the bar present and Chats selected.
+
+### Fixed
+
+- A notification tapped from Today, Health or Vault now selects Chats before it pushes, so
+  the conversation is the screen the tab bar is hidden from and the back swipe returns to the
+  thread list with the bar.
+- The same for a Siri or voice request, the hands-free wake capture, and a recording drained
+  from the share extension, each of which opens a fresh conversation from wherever the user
+  happened to be.
+- A tap that resolves to no conversation now actually shows the thread list. It logged
+  "showing the thread list" and showed whatever tab was already up, which read as a dead
+  notification.
+
 ## [Bridge 0.149.0] - 2026-09-24
 
 **Strand notes can be written in a second layout, v2, that reads in the order a person

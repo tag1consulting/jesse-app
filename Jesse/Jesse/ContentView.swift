@@ -10,6 +10,14 @@ import JesseVault
 // concerns live here — re-attaching to backgrounded runs on foreground, draining
 // Siri/voice hand-offs into fresh threads — because the stack and its path do.
 struct ContentView: View {
+    /// WHICH TAB IS SHOWING, owned by `RootTabView` and written from here.
+    ///
+    /// Four entry points open a conversation without the user having asked this tab for
+    /// one, and all four push onto `path`. A pushed `ThreadDetailView` hides the SHELL's
+    /// tab bar, not this tab's, so a push made while another tab is up takes the bar away
+    /// from a screen that shows no conversation. This binding is how the push selects its
+    /// own tab first — see `land(on:)`.
+    @Binding var selectedTab: RootTabView.Tab
     @Environment(\.modelContext) private var context
     @Environment(RunCoordinator.self) private var coordinator
     @Environment(\.scenePhase) private var scenePhase
@@ -265,9 +273,24 @@ struct ContentView: View {
             Log.push.notice(
                 "tap did not resolve a thread (job=\(tap.jobId ?? "-") conversation=\(tap.conversationId ?? "-")) — showing the thread list"
             )
+            // And actually show it. "Showing the thread list" was only true when Chats
+            // already happened to be selected; from any other tab the tap used to do
+            // nothing visible at all, which reads as a dead notification.
+            selectedTab = .chats
             return
         }
-        path = [thread]
+        land(on: thread)
+    }
+
+    /// Open `thread`: select the Chats tab, then push it.
+    ///
+    /// BOTH WRITES, ALWAYS, and in that order. The pushed detail hides the shared tab
+    /// bar, so the push has to happen on the tab the user can see — otherwise the bar
+    /// vanishes under Today (or Health, or Vault), with the conversation unreachable
+    /// behind it and no back swipe to undo it. The decision itself lives in
+    /// `ThreadLanding` so it is testable without a view host.
+    private func land(on thread: JesseThread) {
+        ThreadLanding.apply(thread: thread, selection: &selectedTab, path: &path)
     }
 
     // The hands-free doorbell fired: capture the spoken request in-app (Siri only
@@ -296,7 +319,7 @@ struct ContentView: View {
         let thread = JesseThread(mode: .ask)
         context.insert(thread)
         coordinator.stage(recording: next, for: thread.id)
-        path = [thread]
+        land(on: thread)
     }
 
     // Each voice invocation is its own new thread; the coordinator runs it and
@@ -304,7 +327,7 @@ struct ContentView: View {
     private func startVoiceThread(_ req: PendingVoiceRequest) {
         let thread = JesseThread(mode: req.mode)
         context.insert(thread)
-        path = [thread]
+        land(on: thread)
         coordinator.send(thread: thread, text: req.text, voice: true, context: context)
     }
 }
@@ -1351,5 +1374,5 @@ struct SettingsView: View {
 }
 
 #Preview {
-    ContentView()
+    ContentView(selectedTab: .constant(.chats))
 }
