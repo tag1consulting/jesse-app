@@ -94,10 +94,12 @@ pub const ORPHAN_DRAFT: &str = "ORPHAN-DRAFT";
 pub const UNOWNED_PROMPT: &str = "UNOWNED-PROMPT";
 pub const TOO_MANY: &str = "TOO-MANY";
 pub const DONE_NOT_ARCHIVED: &str = "DONE-NOT-ARCHIVED";
+pub const NOW_LONG: &str = "NOW-LONG";
+pub const FORMAT_V1: &str = "FORMAT-V1";
 
 /// Every code this module can raise, in the order the module documents them.
 /// Used by the test that asserts each one has a fixture and a name.
-pub const FINDING_CODES: [&str; 17] = [
+pub const FINDING_CODES: [&str; 19] = [
     PARSE,
     GROUP,
     STATE,
@@ -115,7 +117,14 @@ pub const FINDING_CODES: [&str; 17] = [
     UNOWNED_PROMPT,
     TOO_MANY,
     DONE_NOT_ARCHIVED,
+    NOW_LONG,
+    FORMAT_V1,
 ];
+
+/// The longest `**Now:**` a v2 note may carry, in characters. Now is the line
+/// the phone shows under the title, and past this it has stopped being a summary
+/// and become the history that belongs under `## Status`.
+const NOW_MAX_CHARS: usize = 280;
 
 // ---- Wire types ------------------------------------------------------------
 
@@ -156,7 +165,8 @@ pub struct StrandWaiting {
     pub jeremy: bool,
 }
 
-/// The next step: the first unchecked Queue item above `### Later`.
+/// The next step: the first unchecked Queue item above `### Later` (v1), or the
+/// first unchecked, not running `## Drafts` line above `### Later` (v2).
 #[derive(serde::Serialize, PartialEq, Eq, Debug, Clone)]
 pub struct StrandNext {
     pub id: String,
@@ -173,7 +183,13 @@ pub struct StrandCounts {
     pub done: usize,
 }
 
-/// The four sections whose lines are items. `## Decisions` and `## Links` carry
+/// Where an item stands, which is where it sits in a v1 note. A v2 note has one
+/// `## Drafts` list instead of three, so its lines are classified into the same
+/// four on the way in: a line above `### Later` is Queue, or Running when it is
+/// unchecked and says `Launched YYYY-MM-DD.`; a line under `### Later` is Later
+/// (or Running, on the same test); a line under `### Done` is Done. The counts,
+/// the next step and every item finding then read one shape for both layouts.
+/// `## Decisions`, `## Links`, `## Research`, `## Vault` and `## Status` carry
 /// bullets too, but never checkboxes, so nothing in them is an item.
 #[derive(PartialEq, Eq, Debug, Clone, Copy)]
 pub enum StrandSection {
@@ -205,14 +221,28 @@ pub struct StrandItem {
 }
 
 /// A wiki link whose target has to resolve: one in `**Now:**`, `**Waiting
-/// on:**`, `## Queue` (including `### Later`) or `## Running`. Links in Done,
-/// Decisions and Links are not checked, because a finished item's target is
-/// allowed to have been archived out from under it.
+/// on:**`, `## Queue` (including `### Later`) or `## Running` in v1; one in
+/// `**Now:**`, `**Waiting on:**`, `## Drafts` above `### Done`, `## Research`,
+/// `## Vault` or `## Status` in v2. Links in Done, Decisions and Links are not
+/// checked, because a finished item's target is allowed to have been archived
+/// out from under it.
 #[derive(PartialEq, Eq, Debug, Clone)]
 struct LinkRef {
     target: String,
     line: usize,
     in_queue: bool,
+}
+
+/// Which of the two note layouts a note is written in. See [`parse_strand`].
+#[derive(PartialEq, Eq, Debug, Clone, Copy, Default)]
+pub enum StrandLayout {
+    /// `## Queue`, `## Running`, `## Done`, `## Links`. Still parsed, with a
+    /// [`FORMAT_V1`] finding, until no live note uses it.
+    #[default]
+    V1,
+    /// `## Drafts` (with `### Later` and `### Done`), `## Research`, `## Vault`,
+    /// `## Decisions`, `## Status`.
+    V2,
 }
 
 /// One status note, parsed and audited.
@@ -243,6 +273,8 @@ pub struct Strand {
     pub targets: Vec<String>,
     #[serde(skip)]
     link_refs: Vec<LinkRef>,
+    #[serde(skip)]
+    pub layout: StrandLayout,
 }
 
 /// Everything `GET /jesse/strands` serves, and everything the nightly file
@@ -276,23 +308,40 @@ impl StrandsSnapshot {
 /// Parse one note into a [`Strand`], **without touching the filesystem**.
 ///
 /// Raises the findings that are a function of the document alone: [`PARSE`],
-/// [`DUP_ID`], [`CHECKED_NOT_MOVED`] and [`QUEUE_ARCHIVED`] (a link target that
-/// names `archive/` is archived whether or not the file is there). Everything
-/// that needs the vault, a calendar or the other notes is [`audit_strand`].
+/// [`FORMAT_V1`], [`NOW_LONG`], [`DUP_ID`], [`CHECKED_NOT_MOVED`] and
+/// [`QUEUE_ARCHIVED`] (a link target that names `archive/` is archived whether
+/// or not the file is there). Everything that needs the vault, a calendar or the
+/// other notes is [`audit_strand`].
 ///
-/// The grammar, exactly:
+/// Two layouts parse. A note with an H2 `## Queue` is **v1** and carries a
+/// [`FORMAT_V1`] finding; otherwise a note with an H2 `## Drafts` is **v2**; a
+/// note with neither is read as v1 and carries the [`PARSE`] finding for its
+/// missing Queue. Both produce the same [`Strand`], so the wire does not know
+/// which one a note was written in.
+///
+/// Shared by both:
 ///
 /// 1. Frontmatter between two `---` lines: `group`, `state`, `updated`, and an
 ///    optional `repos` flow list.
 /// 2. The first H1 is the title; the file stem is the slug.
 /// 3. `**Now:**` and `**Waiting on:**` take the rest of their line. A waiting
 ///    line is a gate on the operator when its text starts `you:`.
-/// 4. `## Queue` opens the queue and `### Later` its later list; `## Running`,
-///    `## Done`, `## Decisions` and `## Links` open theirs. Any other H2 or H3
-///    closes the current section, and prose is ignored.
-/// 5. An item is `- [ ]` or `- [x]` (or `[X]`), an optional `YYYY-MM-DD`, then
+/// 4. An item is `- [ ]` or `- [x]` (or `[X]`), an optional `YYYY-MM-DD`, then
 ///    the id as the first bold span, then text.
-/// 6. The next step is the first unchecked Queue item above `### Later`.
+/// 5. Any H2 or H3 the layout does not name closes the current section, and
+///    prose is ignored.
+///
+/// v1: `## Queue` opens the queue and `### Later` its later list; `## Running`,
+/// `## Done`, `## Decisions` and `## Links` open theirs. The next step is the
+/// first unchecked Queue item above `### Later`.
+///
+/// v2: `**Now:**` is required and at most [`NOW_MAX_CHARS`] characters
+/// ([`NOW_LONG`]). `## Drafts` is the one ordered list of the strand's work,
+/// with an optional `### Later` and then an optional `### Done` under it. An
+/// unchecked line that says `Launched YYYY-MM-DD.` is running. `## Research`,
+/// `## Vault` and `## Status` hold plain bullets whose links must resolve, and
+/// `## Decisions` holds dated lines. The next step is the first unchecked, not
+/// running Drafts line above `### Later`.
 pub fn parse_strand(slug: &str, src: &str) -> Strand {
     let lines: Vec<&str> = src.lines().collect();
     let mut strand = Strand {
@@ -330,9 +379,19 @@ pub fn parse_strand(slug: &str, src: &str) -> Strand {
             .push(Finding::at(PARSE, 1, "no frontmatter block")),
     }
 
+    // The layout, settled before the walk because the same heading means
+    // different things in the two (`### Done` is a v2 heading and closes a v1
+    // section). Queue wins, so a half moved note is still read the way it reads.
+    let body = || lines.iter().skip(body_start).map(|l| l.trim_end());
+    let has_h2 = |name: &str| body().any(|l| heading_level(l, 2) == Some(name));
+    let saw_queue_heading = has_h2("Queue");
+    if !saw_queue_heading && has_h2("Drafts") {
+        strand.layout = StrandLayout::V2;
+    }
+    let v2 = strand.layout == StrandLayout::V2;
+
     // 2 to 5. One pass over the body.
-    let mut section: Option<StrandSection> = None;
-    let mut saw_queue_heading = false;
+    let mut section: Option<Section> = None;
     for (idx, raw) in lines.iter().enumerate().skip(body_start) {
         let line_no = idx + 1;
         let text = raw.trim_end();
@@ -344,20 +403,26 @@ pub fn parse_strand(slug: &str, src: &str) -> Strand {
             continue;
         }
         if let Some(rest) = heading_level(text, 2) {
-            section = match rest {
-                "Queue" => {
-                    saw_queue_heading = true;
-                    Some(StrandSection::Queue)
-                }
-                "Running" => Some(StrandSection::Running),
-                "Done" => Some(StrandSection::Done),
+            section = match (v2, rest) {
+                (false, "Queue") => Some(Section::Item(StrandSection::Queue)),
+                (false, "Running") => Some(Section::Item(StrandSection::Running)),
+                (false, "Done") => Some(Section::Item(StrandSection::Done)),
+                (true, "Drafts") => Some(Section::Item(StrandSection::Queue)),
+                (true, "Research" | "Vault" | "Status") => Some(Section::Checked),
                 _ => None,
             };
             continue;
         }
         if let Some(rest) = heading_level(text, 3) {
             section = match (rest, section) {
-                ("Later", Some(StrandSection::Queue)) => Some(StrandSection::Later),
+                ("Later", Some(Section::Item(StrandSection::Queue))) => {
+                    Some(Section::Item(StrandSection::Later))
+                }
+                ("Done", Some(Section::Item(StrandSection::Queue | StrandSection::Later)))
+                    if v2 =>
+                {
+                    Some(Section::Item(StrandSection::Done))
+                }
                 _ => None,
             };
             continue;
@@ -365,7 +430,18 @@ pub fn parse_strand(slug: &str, src: &str) -> Strand {
 
         if let Some(rest) = text.strip_prefix("**Now:**") {
             if strand.now.is_none() {
-                strand.now = Some(rest.trim().to_string());
+                let now = rest.trim().to_string();
+                if v2 && now.chars().count() > NOW_MAX_CHARS {
+                    strand.findings.push(Finding::at(
+                        NOW_LONG,
+                        line_no,
+                        format!(
+                            "Now is {} characters, more than {NOW_MAX_CHARS}; move the detail to Status",
+                            now.chars().count()
+                        ),
+                    ));
+                }
+                strand.now = Some(now);
                 push_link_refs(&mut strand.link_refs, text, line_no, false);
             }
             continue;
@@ -382,20 +458,35 @@ pub fn parse_strand(slug: &str, src: &str) -> Strand {
             continue;
         }
 
-        let Some(section) = section else { continue };
-        let Some(item) = parse_item(section, text, line_no) else {
+        let section = match section {
+            None => continue,
+            Some(Section::Checked) => {
+                push_link_refs(&mut strand.link_refs, text, line_no, false);
+                continue;
+            }
+            Some(Section::Item(section)) => section,
+        };
+        let Some(mut item) = parse_item(section, text, line_no) else {
             continue;
         };
-        if matches!(
-            section,
-            StrandSection::Queue | StrandSection::Later | StrandSection::Running
-        ) {
-            push_link_refs(
-                &mut strand.link_refs,
-                text,
-                line_no,
-                !matches!(section, StrandSection::Running),
-            );
+        // A v2 Drafts line is running by what it says, not where it sits.
+        if v2
+            && matches!(section, StrandSection::Queue | StrandSection::Later)
+            && !item.checked
+            && says_launched(text)
+        {
+            item.section = StrandSection::Running;
+        }
+        let in_queue = match v2 {
+            // v1 as it always was: every Queue and Later line, checked or not.
+            false => matches!(section, StrandSection::Queue | StrandSection::Later),
+            // v2: a line that is still waiting to be launched.
+            true => {
+                matches!(item.section, StrandSection::Queue | StrandSection::Later) && !item.checked
+            }
+        };
+        if section != StrandSection::Done {
+            push_link_refs(&mut strand.link_refs, text, line_no, in_queue);
         }
         strand.items.push(item);
     }
@@ -410,20 +501,38 @@ pub fn parse_strand(slug: &str, src: &str) -> Strand {
     if strand.title.is_empty() {
         strand.findings.push(Finding::at(PARSE, 1, "no H1 title"));
     }
-    if !saw_queue_heading {
-        strand
+    match strand.layout {
+        StrandLayout::V1 if saw_queue_heading => {
+            strand
+                .findings
+                .push(Finding::at(FORMAT_V1, 1, "v1 layout; move to v2"))
+        }
+        StrandLayout::V1 => strand
             .findings
-            .push(Finding::at(PARSE, 1, "no `## Queue` heading"));
+            .push(Finding::at(PARSE, 1, "no `## Queue` heading")),
+        StrandLayout::V2 if strand.now.is_none() => {
+            strand
+                .findings
+                .push(Finding::at(PARSE, 1, "no `**Now:**` line"))
+        }
+        StrandLayout::V2 => {}
     }
 
     // Counts, the next step, and the per-item findings the document settles.
     let mut seen_ids: Vec<&str> = Vec::new();
     for item in &strand.items {
-        match item.section {
-            StrandSection::Queue => strand.counts.queue += 1,
-            StrandSection::Later => strand.counts.later += 1,
-            StrandSection::Running => strand.counts.running += 1,
-            StrandSection::Done => strand.counts.done += 1,
+        match (strand.layout, item.section) {
+            (StrandLayout::V1, StrandSection::Queue) => strand.counts.queue += 1,
+            (StrandLayout::V1, StrandSection::Later) => strand.counts.later += 1,
+            (StrandLayout::V1, StrandSection::Done) => strand.counts.done += 1,
+            (_, StrandSection::Running) => strand.counts.running += 1,
+            // v2 counts what a line says: a checked line is done wherever it
+            // sits (and is CHECKED-NOT-MOVED below when that is not Done), and
+            // an unchecked line under Done is counted nowhere.
+            (StrandLayout::V2, _) if item.checked => strand.counts.done += 1,
+            (StrandLayout::V2, StrandSection::Queue) => strand.counts.queue += 1,
+            (StrandLayout::V2, StrandSection::Later) => strand.counts.later += 1,
+            (StrandLayout::V2, StrandSection::Done) => {}
         }
         if item.id.is_empty() {
             strand.findings.push(Finding::at(
@@ -440,19 +549,19 @@ pub fn parse_strand(slug: &str, src: &str) -> Strand {
         } else {
             seen_ids.push(item.id.as_str());
         }
-        if item.checked
-            && matches!(
-                item.section,
-                StrandSection::Queue | StrandSection::Later | StrandSection::Running
-            )
-        {
+        if item.checked && item.section != StrandSection::Done {
             strand.findings.push(Finding::at(
                 CHECKED_NOT_MOVED,
                 item.line,
-                format!(
-                    "{} is checked but still in Queue or Running",
-                    id_or_line(item)
-                ),
+                match strand.layout {
+                    StrandLayout::V1 => format!(
+                        "{} is checked but still in Queue or Running",
+                        id_or_line(item)
+                    ),
+                    StrandLayout::V2 => {
+                        format!("{} is checked but still above Done", id_or_line(item))
+                    }
+                },
             ));
         }
     }
@@ -477,6 +586,27 @@ pub fn parse_strand(slug: &str, src: &str) -> Strand {
         });
     strand.findings.sort_by_key(|f| (f.line, f.code));
     strand
+}
+
+/// What the line walk is inside. `Checked` is a v2 section of plain bullets
+/// whose links have to resolve and that holds nothing else the parser reads.
+#[derive(Clone, Copy)]
+enum Section {
+    Item(StrandSection),
+    Checked,
+}
+
+/// Whether an item line says `Launched YYYY-MM-DD.`, full stop included: the
+/// v2 marker of a running line. The date must parse, so prose that happens to
+/// use the word does not start a run.
+fn says_launched(line: &str) -> bool {
+    let key = "Launched ";
+    line.match_indices(key).any(|(at, _)| {
+        let from = at + key.len();
+        line.get(from..from + 10)
+            .is_some_and(|d| valid_iso_date(d).is_some())
+            && line.as_bytes().get(from + 10) == Some(&b'.')
+    })
 }
 
 /// `# Heading` at exactly `level`, or `None`. `##` is not an H1 and `###` is not
@@ -823,7 +953,10 @@ pub fn audit_strand(strand: &mut Strand, notes_root: &Path, today: &str) {
         strand.findings.push(Finding::at(
             NO_NEXT,
             1,
-            "active with no unchecked Queue item above Later",
+            match strand.layout {
+                StrandLayout::V1 => "active with no unchecked Queue item above Later",
+                StrandLayout::V2 => "active with no unchecked, not running Drafts line above Later",
+            },
         ));
     }
 
@@ -1252,6 +1385,8 @@ mod tests {
 
     const CLEAN: &str = include_str!("../tests/fixtures/strands/vault/Strands/Clean-Strand.md");
     const MESSY: &str = include_str!("../tests/fixtures/strands/vault/Strands/Messy-Strand.md");
+    const TIDY: &str = include_str!("../tests/fixtures/strands/vault/Strands/Tidy-Strand.md");
+    const ROUGH: &str = include_str!("../tests/fixtures/strands/vault/Strands/Rough-Strand.md");
 
     fn fixture_root() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/strands/vault")
@@ -1366,6 +1501,150 @@ mod tests {
         assert_eq!(t.items.len(), 1);
     }
 
+    // ---- The v2 layout ------------------------------------------------------
+
+    #[test]
+    fn layout_is_v2_on_drafts_and_v1_on_queue() {
+        assert_eq!(parse_strand("Tidy-Strand", TIDY).layout, StrandLayout::V2);
+        assert_eq!(parse_strand("Clean-Strand", CLEAN).layout, StrandLayout::V1);
+        // Queue wins: a half moved note still reads the way it always read.
+        let src = "---\ngroup: tag1\nstate: active\nupdated: 2026-09-23\n---\n# T\n\n**Now:** x\n\n## Queue\n- [ ] **A1** In.\n\n## Drafts\n- [ ] **A2** Out.\n";
+        let t = parse_strand("T", src);
+        assert_eq!(t.layout, StrandLayout::V1);
+        assert_eq!(t.next.map(|n| n.id).as_deref(), Some("A1"));
+    }
+
+    #[test]
+    fn v2_next_and_counts_come_from_the_one_drafts_list() {
+        let t = parse_strand("Tidy-Strand", TIDY);
+        assert_eq!(
+            t.now.as_deref(),
+            Some("Launch is out; the next draft is ready once the key lands.")
+        );
+        assert_eq!(t.waiting.clone().map(|w| w.jeremy), Some(false));
+        assert_eq!(t.repos, vec!["jeremyandrews/tidy".to_string()]);
+        assert_eq!(
+            t.next,
+            Some(StrandNext {
+                id: "T3".to_string(),
+                text: "Second run on the fixed build.".to_string(),
+                link: Some("todo-list/Projects/drafts/2026-09-23-tidy-next".to_string()),
+                waits_on: Some("provider key".to_string()),
+            })
+        );
+        assert_eq!(
+            t.counts,
+            StrandCounts {
+                queue: 2,
+                later: 1,
+                running: 1,
+                done: 2
+            }
+        );
+        let running = t
+            .items
+            .iter()
+            .find(|i| i.section == StrandSection::Running)
+            .unwrap();
+        assert_eq!(running.id, "T2");
+        assert_eq!(running.launched.as_deref(), Some("2026-09-22"));
+    }
+
+    #[test]
+    fn v2_a_running_line_is_never_the_next_step() {
+        let src = "---\ngroup: tag1\nstate: active\nupdated: 2026-09-23\n---\n# T\n\n**Now:** x\n\n## Drafts\n- [ ] **A1** Out. Launched 2026-09-22.\n- [ ] **A2** In.\n";
+        let t = parse_strand("T", src);
+        assert_eq!(t.next.map(|n| n.id).as_deref(), Some("A2"));
+        assert_eq!((t.counts.queue, t.counts.running), (1, 1));
+        // The word alone, or a date with no full stop, does not start a run.
+        assert!(!says_launched("- [ ] **A1** Launched soon."));
+        assert!(!says_launched("- [ ] **A1** Launched 2026-09-22 and then"));
+        assert!(says_launched("- [ ] **A1** Launched 2026-09-22."));
+    }
+
+    #[test]
+    fn v2_links_in_research_vault_and_status_must_resolve() {
+        let src = "---\ngroup: tag1\nstate: active\nupdated: 2026-09-23\n---\n# T\n\n**Now:** x\n\n## Drafts\n- [ ] **A1** In.\n### Done\n- [x] 2026-09-20 **A0** Gone. [[todo-list/Gone/Done]]\n\n## Research\n- [[todo-list/Gone/Research]]\n\n## Vault\n- [[todo-list/Gone/Vault]]\n\n## Decisions\n- 2026-09-20 [[todo-list/Gone/Decision]]\n\n## Status\n- 2026-09-22 [[todo-list/Gone/Status]]\n";
+        let mut t = parse_strand("T", src);
+        audit_strand(&mut t, &fixture_root(), "2026-09-23");
+        let dead: Vec<&str> = t
+            .findings
+            .iter()
+            .filter(|f| f.code == LINK_DEAD)
+            .map(|f| f.message.rsplit('/').next().unwrap())
+            .collect();
+        assert_eq!(dead, vec!["Research", "Vault", "Status"]);
+    }
+
+    #[test]
+    fn v2_requires_now() {
+        let src = "---\ngroup: tag1\nstate: active\nupdated: 2026-09-23\n---\n# T\n\n## Drafts\n- [ ] **A1** In.\n";
+        let t = parse_strand("T", src);
+        assert_eq!(codes(&t.findings), vec![PARSE]);
+    }
+
+    #[test]
+    fn v2_rough_note_trips_now_long_checked_not_moved_and_queue_archived() {
+        let mut t = parse_strand("Rough-Strand", ROUGH);
+        audit_strand(&mut t, &fixture_root(), "2026-09-23");
+        assert_eq!(
+            codes(&t.findings),
+            vec![NOW_LONG, CHECKED_NOT_MOVED, QUEUE_ARCHIVED],
+            "{:?}",
+            t.findings
+        );
+        // Only R2 is a queue line; R3 links into archive too, but it is running.
+        let archived: Vec<usize> = t
+            .findings
+            .iter()
+            .filter(|f| f.code == QUEUE_ARCHIVED)
+            .filter_map(|f| f.line)
+            .collect();
+        assert_eq!(archived, vec![12]);
+        assert_eq!(
+            t.counts.done, 2,
+            "a checked line counts as done wherever it sits"
+        );
+    }
+
+    #[test]
+    fn every_v1_fixture_carries_format_v1_and_no_v2_fixture_does() {
+        let snap = snapshot(&fixture_root(), "2026-09-23");
+        for t in &snap.strands {
+            let v1 = codes(&t.findings).contains(&FORMAT_V1);
+            match t.slug.as_str() {
+                "Tidy-Strand" | "Rough-Strand" | "Broken-Strand" => assert!(!v1, "{}", t.slug),
+                _ => assert!(v1, "{}", t.slug),
+            }
+        }
+    }
+
+    #[test]
+    fn v1_findings_are_unchanged_apart_from_format_v1() {
+        let mut t = parse_strand("Messy-Strand", MESSY);
+        audit_strand(&mut t, &fixture_root(), "2026-09-23");
+        let got: Vec<(Option<usize>, &str)> = t.findings.iter().map(|f| (f.line, f.code)).collect();
+        assert_eq!(
+            got,
+            vec![
+                (Some(1), FORMAT_V1),
+                (Some(1), GROUP),
+                (Some(1), NO_NEXT),
+                (Some(1), UPDATED_BEHIND),
+                (Some(1), UPDATED_STALE),
+                (Some(8), LINK_DEAD),
+                (Some(12), CHECKED_NOT_MOVED),
+                (Some(13), PARSE),
+                (Some(14), CHECKED_NOT_MOVED),
+                (Some(14), DUP_ID),
+                (Some(15), CHECKED_NOT_MOVED),
+                (Some(15), QUEUE_ARCHIVED),
+                (Some(20), RUNNING_SILENT),
+                (Some(21), RUNNING_SILENT),
+            ]
+        );
+    }
+
     // ---- One test per finding code -----------------------------------------
 
     fn codes(findings: &[Finding]) -> Vec<&str> {
@@ -1396,7 +1675,7 @@ mod tests {
         let src = "---\ngroup: tag1\nstate: paused\nupdated: 2026-09-23\n---\n# T\n\n## Queue\n- [ ] **A1** In.\n";
         let mut t = parse_strand("T", src);
         audit_strand(&mut t, &fixture_root(), "2026-09-23");
-        assert_eq!(codes(&t.findings), vec![STATE]);
+        assert_eq!(codes(&t.findings), vec![FORMAT_V1, STATE]);
     }
 
     #[test]
@@ -1543,10 +1822,25 @@ mod tests {
     // ---- The snapshot ------------------------------------------------------
 
     #[test]
-    fn a_clean_note_has_no_findings() {
+    fn a_clean_v1_note_has_only_its_format_finding() {
         let mut t = parse_strand("Clean-Strand", CLEAN);
         audit_strand(&mut t, &fixture_root(), "2026-09-23");
-        assert_eq!(t.findings, Vec::new(), "the clean fixture must stay clean");
+        assert_eq!(
+            t.findings,
+            vec![Finding::at(FORMAT_V1, 1, "v1 layout; move to v2")],
+            "the clean v1 fixture is clean apart from its layout"
+        );
+    }
+
+    #[test]
+    fn a_clean_v2_note_has_no_findings() {
+        let mut t = parse_strand("Tidy-Strand", TIDY);
+        audit_strand(&mut t, &fixture_root(), "2026-09-23");
+        assert_eq!(
+            t.findings,
+            Vec::new(),
+            "the clean v2 fixture must stay clean"
+        );
     }
 
     #[test]
@@ -1562,6 +1856,8 @@ mod tests {
             vec![
                 ("2026-09-23", "Alpha Strand"),
                 ("2026-09-23", "Clean Strand"),
+                ("2026-09-23", "Rough Strand"),
+                ("2026-09-23", "Tidy Strand"),
                 ("2026-09-01", "Messy Strand"),
                 ("2026-01-01", "Dormant Strand"),
                 ("", "Broken Strand"),
@@ -1692,7 +1988,7 @@ mod tests {
         let b = render_report(&snapshot(&fixture_root(), "2026-09-23"), "2026-09-23");
         assert_eq!(a, b);
         assert!(a.starts_with(
-            "# Strands audit 2026-09-23\n\nActive 3, waiting 1, dormant 0, findings "
+            "# Strands audit 2026-09-23\n\nActive 4, waiting 2, dormant 0, findings "
         ));
         assert!(a.contains(" · Messy Strand · "));
         assert!(a.contains("(Strands/Messy-Strand.md)"));
