@@ -14,6 +14,46 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [Bridge 0.149.0] - 2026-09-24
+
+**Strand notes can be written in a second layout, v2, that reads in the order a person
+reads.** A v2 note opens with a short `**Now:**` (at most 280 characters), then one
+ordered `## Drafts` list of every prompt, draft and report line with its status on the
+line itself, then `## Research`, then `## Vault`, then `## Decisions`, and last a dated
+`## Status` log that holds the detail. Under Drafts, `### Later` holds the unsequenced
+backlog and `### Done` the finished lines, newest first. An unchecked Drafts line that
+says `Launched YYYY-MM-DD.` is running; a checked one is done.
+
+**Why.** Read on the phone, the v1 notes put things in the wrong order. `**Now:**` had
+grown into a paragraph of history, and the state of the work was split across Queue,
+Running and Done before the reader reached anything else. The ruling was: a concise
+summary first, then the drafts, then the research, then the vault files, and the long
+status detail at the end. Of the two shapes considered, the drafts list replaces the
+Queue rather than sitting beside it, so each draft carries its own status and run order
+lives in one list.
+
+**Nothing changes on the wire.** Both routes serve the same keys and types as 0.148.x,
+and the app reads a v2 note unchanged: `next` is the first unchecked, not running Drafts
+line above Later, `queue` counts those lines, `running` counts running lines above Done,
+`later` counts unchecked lines under Later, and `done` counts every checked line in
+Drafts. The nightly file keeps its name, its time and its write once rule.
+
+**Two new finding codes.**
+
+- `FORMAT-V1`: the note still uses the v1 layout (`## Queue`). v1 parses exactly as
+  before; this finding is the only difference. Every one of the 23 live notes raises
+  it today.
+- `NOW-LONG`: a v2 note whose Now is over 280 characters.
+
+The existing codes read both layouts. In v2, `CHECKED-NOT-MOVED` is a checked line above
+`### Done`, `QUEUE-ARCHIVED` is an unchecked, not running Drafts line whose link names
+`/archive/`, and `RUNNING-SILENT` reads the running Drafts lines. Links in Now, Waiting
+on, Drafts above Done, Research, Vault and Status must resolve; links in Done and
+Decisions are not checked, as in v1. A v2 note with no Now line is `PARSE`.
+
+**Plan.** The live notes move to v2 on the vault side once this is deployed. v1 parsing is
+removed in a later minor, once the nightly audit reports zero `FORMAT-V1`.
+
 ## [Bridge 0.148.1] - 2026-09-24
 
 **The ambient `opus` entry describes Claude Opus 5.5.** Anthropic released Opus 5.5 on

@@ -2080,7 +2080,19 @@ for the day, never touches a Strands note, and never calls the network. No
 days, or undated), `CHECKED-NOT-MOVED`, `NO-NEXT`, `DUP-ID`, and the global
 `ORPHAN-DRAFT`, `UNOWNED-PROMPT` (both over `Projects/drafts/` and
 `Projects/Research/`, not their `archive/`), `TOO-MANY` (over 20 active) and
-`DONE-NOT-ARCHIVED`. The grammar is documented on `strands::parse_strand`.
+`DONE-NOT-ARCHIVED`, plus `FORMAT-V1` (the note still uses the v1 layout) and
+`NOW-LONG` (a v2 note whose Now is over 280 characters). The grammar is documented on
+`strands::parse_strand`.
+
+**Two layouts.** A note with `## Queue` is v1 (`## Queue` with `### Later`, `## Running`,
+`## Done`, `## Decisions`, `## Links`) and carries `FORMAT-V1` until it is moved. A note
+with `## Drafts` is v2: a required `**Now:**` of at most 280 characters, an optional
+`**Waiting on:**`, then one ordered `## Drafts` list (with an optional `### Later` and
+then `### Done` under it) where an unchecked line saying `Launched YYYY-MM-DD.` is
+running, then optional `## Research`, `## Vault`, `## Decisions` and `## Status`. The
+wire is the same for both: in v2, `next` is the first unchecked, not running Drafts line
+above Later, and the four counts are read off the one list. v1 parsing goes once the
+audit reports no `FORMAT-V1`.
 
 **Dry run.** `cargo run --example strands_audit -- ~/jesse/vault` prints the
 report the nightly writer would write, and writes nothing.
