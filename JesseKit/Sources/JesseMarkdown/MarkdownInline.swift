@@ -10,6 +10,14 @@ import Foundation
 // into a tappable link because it knows how to resolve one; this file does not, and that
 // is deliberate — nothing here knows a vault exists.
 //
+// THE FIVE CRITICMARKUP MARKS ARE THE SIXTH THING IT HAS NEVER HEARD OF, and they are
+// the one construct here that somebody writes in order to be ANSWERED rather than read:
+// a highlight, a comment, a rewrite, an insertion, a deletion. Each opens with a brace
+// and closes on the SAME LINE, and what sits between the markers is LITERAL: the words
+// somebody actually marked, never rescanned for a link or an emphasis run. Marking up a
+// sentence that already contains a wiki link is the ordinary case, and a scanner that
+// reached inside a mark would turn the marked words into a construct nobody wrote.
+//
 // ONE RULE ABOVE ALL THE OTHERS: a code span is opaque. `` `[[not a link]]` `` is a code
 // span containing four characters that happen to be brackets, and turning it into a link
 // would be the reader helpfully breaking the one construct whose whole purpose is "show
@@ -44,6 +52,23 @@ public enum MarkdownSpan: Equatable, Sendable {
     /// `![alt](target)`. The target is NEVER fetched — see `VaultNoteRenderer` for why a
     /// reader that loads pictures is a reader that misses its frame budget.
     case image(alt: String, target: String)
+    /// CriticMarkup `{==inner==}`, markers removed. Distinct from `.highlight` on purpose:
+    /// `==this==` is emphasis somebody wrote while writing, and `{==this==}` is a mark
+    /// somebody left while reviewing. They render alike today and they are still not the
+    /// same thing, and the renderer is entitled to tell them apart later.
+    case criticHighlight(String)
+    /// CriticMarkup `{>>inner<<}`, markers removed. A comment whose text opens with
+    /// `Jesse ` is an answer rather than a question; deciding that is the renderer's job,
+    /// because "who wrote this" is not a grammar question.
+    case criticComment(String)
+    /// CriticMarkup `{~~old~>new~~}`. Both halves are carried, because a rewrite that
+    /// showed only its result would be indistinguishable from an insertion.
+    case criticSubstitution(old: String, new: String)
+    /// CriticMarkup `{++inner++}`, markers removed.
+    case criticInsertion(String)
+    /// CriticMarkup deletion, markers removed. Spelled with two hyphens, which is why it
+    /// is named rather than written out in this comment.
+    case criticDeletion(String)
 }
 
 public enum MarkdownInline {
@@ -53,6 +78,9 @@ public enum MarkdownInline {
     /// Adjacent plain text is one span. An unterminated construct (`[[` with no `]]`, an
     /// opening `==` with no close, an opening backtick with no close) is TEXT, because the
     /// alternative is silently swallowing the rest of the line.
+    ///
+    /// A CriticMarkup mark is tried at the BRACE, which is what makes `{==` beat the `==`
+    /// inside it: the brace consumes both characters, so the `=` case never sees them.
     public static func scan(_ text: String) -> [MarkdownSpan] {
         guard mayContainSpans(text) else {
             return text.isEmpty ? [] : [.text(text)]
@@ -103,6 +131,12 @@ public enum MarkdownInline {
                     out.append(.highlight(found.inner))
                     consumed = found.end
                 }
+            case "{":
+                if let found = criticMark(text, from: i) {
+                    flush(i)
+                    out.append(found.span)
+                    consumed = found.end
+                }
             case "#":
                 if atWordStart(text, i), let end = tagEnd(text, from: i) {
                     flush(i)
@@ -134,11 +168,15 @@ public enum MarkdownInline {
     /// allocation. A `false` here is the line's whole cost.
     ///
     /// `:` stands in for a bare URL's `://`, which is cheaper to look for than `http`.
+    ///
+    /// `{` is here for CriticMarkup, and it is NOT redundant with `=`: a comment mark
+    /// (`{>>…<<}`) and a deletion mark hold none of the other five bytes, so a line whose
+    /// only construct is one of those would be returned whole without it.
     public static func mayContainSpans(_ text: String) -> Bool {
         for byte in text.utf8 {
             switch byte {
             case UInt8(ascii: "["), UInt8(ascii: "="), UInt8(ascii: "#"),
-                 UInt8(ascii: "`"), UInt8(ascii: ":"):
+                 UInt8(ascii: "`"), UInt8(ascii: ":"), UInt8(ascii: "{"):
                 return true
             default:
                 continue
@@ -227,6 +265,79 @@ public enum MarkdownInline {
             return nil
         }
         return (String(text[innerStart..<close.lowerBound]), close.upperBound)
+    }
+
+    /// The CriticMarkup mark opening at `start`, which points at the `{`, or nil.
+    ///
+    /// FIVE OPENERS, ONE SHAPE. A brace, two marker characters, the words, the same two
+    /// markers, a brace. So ONE comparison of the two characters after the brace decides
+    /// which of the five this is and what closes it. That is the whole cost this adds to a
+    /// line: every other brace in the vault (a Blade template, a shell expansion, a JSON
+    /// fragment inside a note) fails that comparison and falls through to the text it was.
+    ///
+    /// THE CLOSER MUST BE ON THE SAME LINE. A block's text can be several lines joined,
+    /// and a mark that matched a closer three lines further down would swallow two lines of
+    /// somebody's note into a comment they did not write. An unclosed mark is therefore the
+    /// brace it is: the scan resumes at the next character, exactly as it does for a `[[`
+    /// with no `]]`.
+    ///
+    /// WHAT IS INSIDE IS LITERAL. The inner words are returned whole and are never scanned
+    /// again, so a wiki link inside a highlighted sentence stays the words somebody
+    /// highlighted. That is a deliberate limit and the one thing a reader of marks gives
+    /// up; marking up a link is rare, and inventing a construct inside somebody's review
+    /// comment is worse than showing it plainly.
+    static func criticMark(_ text: String,
+                           from start: String.Index) -> (span: MarkdownSpan, end: String.Index)? {
+        let first = text.index(after: start)
+        guard first < text.endIndex else { return nil }
+        let second = text.index(after: first)
+        guard second < text.endIndex else { return nil }
+
+        let closer: String
+        switch (text[first], text[second]) {
+        case ("=", "="): closer = "==}"
+        case (">", ">"): closer = "<<}"
+        case ("~", "~"): closer = "~~}"
+        case ("+", "+"): closer = "++}"
+        case ("-", "-"):
+            // THE ONE OPENER THAT COLLIDES WITH SOMETHING REAL. A Blade template comment
+            // is a brace, a brace and two hyphens, and this vault's technology notes are
+            // full of them; without this line the scanner would eat the comment's body and
+            // draw it struck through. A doubled brace means somebody is writing a template,
+            // not marking up a sentence.
+            if start > text.startIndex, text[text.index(before: start)] == "{" { return nil }
+            closer = "--}"
+        default:
+            return nil
+        }
+
+        let innerStart = text.index(after: second)
+        // The line this mark is on, and no further.
+        let lineEnd = text[innerStart...].firstIndex(of: "\n") ?? text.endIndex
+        guard innerStart < lineEnd,
+              let close = text.range(of: closer, range: innerStart..<lineEnd),
+              close.lowerBound > innerStart else {
+            // An EMPTY mark lands here too, and deliberately: `{====}` is four characters
+            // somebody typed, the same way `====` is not a highlight.
+            return nil
+        }
+        let inner = String(text[innerStart..<close.lowerBound])
+
+        let span: MarkdownSpan
+        switch closer {
+        case "==}": span = .criticHighlight(inner)
+        case "<<}": span = .criticComment(inner)
+        case "++}": span = .criticInsertion(inner)
+        case "--}": span = .criticDeletion(inner)
+        default:
+            // A substitution is the only one of the five with a second marker INSIDE it,
+            // and without that marker it is not a rewrite of anything, so it is text,
+            // like every other half-written construct in this file.
+            guard let arrow = inner.range(of: "~>") else { return nil }
+            span = .criticSubstitution(old: String(inner[inner.startIndex..<arrow.lowerBound]),
+                                       new: String(inner[arrow.upperBound...]))
+        }
+        return (span, close.upperBound)
     }
 
     /// The end of the `#tag` at `start`, or nil when what follows is not one.

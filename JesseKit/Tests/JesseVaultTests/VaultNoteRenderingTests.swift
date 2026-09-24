@@ -184,6 +184,96 @@ final class VaultNoteRenderingTests: XCTestCase {
                        "the markers leave the text")
     }
 
+    // MARK: - CriticMarkup, as runs rather than as braces
+
+    func testTheFiveMarksBecomeTheirOwnSegments() {
+        XCTAssertEqual(VaultNoteRenderer.segments(
+            "{==seam==} {>>when?<<} {~~four~>six~~} {++arch++} {--lift--}"), [
+                .criticHighlight("seam"),
+                .text(" "),
+                .criticComment("when?"),
+                .text(" "),
+                .criticSubstitution(old: "four", new: "six"),
+                .text(" "),
+                .criticInsertion("arch"),
+                .text(" "),
+                .criticDeletion("lift"),
+            ])
+    }
+
+    /// A REWRITE MUST SHOW WHICH HALF IS WHICH. Both halves are on the line, so the only
+    /// thing telling the reader which wording is being proposed is the styling: the old
+    /// words are struck through, the new ones sit on a background.
+    func testASubstitutionStrikesTheOldWordsAndBacksTheNewOnes() {
+        let attributed = VaultNoteRenderer.attributed("about {~~four~>six~~} mm",
+                                                      resolved: [:])
+
+        let struck = attributed.runs.filter { $0.strikethroughStyle != nil }
+        XCTAssertEqual(struck.count, 1)
+        XCTAssertEqual(struck.first.map { String(attributed[$0.range].characters) }, "four")
+
+        let backed = attributed.runs.filter { $0.backgroundColor != nil }
+        XCTAssertEqual(backed.count, 1)
+        XCTAssertEqual(backed.first.map { String(attributed[$0.range].characters) }, "six")
+        XCTAssertNil(backed.first?.strikethroughStyle,
+                     "the proposed wording is not also being deleted")
+
+        XCTAssertTrue(String(attributed.characters).contains("four"))
+        XCTAssertTrue(String(attributed.characters).contains("six"),
+                      "both halves stay on the line; the styling is what separates them")
+    }
+
+    /// An answer is tinted differently from the question it answers, which is the whole
+    /// reason a reply is worth telling apart at all.
+    func testAReplyCommentIsTintedDifferentlyFromAPlainOne() {
+        let question = VaultNoteRenderer.attributed("x {>>measured when?<<}", resolved: [:])
+        let answer = VaultNoteRenderer.attributed("x {>>Jesse cold, in April<<}",
+                                                  resolved: [:])
+
+        let questionTint = question.runs.compactMap(\.backgroundColor).first
+        let answerTint = answer.runs.compactMap(\.backgroundColor).first
+        XCTAssertNotNil(questionTint)
+        XCTAssertNotNil(answerTint)
+        XCTAssertNotEqual(questionTint, answerTint)
+
+        XCTAssertTrue(VaultNoteRenderer.isReply("Jesse cold, in April"))
+        XCTAssertFalse(VaultNoteRenderer.isReply("measured when?"))
+        XCTAssertTrue(String(answer.characters).contains(VaultNoteRenderer.commentGlyph),
+                      "a comment is marked as one before its words")
+    }
+
+    func testAHighlightMarkCarriesTheSameYellowAnOrdinaryHighlightDoes() {
+        let marked = VaultNoteRenderer.attributed("the {==back seam==} again", resolved: [:])
+        XCTAssertEqual(marked.runs.compactMap(\.backgroundColor),
+                       [Color.yellow.opacity(0.3)])
+        XCTAssertEqual(String(marked.characters), "the back seam again",
+                       "the braces leave the text")
+    }
+
+    func testAnInsertionIsBackedAndADeletionIsStruck() {
+        let inserted = VaultNoteRenderer.attributed("pour {++in two lifts++}", resolved: [:])
+        XCTAssertEqual(inserted.runs.compactMap(\.backgroundColor).count, 1)
+        XCTAssertTrue(inserted.runs.allSatisfy { $0.strikethroughStyle == nil })
+
+        let deleted = VaultNoteRenderer.attributed("pour {--in one lift--}", resolved: [:])
+        XCTAssertEqual(deleted.runs.filter { $0.strikethroughStyle != nil }.count, 1)
+        XCTAssertEqual(String(deleted.characters), "pour in one lift",
+                       "the words stay readable; a strikethrough is not a deletion")
+    }
+
+    /// COLOUR ONLY, NEVER A FONT, the rule the `.tag` case is written against, applied to
+    /// every one of the five marks. A mark inside a heading must keep the heading's size.
+    func testNoMarkCarriesAFontAttribute() {
+        let block = document(
+            "# {==seam==} {>>when?<<} {~~four~>six~~} {++arch++} {--lift--}").blocks[0]
+        XCTAssertEqual(block.kind, .heading(level: 1))
+
+        let heading = VaultNoteRenderer.attributed(block.text, resolved: [:])
+        XCTAssertTrue(heading.runs.allSatisfy { $0.font == nil },
+                      "a font here would leave one word of the heading at body size")
+        XCTAssertTrue(heading.runs.allSatisfy { $0.link == nil })
+    }
+
     // MARK: - The missing-link caption reaches into a table
 
     func testAnUnresolvedLinkInsideATableCellIsStillCaptioned() {

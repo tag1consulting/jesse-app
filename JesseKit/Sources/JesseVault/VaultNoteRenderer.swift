@@ -23,6 +23,13 @@ import JesseMarkdown
 // promise the reader is entitled to be annoyed about, and because "that note does not
 // exist yet" is a useful thing to learn while reading.
 //
+// A MARK IS SOMETHING SOMEBODY LEFT FOR SOMEBODY. The five CriticMarkup forms (a
+// highlight, a comment, a rewrite, an insertion, a deletion) are the only constructs in a
+// note that are addressed to a reader rather than describing the world, and until now they
+// rendered as their own braces and tildes: readable, and invisible. They are styled here,
+// by colour alone, so a glance at a marked-up note shows what was marked and a rewrite
+// shows which half is the old wording and which is the proposed one.
+//
 // AN IMAGE IS NAMED, NEVER LOADED. Not a network fetch, not a file read, not a thumbnail:
 // the reader's whole budget is "open a 250 KB note without a visible pause", and a picture
 // is the one thing in a note that can cost a second. The alt text and the target are shown
@@ -47,6 +54,17 @@ public enum VaultInlineSegment: Equatable, Sendable {
     case autoLink(String)
     /// An inline `![alt](target)`, named rather than loaded.
     case image(alt: String, target: String)
+    /// CriticMarkup `{==marked==}` words.
+    case criticHighlight(String)
+    /// CriticMarkup `{>>a note<<}`, its text as written, the `Jesse ` prefix of a reply
+    /// included, because who wrote it is part of what it says.
+    case criticComment(String)
+    /// CriticMarkup `{~~old~>new~~}`: both halves, so the reader can show which is which.
+    case criticSubstitution(old: String, new: String)
+    /// CriticMarkup `{++added++}` words.
+    case criticInsertion(String)
+    /// CriticMarkup deleted words, markers removed.
+    case criticDeletion(String)
 }
 
 public enum VaultNoteRenderer {
@@ -102,6 +120,21 @@ public enum VaultNoteRenderer {
             case .image(let alt, let target):
                 flush()
                 out.append(.image(alt: alt, target: target))
+            case .criticHighlight(let s):
+                flush()
+                out.append(.criticHighlight(s))
+            case .criticComment(let s):
+                flush()
+                out.append(.criticComment(s))
+            case .criticSubstitution(let old, let new):
+                flush()
+                out.append(.criticSubstitution(old: old, new: new))
+            case .criticInsertion(let s):
+                flush()
+                out.append(.criticInsertion(s))
+            case .criticDeletion(let s):
+                flush()
+                out.append(.criticDeletion(s))
             }
         }
         flush()
@@ -141,6 +174,31 @@ public enum VaultNoteRenderer {
     /// Symbol's private-use codepoint falls back to the LastResort font in plain text,
     /// which draws a box, so a symbol is not an option inside an `AttributedString`.
     public static let imageGlyph = "▨"
+
+    /// What a CriticMarkup comment shows before its words, with the no-break space that
+    /// keeps the two on one line.
+    ///
+    /// Chosen the way `embedGlyph` was, and measured rather than assumed: CoreText reports
+    /// U+275D present in the system font itself at both the body and the caption size, on
+    /// macOS and on iOS, so unlike the other two glyphs here it needs no fallback font at
+    /// all. An SF Symbol is still not an option: a symbol's private-use codepoint falls
+    /// back to LastResort inside plain text and draws a box.
+    public static let commentGlyph = "❝\u{00A0}"
+
+    /// Is this comment an answer rather than a question?
+    ///
+    /// The rule is the prefix and nothing cleverer, because the file is the only record: a
+    /// note carries no authorship, so "who wrote this mark" can only be what the mark says.
+    /// A reply is tinted differently and is otherwise the same comment.
+    public static func isReply(_ comment: String) -> Bool {
+        comment.hasPrefix("Jesse ")
+    }
+
+    /// The opacity every mark's background is drawn at, in BOTH appearances.
+    ///
+    /// One number, for the reason written on the highlight case below: a tint that is
+    /// legible over light text and a solid bar over dark text is a tint somebody turns off.
+    static let markOpacity = 0.2
 
     public static func linkURL(forPath path: String) -> URL? {
         var components = URLComponents()
@@ -193,6 +251,29 @@ public enum VaultNoteRenderer {
                 out += run
             case .image(let alt, let target):
                 out += AttributedString(imageCaption(alt: alt, target: target))
+            case .criticHighlight(let s):
+                var run = AttributedString(s)
+                run.backgroundColor = .yellow.opacity(0.3)
+                out += run
+            case .criticComment(let s):
+                var run = AttributedString(commentGlyph + s)
+                // Blue for an answer, orange for the question it answers, so a note that
+                // has been gone through reads as a conversation rather than as a list.
+                run.backgroundColor = (isReply(s) ? Color.blue : .orange)
+                    .opacity(markOpacity)
+                run.foregroundColor = .secondary
+                run.inlinePresentationIntent = .emphasized
+                out += run
+            case .criticSubstitution(let old, let new):
+                out += struck(old)
+                // A NO-BREAK space, so a rewrite never wraps between the words being
+                // replaced and the words replacing them.
+                out += AttributedString("\u{00A0}")
+                out += added(new)
+            case .criticInsertion(let s):
+                out += added(s)
+            case .criticDeletion(let s):
+                out += struck(s)
             }
         }
         return out
@@ -204,6 +285,30 @@ public enum VaultNoteRenderer {
             ? VaultWikiLink.basename(target)
             : alt
         return imageGlyph + "\u{00A0}" + name
+    }
+
+    /// Words on their way OUT: struck through and red, which is the same treatment a
+    /// deletion mark gets and the old half of a rewrite gets, because they mean the same
+    /// thing.
+    ///
+    /// Colour and a line, never a font: a mark can sit inside a heading, and an explicit
+    /// font attribute would leave one word of that heading at body size. The same reason
+    /// the `.tag` case gives.
+    private static func struck(_ s: String) -> AttributedString {
+        var run = AttributedString(s)
+        run.strikethroughStyle = .single
+        run.foregroundColor = .red
+        return run
+    }
+
+    /// Words on their way IN: italic on green, which is what an insertion and the new half
+    /// of a rewrite both are. `inlinePresentationIntent` rather than `.italic()` for the
+    /// reason above: it asks for emphasis and leaves the font alone.
+    private static func added(_ s: String) -> AttributedString {
+        var run = AttributedString(s)
+        run.backgroundColor = .green.opacity(markOpacity)
+        run.inlinePresentationIntent = .emphasized
+        return run
     }
 
     private static func link(label: String, target: String,
