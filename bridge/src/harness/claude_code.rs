@@ -3382,12 +3382,12 @@ mod tests {
         }
 
         // Pinned: the slug and nothing metered.
-        std::env::set_var("JESSE_MODEL_OPUS_MODEL", "claude-opus-5[1m]");
+        std::env::set_var("JESSE_MODEL_OPUS_MODEL", "claude-opus-5-5");
         let pinned = ModelRegistry::from_env("");
         let env = env_of(&ActiveModel::from_registry(pinned.default_model()));
         assert_eq!(
             env.get("ANTHROPIC_MODEL").map(String::as_str),
-            Some("claude-opus-5[1m]")
+            Some("claude-opus-5-5")
         );
         for k in METERED {
             assert!(!env.contains_key(k), "a pinned opus must not carry {k}");

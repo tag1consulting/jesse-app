@@ -84,8 +84,9 @@ fn shadow_audit_tallies_costs_tripwires_and_watermark_across_runs() {
     // Cost: only A has usage → 1M in @1.40 + 1M cached @0.14 + 1M out @4.40 = 5.94.
     let fw = j["cost_usd"]["fireworks_cumulative"].as_f64().unwrap();
     assert!((fw - 5.94).abs() < 1e-6, "fireworks cost {fw}");
+    // Same vector on Opus 5.5: 1M in @4 + 1M cached @0.20 + 1M out @20 = 24.20.
     let opus = j["cost_usd"]["opus_equivalent"].as_f64().unwrap();
-    assert!((opus - 30.50).abs() < 1e-6, "opus-equivalent cost {opus}");
+    assert!((opus - 24.20).abs() < 1e-6, "opus-equivalent cost {opus}");
     // Three tripwires: leak, write attempt, and spend over $5/day.
     assert_eq!(j["tripwires"].as_array().unwrap().len(), 3);
     // Graduation: nowhere near the target.

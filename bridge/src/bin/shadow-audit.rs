@@ -29,7 +29,7 @@ use std::time::Duration;
 use jesse_bridge::{
     decide_pair, judge_prompt, parse_shadow_pairs, parse_verdict, percentile_ms,
     shadow_has_injection_leak, shadow_tripwires, tally_outcomes, GraduationProgress, PairOutcome,
-    ShadowAuditState, ShadowPair, ShadowUsage, OPUS_IN_PER_M, OPUS_OUT_PER_M,
+    ShadowAuditState, ShadowPair, ShadowUsage, OPUS_5_5_IN_PER_M, OPUS_5_5_OUT_PER_M,
 };
 
 fn home() -> String {
@@ -184,7 +184,7 @@ fn estimate_judge_spend(judged_now: &[ShadowPair]) -> f64 {
         input += (chars as f64 / 4.0) * 2.0; // two orderings
         output += 40.0 * 2.0;
     }
-    input / 1_000_000.0 * OPUS_IN_PER_M + output / 1_000_000.0 * OPUS_OUT_PER_M
+    input / 1_000_000.0 * OPUS_5_5_IN_PER_M + output / 1_000_000.0 * OPUS_5_5_OUT_PER_M
 }
 
 struct Report {

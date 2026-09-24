@@ -2312,9 +2312,10 @@ pub struct EffortScale {
     /// The values, weakest first. For a toggle exactly two: `[off, on]`.
     pub values: Vec<String>,
     /// What the harness sends when a turn names no effort — measured on the wire, not assumed.
-    /// The claude CLI sends `high` by itself (captured 2026-09-10), so a claude-code scale's
-    /// default is `high` and an app that shows no effort in the button label is telling the
-    /// truth about what runs.
+    /// The claude CLI's own default is per model: `high` for the models captured 2026-09-10,
+    /// `medium` for Opus 5.5 (captured 2026-09-24). A claude-code scale's default is whatever
+    /// its model's CLI default is, so an app that shows no effort in the button label is
+    /// telling the truth about what runs.
     pub default: String,
 }
 
@@ -2357,29 +2358,43 @@ pub fn harness_effort_values(harness: &str) -> Option<Vec<&'static str>> {
 /// which takes the effort control out of the picker for that model.
 ///
 /// **THE BUILT-IN SCALES ARE MEASURED, AND THEY ARE NOT THE VENDOR TABLES.** Each was set from
-/// live turns on 2026-09-10 — the same hard reasoning prompt at each level, two samples per
-/// level — and a value is in a scale only when it moved output measurably against its
-/// neighbours:
+/// live turns — the same hard reasoning prompt at each level, two samples per level — and a
+/// value is in a scale only when it moved output measurably against its neighbours. `*` marks
+/// the model's default, the value its CLI sends when a turn names none:
 ///
-/// | model        | low          | high (default) | max              | declared          |
-/// |--------------|--------------|----------------|------------------|-------------------|
-/// | GLM 5.3      | 1,176 / 2,824| 6,234 / 5,976  | 16,000+ / 10,531 | low, high, max    |
-/// | Qwen 3.8 Max | 4,197 / 6,286| 8,365 / 8,953  | 9,580 / 11,803   | low, high, max    |
-/// | Opus 5       | 976 / 1,164  | 682 / 1,774    | 4,974 / 4,095    | high, max         |
-/// | Fable 5.1    | 973 / 3,470  | 3,949 / 2,087  | 5,635 / 5,547    | high, max         |
-/// | Kimi K3      | 6,039 / 3,035| —              | 3,575 / 10,694   | none              |
+/// | model (measured)         | low           | medium         | high           | xhigh          | max              | declared            |
+/// |--------------------------|---------------|----------------|----------------|----------------|------------------|---------------------|
+/// | GLM 5.3 (09-10)          | 1,176 / 2,824 | 5,462 / 3,646  | 6,234 / 5,976* | —              | 16,000+ / 10,531 | low, high, max      |
+/// | Qwen 3.8 Max (09-10)     | 4,197 / 6,286 | —              | 8,365 / 8,953* | —              | 9,580 / 11,803   | low, high, max      |
+/// | Opus 5.5 (09-24)         | 3,547 / 2,728 | 4,418 / 4,327* | 6,514 / 5,312  | 8,220 / 6,647  | 34,436 / 33,839  | medium, high, max   |
+/// | Opus 5 (09-10, superseded)| 976 / 1,164  | —              | 682 / 1,774*   | —              | 4,974 / 4,095    | (was high, max)     |
+/// | Fable 5.1 (09-10)        | 973 / 3,470   | —              | 3,949 / 2,087* | —              | 5,635 / 5,547    | high, max           |
+/// | Kimi K3 (09-10)          | 6,039 / 3,035 | —              | —              | —              | 3,575 / 10,694   | none                |
 ///
-/// (Output tokens. GLM's `medium` measured with its `high`, 5,462 / 3,646, so it is left out.
-/// Opus and Fable were re-run on a second prompt with the same result: `low` indistinguishable
-/// from the default, `max` two to four times the output.) Kimi declares nothing because
-/// `low` and `max` overlapped completely on two prompts — its vendor documents three levels,
-/// and on this surface they did not do anything a person could see.
+/// (Output tokens; dates are 2026. GLM's `medium` measured with its `high`, so it is left out.
+/// Opus 5 and Fable were re-run on a second prompt with the same result: `low` indistinguishable
+/// from the default, `max` two to four times the output.) Kimi declares nothing because `low`
+/// and `max` overlapped completely on two prompts — its vendor documents three levels, and on
+/// this surface they did not do anything a person could see.
 ///
-/// **The default is always `high`**: it is what the claude CLI sends when a turn names no
-/// effort (captured on the wire), so an override that leaves `high` out is refused with a
-/// warning and the built-in scale stands. A picker that did not list the value a turn actually
-/// runs at would be describing a model that is not the one answering. The values themselves are
-/// held to what the harness can deliver by the startup gate.
+/// **Opus 5.5 was measured on 2026-09-24**, on the pinned CLI (2.1.281) with
+/// `ANTHROPIC_MODEL=claude-opus-5-5` and no API-key variables, in two sweeps. The row above is
+/// the second; the first (the same prompt without a no-tools sentence) read `medium` 4,076 /
+/// 4,967, `high` 5,846 / 5,532, `xhigh` 10,509 / (did not finish), `max` 32,052 / 23,028, and
+/// its two `low` samples wrote tool calls as text into a tool-less turn, so they measured
+/// nothing. `high` sat above `medium` in all four samples of both sweeps, and `max` ran five to
+/// eight times `medium`, so both are declared. `low` has one clean sweep and `xhigh` all but
+/// touched `high` in it (6,647 against 6,514), so neither cleared the bar; both are
+/// re-declarable from the environment if a workload shows otherwise.
+///
+/// **The default is the model's CLI default, captured on the wire, and it is per model**: with
+/// no `--effort` the CLI sends `output_config.effort = "medium"` for `claude-opus-5-5` (pinned
+/// or as the unpinned default) and `"high"` for `claude-fable-5-1` (captured 2026-09-24 against a
+/// local listener, nothing sent to a provider); `high` for the rest, captured 2026-09-10. An
+/// override that leaves out the built-in's default is refused with a warning and the built-in
+/// scale stands. A picker that did not list the value a turn actually runs at would be
+/// describing a model that is not the one answering. The values themselves are held to what the
+/// harness can deliver by the startup gate.
 fn effort_from_env(prefix: &str, id: &str, built_in: Option<EffortScale>) -> Option<EffortScale> {
     let Ok(raw) = std::env::var(format!("{prefix}_EFFORT")) else {
         return built_in;
@@ -2392,17 +2407,23 @@ fn effort_from_env(prefix: &str, id: &str, built_in: Option<EffortScale>) -> Opt
     if values.is_empty() {
         return None;
     }
-    if !values.iter().any(|v| v == "high") {
+    // The value a turn that names no effort runs at is the built-in's default, not a
+    // constant: the CLI's own default is per model (`medium` for Opus 5.5, `high` for the
+    // rest). A model with no built-in scale falls back to `high`, as before.
+    let default = built_in
+        .as_ref()
+        .map_or_else(|| "high".to_string(), |s| s.default.clone());
+    if !values.contains(&default) {
         eprintln!(
-            "jesse-bridge: WARNING {prefix}_EFFORT leaves out 'high', the value a turn that \
-             names no effort runs at; keeping model '{id}''s built-in effort scale."
+            "jesse-bridge: WARNING {prefix}_EFFORT leaves out '{default}', the value a turn \
+             that names no effort runs at; keeping model '{id}''s built-in effort scale."
         );
         return built_in;
     }
     Some(EffortScale {
         kind: EffortKind::Scale,
         values,
-        default: "high".to_string(),
+        default,
     })
 }
 
@@ -3680,10 +3701,10 @@ impl ActiveModel {
             // Ambient opus runs on `claude-code`, which reads none of this.
             codex: CodexTuning::default(),
             price: PriceDeck {
-                in_per_m: OPUS_IN_PER_M,
-                cached_per_m: OPUS_CACHED_PER_M,
+                in_per_m: OPUS_5_5_IN_PER_M,
+                cached_per_m: OPUS_5_5_CACHED_PER_M,
                 cache_write_per_m: None,
-                out_per_m: OPUS_OUT_PER_M,
+                out_per_m: OPUS_5_5_OUT_PER_M,
             },
             // Ambient opus sees images natively (CLI Read tool); never uses the helper layer.
             vision: Vec::new(),
@@ -3734,7 +3755,9 @@ impl ActiveModel {
 fn opus_entry() -> RegistryModel {
     RegistryModel {
         family: Some("Claude".to_string()),
-        effort: Some(EffortScale::scale(&["high", "max"], "high")),
+        // Opus 5.5's measured scale and its CLI default (see [`effort_from_env`]). Unpinned,
+        // the CLI's default model is Opus 5.5 too (2026-09-24), so this describes that turn.
+        effort: Some(EffortScale::scale(&["medium", "high", "max"], "medium")),
         codex: CodexTuning::default(),
         id: DEFAULT_MODEL_ID.to_string(),
         label: "Claude Opus".to_string(),
@@ -3759,10 +3782,10 @@ fn opus_entry() -> RegistryModel {
         quirks: DirectQuirks::default(),
         thinking: None,
         price: PriceDeck {
-            in_per_m: OPUS_IN_PER_M,
-            cached_per_m: OPUS_CACHED_PER_M,
+            in_per_m: OPUS_5_5_IN_PER_M,
+            cached_per_m: OPUS_5_5_CACHED_PER_M,
             cache_write_per_m: None,
-            out_per_m: OPUS_OUT_PER_M,
+            out_per_m: OPUS_5_5_OUT_PER_M,
         },
         health: HealthConfig::default(),
         // Ambient opus already sees images through the CLI's native Read tool, so it is
@@ -3784,11 +3807,20 @@ fn opus_entry() -> RegistryModel {
 /// no wire, no level, no base URL, and a `[[models]]` entry that tries to redefine `opus` is
 /// still refused.
 ///
-/// **Why the default pins nothing, measured rather than assumed:** on 2026-09-10 the CLI's own
-/// default on the subscription login was `claude-opus-5[1m]`, the 1M-context variant. Pinning
-/// the bare `claude-opus-5` would have quietly narrowed the window. An operator who pins — which
-/// is worth doing alongside `fable`, so "Opus" in the picker stays Opus if the CLI's default
-/// ever moves — should pin `claude-opus-5[1m]`, which the login accepts.
+/// **What to pin today, measured rather than assumed: `claude-opus-5-5`.** On 2026-09-24 a real
+/// `-p` turn on the pinned CLI (2.1.281) with `ANTHROPIC_MODEL=claude-opus-5-5` and every
+/// API-key variable removed reported `apiKeySource: "none"` and `model: "claude-opus-5-5"`, and
+/// billed its usage to `claude-opus-5-5` with a 1,000,000-token context window: 1M is Opus
+/// 5.5's standard window, so the plain slug narrows nothing. Asked for `claude-opus-5-5[1m]`,
+/// the login accepted the suffix and served the same `claude-opus-5-5` with the same window;
+/// there is no separate 1M variant to pin. Pinning is worth doing alongside `fable`, so "Opus"
+/// in the picker stays Opus 5.5 if the CLI's default ever moves.
+///
+/// History: on 2026-09-10 the CLI's own default was `claude-opus-5[1m]`, and the bare
+/// `claude-opus-5` would have narrowed the window, which is why the advice then was to pin the
+/// suffixed form. That no longer applies to 5.5. The unpinned default is still left alone,
+/// so an operator who sets nothing gets exactly the CLI's choice (on 2026-09-24,
+/// `claude-opus-5-5`).
 ///
 /// [`opus_entry`] itself stays free of the environment, so [`ModelRegistry::opus_only`] — the
 /// test fixture and the no-config baseline — cannot be moved by a stray variable.
@@ -5121,7 +5153,7 @@ mod tests {
     fn the_opus_only_registry_pins_nothing_whatever_the_environment_says() {
         let _g = ENV_LOCK.lock_ok();
         let saved = std::env::var("JESSE_MODEL_OPUS_MODEL").ok();
-        std::env::set_var("JESSE_MODEL_OPUS_MODEL", "claude-opus-5[1m]");
+        std::env::set_var("JESSE_MODEL_OPUS_MODEL", "claude-opus-5-5");
         assert_eq!(ModelRegistry::opus_only().default_model().login_model, None);
         match saved {
             Some(v) => std::env::set_var("JESSE_MODEL_OPUS_MODEL", v),
@@ -5301,11 +5333,16 @@ mod tests {
             scale(qwen_env_entry(DEFAULT_HEALTH_INTERVAL_SECS, None)),
             lhm
         );
+        // Opus 5.5 (2026-09-24): its CLI default is `medium`, not `high`.
+        let mhm = Some((
+            vec!["medium".to_string(), "high".into(), "max".into()],
+            "medium".to_string(),
+        ));
         assert_eq!(scale(fable_env_entry()), hm);
-        assert_eq!(scale(opus_env_entry()), hm);
+        assert_eq!(scale(opus_env_entry()), mhm);
         assert_eq!(
             scale(opus_entry()),
-            hm,
+            mhm,
             "the env-free fixture carries it too"
         );
         assert_eq!(
@@ -5350,6 +5387,23 @@ mod tests {
             lhm,
             "an override without 'high' keeps the built-in scale"
         );
+        // The required value is the BUILT-IN's default, not a constant: for opus it is
+        // `medium`, so an override without it is refused even though it lists `high`...
+        std::env::set_var("JESSE_MODEL_OPUS_EFFORT", "high,max");
+        assert_eq!(
+            scale(opus_env_entry()),
+            mhm,
+            "an opus override without 'medium' keeps the built-in scale"
+        );
+        // ...and one with it is taken, still defaulting to `medium`.
+        std::env::set_var("JESSE_MODEL_OPUS_EFFORT", "low,medium,max");
+        assert_eq!(
+            scale(opus_env_entry()),
+            Some((
+                vec!["low".to_string(), "medium".into(), "max".into()],
+                "medium".to_string()
+            ))
+        );
 
         for (k, v) in saved {
             match v {
@@ -5380,28 +5434,61 @@ mod tests {
         assert!(unpinned.backend.is_none());
         assert!(matches!(unpinned.kind, ModelKind::Ambient));
 
-        // The [1m] form, because that is what the CLI's own default was when this was
-        // measured: pinning the bare slug would narrow the window.
-        std::env::set_var("JESSE_MODEL_OPUS_MODEL", "claude-opus-5[1m]");
-        std::env::set_var("JESSE_MODEL_OPUS_VERSION", "5");
+        // The plain slug: on 2026-09-24 the login served `claude-opus-5-5` for it with a 1M
+        // window, and served the same model for the `[1m]` form.
+        std::env::set_var("JESSE_MODEL_OPUS_MODEL", "claude-opus-5-5");
+        std::env::set_var("JESSE_MODEL_OPUS_VERSION", "5.5");
         let pinned = opus_env_entry();
-        assert_eq!(pinned.login_model.as_deref(), Some("claude-opus-5[1m]"));
+        assert_eq!(pinned.login_model.as_deref(), Some("claude-opus-5-5"));
         assert_eq!(
             pinned.subagent_model.as_deref(),
-            Some("claude-opus-5[1m]"),
+            Some("claude-opus-5-5"),
             "the subagents follow the pin"
         );
-        assert_eq!(pinned.label, "Claude Opus 5");
+        assert_eq!(pinned.label, "Claude Opus 5.5");
         // Nothing else about the ambient contract moved.
         assert!(matches!(pinned.kind, ModelKind::Ambient));
         assert!(pinned.backend.is_none(), "no base url and no token");
         assert!(pinned.configured && pinned.level == Capability::Write);
+
+        // The pin is a pass-through, not a whitelist: a slug this build has never heard of
+        // reaches the login exactly as written.
+        std::env::set_var("JESSE_MODEL_OPUS_MODEL", "claude-opus-9-9[1m]");
+        let arbitrary = opus_env_entry();
+        assert_eq!(
+            arbitrary.login_model.as_deref(),
+            Some("claude-opus-9-9[1m]")
+        );
+        assert_eq!(
+            arbitrary.subagent_model.as_deref(),
+            Some("claude-opus-9-9[1m]")
+        );
 
         for (k, v) in saved {
             match v {
                 Some(val) => std::env::set_var(k, val),
                 None => std::env::remove_var(k),
             }
+        }
+    }
+
+    /// The compiled-in Opus deck is Opus 5.5's, on every path that builds the ambient entry: the
+    /// env-free fixture, the running bridge's entry, and the `ActiveModel` the title one-shot
+    /// and the no-switch callers pass.
+    #[test]
+    fn the_opus_deck_is_opus_5_5s() {
+        let _g = ENV_LOCK.lock_ok();
+        let deck = |p: PriceDeck| (p.in_per_m, p.cached_per_m, p.out_per_m);
+        for (path, d) in [
+            ("opus_entry", deck(opus_entry().price)),
+            ("opus_env_entry", deck(opus_env_entry().price)),
+            ("ActiveModel::ambient", deck(ActiveModel::ambient().price)),
+        ] {
+            assert_eq!(
+                d,
+                (4.0, 0.20, 20.0),
+                "{path}: Opus 5.5's deck — its cache reads are 0.05x input, not a tenth"
+            );
         }
     }
 

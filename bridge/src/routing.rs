@@ -360,9 +360,9 @@ mod tests {
 
         // The floor, pinned: opus's own slug, read off the registry's default entry.
         let mut pinned = cfg_with(vec![], &[]);
-        pinned.model_registry.models[0].login_model = Some("claude-opus-5[1m]".to_string());
+        pinned.model_registry.models[0].login_model = Some("claude-opus-5-5".to_string());
         let floor = route_job(&pinned, &all_healthy(&pinned), RoutedJob::Title, None, None);
-        assert_eq!(floor.login_model.as_deref(), Some("claude-opus-5[1m]"));
+        assert_eq!(floor.login_model.as_deref(), Some("claude-opus-5-5"));
     }
 
     /// THE BUG THIS CHECK EXISTS FOR, stated as a test rather than as a comment.
