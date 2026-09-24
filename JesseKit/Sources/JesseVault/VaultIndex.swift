@@ -357,6 +357,14 @@ public final class VaultIndex: @unchecked Sendable {
         }
     }
 
+    /// Every folder in the vault, with the number of notes under each.
+    ///
+    /// Derived from `allPaths()` rather than stored — see `VaultFolderTree` for why a
+    /// `folders` table would be the expensive answer to a cheap question.
+    public func folders() -> [VaultFolderCount] {
+        VaultFolderTree.folders(fromPaths: allPaths())
+    }
+
     /// The chunk ids recorded for one file, in order.
     ///
     /// Exists for the incremental reindex's test: "an unchanged file is not touched" is

@@ -170,6 +170,57 @@ final class VaultSearchTests: XCTestCase {
         XCTAssertEqual(outcome.expansionCaption, "Also searched: oven")
     }
 
+    /// **THE FOLDER BINDS THE WIDENING TOO.** The typed query is thin, so the tier runs
+    /// and the expander offers a term that matches a note OUTSIDE the chosen folder. The
+    /// screen says it is showing one folder, so that note must not appear — and the term
+    /// must not be named either, because a caption claiming a term "also searched" for a
+    /// row nobody can see is worse than no caption.
+    func testTheExpansionTierNeverReachesOutsideTheChosenFolder() async throws {
+        let index = try indexed([
+            ("Strands/Kiln.md", "# Kiln\n\nThe arch is rebuilt.\n"),
+            ("Bicycle/Oven.md", "# Oven\n\nThe bread oven is separate.\n"),
+        ])
+        let expander = FakeExpander(terms: ["oven"])
+        let searcher = VaultSearcher(index: index, folder: "Strands")
+
+        let outcome = await searcher.search("kiln", expander: expander)
+
+        XCTAssertEqual(expander.calls, ["kiln"], "the tier still ran; it just found nothing")
+        XCTAssertEqual(outcome.hits.map(\.path), ["Strands/Kiln.md"])
+        XCTAssertEqual(outcome.expansionTerms, [], "no term contributed, so none is named")
+        XCTAssertNil(outcome.expansionCaption)
+    }
+
+    /// The same expander, the same corpus, with no folder held: the alternate term DOES
+    /// contribute, which is what makes the test above a claim about the folder rather
+    /// than about a dry expander.
+    func testTheSameAlternateTermContributesWithNoFolderHeld() async throws {
+        let index = try indexed([
+            ("Strands/Kiln.md", "# Kiln\n\nThe arch is rebuilt.\n"),
+            ("Bicycle/Oven.md", "# Oven\n\nThe bread oven is separate.\n"),
+        ])
+        let searcher = VaultSearcher(index: index)
+
+        let outcome = await searcher.search("kiln", expander: FakeExpander(terms: ["oven"]))
+
+        XCTAssertEqual(outcome.hits.map(\.path), ["Strands/Kiln.md", "Bicycle/Oven.md"])
+        XCTAssertEqual(outcome.expansionTerms, ["oven"])
+    }
+
+    /// A folder is given WITHOUT its trailing slash by the screen; the searcher adds it,
+    /// so `Work` cannot answer with `Workshop/`.
+    func testAFolderIsMatchedOnAPathBoundary() throws {
+        let index = try indexed([
+            ("Work/Bench.md", "# Bench\n\nThe bisque schedule.\n"),
+            ("Workshop/Kiln.md", "# Kiln\n\nThe bisque schedule.\n"),
+        ])
+
+        XCTAssertEqual(VaultSearcher(index: index, folder: "Work").base("bisque")
+                        .hits.map(\.path), ["Work/Bench.md"])
+        XCTAssertEqual(VaultSearcher(index: index, folder: "Workshop").base("bisque")
+                        .hits.map(\.path), ["Workshop/Kiln.md"])
+    }
+
     /// AT FIVE HITS the model is never spent: a plentiful result set is never widened. The
     /// same threshold the conversation list uses, and the same `shouldExpand` deciding it.
     func testAPlentifulResultSetNeverSpendsTheModel() async throws {

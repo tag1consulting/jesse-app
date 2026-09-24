@@ -38,6 +38,60 @@ final class VaultIndexTests: XCTestCase {
         return try index.reindex(scan: scan, read: { try file.read(relativePath: $0) })
     }
 
+    // MARK: - The folder list
+
+    /// The folders the picker offers, over the standing corpus. `.obsidian/` is not a
+    /// folder in this list because it is not indexed at all, which is the same reason it
+    /// is not searchable.
+    func testTheFoldersOfTheIndexAreTheFoldersOfTheCorpus() throws {
+        VaultFixture.writeCorpus(in: root)
+        VaultFixture.write("# Today\n\nA note at the root.", to: "Today.md", in: root)
+        VaultFixture.write("# Old\n\nArchived.", to: "Workshop/archive/Old.md", in: root)
+        let index = try makeIndex()
+        try reindex(index)
+
+        XCTAssertEqual(index.folders(), [
+            VaultFolderCount(path: "Bicycle", noteCount: 1),
+            VaultFolderCount(path: "People", noteCount: 1),
+            VaultFolderCount(path: "Suppliers", noteCount: 1),
+            VaultFolderCount(path: "Workshop", noteCount: 3),
+            VaultFolderCount(path: "Workshop/archive", noteCount: 1),
+        ])
+        XCTAssertFalse(index.folders().contains { $0.path.hasPrefix(".obsidian") },
+                       "a dot directory is not indexed, so it is not a folder to pick")
+    }
+
+    /// **The prefix trap, through the database.** `Work` and `Workshop` are two folders
+    /// and one is a string prefix of the other; the trailing slash on the bound prefix is
+    /// what keeps the narrowed list honest, in the recents query and in search alike.
+    func testAFolderThatIsAStringPrefixOfAnotherMatchesOnlyItself() throws {
+        VaultFixture.write("# Bench\n\nThe bisque schedule.", to: "Work/Bench.md", in: root)
+        VaultFixture.write("# Kiln\n\nThe bisque schedule.", to: "Workshop/Kiln.md", in: root)
+        let index = try makeIndex()
+        try reindex(index)
+
+        XCTAssertEqual(index.recentFiles(limit: 30, underPrefix: "Work/").map(\.path),
+                       ["Work/Bench.md"])
+        XCTAssertEqual(index.search(expression: "bisque", limit: 50,
+                                    underPrefix: "Work/").map(\.path),
+                       ["Work/Bench.md"])
+    }
+
+    /// A term that exists only OUTSIDE the folder answers with nothing, rather than with
+    /// the note it found elsewhere.
+    func testATermThatLivesOutsideTheFolderIsNotFoundInsideIt() throws {
+        VaultFixture.write("# Kiln\n\nThe arch is rebuilt.", to: "Strands/Kiln.md", in: root)
+        VaultFixture.write("# Bike\n\nThe bottom bracket creaks.",
+                           to: "Bicycle/Bike.md", in: root)
+        let index = try makeIndex()
+        try reindex(index)
+
+        XCTAssertEqual(index.search(expression: "bracket", limit: 50,
+                                    underPrefix: "Strands/"), [])
+        XCTAssertEqual(index.search(expression: "bracket", limit: 50).map(\.path),
+                       ["Bicycle/Bike.md"], "it is found, just not in that folder")
+    }
+
     // MARK: - The platform fact the whole design rests on
 
     /// FTS5 IS COMPILED IN. Apple ships it on iOS and macOS, and this measures rather than
