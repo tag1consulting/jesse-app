@@ -39,6 +39,10 @@ final class TodayDashboardModelTests: XCTestCase {
         /// says whether it carried a tag. `.some(nil)` is an unconditional fetch.
         private(set) var lastIfNoneMatch: String??
         private(set) var lastIfMatch: String?
+        /// EVERY `If-Match` sent, in order, across all four mutations. `lastIfMatch`
+        /// cannot express a retry — the whole assertion for one is that the SECOND
+        /// attempt carried a different tag from the first.
+        private(set) var ifMatchLog: [String] = []
         private(set) var lastCheck: (id: String, checked: Bool, evidence: String?)?
         private(set) var lastMove: (id: String, op: TodayMoveOp)?
         private(set) var lastPostpone: (id: String, deferred: Bool)?
@@ -65,6 +69,7 @@ final class TodayDashboardModelTests: XCTestCase {
                        day: String?, ifMatch: String) async throws -> TodayMutationResult {
             lastCheck = (id, checked, evidence)
             lastIfMatch = ifMatch
+            ifMatchLog.append(ifMatch)
             lastAt = at
             let out = outcome(checks, checkCount)
             checkCount += 1
@@ -76,6 +81,7 @@ final class TodayDashboardModelTests: XCTestCase {
             lastMove = (id, op)
             moveLog.append((id, op))
             lastIfMatch = ifMatch
+            ifMatchLog.append(ifMatch)
             lastAt = at
             let out = outcome(moves, moveCount)
             moveCount += 1
@@ -86,6 +92,7 @@ final class TodayDashboardModelTests: XCTestCase {
                       day: String?, ifMatch: String) async throws -> TodayMutationResult {
             lastPostpone = (id, deferred)
             lastIfMatch = ifMatch
+            ifMatchLog.append(ifMatch)
             lastAt = at
             let out = outcome(postpones, postponeCount)
             postponeCount += 1
@@ -95,6 +102,7 @@ final class TodayDashboardModelTests: XCTestCase {
         func glance(id: String, at: Date, ifMatch: String) async throws -> TodayMutationResult {
             lastGlanceId = id
             lastIfMatch = ifMatch
+            ifMatchLog.append(ifMatch)
             lastAt = at
             let out = outcome(glances, glanceCount)
             glanceCount += 1
@@ -420,28 +428,116 @@ final class TodayDashboardModelTests: XCTestCase {
         XCTAssertFalse(m.isOffline, "a 410 is an answer, not a failure")
     }
 
-    /// `412`: our ETag is stale, so the tap was aimed at a document that no longer
-    /// exists. Drop the optimism and refetch — re-sending against a fresh tag would
-    /// apply the user's intent to a line they never saw.
-    func testA412DropsTheOptimismAndRefetchesWithoutRetrying() async {
-        var rewritten = Fixt.snapshot(etag: "\"tag-9\"")
-        rewritten.sections[0].items[1].lead = "Reply to Ada — rewritten by the agent."
+    /// THE 2026-09-23 BUG, from the app's side. A `412` used to mean "drop the tap and
+    /// say nothing", which was right about a rewritten document and wrong about the
+    /// common case: the tag also moved when a background brief landed, and the box
+    /// sprang open taking the user's evidence note with it. Same day, same item, only
+    /// the tag moved — so it goes again, once, under the fresh tag.
+    func testA412WithTheItemStillThereRetriesOnceWithTheFreshTag() async {
+        var checked = Fixt.snapshot(etag: "\"tag-9\"", documentEtag: "\"doc-9\"")
+        checked.sections[0].items[1].checked = true
         let fake = FakeClient()
-        fake.fetches = [.snapshot(Fixt.snapshot(etag: "\"tag-1\"")), .snapshot(rewritten)]
+        fake.fetches = [.snapshot(Fixt.snapshot(etag: "\"tag-1\"", documentEtag: "\"doc-1\"")),
+                        .snapshot(Fixt.snapshot(etag: "\"tag-9\"", documentEtag: "\"doc-9\""))]
+        fake.checks = [.preconditionFailed, .snapshot(checked)]
+        let m = model(fake)
+        await m.load()
+
+        await m.check(id: Fixt.ada, checked: true, evidence: "done")
+
+        XCTAssertEqual(fake.checkCount, 2, "the tap goes again")
+        XCTAssertEqual(fake.ifMatchLog, ["\"doc-1\"", "\"doc-9\""],
+                       "and the second attempt carries the tag the refetch handed back")
+        XCTAssertEqual(m.snapshot?.item(id: Fixt.ada)?.checked, true, "the box stays ticked")
+        XCTAssertEqual(fake.lastCheck?.evidence, "done",
+                       "and the note the user typed is sent with it, both times")
+        XCTAssertNil(m.notice, "nothing was refused, so there is nothing to say")
+        XCTAssertFalse(m.isOffline)
+    }
+
+    /// The case the old silence was right about — and still is, except for the silence.
+    /// The lead was rewritten, so the id the tap addressed is not in the document any
+    /// more; re-sending would tick a line the user never saw. The box goes back, and the
+    /// note comes back with the refusal rather than disappearing.
+    func testA412WithTheItemRewordedPutsTheBoxBackAndShowsTheNote() async {
+        var rewritten = Fixt.snapshot(etag: "\"tag-9\"", documentEtag: "\"doc-9\"")
+        rewritten.sections[0].items[1].lead = "Reply to Ada — rewritten by the agent."
+        rewritten.sections[0].items[1].id = "1111deadbeef"
+        let fake = FakeClient()
+        fake.fetches = [.snapshot(Fixt.snapshot(etag: "\"tag-1\"", documentEtag: "\"doc-1\"")),
+                        .snapshot(rewritten)]
         fake.checks = [.preconditionFailed]
         let m = model(fake)
         await m.load()
 
         await m.check(id: Fixt.ada, checked: true, evidence: "done")
 
-        XCTAssertEqual(fake.checkCount, 1, "the tap is NOT retried against the fresh tag")
+        XCTAssertEqual(fake.checkCount, 1, "the tap is NOT retried against a document it never saw")
         XCTAssertEqual(fake.fetchCount, 2, "it refetched instead")
-        XCTAssertEqual(m.etag, "\"tag-9\"", "and adopted the tag the refetch carried")
+        XCTAssertEqual(m.etag, "\"tag-9\"", "and adopted the tags the refetch carried")
+        XCTAssertEqual(m.documentEtag, "\"doc-9\"")
         XCTAssertFalse(m.isPending(Fixt.ada))
         XCTAssertTrue(m.overlay.isEmpty, "no optimistic state survives a stale precondition")
-        XCTAssertEqual(m.snapshot?.item(id: Fixt.ada)?.checked, false,
-                       "the box is back where the file says it is")
+        XCTAssertNil(m.snapshot?.item(id: Fixt.ada),
+                     "the id the tap addressed is not in the rewritten document at all")
+        XCTAssertEqual(m.snapshot?.item(id: "1111deadbeef")?.checked, false,
+                       "and the line that replaced it is unticked, as the file says")
+        XCTAssertEqual(m.notice, TodayDashboardModel.staleNotice(note: "done"))
+        XCTAssertTrue(try XCTUnwrap(m.notice).contains("done"),
+                      "the note is handed back verbatim, never swallowed")
         XCTAssertFalse(m.isOffline)
+    }
+
+    /// One retry, not a loop. Losing the race twice means something else is writing the
+    /// day file continuously, and a client that quietly went round again would be an
+    /// invisible retry loop — the same rule the offline replayer has always had.
+    func testASecond412StopsAndShowsTheNote() async {
+        let fake = FakeClient()
+        fake.fetches = [.snapshot(Fixt.snapshot(etag: "\"tag-1\"", documentEtag: "\"doc-1\"")),
+                        .snapshot(Fixt.snapshot(etag: "\"tag-9\"", documentEtag: "\"doc-9\""))]
+        fake.checks = [.preconditionFailed]
+        let m = model(fake)
+        await m.load()
+
+        await m.check(id: Fixt.ada, checked: true, evidence: "done")
+
+        XCTAssertEqual(fake.checkCount, 2, "it tried once more, and then stopped")
+        XCTAssertTrue(m.overlay.isEmpty)
+        XCTAssertEqual(m.snapshot?.item(id: Fixt.ada)?.checked, false)
+        XCTAssertTrue(try XCTUnwrap(m.notice).contains("done"),
+                      "and the note survives the second refusal too")
+    }
+
+    /// The two tags, each on its own contract: the write tag on `If-Match`, the cache
+    /// tag on `If-None-Match`. Sending the cache tag as the precondition is the whole
+    /// bug, and sending the write tag as the conditional-GET tag would stop the screen
+    /// ever refreshing a brief.
+    func testMutationsSendTheDocumentTagAndConditionalGetSendsTheEtag() async {
+        let fake = FakeClient()
+        fake.fetches = [.snapshot(Fixt.snapshot(etag: "\"tag-1\"", documentEtag: "\"doc-1\""))]
+        let m = model(fake)
+        await m.load()
+
+        await m.check(id: Fixt.ada, checked: true)
+        XCTAssertEqual(fake.lastIfMatch, "\"doc-1\"", "a mutation sends the DOCUMENT tag")
+
+        await m.load()
+        XCTAssertEqual(fake.lastIfNoneMatch, .some("\"tag-1\""),
+                       "and a conditional GET still sends the cache tag")
+    }
+
+    /// A bridge that predates `documentEtag` sends only the one tag, and accepts it.
+    /// Falling back rather than refusing is what keeps an app talking to it.
+    func testAnOlderBridgeWithNoDocumentTagFallsBackToTheEtag() async {
+        let fake = FakeClient()
+        fake.fetches = [.snapshot(Fixt.snapshot(etag: "\"tag-1\""))]
+        let m = model(fake)
+        await m.load()
+
+        XCTAssertNil(m.documentEtag)
+        await m.check(id: Fixt.ada, checked: true)
+
+        XCTAssertEqual(fake.lastIfMatch, "\"tag-1\"")
     }
 
     func testA428DropsTheOptimismAndRefetches() async {

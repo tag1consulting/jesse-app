@@ -311,11 +311,20 @@ public struct TodayCounts: Decodable, Equatable, Hashable, Sendable {
 /// morning routine has run there is legitimately no file, and the screen should
 /// render an empty day rather than an error).
 ///
-/// `generatedAt`, `etag` and `pending` are added by the ENDPOINT, not by the
-/// parser, which is why they are optional here: `etag` is echoed inside the body so
-/// a client that stored the payload need not also keep headers; `pending` appears
+/// `generatedAt`, `etag`, `documentEtag` and `pending` are added by the ENDPOINT, not
+/// by the parser, which is why they are optional here: `etag` is echoed inside the body
+/// so a client that stored the payload need not also keep headers; `pending` appears
 /// only on a mutation response and means "journaled and visible here, but not in
 /// the file yet — a turn is mid-write and replay will land it".
+///
+/// **`etag` and `documentEtag` are two tags for two jobs.** `etag` is the CACHE tag: it
+/// moves whenever anything the screen renders changes, including a background brief's
+/// verdict, a glance or a postponement, and it is what `If-None-Match` is evaluated
+/// against. `documentEtag` is the WRITE tag: it moves only when `Today.md` itself
+/// changes, and it is what a mutation sends as `If-Match`. Sending the cache tag as the
+/// precondition is what made a ticked box spring back open, taking its evidence note
+/// with it, whenever a brief happened to land in the same second (2026-09-23). It is
+/// optional because a bridge older than 0.148.0 does not send it — see `writeTag`.
 public struct TodaySnapshot: Decodable, Equatable, Sendable {
     public var title: String?
     public var date: String?
@@ -326,12 +335,19 @@ public struct TodaySnapshot: Decodable, Equatable, Sendable {
     public var missing: Bool
     public var generatedAt: String?
     public var etag: String?
+    public var documentEtag: String?
     public var pending: Bool?
+
+    /// The tag a MUTATION sends as `If-Match`, with the fallback that keeps this app
+    /// talking to a bridge that predates `documentEtag`: on an older bridge the cache
+    /// tag is the only tag there is, and the bridge accepts it.
+    public var writeTag: String? { documentEtag ?? etag }
 
     public init(title: String? = nil, date: String? = nil, narrative: String? = nil,
                 leadItems: [TodayItem] = [], sections: [TodaySection] = [],
                 counts: TodayCounts = TodayCounts(), missing: Bool = false,
-                generatedAt: String? = nil, etag: String? = nil, pending: Bool? = nil) {
+                generatedAt: String? = nil, etag: String? = nil,
+                documentEtag: String? = nil, pending: Bool? = nil) {
         self.title = title
         self.date = date
         self.narrative = narrative
@@ -341,6 +357,7 @@ public struct TodaySnapshot: Decodable, Equatable, Sendable {
         self.missing = missing
         self.generatedAt = generatedAt
         self.etag = etag
+        self.documentEtag = documentEtag
         self.pending = pending
     }
 
@@ -349,7 +366,7 @@ public struct TodaySnapshot: Decodable, Equatable, Sendable {
     /// bridge stops emitting cannot blank the screen.
     private enum CodingKeys: String, CodingKey {
         case title, date, narrative, leadItems, sections, counts, missing
-        case generatedAt, etag, pending
+        case generatedAt, etag, documentEtag, pending
     }
 
     public init(from decoder: any Decoder) throws {
@@ -363,6 +380,7 @@ public struct TodaySnapshot: Decodable, Equatable, Sendable {
         missing = try c.decodeIfPresent(Bool.self, forKey: .missing) ?? false
         generatedAt = try c.decodeIfPresent(String.self, forKey: .generatedAt)
         etag = try c.decodeIfPresent(String.self, forKey: .etag)
+        documentEtag = try c.decodeIfPresent(String.self, forKey: .documentEtag)
         pending = try c.decodeIfPresent(Bool.self, forKey: .pending)
     }
 

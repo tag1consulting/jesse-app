@@ -14,6 +14,68 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [App 1.0 (155)] - 2026-09-24
+
+**A ticked item with a note sprang back open, and the note was gone.** On 2026-09-23 the
+owner ticked an item on the day screen, typed a note into the evidence sheet, tapped
+`Done with note`, and the box reverted with nothing said. Several times in one morning,
+once immediately after a restart.
+
+The bridge half of the cause is in the Bridge 0.148.0 entry above: one ETag was serving
+both the cache and the write precondition, so a background brief moved the tag and the
+tap earned a `412` on a day file nothing had touched. The app half is what it did with
+that `412`. It dropped the optimism, refetched, and retried nothing — on the argument
+that re-sending would apply the user's intent to a line they never saw. That argument is
+right about a REWRITTEN document and wrong about every other case, and it said nothing
+either way, so the note went with it.
+
+The offline replayer had the better rule all along: refetch, and if the day and the item
+are both still what the tap was aimed at, send it once more. That rule is now one
+function, `StalePrecondition`, and both paths decide by it. Two pieces of code with their
+own idea of what "stale" means is how they came to disagree in the first place.
+
+### Added
+
+- **`StalePrecondition`**, the one definition of what a stale precondition means:
+  `retry` when only the tag moved, `dayMovedOn` when the day was rebuilt or the item's
+  words were rewritten into a different id, `noAnswer` when the refetch itself did not
+  answer.
+- **`TodaySnapshot.documentEtag`** and **`writeTag`**, the tag a mutation sends.
+  `writeTag` falls back to `etag`, which is what keeps this app talking to a bridge older
+  than 0.148.0 — on those there is only the one tag, and the bridge accepts it.
+- **`TodayDashboardModel.staleNotice(note:)`**, which carries the evidence note back
+  verbatim. A note the user typed is the one thing in that interaction they cannot
+  reconstruct from the screen; the box reverting was visible, the note vanishing was not.
+
+### Changed
+
+- Every mutation — check, move, focus, postpone, glance — sends the write tag as
+  `If-Match`. The conditional `GET` still sends `etag` as `If-None-Match`, and must: the
+  cache tag is what makes a brief, a glance or a postponement reach the screen.
+- `perform` takes the `If-Match` as a parameter rather than letting each caller capture
+  it, because a retry under a fresher tag must not re-send the stale one.
+- `IntentReplayer` sends the write tag too, and reaches the same shared rule for its own
+  `412`. Its one-retry-then-refuse behaviour is unchanged.
+
+### Fixed
+
+- A `412` whose day and item are unchanged now sends the tap once more under the fresh
+  tag, keeping the optimistic tick and the evidence in place while it runs.
+- A `412` that really is a changed day puts the box back AND says so, with the typed note
+  in the notice. Nothing the user typed is discarded in silence.
+
+### Tests
+
+- `testA412DropsTheOptimismAndRefetchesWithoutRetrying` is gone; it pinned the silence.
+  In its place: `testA412WithTheItemStillThereRetriesOnceWithTheFreshTag`,
+  `testA412WithTheItemRewordedPutsTheBoxBackAndShowsTheNote`,
+  `testASecond412StopsAndShowsTheNote`,
+  `testMutationsSendTheDocumentTagAndConditionalGetSendsTheEtag` and
+  `testAnOlderBridgeWithNoDocumentTagFallsBackToTheEtag`.
+- `FakeClient` records every `If-Match` it was sent, in order — `lastIfMatch` cannot
+  express a retry, and the whole assertion for one is that the second attempt carried a
+  different tag from the first.
+
 ## [Bridge 0.148.0] - 2026-09-24
 
 **One ETag was serving two contracts, and a ticked box paid for it.** On 2026-09-23 the

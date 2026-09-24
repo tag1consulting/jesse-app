@@ -11,9 +11,11 @@ import JesseNetworking
 //    has loaded it stays on screen and the failure surfaces as `isOffline`.
 //  * A tap is reflected IMMEDIATELY and reconciled on the server's answer — the
 //    overlay entry is dropped only when the response carries the truth it stood for.
-//  * `410` removes the row; `412` refetches instead of retrying blind, because a
-//    stale ETag means the file was rewritten and the user's tap was aimed at a
-//    document that no longer exists.
+//  * `410` removes the row. `412` refetches and, when the day and the item are both
+//    still what the tap was aimed at, sends it once more under the fresh tag; when
+//    they are not, the optimism is dropped AND the notice carries the evidence note
+//    back, so nothing the user typed disappears without being shown. See
+//    `StalePrecondition`, which the offline replayer decides by too.
 //  * A `to_do_now` move can change an item's id (the id hashes the section name).
 //    The response is authoritative: the overlay is re-keyed onto the new id and the
 //    old one is left holding nothing, so the row never renders twice or as a ghost.
@@ -39,8 +41,23 @@ public final class TodayDashboardModel {
     /// reconciliation always compares against what the bridge actually said.
     public private(set) var serverSnapshot: TodaySnapshot?
 
-    /// The ETag every mutation must send back. Refreshed by each `200`.
+    /// The CACHE tag, sent as `If-None-Match` on a conditional fetch. Refreshed by
+    /// each `200`.
+    ///
+    /// It moves whenever anything the screen renders changes — a brief's verdict, a
+    /// glance, a postponement — which is exactly right for a cache and exactly wrong
+    /// for a write precondition. See `writeTag`.
     public private(set) var etag: String?
+
+    /// The WRITE tag, sent as `If-Match` by every mutation. Refreshed alongside
+    /// `etag`, from the same responses.
+    ///
+    /// Nil against a bridge older than 0.148.0, which does not send one.
+    public private(set) var documentEtag: String?
+
+    /// The tag a mutation sends. The document tag when the bridge offers one, and the
+    /// cache tag otherwise — an older bridge has only the one tag and accepts it.
+    public var writeTag: String? { documentEtag ?? etag }
 
     /// The local state layered on top of `serverSnapshot`. Settable within the
     /// package so tests can stage a half-completed interaction (a check still in
@@ -147,6 +164,9 @@ public final class TodayDashboardModel {
         if snap.etag == nil || snap.etag?.isEmpty == true { snap.etag = entry.etag }
         serverSnapshot = snap
         if let tag = snap.etag, !tag.isEmpty { etag = tag }
+        // Only from the BODY: the cached header is the cache tag, and adopting it as
+        // the write tag would put the wrong tag back on the wire.
+        if let tag = snap.documentEtag, !tag.isEmpty { documentEtag = tag }
         // Deliberately NOT `isPendingReplay`: that flag describes a turn that was
         // mid-write when the snapshot was taken, and whether it is still mid-write now
         // is not something a file on disk can answer.
@@ -449,6 +469,9 @@ public final class TodayDashboardModel {
     private func adopt(_ snap: TodaySnapshot) {
         serverSnapshot = snap
         if let tag = snap.etag, !tag.isEmpty { etag = tag }
+        // Cleared rather than kept when the answer carries none: a document tag held
+        // over from an earlier answer describes a document this one has replaced.
+        documentEtag = (snap.documentEtag?.isEmpty == false) ? snap.documentEtag : nil
         isPendingReplay = snap.pending ?? false
         reconcile(against: snap)
         confirmFresh()
@@ -723,10 +746,10 @@ public final class TodayDashboardModel {
     /// de-duper on the other side of that boundary is empty, and the queue is not.
     public func check(id: String, checked: Bool, evidence: String? = nil,
                       intentId: UUID = UUID()) async {
-        // Order matters: the missing-tag path runs FIRST. With no ETag in hand there
+        // Order matters: the missing-tag path runs FIRST. With no tag in hand there
         // is nothing to refuse against — the only useful act is to go and get one,
         // which is also a live re-test of whether the bridge is reachable at all.
-        guard let tag = etag, !tag.isEmpty else {
+        guard writeTag?.isEmpty == false else {
             await load()
             return
         }
@@ -744,9 +767,9 @@ public final class TodayDashboardModel {
         if refuseIfReadOnly() { return }
         lastConflictMessage = nil
         applyCheckOverlay(id: id, checked: checked, note: note)
-        await perform(id: id, capturing: intent) { client in
+        await perform(id: id, capturing: intent, note: note) { client, ifMatch in
             try await client.checkItem(id: id, checked: checked, evidence: note,
-                                       at: self.now(), day: nil, ifMatch: tag)
+                                       at: self.now(), day: nil, ifMatch: ifMatch)
         }
     }
 
@@ -772,10 +795,10 @@ public final class TodayDashboardModel {
     /// destination section the client cannot compute — and the response's snapshot
     /// then decides where it really lives and under what id. See `settleMove`.
     public func move(id: String, op: TodayMoveOp, capturable: Bool = true) async {
-        // Order matters: the missing-tag path runs FIRST. With no ETag in hand there
+        // Order matters: the missing-tag path runs FIRST. With no tag in hand there
         // is nothing to refuse against — the only useful act is to go and get one,
         // which is also a live re-test of whether the bridge is reachable at all.
-        guard let tag = etag, !tag.isEmpty else {
+        guard writeTag?.isEmpty == false else {
             await load()
             return
         }
@@ -802,8 +825,8 @@ public final class TodayDashboardModel {
         await perform(id: id, capturing: intent, adopting: { [weak self] snap in
             guard let self else { return }
             self.settleMove(id: id, item: item, knownIds: knownIds, in: snap)
-        }) { client in
-            try await client.moveItem(id: id, op: op, at: self.now(), day: nil, ifMatch: tag)
+        }) { client, ifMatch in
+            try await client.moveItem(id: id, op: op, at: self.now(), day: nil, ifMatch: ifMatch)
         }
     }
 
@@ -897,6 +920,18 @@ public final class TodayDashboardModel {
     public static let itemGoneNotice =
         "That item isn't in today's day file any more — a rebuild dropped it, or its wording changed."
 
+    /// The notice for a change that could not stand because the day itself moved.
+    ///
+    /// **It carries the evidence note back verbatim**, and that is the point of it. A
+    /// note the user typed is the one thing in this interaction they cannot reconstruct
+    /// from the screen, and a refusal that dropped it in silence is what made this
+    /// worth fixing. The box reverting is visible; the note vanishing was not.
+    public static func staleNotice(note: String?) -> String {
+        let lead = "The day file changed while that was being saved, so it wasn't applied."
+        guard let note, !note.isEmpty else { return lead }
+        return "\(lead) Your note, to use again: \(note)"
+    }
+
     /// **Focus an item** — "work on this next", as a durable edit to the day file.
     ///
     /// One line, because that is the whole of it: focus is spelled in terms of the two
@@ -924,9 +959,9 @@ public final class TodayDashboardModel {
     /// response is a whole fresh snapshot and a client editing a day it is not
     /// looking at should refetch rather than act.
     public func postpone(id: String, deferred: Bool) async {
-        // Order matters, exactly as in `check`: with no ETag in hand there is
+        // Order matters, exactly as in `check`: with no tag in hand there is
         // nothing to refuse against, and the only useful act is to go and get one.
-        guard let tag = etag, !tag.isEmpty else {
+        guard writeTag?.isEmpty == false else {
             await load()
             return
         }
@@ -942,26 +977,26 @@ public final class TodayDashboardModel {
         // set, and it has to stay readable long enough to be undone.
         pinRowsOnScreen()
         overlay.deferrals[id] = deferred
-        await perform(id: id, capturing: intent) { client in
+        await perform(id: id, capturing: intent) { client, ifMatch in
             try await client.postpone(id: id, deferred: deferred, at: self.now(),
-                                      day: nil, ifMatch: tag)
+                                      day: nil, ifMatch: ifMatch)
         }
     }
 
     /// Mark a glanceable row seen. The dot clears at once; the bridge's glance store
     /// is what makes it stay cleared across a relaunch.
     public func glance(id: String) async {
-        // Order matters: the missing-tag path runs FIRST. With no ETag in hand there
+        // Order matters: the missing-tag path runs FIRST. With no tag in hand there
         // is nothing to refuse against — the only useful act is to go and get one,
         // which is also a live re-test of whether the bridge is reachable at all.
-        guard let tag = etag, !tag.isEmpty else {
+        guard writeTag?.isEmpty == false else {
             await load()
             return
         }
         if refuseIfReadOnly() { return }
         overlay.seen.insert(id)
-        await perform(id: id) { client in
-            try await client.glance(id: id, at: self.now(), ifMatch: tag)
+        await perform(id: id) { client, ifMatch in
+            try await client.glance(id: id, at: self.now(), ifMatch: ifMatch)
         }
     }
 
@@ -970,15 +1005,38 @@ public final class TodayDashboardModel {
     /// `adopting` runs BEFORE the snapshot is adopted, on the response's own
     /// document, because a re-key has to happen while the client still remembers
     /// which id it queued the work under.
+    ///
+    /// The `If-Match` is handed to `call` rather than captured by it, because a `412`
+    /// may send the very same call again under a fresher tag and a closure holding the
+    /// stale one would re-send the stale one. `note` is the evidence the user typed, if
+    /// any: it is what the refusal notice hands back rather than swallowing.
     private func perform(id: String,
                          capturing intent: PendingIntentRecord? = nil,
+                         note: String? = nil,
                          adopting extra: ((TodaySnapshot) -> Void)? = nil,
-                         _ call: @escaping (any TodayProviding) async throws -> TodayMutationResult
+                         _ call: @escaping (any TodayProviding, String) async throws
+                             -> TodayMutationResult
+    ) async {
+        // The day this tap was aimed at, read before anything can refetch under it.
+        let day = serverSnapshot?.date
+        await perform(id: id, day: day, ifMatch: writeTag ?? "", capturing: intent,
+                      note: note, retrying: true, adopting: extra, call)
+    }
+
+    private func perform(id: String,
+                         day: String?,
+                         ifMatch: String,
+                         capturing intent: PendingIntentRecord?,
+                         note: String?,
+                         retrying mayRetry: Bool,
+                         adopting extra: ((TodaySnapshot) -> Void)?,
+                         _ call: @escaping (any TodayProviding, String) async throws
+                             -> TodayMutationResult
     ) async {
         isLoading = true
         defer { isLoading = false }
         do {
-            switch try await call(makeClient()) {
+            switch try await call(makeClient(), ifMatch) {
             case .snapshot(let snap):
                 extra?(snap)
                 adopt(snap)
@@ -991,12 +1049,33 @@ public final class TodayDashboardModel {
                 clearFailure()
                 await fetch(conditional: false)
             case .preconditionFailed:
-                // `412`: our ETag is stale, so this tap was aimed at a document that no
-                // longer exists. Drop the optimism and refetch — re-sending against a
-                // fresh tag would apply the user's intent to a line they never saw.
-                overlay.settle(id)
+                // `412`: the precondition we sent no longer describes the document.
+                //
+                // This used to drop the tap in silence, on the argument that re-sending
+                // would apply the user's intent to a line they never saw. That argument
+                // is right about a REWRITTEN document and wrong about everything else —
+                // and everything else is the common case, because the tag also moved
+                // when a background brief, a glance or a postponement landed. On
+                // 2026-09-23 that repeatedly threw away a ticked box AND the evidence
+                // note typed with it, with nothing said.
+                //
+                // So: refetch, and ask `StalePrecondition` which case this is. Same day,
+                // same item still there — only the tag moved, so send it once more. Day
+                // rebuilt or item reworded — drop it, but SAY so, and hand the note back
+                // in the notice rather than swallowing what the user typed.
                 clearFailure()
                 await fetch(conditional: false)
+                switch StalePrecondition.verdict(after: serverSnapshot, day: day,
+                                                 itemId: id) {
+                case .retry(let fresh) where mayRetry:
+                    // The optimism and the evidence deliberately stay in place while it
+                    // runs: nothing about the day contradicted them.
+                    await perform(id: id, day: day, ifMatch: fresh, capturing: intent,
+                                  note: note, retrying: false, adopting: extra, call)
+                case .retry, .dayMovedOn, .noAnswer:
+                    overlay.settle(id)
+                    lastConflictMessage = Self.staleNotice(note: note)
+                }
             case .preconditionRequired:
                 // `428`: we sent no If-Match at all. A client bug, not a race — the
                 // only honest recovery is to go get a tag.
