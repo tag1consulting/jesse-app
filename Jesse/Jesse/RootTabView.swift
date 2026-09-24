@@ -106,6 +106,16 @@ struct RootTabView: View {
         cache: SnapshotCache.shared,
         pending: RootTabView.pendingStore)
 
+    /// **The strand board's model**, beside the day's and for the same reason: the
+    /// Today tab hosts both segments, so both have to survive a tab switch. It reads
+    /// nothing the day model reads and writes nothing at all, so the two are entirely
+    /// independent apart from sharing the on-disk cache.
+    @State private var strandsModel = StrandsModel(
+        makeClient: {
+            JesseBridgeClient(config: ConfigStore.load(), snapshotCache: SnapshotCache.shared)
+        },
+        cache: SnapshotCache.shared)
+
     /// **The offline capture queue**, one per process.
     ///
     /// One store, shared by both tabs and the replayer, because it is one queue: the
@@ -333,6 +343,7 @@ struct RootTabView: View {
                 .equatable()
         case .today:
             TodayTabView(isActive: selection == .today, model: todayModel,
+                         strands: strandsModel,
                          onReplay: replayNow)
                 .equatable()
         case .vault:

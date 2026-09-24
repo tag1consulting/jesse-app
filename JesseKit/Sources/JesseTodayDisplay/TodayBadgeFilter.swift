@@ -93,6 +93,12 @@ public struct TodayViewPreferences {
     /// ever wants to, rather than inventing a second spelling.
     public static let badgeFilterKey = "today.badgeFilter"
 
+    /// Which of the tab's two segments is showing. Bound directly with `@AppStorage`
+    /// by `TodayListView`, which is why the KEY is what is shared here rather than an
+    /// accessor: the segment is view state with no model behind it, and a second
+    /// spelling of the key is the only way the picker and a relaunch could disagree.
+    public static let segmentKey = "today.segment"
+
     private let defaults: UserDefaults
 
     public init(defaults: UserDefaults = .standard) {
@@ -105,5 +111,40 @@ public struct TodayViewPreferences {
     public var isBadgeFilterOn: Bool {
         get { defaults.bool(forKey: Self.badgeFilterKey) }
         nonmutating set { defaults.set(newValue, forKey: Self.badgeFilterKey) }
+    }
+
+    /// Which segment the tab opens on. **Today by default**, for the badge filter's
+    /// reason: the day is what the tab has always shown, and a launch into the board
+    /// would be the app deciding what the morning is about.
+    public var segment: TodaySegment {
+        get { TodaySegment(rawValue: defaults.string(forKey: Self.segmentKey) ?? "") ?? .today }
+        nonmutating set { defaults.set(newValue.rawValue, forKey: Self.segmentKey) }
+    }
+}
+
+// MARK: - The two segments
+
+/// The Today tab's two lists.
+///
+/// **Two segments rather than a fifth tab.** The vault has two objects a person reads
+/// on a phone — the day, and the long running work — and they are read at very
+/// different rates: the day twenty times, the board once or twice. A fifth tab would
+/// have made them look equally prominent and would have cost the bar's width on a
+/// phone. A segment says what is true: the same tab, two views of what is on.
+///
+/// The Today badge, the badge filter, the sort menu's existing entries and Process
+/// updates all belong to `.today` and are hidden on `.strands`, because every one of
+/// them is a claim about day-file items and there are none on the board.
+public enum TodaySegment: String, CaseIterable, Identifiable, Equatable, Hashable, Sendable {
+    case today
+    case strands
+
+    public var id: String { rawValue }
+
+    public var label: String {
+        switch self {
+        case .today: return "Today"
+        case .strands: return "Strands"
+        }
     }
 }

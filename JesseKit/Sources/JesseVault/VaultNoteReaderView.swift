@@ -883,11 +883,7 @@ public struct VaultNoteReaderView: View {
                 missing.append(target)
             }
         }
-        guard !missing.isEmpty else { return nil }
-        let names = missing.map { VaultWikiLink.basename($0) }.joined(separator: ", ")
-        return missing.count == 1
-            ? "\(names) is not in this copy of the vault."
-            : "Not in this copy of the vault: \(names)."
+        return VaultWikiLink.missingCaption(targets: missing)
     }
 
     static func headingFont(_ level: Int) -> Font {

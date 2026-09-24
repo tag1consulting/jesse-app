@@ -139,11 +139,18 @@ public struct VaultSearcher: Sendable {
     /// the conversation list's own threshold.
     private let expansionThreshold: Int
     private let limit: Int
+    /// The folder every hit must be under, or nil for the whole vault. The Vault tab's
+    /// scope control, carried HERE rather than applied to the answer: a scope filtered
+    /// after ranking would return the top fifty of the vault and show whichever of them
+    /// happened to be in the folder.
+    private let scope: VaultSearchScope
 
-    public init(index: VaultIndex, expansionThreshold: Int = 5, limit: Int = 50) {
+    public init(index: VaultIndex, expansionThreshold: Int = 5, limit: Int = 50,
+                scope: VaultSearchScope = .all) {
         self.index = index
         self.expansionThreshold = expansionThreshold
         self.limit = limit
+        self.scope = scope
     }
 
     /// The typed query alone — no model, no expansion. This is the call whose latency the
@@ -157,7 +164,9 @@ public struct VaultSearcher: Sendable {
         // Ask for more rows than will be shown, because collapsing to one hit per file
         // and re-ranking both happen after SQL: taking exactly `limit` from SQLite would
         // mean a file's second-best chunk crowding out another file's only one.
-        let raw = index.search(expression: expression, limit: limit * 4)
+        let raw = index.search(expression: expression, limit: limit * 4,
+                               underPrefix: scope.pathPrefix)
+            .filter { scope.includes($0.path) }
         let ranked = VaultSearchQuery.ranked(VaultSearchQuery.collapsedByFile(raw),
                                              tokens: tokens, limit: limit)
         return VaultSearchOutcome(hits: ranked,

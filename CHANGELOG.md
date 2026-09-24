@@ -14,6 +14,53 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [App 1.0 (152)] - 2026-09-24
+
+**Work state had no surface in the app.** The bridge learned to parse and serve the
+vault's Strands notes in 0.147.0, and nothing on the phone could ask: the fifteen long
+running pieces of work (Argus, Netgrasp, Jesse, Scolta, the DrupalCon talk and the rest)
+existed as a route nobody called. A `[[wiki link]]` in a reply had the same problem from
+the other end: it names a real file on the device, and it rendered as literal brackets
+around a path, so the one run in a reply that pointed at something was the one run you
+could not act on.
+
+### Added
+
+- **A Strands segment on the Today tab.** A two way segmented control, Today and
+  Strands, remembered per device and opening on Today. The board lists every active
+  strand newest first with its group colour, its `Now` text, its next step (id, text,
+  and what it waits on), a relative age, a caption on the ones gated on Jeremy himself,
+  and a warning glyph that opens the nightly audit's findings for that note. `Most
+  recent` and `By group` are its two orders; `By group` files rows under the five
+  Dashboard headings in Dashboard order with unfiled last. Dormant strands sit in a
+  collapsed group at the bottom under both orders. No fifth tab, and the only new
+  control is the picker.
+- **Tapping a strand opens its note in the on device reader**, with its checkboxes and
+  the guarded write behind them. A device with no vault folder, or one whose copy does
+  not hold the note yet, gets the bridge's markdown in a read only reader instead: those
+  bytes arrive with no stamp, and a guarded write needs one.
+- **`[[Wiki links]]` in a chat reply are tappable**, on iOS and macOS, showing the alias
+  or the note's file name. A tap resolves the target against the copy of the vault on
+  the device and opens the same reader a citation does; a target that resolves to
+  nothing says so in the reader's own sentence and starts no conversation.
+- **A scope control on the Vault tab**, `All` and `Strands`. Under `Strands` both the
+  recents and the search are limited to `Strands/` (its archive excluded), and the
+  recents are ordered by each note's own `updated:` frontmatter, falling back to the
+  file's modification time. The predicate is in the query rather than applied to its
+  answer: a `LIMIT 30` filtered afterwards would return the vault's newest thirty and
+  keep whichever happened to be in the folder.
+
+### Changed
+
+- The Today tab's Process updates button, badge filter and sort menu now appear on the
+  Today segment only. Every one of them is a claim about day file items, and there are
+  none on the board.
+- One wiki-link scanner now serves both markdown renderers. The rewrite that makes a
+  wiki link tappable runs before either parser sees the text, so iOS and macOS cannot
+  develop separate ideas of what `[[a#b|c]]` means.
+- "X is not in this copy of the vault." is written in one place and read by the note
+  reader and the chat tap alike.
+
 ## [Bridge 0.147.1] - 2026-09-24
 
 **A default feature test build was never compiled anywhere, so from 0.145.0 on nothing

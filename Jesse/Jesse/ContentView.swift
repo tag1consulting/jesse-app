@@ -20,6 +20,11 @@ struct ContentView: View {
     @State private var path: [JesseThread] = []
     /// The note a citation link in an offline answer asked for, presented as a sheet.
     @State private var citedNote: VaultNoteRoute?
+    /// A `[[wiki link]]` tapped in a reply. Held as its own object rather than folded
+    /// into `citedNote` because it has a step the citation does not: a citation names a
+    /// path that already resolved, and a wiki target has to be looked up and may not be
+    /// on this device at all.
+    @State private var wiki = VaultWikiOpener()
     @State private var config = ConfigStore.load()
     @State private var showSettings = false
     // Raised with `showSettings` by the first-run pairing CTA so Settings opens
@@ -154,11 +159,15 @@ struct ContentView: View {
         // named it would be a second source of truth that could disagree with the
         // directory. Foregrounding is the whole message.
         .onOpenURL { url in
-            // TWO users of the `jesse` scheme now. A citation in an offline answer opens
-            // the note it came from; everything else is still the share extension
-            // bringing the app forward, whose URL carries nothing.
+            // THREE users of the `jesse` scheme now. A citation in an offline answer
+            // opens the note it came from; a `[[wiki link]]` in a reply resolves against
+            // the copy of the vault on this device and opens the same reader; everything
+            // else is still the share extension bringing the app forward, whose URL
+            // carries nothing.
             if let route = VaultNoteRoute.parse(url) {
                 citedNote = route
+            } else if let route = VaultWikiRoute.parse(url) {
+                Task { await wiki.follow(route) }
             } else {
                 drainSharedRecording()
             }
@@ -167,6 +176,21 @@ struct ContentView: View {
             // The same reader the vault browser pushes, in the same stack, so a citation
             // and a search hit open one screen and not two.
             VaultNoteStack(path: route.path, line: route.line) { citedNote = nil }
+        }
+        // THE SAME READER a citation opens, deliberately: a link is a link, and two
+        // screens for one gesture is how they start to differ.
+        .sheet(item: $wiki.opened) { route in
+            VaultNoteStack(path: route.path, line: route.line) { wiki.opened = nil }
+        }
+        // A target that resolved to nothing gets the reader's own sentence and no turn.
+        // The user asked to read a note; a conversation they did not ask for is a worse
+        // answer than saying the note is not here.
+        .alert("Can't open that note",
+               isPresented: Binding(get: { wiki.missing != nil },
+                                    set: { if !$0 { wiki.missing = nil } })) {
+            Button("OK", role: .cancel) { wiki.missing = nil }
+        } message: {
+            Text(wiki.missing ?? "")
         }
         .onChange(of: pushRouter.pendingTap) { _, tap in
             guard let tap else { return }

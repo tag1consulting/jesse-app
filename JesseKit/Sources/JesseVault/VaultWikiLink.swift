@@ -105,4 +105,21 @@ public enum VaultWikiLink {
     public static func basename(_ path: String) -> String {
         path.split(separator: "/").last.map(String.init) ?? path
     }
+
+    /// **What the app says about a link whose note is not here**, in one place.
+    ///
+    /// Three surfaces now say it — a block of a note being read, a tap on a wiki link in
+    /// a chat reply, and anything that follows them — and they have to say it the same
+    /// way. `targets` are normalized wiki targets; the sentence names the FILE NAMES,
+    /// because the path a link spells is the vault's convention (`todo-list/…`) and not
+    /// what the reader would recognise.
+    ///
+    /// Nil for an empty list, which is the caller saying nothing was missing.
+    public static func missingCaption(targets: [String]) -> String? {
+        guard !targets.isEmpty else { return nil }
+        let names = targets.map(basename).joined(separator: ", ")
+        return targets.count == 1
+            ? "\(names) is not in this copy of the vault."
+            : "Not in this copy of the vault: \(names)."
+    }
 }
