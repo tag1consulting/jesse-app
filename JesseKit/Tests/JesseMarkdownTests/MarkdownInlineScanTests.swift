@@ -157,6 +157,144 @@ final class MarkdownInlineScanTests: XCTestCase {
         XCTAssertEqual(MarkdownInline.scan("![alt] (x.png)"), [.text("![alt] (x.png)")])
     }
 
+    // MARK: - CriticMarkup
+
+    // FIVE FORMS, ONE SHAPE, AND THE THREE WAYS EACH OF THEM IS NOT ONE.
+    //
+    // These marks are the only thing in a note somebody writes in order to be ANSWERED,
+    // which is why "what is inside stays literal" is asserted as hard as the forms
+    // themselves: a review comment that quietly grew a link is a review comment somebody
+    // has to go and check.
+
+    func testAHighlightMarkIsItsOwnSpanAndLosesItsBraces() {
+        XCTAssertEqual(MarkdownInline.scan("the {==back seam==} again"), [
+            .text("the "),
+            .criticHighlight("back seam"),
+            .text(" again"),
+        ])
+    }
+
+    func testACommentMarkIsItsOwnSpan() {
+        XCTAssertEqual(MarkdownInline.scan("cold {>>measured when?<<}"), [
+            .text("cold "),
+            .criticComment("measured when?"),
+        ])
+    }
+
+    /// A reply is a comment as far as the GRAMMAR is concerned. Who wrote it is the
+    /// renderer's question, and the scanner does not answer questions it cannot see.
+    func testAReplyIsScannedAsAnOrdinaryCommentWithItsPrefixIntact() {
+        XCTAssertEqual(MarkdownInline.scan("{>>Jesse cold, in April<<}"),
+                       [.criticComment("Jesse cold, in April")])
+    }
+
+    func testASubstitutionCarriesBothHalves() {
+        XCTAssertEqual(MarkdownInline.scan("about {~~four~>six~~} millimetres"), [
+            .text("about "),
+            .criticSubstitution(old: "four", new: "six"),
+            .text(" millimetres"),
+        ])
+    }
+
+    func testAnInsertionAndADeletionAreTheirOwnSpans() {
+        XCTAssertEqual(MarkdownInline.scan("pour {++in two lifts++} now"), [
+            .text("pour "),
+            .criticInsertion("in two lifts"),
+            .text(" now"),
+        ])
+        XCTAssertEqual(MarkdownInline.scan("pour {--in one lift--} now"), [
+            .text("pour "),
+            .criticDeletion("in one lift"),
+            .text(" now"),
+        ])
+    }
+
+    func testTheFastPathLetsAMarkThroughThatHoldsNoOtherConstructsByte() {
+        // A comment and a deletion contain none of `[ = # ` :`, so without `{` in the fast
+        // path these two lines would be returned whole and never scanned at all.
+        XCTAssertTrue(MarkdownInline.mayContainSpans("{>>a note<<}"))
+        XCTAssertTrue(MarkdownInline.mayContainSpans("{--struck out--}"))
+    }
+
+    func testTwoMarksOnOneLineAreTwoSpansInOrder() {
+        XCTAssertEqual(MarkdownInline.scan("{==seam==} and {++arch++}"), [
+            .criticHighlight("seam"),
+            .text(" and "),
+            .criticInsertion("arch"),
+        ])
+    }
+
+    /// THE ORDER THAT DECIDES THE AMBIGUITY. A brace is tried before an `=`, so `{==`
+    /// is a mark and the `==` an arm's length away is still an ordinary highlight.
+    func testAMarkAndAnOrdinaryHighlightCoexistOnOneLine() {
+        XCTAssertEqual(MarkdownInline.scan("{==marked==} beside ==highlighted=="), [
+            .criticHighlight("marked"),
+            .text(" beside "),
+            .highlight("highlighted"),
+        ])
+    }
+
+    func testAHighlightFollowedDirectlyByACommentIsTwoSpansInOrder() {
+        XCTAssertEqual(MarkdownInline.scan("{==back seam==}{>>measured when?<<}"), [
+            .criticHighlight("back seam"),
+            .criticComment("measured when?"),
+        ])
+    }
+
+    func testAnUnclosedMarkIsText() {
+        for line in ["before {==never closed", "before {>>never closed",
+                     "before {~~never closed", "before {++never closed",
+                     "before {--never closed"] {
+            XCTAssertEqual(MarkdownInline.scan(line), [.text(line)], line)
+        }
+    }
+
+    /// The same rule `====` already obeys: an empty construct is the characters somebody
+    /// typed.
+    func testAnEmptyMarkIsText() {
+        for line in ["{====}", "{>><<}", "{~~~~}", "{++++}", "{----}"] {
+            XCTAssertEqual(MarkdownInline.scan(line), [.text(line)], line)
+        }
+    }
+
+    /// A rewrite with nothing to rewrite INTO is not a rewrite.
+    func testASubstitutionWithoutItsArrowIsText() {
+        XCTAssertEqual(MarkdownInline.scan("{~~four millimetres~~}"),
+                       [.text("{~~four millimetres~~}")])
+    }
+
+    /// A MARK MAY NOT CROSS A LINE. A block's text is several lines joined, and a closer
+    /// found two lines down would swallow somebody's note into a comment they never wrote.
+    func testAMarkNeverReachesPastTheEndOfItsLine() {
+        let joined = "open {>>here\nand close<<} there"
+        XCTAssertEqual(MarkdownInline.scan(joined), [.text(joined)])
+    }
+
+    /// The rule the whole scanner is ordered around, applied to the sixth construct.
+    func testAMarkInsideACodeSpanIsStillACodeSpan() {
+        XCTAssertEqual(MarkdownInline.scan("write `{==x==}` to mark"), [
+            .text("write "),
+            .codeSpan("`{==x==}`"),
+            .text(" to mark"),
+        ])
+    }
+
+    /// A BLADE TEMPLATE COMMENT, which this vault's technology notes are full of. Without
+    /// the doubled-brace rule the scanner eats its body and the reader draws it struck out.
+    func testADoubledBraceIsATemplateCommentAndNotADeletion() {
+        let line = "{{-- the old include --}}"
+        XCTAssertEqual(MarkdownInline.scan(line), [.text(line)])
+    }
+
+    /// What is inside a mark is LITERAL: the words somebody marked, not a construct the
+    /// scanner went looking for inside them.
+    func testTheWordsInsideAMarkAreNeverScannedAgain() {
+        XCTAssertEqual(MarkdownInline.scan("{==see [[Firings/Log 4]] and #pottery==}"),
+                       [.criticHighlight("see [[Firings/Log 4]] and #pottery")])
+        XCTAssertEqual(MarkdownInline.scan("{>>compare ==that== one<<}"),
+                       [.criticComment("compare ==that== one")])
+    }
+
     // MARK: - A reminder date is left alone
 
     /// `(@2026-09-30)` is obsidian-reminder syntax this vault uses everywhere. It contains

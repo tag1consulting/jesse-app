@@ -14,6 +14,51 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [App 1.0 (157)] - 2026-09-24
+
+**A note marked up for review rendered its marks as punctuation: readable, and invisible.**
+Every annotation somebody leaves in this vault is CriticMarkup, and the reader knew one
+inline construct that begins with a brace, which is none of them. A highlighted sentence
+arrived wearing its own braces and equals signs; a comment arrived as a row of angle
+brackets in the middle of the paragraph it was about; and a rewrite was the worst of the
+five, because it showed the old wording and the proposed wording side by side with nothing
+whatever to say which was which. Reading a marked-up note meant parsing the markers by eye.
+
+The five forms are now runs with their own styling. A highlight takes the same yellow an
+ordinary `==highlight==` takes. A comment is italic on orange, behind a marker character,
+and a reply (a comment whose text opens with `Jesse `) takes blue instead, so a note that
+has been gone through reads as a conversation. A rewrite strikes its old words in red and
+sets the new ones on green; an insertion is that same green, a deletion that same red. The
+styling is colour and a line only, never a font, so a mark inside a heading keeps the
+heading's size. Raw mode is untouched: it shows the file as typed, which is the point of it.
+
+Two limits are deliberate. A mark opens and closes on ONE LINE, because a block's text is
+several lines joined and a closer matched three lines down would swallow somebody's note
+into a comment they never wrote. And what sits between the markers is LITERAL: the words
+somebody marked, never rescanned, so a review comment cannot quietly grow a link that
+nobody typed. A doubled brace stays a Blade template comment rather than becoming a
+deletion, which is what this vault's technology notes are full of.
+
+### Added
+
+- **Five spans in `MarkdownSpan`**: `criticHighlight`, `criticComment`,
+  `criticSubstitution(old:new:)`, `criticInsertion` and `criticDeletion`, found by
+  `MarkdownInline.criticMark`, which decides all five on one comparison of the two
+  characters after the brace and then looks for that opener's closer on the same line.
+  `{` joins the scanner's no-allocation fast path, because a comment and a deletion contain
+  none of the five bytes already in it.
+- **The same five cases in `VaultInlineSegment`**, mapped in `VaultNoteRenderer.segments`,
+  so what a line is made of is still a value a test can assert rather than a screenshot.
+- **The styling in `VaultNoteRenderer.attributed`**: the highlight's 30 percent yellow, the
+  comment's 20 percent orange with `commentGlyph` (U+275D, measured with CoreText as present
+  in the system font itself on both platforms, so no fallback and no SF Symbol), the reply's
+  20 percent blue behind `isReply`, and the struck-red / backed-green pair that a
+  substitution, an insertion and a deletion are all built from.
+- **Tests** for each form, for two marks on a line, for a mark beside an ordinary
+  `==highlight==`, for the unclosed, empty and arrowless cases that stay plain text, for a
+  mark inside a code span and a doubled brace that stay what they were, and for the
+  attributed runs a rewrite, a reply and a mark inside a heading carry.
+
 ## [App 1.0 (156)] - 2026-09-24
 
 **On the Today tab, tapping a Jesse notification hid the tab bar behind Today, with no way
