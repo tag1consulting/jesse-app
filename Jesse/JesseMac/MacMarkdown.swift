@@ -1,4 +1,5 @@
 import SwiftUI
+import JesseVault
 
 // A small, dependency-free Markdown renderer for Jesse's replies on macOS. The iOS app
 // renders through a UIKit/`NSAttributedString` path (`MarkdownText`/`MarkdownInline`)
@@ -83,7 +84,11 @@ enum MacMarkdownBlock {
     /// Inline emphasis via the system Markdown parser, preserving whitespace. Falls back
     /// to plain text if the fragment doesn't parse.
     nonisolated static func inline(_ s: String) -> AttributedString {
-        (try? AttributedString(
+        // The SAME wiki-link rewrite the iOS renderer runs, from the same function, so
+        // a reply that is tappable on the phone is tappable here. See
+        // `VaultWikiMarkdown` for why this is a rewrite and not a renderer change.
+        let s = VaultWikiMarkdown.linked(s)
+        return (try? AttributedString(
             markdown: s,
             options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)))
             ?? AttributedString(s)

@@ -63,6 +63,21 @@ public struct TodayListView: View {
     /// was parsed from.
     private let onOpenLocalDayFile: (() -> Void)?
 
+    /// **The strand board**, or `nil` in a shell (or a preview, or a test) that has no
+    /// board to show. `nil` means the segmented picker is not drawn at all and this
+    /// screen is exactly the day screen it was — which is what keeps every existing
+    /// caller of this view unchanged.
+    private let strands: StrandsModel?
+
+    /// The local copy of the vault, handed to the strand board so a tap opens the note
+    /// on this device rather than a copy fetched over the network.
+    private let localNotes: (any TodayLocalNoteProviding)?
+
+    /// Which segment is showing, remembered on this device. `@AppStorage` rather than a
+    /// value the shell threads through: it is view state with nothing behind it, and
+    /// both shells would otherwise have to write the same three lines.
+    @AppStorage(TodayViewPreferences.segmentKey) private var storedSegment = TodaySegment.today.rawValue
+
     /// Which item's evidence sheet is up, if any. Held by id rather than by value so
     /// a refresh landing mid-sheet cannot leave a stale copy of the row on screen.
     @State private var evidenceFor: EvidenceTarget?
@@ -83,8 +98,12 @@ public struct TodayListView: View {
                 onProcessUpdates: @escaping ([TodayItem]) -> Void = { _ in },
                 onRetryPending: ((PendingIntentRecord) -> Void)? = nil,
                 onTellFallback: ((PendingIntentRecord) -> Void)? = nil,
-                onOpenLocalDayFile: (() -> Void)? = nil) {
+                onOpenLocalDayFile: (() -> Void)? = nil,
+                strands: StrandsModel? = nil,
+                localNotes: (any TodayLocalNoteProviding)? = nil) {
         self.model = model
+        self.strands = strands
+        self.localNotes = localNotes
         self.isProcessing = isProcessing
         self.selection = selection
         self.opensOnDoubleTap = opensOnDoubleTap
@@ -101,7 +120,87 @@ public struct TodayListView: View {
         self.onOpenLocalDayFile = onOpenLocalDayFile
     }
 
+    /// The segment on screen. Falls back to Today for a stored value this build does
+    /// not know, and is pinned to Today whenever there is no board to show at all.
+    private var segment: TodaySegment {
+        guard strands != nil else { return .today }
+        return TodaySegment(rawValue: storedSegment) ?? .today
+    }
+
     public var body: some View {
+        Group {
+            if let strands {
+                VStack(spacing: 0) {
+                    segmentPicker
+                    Divider()
+                    switch segment {
+                    case .today: day
+                    case .strands:
+                        StrandsListView(model: strands,
+                                        localNotes: localNotes,
+                                        onOpenLink: onOpenLink)
+                            .navigationTitle("Strands")
+                    }
+                }
+            } else {
+                day
+            }
+        }
+        // DECLARATION ORDER IS LEFT-TO-RIGHT, ordered by taps per day. Process updates
+        // is declared FIRST: it closes checked items at source, rewriting every named
+        // project file, the Dashboard and the day file, and a heavy action never takes
+        // the slot a mis-tap lands in. Then the sort menu, then the badge filter, which
+        // takes the rightmost slot because it is the most-tapped of the three: "show me
+        // what's left" is the loop this screen exists for, while the sort is set once and
+        // left alone for hours. Both are cheap, safe and instantly reversible, which is
+        // what that slot is for. See README, "UI conventions".
+        //
+        // ALL THREE BELONG TO THE DAY. Every one of them is a claim about day-file items
+        // — how many are checked, what order the sections are in, how many need action —
+        // and there are none of those on the board. On the Strands segment the only
+        // control is that segment's own order, in the same slot, so the toolbar never
+        // offers a button that would act on a list nobody is looking at.
+        .toolbar {
+            if segment == .today {
+                // `.primaryAction`, not `.secondaryAction`: the latter collapses into an
+                // overflow "More" ellipsis on iOS, which is where a control goes to be
+                // undiscoverable.
+                ToolbarItem(placement: .primaryAction) {
+                    TodayProcessButton(count: model.itemsToProcess.count,
+                                       isProcessing: isProcessing) {
+                        isConfirmingProcess = true
+                    }
+                }
+                ToolbarItem(placement: .primaryAction) {
+                    TodaySortMenu(selection: $model.sortKey)
+                }
+                ToolbarItem(placement: .primaryAction) {
+                    TodayBadgeFilterButton(count: model.badgeCount, isOn: $model.isBadgeFilterOn)
+                }
+            } else if let strands {
+                ToolbarItem(placement: .primaryAction) {
+                    StrandsSortMenu(selection: Bindable(strands).sortKey)
+                }
+            }
+        }
+    }
+
+    /// The one new control: two segments, and nothing else.
+    private var segmentPicker: some View {
+        Picker("View", selection: Binding(get: { segment },
+                                          set: { storedSegment = $0.rawValue })) {
+            ForEach(TodaySegment.allCases) { choice in
+                Text(choice.label).tag(choice)
+            }
+        }
+        .pickerStyle(.segmented)
+        .padding(.horizontal)
+        .padding(.vertical, 6)
+        .accessibilityLabel("Show")
+    }
+
+    /// The day itself, exactly as it was before the segment existed.
+    private var day: some View {
         Group {
             switch model.displayState {
             case .loading:
@@ -133,31 +232,6 @@ public struct TodayListView: View {
                 } else {
                     content(snapshot)
                 }
-            }
-        }
-        // DECLARATION ORDER IS LEFT-TO-RIGHT, ordered by taps per day. Process updates
-        // is declared FIRST: it closes checked items at source, rewriting every named
-        // project file, the Dashboard and the day file, and a heavy action never takes
-        // the slot a mis-tap lands in. Then the sort menu, then the badge filter, which
-        // takes the rightmost slot because it is the most-tapped of the three: "show me
-        // what's left" is the loop this screen exists for, while the sort is set once and
-        // left alone for hours. Both are cheap, safe and instantly reversible, which is
-        // what that slot is for. See README, "UI conventions".
-        .toolbar {
-            // `.primaryAction`, not `.secondaryAction`: the latter collapses into an
-            // overflow "More" ellipsis on iOS, which is where a control goes to be
-            // undiscoverable.
-            ToolbarItem(placement: .primaryAction) {
-                TodayProcessButton(count: model.itemsToProcess.count,
-                                   isProcessing: isProcessing) {
-                    isConfirmingProcess = true
-                }
-            }
-            ToolbarItem(placement: .primaryAction) {
-                TodaySortMenu(selection: $model.sortKey)
-            }
-            ToolbarItem(placement: .primaryAction) {
-                TodayBadgeFilterButton(count: model.badgeCount, isOn: $model.isBadgeFilterOn)
             }
         }
         // Entering the screen is one of the two moments the filter drops the rows it was

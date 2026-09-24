@@ -24,6 +24,18 @@ public final class VaultBrowserModel {
     /// The live query. Bound straight to `.searchable`.
     public var query: String = ""
 
+    /// **What the tab is looking at.** `.all` is the default and always will be: the
+    /// Vault tab's promise is every note on the device, and a scope remembered across
+    /// launches would be a search that silently answered a narrower question than the
+    /// one that was typed. Per session, like the day screen's sort.
+    public var scope: VaultSearchScope = .all {
+        didSet {
+            guard oldValue != scope else { return }
+            refresh()
+            search()
+        }
+    }
+
     public private(set) var hits: [VaultSearchHit] = []
     public private(set) var recents: [VaultIndexedFile] = []
     /// Set when expansion terms actually contributed a hit the typed query missed.
@@ -72,11 +84,53 @@ public final class VaultBrowserModel {
         }
         do {
             guard let index = try source.index() else { return }
-            recents = index.recentFiles(limit: 30)
+            // Asked for more than are shown when a scope excludes a subfolder, so the
+            // thirty are thirty after `Strands/archive/` is dropped rather than before.
+            let scope = self.scope
+            let wanted = scope.pathPrefix == nil ? 30 : 60
+            recents = Array(index.recentFiles(limit: wanted, underPrefix: scope.pathPrefix)
+                .filter { scope.includes($0.path) }
+                .prefix(30))
             counts = index.counts()
             lastError = nil
         } catch {
             lastError = VaultIndexer.describe(error)
+            return
+        }
+        // A strand's own `updated:` stamp outranks its mtime — see `VaultStrandOrder`.
+        // Done as a second pass rather than in the query because the stamp is inside the
+        // note and the index does not hold it: fifteen small reads, off the main actor,
+        // and the list is already on screen in mtime order while they happen.
+        if scope.ordersByFrontmatterUpdated { applyFrontmatterOrder(for: scope) }
+    }
+
+    /// Re-sort the recents by each note's `updated:` frontmatter.
+    ///
+    /// Guarded on the scope it started under, so an answer for `Strands` cannot land on
+    /// a list the user has since switched back to `All`.
+    private func applyFrontmatterOrder(for scope: VaultSearchScope) {
+        let files = recents
+        guard !files.isEmpty else { return }
+        let source = self.source
+        Task { [weak self] in
+            let stamps = await Task.detached { () -> [String: String] in
+                // EVERY read inside one `withAccess`: the security scope it opens is
+                // closed the moment the closure returns, so carrying the root out and
+                // reading afterwards would read a folder nothing is entitled to.
+                (try? source.vaultFolder.withAccess { root -> [String: String] in
+                    var out: [String: String] = [:]
+                    let reader = VaultFile(root: root)
+                    for file in files {
+                        guard let text = try? reader.read(relativePath: file.path),
+                              let updated = VaultFrontmatter.value(for: "updated", in: text)
+                        else { continue }
+                        out[file.path] = updated
+                    }
+                    return out
+                }) ?? [:]
+            }.value
+            guard let self, self.scope == scope, self.recents == files else { return }
+            self.recents = VaultStrandOrder.ordered(files, updated: stamps)
         }
     }
 
@@ -94,15 +148,17 @@ public final class VaultBrowserModel {
         }
         guard folderStatus.isReady else { return }
         isSearching = true
+        let scope = self.scope
         let source = self.source
         let expander = self.expander
         let debounce = self.debounce
         searchTask = Task { [weak self] in
             try? await Task.sleep(for: debounce)
             if Task.isCancelled { return }
-            let outcome: VaultSearchOutcome? = await Task.detached {
+            let outcome: VaultSearchOutcome? = await Task.detached { [scope] in
                 guard let index = try? source.index() else { return nil }
-                return await VaultSearcher(index: index).search(typed, expander: expander)
+                return await VaultSearcher(index: index, scope: scope)
+                    .search(typed, expander: expander)
             }.value
             if Task.isCancelled { return }
             self?.apply(outcome, for: typed)
@@ -200,13 +256,17 @@ public struct VaultBrowserView: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
+                // UNDER the search field, above everything it narrows, because it
+                // qualifies both lists below it and not only the typed one: with
+                // nothing typed it says which notes the recents are drawn from.
+                scopeControl
                 if model.query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     Section {
                         ForEach(model.recents, id: \.path) { file in
                             recentRow(file)
                         }
                     } header: {
-                        Text("Recently changed")
+                        Text(Self.recentsHeading(model.scope))
                     }
                 } else if model.hits.isEmpty {
                     Section {
@@ -236,6 +296,28 @@ public struct VaultBrowserView: View {
 
     static func resultsHeading(_ count: Int) -> String {
         count == 1 ? "1 note" : "\(count) notes"
+    }
+
+    /// What the recents section is called under each scope. The Strands scope says
+    /// "Recently updated" rather than "Recently changed" because it is ordered by the
+    /// notes' own `updated:` stamps and not by when the files were touched, and a
+    /// heading that claimed otherwise would be the one line on the screen that lies.
+    /// `nonisolated` because it is a pure function of its argument and a test has no
+    /// business hopping to the main actor to ask what a heading says.
+    nonisolated static func recentsHeading(_ scope: VaultSearchScope) -> String {
+        scope == .strands ? "Recently updated" : "Recently changed"
+    }
+
+    /// The scope control: two segments, and no folder picker.
+    private var scopeControl: some View {
+        Picker("Scope", selection: Bindable(model).scope) {
+            ForEach(VaultSearchScope.allCases) { scope in
+                Text(scope.label).tag(scope)
+            }
+        }
+        .pickerStyle(.segmented)
+        .listRowSeparator(.hidden)
+        .accessibilityLabel("Search scope")
     }
 
     private var noFolder: some View {

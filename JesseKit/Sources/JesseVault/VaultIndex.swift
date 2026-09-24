@@ -266,12 +266,31 @@ public final class VaultIndex: @unchecked Sendable {
     /// The `limit` most recently modified files, newest first — what the Vault tab shows
     /// before anything is typed.
     public func recentFiles(limit: Int = 30) -> [VaultIndexedFile] {
+        recentFiles(limit: limit, underPrefix: nil)
+    }
+
+    /// The same, limited to one folder.
+    ///
+    /// The predicate is SQL rather than a filter over the unscoped answer, and that is
+    /// not an optimization: `LIMIT 30` applied before a Swift-side filter would return
+    /// the thirty most recent files in the whole vault and then keep whichever of them
+    /// happened to be in the folder, which on any busy morning is none. The prefix is
+    /// bound as a parameter and matched with `LIKE … ESCAPE`, so a folder name carrying
+    /// a `%` or a `_` cannot widen the query.
+    public func recentFiles(limit: Int = 30, underPrefix prefix: String?) -> [VaultIndexedFile] {
         locked {
             var out: [VaultIndexedFile] = []
-            let sql = "SELECT path, title, mtime, size FROM files ORDER BY mtime DESC LIMIT ?;"
+            let sql = prefix == nil
+                ? "SELECT path, title, mtime, size FROM files ORDER BY mtime DESC LIMIT ?;"
+                : "SELECT path, title, mtime, size FROM files WHERE path LIKE ? ESCAPE '\\' ORDER BY mtime DESC LIMIT ?;"
             guard let stmt = try? prepare(sql) else { return [] }
             defer { sqlite3_finalize(stmt) }
-            sqlite3_bind_int(stmt, 1, Int32(limit))
+            if let prefix {
+                bind(stmt, 1, Self.likePrefix(prefix))
+                sqlite3_bind_int(stmt, 2, Int32(limit))
+            } else {
+                sqlite3_bind_int(stmt, 1, Int32(limit))
+            }
             while sqlite3_step(stmt) == SQLITE_ROW {
                 out.append(VaultIndexedFile(
                     path: text(stmt, 0), title: text(stmt, 1),
@@ -280,6 +299,17 @@ public final class VaultIndex: @unchecked Sendable {
             }
             return out
         }
+    }
+
+    /// One prefix as a `LIKE` pattern whose wildcards are escaped, so only the trailing
+    /// `%` this adds is one.
+    static func likePrefix(_ prefix: String) -> String {
+        var out = ""
+        for character in prefix {
+            if character == "%" || character == "_" || character == "\\" { out.append("\\") }
+            out.append(character)
+        }
+        return out + "%"
     }
 
     public func counts() -> VaultIndexCounts {
@@ -405,8 +435,17 @@ public final class VaultIndex: @unchecked Sendable {
     /// caller then refines with the name-match rule, which SQL cannot express because it
     /// is about the tokens as the user typed them.
     public func search(expression: String, limit: Int = 50) -> [VaultSearchHit] {
+        search(expression: expression, limit: limit, underPrefix: nil)
+    }
+
+    /// The same, limited to one folder — the Vault tab's scope control. The predicate
+    /// is in the query for `recentFiles(limit:underPrefix:)`'s reason: filtering after
+    /// `LIMIT 50` would answer a scoped question with an unscoped top fifty.
+    public func search(expression: String, limit: Int = 50,
+                       underPrefix prefix: String?) -> [VaultSearchHit] {
         locked {
             var out: [VaultSearchHit] = []
+            let scope = prefix == nil ? "" : "   AND c.path LIKE ? ESCAPE '\\'\n"
             let sql = """
                 SELECT c.path, c.title, c.heading, c.line_start,
                        snippet(chunk_fts, 0, ?, ?, '…', 14),
@@ -414,7 +453,7 @@ public final class VaultIndex: @unchecked Sendable {
                   FROM chunk_fts
                   JOIN chunks c ON c.id = chunk_fts.rowid
                  WHERE chunk_fts MATCH ?
-                 ORDER BY bm25(chunk_fts, 1.0, 2.0, 4.0, 1.0)
+                \(scope) ORDER BY bm25(chunk_fts, 1.0, 2.0, 4.0, 1.0)
                  LIMIT ?;
                 """
             guard let stmt = try? prepare(sql) else { return [] }
@@ -422,7 +461,12 @@ public final class VaultIndex: @unchecked Sendable {
             bind(stmt, 1, VaultSearchHit.markStart)
             bind(stmt, 2, VaultSearchHit.markEnd)
             bind(stmt, 3, expression)
-            sqlite3_bind_int(stmt, 4, Int32(limit))
+            if let prefix {
+                bind(stmt, 4, Self.likePrefix(prefix))
+                sqlite3_bind_int(stmt, 5, Int32(limit))
+            } else {
+                sqlite3_bind_int(stmt, 4, Int32(limit))
+            }
             while sqlite3_step(stmt) == SQLITE_ROW {
                 out.append(VaultSearchHit(path: text(stmt, 0),
                                           title: text(stmt, 1),

@@ -236,6 +236,10 @@ public enum SnapshotCacheKey {
     /// The live diet day — the un-dated `GET /jesse/diet`.
     public static let liveDiet = "diet-live"
 
+    /// The strand board. One key, like `today`: `GET /jesse/strands` is always "every
+    /// strand that is not done", and there is no second view of it to cache.
+    public static let strands = "strands"
+
     /// The diet snapshot for one day; `nil` is the live day.
     ///
     /// A date that is not a plain ISO day yields `nil` rather than a sanitized guess: a

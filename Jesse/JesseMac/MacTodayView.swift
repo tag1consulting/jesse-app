@@ -41,6 +41,10 @@ struct MacTodayView: View {
     /// tab and the iPhone both use.
     @State private var model: TodayDashboardModel
 
+    /// The strand board, beside the day and independent of it: it reads a different
+    /// route, writes nothing, and shares only the on-disk cache.
+    @State private var strands: StrandsModel
+
     /// The note behind whichever item is open. ONE model for the whole tab, not one per
     /// pushed screen: it holds the per-item cache, and a fresh model per push would
     /// re-read a note that was on screen thirty seconds ago.
@@ -100,6 +104,9 @@ struct MacTodayView: View {
         _model = State(initialValue: TodayDashboardModel(makeClient: {
             JesseBridgeClient(config: configStore.config, snapshotCache: SnapshotCache.shared)
         }, cache: SnapshotCache.shared))
+        _strands = State(initialValue: StrandsModel(makeClient: {
+            JesseBridgeClient(config: configStore.config, snapshotCache: SnapshotCache.shared)
+        }, cache: SnapshotCache.shared))
         // `localNotes` is the offline half, the same one the iPhone passes: with the bridge
         // unreachable the item's own wiki link is resolved against the Obsidian copy of the
         // vault on THIS Mac and the note is read from there.
@@ -122,7 +129,11 @@ struct MacTodayView: View {
                           onDiscuss: { discuss(.discuss(item: $0)) },
                           onPropagate: { execute(.propagate(item: $0, evidence: $1)) },
                           onProcessUpdates: processUpdates,
-                          onOpenLocalDayFile: Self.hasVaultFolder ? { openedDayFile = true } : nil)
+                          onOpenLocalDayFile: Self.hasVaultFolder ? { openedDayFile = true } : nil,
+                          strands: strands,
+                          // A strand's note opens from the copy on THIS Mac when it holds
+                          // one, exactly as a day row's note does.
+                          localNotes: VaultLocalNoteProvider())
                 // DECLARATION ORDER IS LEFT-TO-RIGHT, ordered by clicks per day: Settings
                 // is opened least often, Refresh far more, so Refresh sits to its right.
                 // These two are the shell's half of this screen's toolbar and always

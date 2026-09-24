@@ -26,6 +26,11 @@ struct TodayTabView: View {
     /// screen does. One model, one number, no second definition of "how many".
     @Bindable var model: TodayDashboardModel
 
+    /// The strand board, owned by `RootTabView` for the day model's reason: this tab
+    /// hosts both segments and neither may be rebuilt by a tab switch. `nil` draws the
+    /// day screen exactly as it was before the segment existed.
+    var strands: StrandsModel?
+
     /// Drain the offline capture queue NOW. Owned by `RootTabView` (which holds the
     /// replayer) and reached from here for the one trigger this screen knows about: a
     /// per-row Retry, which has to look like it did something.
@@ -110,7 +115,12 @@ struct TodayTabView: View {
                           onProcessUpdates: processUpdates,
                           onRetryPending: retryPending,
                           onTellFallback: tellFallback,
-                          onOpenLocalDayFile: Self.hasVaultFolder ? { openedDayFile = true } : nil)
+                          onOpenLocalDayFile: Self.hasVaultFolder ? { openedDayFile = true } : nil,
+                          strands: strands,
+                          // The strand board opens a note the same way the day's rows
+                          // do: the copy on THIS iPhone when it holds one, and the
+                          // bridge's bytes only when it does not.
+                          localNotes: VaultLocalNoteProvider())
                 // The day file's own title is a sentence ("Today: Monday, August 10,
                 // 2026"), which a large title truncates to "Today: Monday, Augus…" on
                 // a phone. Inline fits it and buys back the vertical space the list
@@ -335,5 +345,6 @@ struct TodayTabView: View {
 extension TodayTabView: Equatable {
     static func == (lhs: TodayTabView, rhs: TodayTabView) -> Bool {
         lhs.isActive == rhs.isActive && lhs.model === rhs.model
+            && lhs.strands === rhs.strands
     }
 }

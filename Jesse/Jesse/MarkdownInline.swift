@@ -1,4 +1,5 @@
 import UIKit
+import JesseVault
 
 // Inline markdown → `NSAttributedString` with *concrete* UIKit fonts and colors.
 //
@@ -16,6 +17,15 @@ enum MarkdownInline {
     /// resolved to concrete attributes; on a parse failure the raw string is
     /// returned with the base attributes so text is never lost.
     static func attributed(_ s: String, font: UIFont, color: UIColor) -> NSAttributedString {
+        // `[[WIKI LINKS]]` FIRST, and as a rewrite rather than a case in the loop below.
+        // Foundation's parser knows `[text](url)` and knows nothing about double
+        // brackets, so a reply naming `[[todo-list/Strands/Strands-System]]` used to
+        // arrive as literal brackets around a path: the one run in a reply that names a
+        // real file on this device, and the one you could not act on. Rewriting it into
+        // an ordinary markdown link before the parse means the `.link` attribution,
+        // the font resolution and the macOS renderer all get it for free — see
+        // `VaultWikiMarkdown`, which is the one scanner both platforms share.
+        let s = VaultWikiMarkdown.linked(s)
         guard let parsed = try? AttributedString(
             markdown: s,
             options: .init(
