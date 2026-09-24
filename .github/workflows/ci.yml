@@ -236,3 +236,19 @@ jobs:
       - name: Source guards (incl. R5 personal-infra + gitleaks)
         working-directory: ${{ github.workspace }}
         run: bash scripts/ci-guards.sh
+
+  # The iOS deployment-target rule, guarded on Linux so it is checked on EVERY
+  # push rather than only when someone runs the Mac gate. The rule (build at the
+  # shipped target, lowered only to fit an older simulator) is one line of version
+  # arithmetic shared by scripts/local-ci-macos.sh and ios-ci.yml, and its two
+  # failure modes are silent: compare as strings and 26.10 sorts below 26.5; take
+  # the max and every SDK deprecation becomes a build error the product never
+  # sees. Neither shows up until a gate fails on code nobody touched.
+  ios-deployment-target:
+    name: iOS deployment target rule
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Helper unit tests
+        run: bash scripts/test-ios-deployment-target.sh

@@ -153,9 +153,18 @@ resolve_sim() {
   echo "Resolved: ${DEV_NAME} (${platform} ${RUNTIME_VER}) -> ${SIM_DEST}"
 }
 
+# The gate builds at the target the app SHIPS, lowered only far enough to fit an
+# older simulator. Pinning to the simulator's own version instead (which this did
+# until the iOS 27 runtime arrived) turns every API the newer SDK deprecates into
+# a build error under warnings-as-errors, failing the gate on a diagnostic the
+# shipping app never sees. The min, and the reason for it, live in
+# scripts/ios-deployment-target.sh.
 resolve_ios_sim() {
   resolve_sim "iOS" "iPhone" "jesse-local-ci-iphone" || return 1
-  IOS_DEST="$SIM_DEST"; IOS_TARGET="$SIM_VER"
+  IOS_DEST="$SIM_DEST"
+  PROJECT_TARGET="$("$ROOT/scripts/ios-deployment-target.sh" --project-target)" || return 1
+  IOS_TARGET="$("$ROOT/scripts/ios-deployment-target.sh" "$SIM_VER")" || return 1
+  echo "Deployment target: project ships ${PROJECT_TARGET}, simulator runs ${SIM_VER} -> building at ${IOS_TARGET}"
 }
 
 resolve_watch_sim() {

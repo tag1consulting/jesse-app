@@ -202,9 +202,17 @@ jobs:
           DEST="platform=iOS Simulator,id=${UDID}"
           echo "Resolved: ${DEV_NAME} (iOS ${RUNTIME_VER}) -> ${DEST}"
           echo "destination=${DEST}" >> "$GITHUB_OUTPUT"
-          # Pin the build's deployment target to the runtime we'll actually run
-          # on, so the app installs regardless of which iOS the runner ships.
-          echo "deployment_target=${RUNTIME_VER}" >> "$GITHUB_OUTPUT"
+          # Build at the target the app SHIPS, lowered only far enough to fit an
+          # older runner: a runtime below the project's target cannot install the
+          # app, but a newer one has nothing to offer and costs plenty. Pinning
+          # upward (which this did until the iOS 27 runtime arrived) turns every
+          # API the newer SDK deprecates into a build error under
+          # warnings-as-errors, failing on a diagnostic the shipping app never
+          # sees. The min lives in scripts/ios-deployment-target.sh, so this job
+          # and scripts/local-ci-macos.sh cannot drift.
+          TARGET="$(bash scripts/ios-deployment-target.sh "$RUNTIME_VER")"
+          echo "Deployment target: project ships $(bash scripts/ios-deployment-target.sh --project-target), runner runs ${RUNTIME_VER} -> building at ${TARGET}"
+          echo "deployment_target=${TARGET}" >> "$GITHUB_OUTPUT"
 
       # Warnings are errors for PRODUCTION code — the Swift-side counterpart of the
       # bridge's `cargo clippy --all-targets -- -D warnings`, though narrower than it:
@@ -304,6 +312,11 @@ jobs:
           DEST="platform=watchOS Simulator,id=${UDID}"
           echo "Resolved: ${DEV_NAME} (watchOS ${RUNTIME_VER}) -> ${DEST}"
           echo "destination=${DEST}" >> "$GITHUB_OUTPUT"
+          # Reported for the log only: no watch xcodebuild call below passes
+          # WATCHOS_DEPLOYMENT_TARGET, so unlike the iOS step this is not a
+          # deployment target anything builds at, and it needs no min. Run it
+          # through scripts/ios-deployment-target.sh's watchOS equivalent if a
+          # build ever starts consuming it.
           echo "deployment_target=${RUNTIME_VER}" >> "$GITHUB_OUTPUT"
 
       - name: Build (watch)
