@@ -198,4 +198,25 @@ final class VaultScopeTests: XCTestCase {
         XCTAssertEqual(VaultBrowserView.recentsHeading(.all), "Recently changed")
         XCTAssertEqual(VaultBrowserView.recentsHeading(.strands), "Recently updated")
     }
+
+    /// A picked folder is a plain prefix over plain mtime order, so the heading is the
+    /// plain one with the folder named.
+    func testTheRecentsHeadingNamesTheFolderWhenOneIsHeld() {
+        XCTAssertEqual(VaultBrowserView.recentsHeading(.all, folder: "Strands"),
+                       "Recently changed in Strands")
+        XCTAssertEqual(VaultBrowserView.recentsHeading(.all, folder: "Projects/drafts"),
+                       "Recently changed in Projects/drafts")
+    }
+
+    /// An empty result NAMES the folder, because "no note in this copy of the vault"
+    /// is not true of the vault when only one folder was searched, and it sends a person
+    /// off to check a note they can see is there.
+    func testTheEmptySentenceNamesTheFolderItSearched() {
+        XCTAssertEqual(VaultBrowserView.emptyResultSentence(folder: nil),
+                       "No note in this copy of the vault has all of those words.")
+        XCTAssertEqual(VaultBrowserView.emptyResultSentence(folder: "Strands"),
+                       "No note under Strands has all of those words.")
+        XCTAssertEqual(VaultBrowserView.emptyFolderSentence("Strands"),
+                       "Nothing under Strands yet.")
+    }
 }
