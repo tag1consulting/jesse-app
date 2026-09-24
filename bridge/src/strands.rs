@@ -1,8 +1,8 @@
-//! `GET /jesse/things` — the vault's `Things/` status notes as a structured,
+//! `GET /jesse/strands` — the vault's `Strands/` status notes as a structured,
 //! audited snapshot, plus the nightly file that says whether they are still true.
 //!
 //! **This module reads the vault; it writes exactly one file, once a day, and
-//! never a Things note.** That file is `Inbox/YYYY-MM-DD-things-audit.md`, a
+//! never a Strands note.** That file is `Inbox/YYYY-MM-DD-strands-audit.md`, a
 //! rendering of the same findings this endpoint serves. There is one audit
 //! implementation and two outputs, deliberately: a nightly report that could
 //! disagree with the screen would be a second source of truth about the same
@@ -11,19 +11,19 @@
 //!
 //! ## Why a parser and not a search
 //!
-//! Work state had no machine readable home. A thing's status lived in prose,
+//! Work state had no machine readable home. A strand's status lived in prose,
 //! spread over a series index, a handful of drafts and whatever the last turn
 //! remembered, so nothing could check it: a prompt could be launched and never
 //! come back, a queue line could point at a file that had already been archived,
 //! and a note could go a fortnight without an edit, and all three were invisible
 //! until somebody re-read everything by hand. The format is now fixed (see
-//! [`parse_thing`]), which is what makes a check possible at all.
+//! [`parse_strand`]), which is what makes a check possible at all.
 //!
 //! ## Same posture as [`crate::today`]
 //!
 //! Bearer auth, the shared rate limiter, ids-and-values-only JSON, a strong
 //! ETag so the phone's poll costs a `304`, and a **line oriented, tolerant
-//! parser**: no error path, every malformed thing degrades to a finding rather
+//! parser**: no error path, every malformed strand degrades to a finding rather
 //! than a failure. A note with no frontmatter still parses, still sorts and
 //! still appears; it simply carries a `PARSE` finding saying so. The one thing
 //! this parser does NOT share with `today.rs` is byte ranges, because nothing
@@ -35,20 +35,20 @@ use chrono::{Datelike, NaiveDate, Timelike};
 // ---- The format's fixed vocabulary -----------------------------------------
 
 /// The directory under the notes root that holds the status notes.
-pub const THINGS_DIR: &str = "Things";
+pub const STRANDS_DIR: &str = "Strands";
 
 /// The path segment that marks a note, a draft or a research file as retired.
-/// A Things note under it is not parsed at all, and a link INTO it from a live
+/// A Strands note under it is not parsed at all, and a link INTO it from a live
 /// queue line is [`QUEUE_ARCHIVED`] (the item was launched and never moved).
 pub const ARCHIVE_SEGMENT: &str = "archive";
 
 /// The five groups a note may declare. Anything else is [`GROUP`].
-pub const THING_GROUPS: [&str; 5] = ["tag1", "personal", "network", "via-con-me", "perseido"];
+pub const STRAND_GROUPS: [&str; 5] = ["tag1", "personal", "network", "via-con-me", "perseido"];
 
 /// The four states a note may declare. Anything else is [`STATE`].
-pub const THING_STATES: [&str; 4] = ["active", "waiting", "dormant", "done"];
+pub const STRAND_STATES: [&str; 4] = ["active", "waiting", "dormant", "done"];
 
-/// The two directories whose live files are expected to be owned by a thing.
+/// The two directories whose live files are expected to be owned by a strand.
 /// Their `archive/` subdirectories are NOT walked: a retired draft owes nothing
 /// to anybody, and walking them would make every completed piece of work a
 /// standing finding.
@@ -66,7 +66,7 @@ const STALE_DAYS: i64 = 14;
 /// An active note that has not been edited in this many days is not active.
 const DORMANT_DAYS: i64 = 90;
 
-/// More active things than a person can hold. Past this the board is a list,
+/// More active strands than a person can hold. Past this the board is a list,
 /// not a plan.
 const MAX_ACTIVE: usize = 20;
 
@@ -151,14 +151,14 @@ impl Finding {
 /// renders differently: a gate on the operator is a thing he can clear right
 /// now, and a gate on a provider or a dependency is not.
 #[derive(serde::Serialize, PartialEq, Eq, Debug, Clone)]
-pub struct ThingWaiting {
+pub struct StrandWaiting {
     pub text: String,
     pub jeremy: bool,
 }
 
 /// The next step: the first unchecked Queue item above `### Later`.
 #[derive(serde::Serialize, PartialEq, Eq, Debug, Clone)]
-pub struct ThingNext {
+pub struct StrandNext {
     pub id: String,
     pub text: String,
     pub link: Option<String>,
@@ -166,7 +166,7 @@ pub struct ThingNext {
 }
 
 #[derive(serde::Serialize, PartialEq, Eq, Debug, Clone, Default)]
-pub struct ThingCounts {
+pub struct StrandCounts {
     pub queue: usize,
     pub later: usize,
     pub running: usize,
@@ -176,7 +176,7 @@ pub struct ThingCounts {
 /// The four sections whose lines are items. `## Decisions` and `## Links` carry
 /// bullets too, but never checkboxes, so nothing in them is an item.
 #[derive(PartialEq, Eq, Debug, Clone, Copy)]
-pub enum ThingSection {
+pub enum StrandSection {
     Queue,
     Later,
     Running,
@@ -185,8 +185,8 @@ pub enum ThingSection {
 
 /// One `- [ ]` / `- [x]` line.
 #[derive(PartialEq, Eq, Debug, Clone)]
-pub struct ThingItem {
-    pub section: ThingSection,
+pub struct StrandItem {
+    pub section: StrandSection,
     /// The first bold span on the line, or empty when the line has none (which
     /// is itself a [`PARSE`] finding).
     pub id: String,
@@ -217,7 +217,7 @@ struct LinkRef {
 
 /// One status note, parsed and audited.
 #[derive(serde::Serialize, PartialEq, Eq, Debug, Clone, Default)]
-pub struct Thing {
+pub struct Strand {
     pub slug: String,
     pub title: String,
     pub group: String,
@@ -225,18 +225,18 @@ pub struct Thing {
     pub updated: String,
     pub repos: Vec<String>,
     pub now: Option<String>,
-    pub waiting: Option<ThingWaiting>,
-    pub next: Option<ThingNext>,
-    pub counts: ThingCounts,
+    pub waiting: Option<StrandWaiting>,
+    pub next: Option<StrandNext>,
+    pub counts: StrandCounts,
     pub findings: Vec<Finding>,
 
-    /// The note's path relative to the notes root (`Things/Argus.md`). Off the
+    /// The note's path relative to the notes root (`Strands/Argus.md`). Off the
     /// wire because a client addresses a note by slug and never by path, and in
     /// the struct because the nightly file names the path on every bullet.
     #[serde(skip)]
     pub path: String,
     #[serde(skip)]
-    pub items: Vec<ThingItem>,
+    pub items: Vec<StrandItem>,
     /// Every wiki target anywhere in the note, vault relative, `.md` appended.
     /// This is what answers "does this note link that draft".
     #[serde(skip)]
@@ -245,13 +245,13 @@ pub struct Thing {
     link_refs: Vec<LinkRef>,
 }
 
-/// Everything `GET /jesse/things` serves, and everything the nightly file
+/// Everything `GET /jesse/strands` serves, and everything the nightly file
 /// renders. `generated_at` is stamped on at response time rather than stored,
 /// for the reason `today.rs` keeps it out of the snapshot: it moves on every
 /// call, so folding it into the ETag would mean no client ever saw a `304`.
 #[derive(serde::Serialize, PartialEq, Eq, Debug, Clone, Default)]
-pub struct ThingsSnapshot {
-    pub things: Vec<Thing>,
+pub struct StrandsSnapshot {
+    pub strands: Vec<Strand>,
     pub global_findings: Vec<Finding>,
     pub counts: SnapshotCounts,
 }
@@ -263,22 +263,22 @@ pub struct SnapshotCounts {
     pub dormant: usize,
 }
 
-impl ThingsSnapshot {
+impl StrandsSnapshot {
     /// Every finding in the snapshot, note findings first and then the global
     /// ones. The count the nightly file's header reports.
     pub fn finding_count(&self) -> usize {
-        self.things.iter().map(|t| t.findings.len()).sum::<usize>() + self.global_findings.len()
+        self.strands.iter().map(|t| t.findings.len()).sum::<usize>() + self.global_findings.len()
     }
 }
 
 // ---- The parser ------------------------------------------------------------
 
-/// Parse one note into a [`Thing`], **without touching the filesystem**.
+/// Parse one note into a [`Strand`], **without touching the filesystem**.
 ///
 /// Raises the findings that are a function of the document alone: [`PARSE`],
 /// [`DUP_ID`], [`CHECKED_NOT_MOVED`] and [`QUEUE_ARCHIVED`] (a link target that
 /// names `archive/` is archived whether or not the file is there). Everything
-/// that needs the vault, a calendar or the other notes is [`audit_thing`].
+/// that needs the vault, a calendar or the other notes is [`audit_strand`].
 ///
 /// The grammar, exactly:
 ///
@@ -293,12 +293,12 @@ impl ThingsSnapshot {
 /// 5. An item is `- [ ]` or `- [x]` (or `[X]`), an optional `YYYY-MM-DD`, then
 ///    the id as the first bold span, then text.
 /// 6. The next step is the first unchecked Queue item above `### Later`.
-pub fn parse_thing(slug: &str, src: &str) -> Thing {
+pub fn parse_strand(slug: &str, src: &str) -> Strand {
     let lines: Vec<&str> = src.lines().collect();
-    let mut thing = Thing {
+    let mut strand = Strand {
         slug: slug.to_string(),
-        path: format!("{THINGS_DIR}/{slug}.md"),
-        ..Thing::default()
+        path: format!("{STRANDS_DIR}/{slug}.md"),
+        ..Strand::default()
     };
 
     // 1. Frontmatter. A file that does not open with `---` has none at all,
@@ -317,29 +317,29 @@ pub fn parse_thing(slug: &str, src: &str) -> Thing {
                 };
                 let value = value.trim();
                 match key.trim() {
-                    "group" => thing.group = value.to_string(),
-                    "state" => thing.state = value.to_string(),
-                    "updated" => thing.updated = value.to_string(),
-                    "repos" => thing.repos = parse_flow_list(value),
+                    "group" => strand.group = value.to_string(),
+                    "state" => strand.state = value.to_string(),
+                    "updated" => strand.updated = value.to_string(),
+                    "repos" => strand.repos = parse_flow_list(value),
                     _ => {}
                 }
             }
         }
-        None => thing
+        None => strand
             .findings
             .push(Finding::at(PARSE, 1, "no frontmatter block")),
     }
 
     // 2 to 5. One pass over the body.
-    let mut section: Option<ThingSection> = None;
+    let mut section: Option<StrandSection> = None;
     let mut saw_queue_heading = false;
     for (idx, raw) in lines.iter().enumerate().skip(body_start) {
         let line_no = idx + 1;
         let text = raw.trim_end();
 
         if let Some(rest) = heading_level(text, 1) {
-            if thing.title.is_empty() {
-                thing.title = rest.to_string();
+            if strand.title.is_empty() {
+                strand.title = rest.to_string();
             }
             continue;
         }
@@ -347,37 +347,37 @@ pub fn parse_thing(slug: &str, src: &str) -> Thing {
             section = match rest {
                 "Queue" => {
                     saw_queue_heading = true;
-                    Some(ThingSection::Queue)
+                    Some(StrandSection::Queue)
                 }
-                "Running" => Some(ThingSection::Running),
-                "Done" => Some(ThingSection::Done),
+                "Running" => Some(StrandSection::Running),
+                "Done" => Some(StrandSection::Done),
                 _ => None,
             };
             continue;
         }
         if let Some(rest) = heading_level(text, 3) {
             section = match (rest, section) {
-                ("Later", Some(ThingSection::Queue)) => Some(ThingSection::Later),
+                ("Later", Some(StrandSection::Queue)) => Some(StrandSection::Later),
                 _ => None,
             };
             continue;
         }
 
         if let Some(rest) = text.strip_prefix("**Now:**") {
-            if thing.now.is_none() {
-                thing.now = Some(rest.trim().to_string());
-                push_link_refs(&mut thing.link_refs, text, line_no, false);
+            if strand.now.is_none() {
+                strand.now = Some(rest.trim().to_string());
+                push_link_refs(&mut strand.link_refs, text, line_no, false);
             }
             continue;
         }
         if let Some(rest) = text.strip_prefix("**Waiting on:**") {
-            if thing.waiting.is_none() {
+            if strand.waiting.is_none() {
                 let text_out = rest.trim().to_string();
-                thing.waiting = Some(ThingWaiting {
+                strand.waiting = Some(StrandWaiting {
                     jeremy: text_out.to_lowercase().starts_with("you:"),
                     text: text_out,
                 });
-                push_link_refs(&mut thing.link_refs, text, line_no, false);
+                push_link_refs(&mut strand.link_refs, text, line_no, false);
             }
             continue;
         }
@@ -388,51 +388,51 @@ pub fn parse_thing(slug: &str, src: &str) -> Thing {
         };
         if matches!(
             section,
-            ThingSection::Queue | ThingSection::Later | ThingSection::Running
+            StrandSection::Queue | StrandSection::Later | StrandSection::Running
         ) {
             push_link_refs(
-                &mut thing.link_refs,
+                &mut strand.link_refs,
                 text,
                 line_no,
-                !matches!(section, ThingSection::Running),
+                !matches!(section, StrandSection::Running),
             );
         }
-        thing.items.push(item);
+        strand.items.push(item);
     }
 
     for target in wiki_targets(src) {
         let resolved = resolve_target(&target);
-        if !resolved.is_empty() && !thing.targets.contains(&resolved) {
-            thing.targets.push(resolved);
+        if !resolved.is_empty() && !strand.targets.contains(&resolved) {
+            strand.targets.push(resolved);
         }
     }
 
-    if thing.title.is_empty() {
-        thing.findings.push(Finding::at(PARSE, 1, "no H1 title"));
+    if strand.title.is_empty() {
+        strand.findings.push(Finding::at(PARSE, 1, "no H1 title"));
     }
     if !saw_queue_heading {
-        thing
+        strand
             .findings
             .push(Finding::at(PARSE, 1, "no `## Queue` heading"));
     }
 
     // Counts, the next step, and the per-item findings the document settles.
     let mut seen_ids: Vec<&str> = Vec::new();
-    for item in &thing.items {
+    for item in &strand.items {
         match item.section {
-            ThingSection::Queue => thing.counts.queue += 1,
-            ThingSection::Later => thing.counts.later += 1,
-            ThingSection::Running => thing.counts.running += 1,
-            ThingSection::Done => thing.counts.done += 1,
+            StrandSection::Queue => strand.counts.queue += 1,
+            StrandSection::Later => strand.counts.later += 1,
+            StrandSection::Running => strand.counts.running += 1,
+            StrandSection::Done => strand.counts.done += 1,
         }
         if item.id.is_empty() {
-            thing.findings.push(Finding::at(
+            strand.findings.push(Finding::at(
                 PARSE,
                 item.line,
                 format!("item line has no bold id: {}", clip(&item.text)),
             ));
         } else if seen_ids.contains(&item.id.as_str()) {
-            thing.findings.push(Finding::at(
+            strand.findings.push(Finding::at(
                 DUP_ID,
                 item.line,
                 format!("id {} is used more than once", item.id),
@@ -443,10 +443,10 @@ pub fn parse_thing(slug: &str, src: &str) -> Thing {
         if item.checked
             && matches!(
                 item.section,
-                ThingSection::Queue | ThingSection::Later | ThingSection::Running
+                StrandSection::Queue | StrandSection::Later | StrandSection::Running
             )
         {
-            thing.findings.push(Finding::at(
+            strand.findings.push(Finding::at(
                 CHECKED_NOT_MOVED,
                 item.line,
                 format!(
@@ -456,27 +456,27 @@ pub fn parse_thing(slug: &str, src: &str) -> Thing {
             ));
         }
     }
-    for reference in &thing.link_refs {
+    for reference in &strand.link_refs {
         if reference.in_queue && is_archived(&reference.target) {
-            thing.findings.push(Finding::at(
+            strand.findings.push(Finding::at(
                 QUEUE_ARCHIVED,
                 reference.line,
                 format!("queue link points into archive: {}", reference.target),
             ));
         }
     }
-    thing.next = thing
+    strand.next = strand
         .items
         .iter()
-        .find(|i| i.section == ThingSection::Queue && !i.checked && !i.id.is_empty())
-        .map(|i| ThingNext {
+        .find(|i| i.section == StrandSection::Queue && !i.checked && !i.id.is_empty())
+        .map(|i| StrandNext {
             id: i.id.clone(),
             text: i.text.clone(),
             link: i.link.clone(),
             waits_on: i.waits_on.clone(),
         });
-    thing.findings.sort_by_key(|f| (f.line, f.code));
-    thing
+    strand.findings.sort_by_key(|f| (f.line, f.code));
+    strand
 }
 
 /// `# Heading` at exactly `level`, or `None`. `##` is not an H1 and `###` is not
@@ -503,7 +503,7 @@ fn parse_flow_list(value: &str) -> Vec<String> {
 }
 
 /// One item line, or `None` when the line is not one.
-fn parse_item(section: ThingSection, line: &str, line_no: usize) -> Option<ThingItem> {
+fn parse_item(section: StrandSection, line: &str, line_no: usize) -> Option<StrandItem> {
     let body = line.trim_start();
     let (checked, rest) = if let Some(r) = body.strip_prefix("- [ ] ") {
         (false, r)
@@ -526,7 +526,7 @@ fn parse_item(section: ThingSection, line: &str, line_no: usize) -> Option<Thing
         None => (String::new(), rest),
     };
 
-    Some(ThingItem {
+    Some(StrandItem {
         section,
         id,
         text: item_text(after_id),
@@ -684,7 +684,7 @@ fn clip(s: &str) -> String {
     }
 }
 
-fn id_or_line(item: &ThingItem) -> String {
+fn id_or_line(item: &StrandItem) -> String {
     match item.id.is_empty() {
         true => format!("the item on line {}", item.line),
         false => item.id.clone(),
@@ -701,74 +701,74 @@ fn days_between(earlier: &str, later: &str) -> Option<i64> {
 }
 
 /// The findings that need the vault or a calendar: everything except the ones
-/// [`parse_thing`] already raised. `today` is `YYYY-MM-DD` in the scheduler's
+/// [`parse_strand`] already raised. `today` is `YYYY-MM-DD` in the scheduler's
 /// zone, passed in rather than read, so the whole audit is reproducible.
-pub fn audit_thing(thing: &mut Thing, notes_root: &Path, today: &str) {
-    if !THING_GROUPS.contains(&thing.group.as_str()) {
-        thing.findings.push(Finding::at(
+pub fn audit_strand(strand: &mut Strand, notes_root: &Path, today: &str) {
+    if !STRAND_GROUPS.contains(&strand.group.as_str()) {
+        strand.findings.push(Finding::at(
             GROUP,
             1,
-            match thing.group.is_empty() {
+            match strand.group.is_empty() {
                 true => "no group in the frontmatter".to_string(),
-                false => format!("group {} is not one of the five", thing.group),
+                false => format!("group {} is not one of the five", strand.group),
             },
         ));
     }
-    if !THING_STATES.contains(&thing.state.as_str()) {
-        thing.findings.push(Finding::at(
+    if !STRAND_STATES.contains(&strand.state.as_str()) {
+        strand.findings.push(Finding::at(
             STATE,
             1,
-            match thing.state.is_empty() {
+            match strand.state.is_empty() {
                 true => "no state in the frontmatter".to_string(),
-                false => format!("state {} is not one of the four", thing.state),
+                false => format!("state {} is not one of the four", strand.state),
             },
         ));
     }
 
-    let updated_age = days_between(&thing.updated, today);
+    let updated_age = days_between(&strand.updated, today);
     match updated_age {
-        None => thing.findings.push(Finding::at(
+        None => strand.findings.push(Finding::at(
             UPDATED_INVALID,
             1,
-            match thing.updated.is_empty() {
+            match strand.updated.is_empty() {
                 true => "no updated date in the frontmatter".to_string(),
-                false => format!("updated {} is not a date", thing.updated),
+                false => format!("updated {} is not a date", strand.updated),
             },
         )),
-        Some(age) if age < 0 => thing.findings.push(Finding::at(
+        Some(age) if age < 0 => strand.findings.push(Finding::at(
             UPDATED_INVALID,
             1,
-            format!("updated {} is in the future", thing.updated),
+            format!("updated {} is in the future", strand.updated),
         )),
         Some(age) => {
             // The newest date the note itself carries in Running or Done. If the
             // work moved after the header said it last did, the header is behind.
-            let newest = thing
+            let newest = strand
                 .items
                 .iter()
-                .filter(|i| matches!(i.section, ThingSection::Running | ThingSection::Done))
+                .filter(|i| matches!(i.section, StrandSection::Running | StrandSection::Done))
                 .filter_map(|i| i.date.clone().or_else(|| i.launched.clone()))
                 .max();
             if let Some(newest) = newest {
-                if days_between(&thing.updated, &newest).is_some_and(|d| d > 0) {
-                    thing.findings.push(Finding::at(
+                if days_between(&strand.updated, &newest).is_some_and(|d| d > 0) {
+                    strand.findings.push(Finding::at(
                         UPDATED_BEHIND,
                         1,
                         format!(
                             "updated {} is older than {}, the newest date in Running or Done",
-                            thing.updated, newest
+                            strand.updated, newest
                         ),
                     ));
                 }
             }
-            if thing.state == "active" && age > DORMANT_DAYS {
-                thing.findings.push(Finding::at(
+            if strand.state == "active" && age > DORMANT_DAYS {
+                strand.findings.push(Finding::at(
                     DORMANT_CANDIDATE,
                     1,
                     format!("active and untouched for {age} days"),
                 ));
-            } else if thing.state == "active" && age > STALE_DAYS {
-                thing.findings.push(Finding::at(
+            } else if strand.state == "active" && age > STALE_DAYS {
+                strand.findings.push(Finding::at(
                     UPDATED_STALE,
                     1,
                     format!("active and untouched for {age} days"),
@@ -777,12 +777,12 @@ pub fn audit_thing(thing: &mut Thing, notes_root: &Path, today: &str) {
         }
     }
 
-    for reference in &thing.link_refs {
+    for reference in &strand.link_refs {
         let resolved = resolve_target(&reference.target);
         if resolved.is_empty() || notes_root.join(&resolved).is_file() {
             continue;
         }
-        thing.findings.push(Finding::at(
+        strand.findings.push(Finding::at(
             LINK_DEAD,
             reference.line,
             format!(
@@ -792,12 +792,12 @@ pub fn audit_thing(thing: &mut Thing, notes_root: &Path, today: &str) {
         ));
     }
 
-    for item in &thing.items {
-        if item.section != ThingSection::Running {
+    for item in &strand.items {
+        if item.section != StrandSection::Running {
             continue;
         }
         match &item.launched {
-            None => thing.findings.push(Finding::at(
+            None => strand.findings.push(Finding::at(
                 RUNNING_SILENT,
                 item.line,
                 format!("{} is running with no launched date", id_or_line(item)),
@@ -805,7 +805,7 @@ pub fn audit_thing(thing: &mut Thing, notes_root: &Path, today: &str) {
             Some(launched) => {
                 if let Some(age) = days_between(launched, today) {
                     if age > RUNNING_SILENT_DAYS {
-                        thing.findings.push(Finding::at(
+                        strand.findings.push(Finding::at(
                             RUNNING_SILENT,
                             item.line,
                             format!(
@@ -819,27 +819,27 @@ pub fn audit_thing(thing: &mut Thing, notes_root: &Path, today: &str) {
         }
     }
 
-    if thing.state == "active" && thing.next.is_none() {
-        thing.findings.push(Finding::at(
+    if strand.state == "active" && strand.next.is_none() {
+        strand.findings.push(Finding::at(
             NO_NEXT,
             1,
             "active with no unchecked Queue item above Later",
         ));
     }
 
-    thing.findings.sort_by_key(|f| (f.line, f.code));
+    strand.findings.sort_by_key(|f| (f.line, f.code));
 }
 
 // ---- The snapshot ----------------------------------------------------------
 
-/// Read, parse, audit and sort every live note under `<notes_root>/Things/`,
+/// Read, parse, audit and sort every live note under `<notes_root>/Strands/`,
 /// then scan the owned directories for the two global findings.
 ///
 /// `today` is `YYYY-MM-DD`; every date comparison in the audit is against it, so
 /// the whole snapshot is a pure function of the vault plus that one string.
-pub fn snapshot(notes_root: &Path, today: &str) -> ThingsSnapshot {
-    let dir = notes_root.join(THINGS_DIR);
-    let mut parsed: Vec<Thing> = Vec::new();
+pub fn snapshot(notes_root: &Path, today: &str) -> StrandsSnapshot {
+    let dir = notes_root.join(STRANDS_DIR);
+    let mut parsed: Vec<Strand> = Vec::new();
     let mut entries: Vec<PathBuf> = match std::fs::read_dir(&dir) {
         Ok(rd) => rd
             .filter_map(|e| e.ok())
@@ -856,54 +856,54 @@ pub fn snapshot(notes_root: &Path, today: &str) -> ThingsSnapshot {
         let Ok(src) = std::fs::read_to_string(&path) else {
             continue;
         };
-        let mut thing = parse_thing(slug, &src);
-        audit_thing(&mut thing, notes_root, today);
-        parsed.push(thing);
+        let mut strand = parse_strand(slug, &src);
+        audit_strand(&mut strand, notes_root, today);
+        parsed.push(strand);
     }
 
     // A `done` note is off the board, but a `done` note still sitting beside the
     // live ones is a filing failure and has to be said somewhere. It goes to the
     // global list, which is the only place left once the note itself is excluded.
     let mut global: Vec<Finding> = Vec::new();
-    for thing in parsed.iter().filter(|t| t.state == "done") {
+    for strand in parsed.iter().filter(|t| t.state == "done") {
         global.push(Finding::global(
             DONE_NOT_ARCHIVED,
             format!(
-                "{} is done but is not under {THINGS_DIR}/{ARCHIVE_SEGMENT}/",
-                thing.path
+                "{} is done but is not under {STRANDS_DIR}/{ARCHIVE_SEGMENT}/",
+                strand.path
             ),
         ));
     }
 
-    let mut things: Vec<Thing> = parsed.into_iter().filter(|t| t.state != "done").collect();
+    let mut strands: Vec<Strand> = parsed.into_iter().filter(|t| t.state != "done").collect();
     // Newest first, then by title so the order is total and a redeploy cannot
     // reshuffle two notes edited on the same day.
-    things.sort_by(|a, b| {
+    strands.sort_by(|a, b| {
         b.updated
             .cmp(&a.updated)
             .then_with(|| a.title.cmp(&b.title))
             .then_with(|| a.slug.cmp(&b.slug))
     });
 
-    global.extend(scan_owned_files(notes_root, &things));
+    global.extend(scan_owned_files(notes_root, &strands));
 
     let counts = SnapshotCounts {
-        active: things.iter().filter(|t| t.state == "active").count(),
-        waiting: things.iter().filter(|t| t.state == "waiting").count(),
-        dormant: things.iter().filter(|t| t.state == "dormant").count(),
+        active: strands.iter().filter(|t| t.state == "active").count(),
+        waiting: strands.iter().filter(|t| t.state == "waiting").count(),
+        dormant: strands.iter().filter(|t| t.state == "dormant").count(),
     };
     if counts.active > MAX_ACTIVE {
         global.push(Finding::global(
             TOO_MANY,
             format!(
-                "{} active things, more than the {MAX_ACTIVE} a board can hold",
+                "{} active strands, more than the {MAX_ACTIVE} a board can hold",
                 counts.active
             ),
         ));
     }
 
-    ThingsSnapshot {
-        things,
+    StrandsSnapshot {
+        strands,
         global_findings: global,
         counts,
     }
@@ -912,7 +912,7 @@ pub fn snapshot(notes_root: &Path, today: &str) -> ThingsSnapshot {
 /// [`ORPHAN_DRAFT`] and [`UNOWNED_PROMPT`]: the live files under the owned
 /// directories, checked against the notes that claim them. Subdirectories are
 /// not walked, which is exactly what keeps `archive/` out of scope.
-fn scan_owned_files(notes_root: &Path, things: &[Thing]) -> Vec<Finding> {
+fn scan_owned_files(notes_root: &Path, strands: &[Strand]) -> Vec<Finding> {
     let mut out = Vec::new();
     for dir in OWNED_DIRS {
         let mut paths: Vec<PathBuf> = match std::fs::read_dir(notes_root.join(dir)) {
@@ -932,25 +932,25 @@ fn scan_owned_files(notes_root: &Path, things: &[Thing]) -> Vec<Finding> {
             let Ok(src) = std::fs::read_to_string(&path) else {
                 continue;
             };
-            match frontmatter_value(&src, "thing") {
+            match frontmatter_value(&src, "strand") {
                 None => {
                     if name.to_lowercase().contains("prompt") {
                         out.push(Finding::global(
                             UNOWNED_PROMPT,
-                            format!("{rel} has no thing: key"),
+                            format!("{rel} has no strand: key"),
                         ));
                     }
                 }
-                Some(slug) => match things.iter().find(|t| t.slug == slug) {
+                Some(slug) => match strands.iter().find(|t| t.slug == slug) {
                     None => out.push(Finding::global(
                         ORPHAN_DRAFT,
-                        format!("{rel} names thing: {slug}, which has no note"),
+                        format!("{rel} names strand: {slug}, which has no note"),
                     )),
-                    Some(thing) => {
-                        if !thing.targets.iter().any(|t| t == &rel) {
+                    Some(strand) => {
+                        if !strand.targets.iter().any(|t| t == &rel) {
                             out.push(Finding::global(
                                 ORPHAN_DRAFT,
-                                format!("{rel} names thing: {slug}, which does not link it"),
+                                format!("{rel} names strand: {slug}, which does not link it"),
                             ));
                         }
                     }
@@ -987,9 +987,9 @@ fn frontmatter_value(src: &str, key: &str) -> Option<String> {
 /// and pasted into notes and prompts, where an em dash is a character that has to
 /// survive four more programs; a colon or a full stop says the same thing and
 /// always arrives. The `- ` bullet marker is a list, not a dash.
-pub fn render_report(snapshot: &ThingsSnapshot, date: &str) -> String {
+pub fn render_report(snapshot: &StrandsSnapshot, date: &str) -> String {
     let mut out = String::new();
-    out.push_str(&format!("# Things audit {date}\n\n"));
+    out.push_str(&format!("# Strands audit {date}\n\n"));
     out.push_str(&format!(
         "Active {}, waiting {}, dormant {}, findings {}.\n\n",
         snapshot.counts.active,
@@ -1001,11 +1001,11 @@ pub fn render_report(snapshot: &ThingsSnapshot, date: &str) -> String {
         out.push_str("No findings.\n");
         return out;
     }
-    for thing in &snapshot.things {
-        for finding in &thing.findings {
+    for strand in &snapshot.strands {
+        for finding in &strand.findings {
             out.push_str(&format!(
                 "- {} · {} · {} ({})\n",
-                finding.code, thing.title, finding.message, thing.path
+                finding.code, strand.title, finding.message, strand.path
             ));
         }
     }
@@ -1038,8 +1038,8 @@ pub enum AuditWrite {
     AlreadyThere(PathBuf),
     /// Before 03:20 in the scheduler's zone.
     NotYet,
-    /// No `Things/` directory under the notes root.
-    NoThingsDir,
+    /// No `Strands/` directory under the notes root.
+    NoStrandsDir,
     /// No vault configured, or the write failed.
     Unavailable(String),
 }
@@ -1047,7 +1047,7 @@ pub enum AuditWrite {
 /// The day's audit file, written once. Takes the clock rather than reading one,
 /// so a test can put the instant past 03:20 and prove both halves of the
 /// contract: it creates the file, and a second call does not overwrite it.
-pub fn run_things_audit(cfg: &Config, clock: &SchedulerClock) -> AuditWrite {
+pub fn run_strands_audit(cfg: &Config, clock: &SchedulerClock) -> AuditWrite {
     if cfg.vault.is_empty() {
         return AuditWrite::Unavailable("no vault configured".to_string());
     }
@@ -1067,12 +1067,12 @@ pub fn run_things_audit(cfg: &Config, clock: &SchedulerClock) -> AuditWrite {
     );
 
     let notes_root = notes_root(cfg);
-    if !notes_root.join(THINGS_DIR).is_dir() {
-        return AuditWrite::NoThingsDir;
+    if !notes_root.join(STRANDS_DIR).is_dir() {
+        return AuditWrite::NoStrandsDir;
     }
     let path = notes_root
         .join("Inbox")
-        .join(format!("{date}-things-audit.md"));
+        .join(format!("{date}-strands-audit.md"));
     if path.exists() {
         return AuditWrite::AlreadyThere(path);
     }
@@ -1095,29 +1095,29 @@ pub fn run_things_audit(cfg: &Config, clock: &SchedulerClock) -> AuditWrite {
 /// if today's file is missing and it is past 03:20" case needs no second code
 /// path. It reads the scheduler's clock on every pass, so an away profile's zone
 /// moves the audit exactly as it moves every other calendar decision.
-pub fn spawn_things_audit(st: AppState) {
+pub fn spawn_strands_audit(st: AppState) {
     tokio::spawn(async move {
         // Every pass that changes nothing is silent after the first, so a quiet
         // day costs one line rather than 2,880.
         let mut last_quiet = String::new();
         loop {
             let clock = st.scheduler.clock();
-            match run_things_audit(&st.cfg, &clock) {
+            match run_strands_audit(&st.cfg, &clock) {
                 AuditWrite::Wrote(path) => {
                     last_quiet.clear();
-                    eprintln!("jesse-bridge: things audit written to {}", path.display());
+                    eprintln!("jesse-bridge: strands audit written to {}", path.display());
                 }
                 AuditWrite::AlreadyThere(_) | AuditWrite::NotYet => last_quiet.clear(),
-                AuditWrite::NoThingsDir => {
-                    let msg = "no Things/ directory under the vault".to_string();
+                AuditWrite::NoStrandsDir => {
+                    let msg = "no Strands/ directory under the vault".to_string();
                     if last_quiet != msg {
-                        eprintln!("jesse-bridge: WARNING: things audit skipped: {msg}");
+                        eprintln!("jesse-bridge: WARNING: strands audit skipped: {msg}");
                         last_quiet = msg;
                     }
                 }
                 AuditWrite::Unavailable(why) => {
                     if last_quiet != why {
-                        eprintln!("jesse-bridge: WARNING: things audit skipped: {why}");
+                        eprintln!("jesse-bridge: WARNING: strands audit skipped: {why}");
                         last_quiet = why;
                     }
                 }
@@ -1150,7 +1150,7 @@ fn zoned_now(st: &AppState) -> (String, String) {
 /// Serve a body under a strong ETag, with `generated_at` stamped on AFTER the
 /// tag is computed. Same contract as [`crate::today`]'s response helper, and for
 /// the same reason: a tag that moved with the clock would never produce a `304`.
-fn things_response(headers: &HeaderMap, mut value: Value, generated_at: &str) -> Response {
+fn strands_response(headers: &HeaderMap, mut value: Value, generated_at: &str) -> Response {
     let etag = strong_etag(&serde_json::to_string(&value).unwrap_or_default());
     if let Some(inm) = headers
         .get(axum::http::header::IF_NONE_MATCH)
@@ -1177,14 +1177,14 @@ fn things_response(headers: &HeaderMap, mut value: Value, generated_at: &str) ->
         .into_response()
 }
 
-/// `GET /jesse/things` — every active thing, sorted newest first, with its next
+/// `GET /jesse/strands` — every active strand, sorted newest first, with its next
 /// step and its findings. Bearer auth and the shared limiter, strictly read
 /// only, and a pure function of the vault plus today's date.
 ///
-/// A missing `Things/` directory is `200` with empty lists rather than a `404`,
+/// A missing `Strands/` directory is `200` with empty lists rather than a `404`,
 /// the same degradation `/jesse/today` gives a missing day file: the phone
 /// renders an empty board, not an error.
-pub async fn jesse_things(
+pub async fn jesse_strands(
     State(st): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
@@ -1198,16 +1198,16 @@ pub async fn jesse_things(
     let (today, generated_at) = zoned_now(&st);
     let snap = snapshot(&notes_root(&st.cfg), &today);
     let value = serde_json::to_value(&snap).unwrap_or_else(|_| json!({}));
-    Ok(things_response(&headers, value, &generated_at))
+    Ok(strands_response(&headers, value, &generated_at))
 }
 
-/// `GET /jesse/things/{slug}` — one note's markdown beside its parsed form.
+/// `GET /jesse/strands/{slug}` — one note's markdown beside its parsed form.
 ///
 /// The slug is the file stem and nothing else. A slug carrying a path separator
-/// or a `..` is `404` BEFORE any path is composed: the only thing that reaches
-/// the filesystem is `<notes root>/Things/<slug>.md`, and rejecting the shape
+/// or a `..` is `404` BEFORE any path is composed: the only strand that reaches
+/// the filesystem is `<notes root>/Strands/<slug>.md`, and rejecting the shape
 /// first is what keeps that a claim about the code rather than about `PathBuf`.
-pub async fn jesse_thing(
+pub async fn jesse_strand(
     State(st): State<AppState>,
     UrlPath(slug): UrlPath<String>,
     headers: HeaderMap,
@@ -1220,21 +1220,21 @@ pub async fn jesse_thing(
         ));
     }
     if !is_safe_slug(&slug) {
-        return Err((StatusCode::NOT_FOUND, "no thing by that slug".to_string()));
+        return Err((StatusCode::NOT_FOUND, "no strand by that slug".to_string()));
     }
     let notes_root = notes_root(&st.cfg);
-    let path = notes_root.join(THINGS_DIR).join(format!("{slug}.md"));
+    let path = notes_root.join(STRANDS_DIR).join(format!("{slug}.md"));
     let Ok(markdown) = std::fs::read_to_string(&path) else {
-        return Err((StatusCode::NOT_FOUND, "no thing by that slug".to_string()));
+        return Err((StatusCode::NOT_FOUND, "no strand by that slug".to_string()));
     };
     let (today, generated_at) = zoned_now(&st);
-    let mut thing = parse_thing(&slug, &markdown);
-    audit_thing(&mut thing, &notes_root, &today);
-    let value = json!({ "markdown": markdown, "thing": thing });
-    Ok(things_response(&headers, value, &generated_at))
+    let mut strand = parse_strand(&slug, &markdown);
+    audit_strand(&mut strand, &notes_root, &today);
+    let value = json!({ "markdown": markdown, "strand": strand });
+    Ok(strands_response(&headers, value, &generated_at))
 }
 
-/// A slug that can only ever name a file directly inside `Things/`: no
+/// A slug that can only ever name a file directly inside `Strands/`: no
 /// separator, no traversal, no dot-file, no empty string.
 fn is_safe_slug(slug: &str) -> bool {
     !slug.is_empty()
@@ -1250,27 +1250,27 @@ mod tests {
     use super::*;
     use chrono::TimeZone;
 
-    const CLEAN: &str = include_str!("../tests/fixtures/things/vault/Things/Clean-Thing.md");
-    const MESSY: &str = include_str!("../tests/fixtures/things/vault/Things/Messy-Thing.md");
+    const CLEAN: &str = include_str!("../tests/fixtures/strands/vault/Strands/Clean-Strand.md");
+    const MESSY: &str = include_str!("../tests/fixtures/strands/vault/Strands/Messy-Strand.md");
 
     fn fixture_root() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/things/vault")
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/strands/vault")
     }
 
     // ---- The grammar -------------------------------------------------------
 
     #[test]
     fn parses_frontmatter_title_now_and_waiting() {
-        let t = parse_thing("Clean-Thing", CLEAN);
+        let t = parse_strand("Clean-Strand", CLEAN);
         assert_eq!(t.group, "personal");
         assert_eq!(t.state, "active");
         assert_eq!(t.updated, "2026-09-23");
         assert_eq!(t.repos, vec!["jeremyandrews/argus".to_string()]);
-        assert_eq!(t.title, "Clean Thing");
-        assert_eq!(t.slug, "Clean-Thing");
+        assert_eq!(t.title, "Clean Strand");
+        assert_eq!(t.slug, "Clean-Strand");
         assert_eq!(
             t.now.as_deref(),
-            Some("One sentence saying where the thing stands today.")
+            Some("One sentence saying where the strand stands today.")
         );
         let waiting = t.waiting.clone().unwrap();
         assert!(waiting.jeremy, "a `you:` gate is the operator's");
@@ -1279,13 +1279,13 @@ mod tests {
 
     #[test]
     fn waiting_without_you_is_not_a_jeremy_gate() {
-        let t = parse_thing("Messy-Thing", MESSY);
+        let t = parse_strand("Messy-Strand", MESSY);
         assert_eq!(t.waiting.map(|w| w.jeremy), Some(false));
     }
 
     #[test]
     fn item_line_splits_into_id_text_link_and_waits_on() {
-        let t = parse_thing("Clean-Thing", CLEAN);
+        let t = parse_strand("Clean-Strand", CLEAN);
         let next = t.next.clone().unwrap();
         assert_eq!(next.id, "A1d");
         assert_eq!(next.text, "Guest budget probe on the fixed kernel.");
@@ -1298,10 +1298,10 @@ mod tests {
 
     #[test]
     fn counts_separate_queue_later_running_and_done() {
-        let t = parse_thing("Clean-Thing", CLEAN);
+        let t = parse_strand("Clean-Strand", CLEAN);
         assert_eq!(
             t.counts,
-            ThingCounts {
+            StrandCounts {
                 queue: 2,
                 later: 1,
                 running: 1,
@@ -1313,18 +1313,18 @@ mod tests {
     #[test]
     fn next_step_is_the_first_unchecked_queue_item_above_later() {
         // The Later list holds an unchecked item; it must never be the next step.
-        let t = parse_thing("Clean-Thing", CLEAN);
+        let t = parse_strand("Clean-Strand", CLEAN);
         assert_eq!(t.next.map(|n| n.id).as_deref(), Some("A1d"));
-        assert!(t.items.iter().any(|i| i.section == ThingSection::Later));
+        assert!(t.items.iter().any(|i| i.section == StrandSection::Later));
     }
 
     #[test]
     fn done_line_carries_its_date_and_running_line_its_launched() {
-        let t = parse_thing("Clean-Thing", CLEAN);
+        let t = parse_strand("Clean-Strand", CLEAN);
         let done: Vec<Option<String>> = t
             .items
             .iter()
-            .filter(|i| i.section == ThingSection::Done)
+            .filter(|i| i.section == StrandSection::Done)
             .map(|i| i.date.clone())
             .collect();
         assert_eq!(
@@ -1337,7 +1337,7 @@ mod tests {
         let running = t
             .items
             .iter()
-            .find(|i| i.section == ThingSection::Running)
+            .find(|i| i.section == StrandSection::Running)
             .unwrap();
         assert_eq!(running.launched.as_deref(), Some("2026-09-23"));
     }
@@ -1345,14 +1345,14 @@ mod tests {
     #[test]
     fn a_repeated_launched_word_takes_the_first_date() {
         let line = "- [ ] **A6** Forms. Launched 2026-09-18 while A5 was half merged. Launched 2026-09-20.";
-        let item = parse_item(ThingSection::Running, line, 1).unwrap();
+        let item = parse_item(StrandSection::Running, line, 1).unwrap();
         assert_eq!(item.launched.as_deref(), Some("2026-09-18"));
     }
 
     #[test]
     fn an_unknown_h2_closes_the_current_section() {
         let src = "---\ngroup: tag1\nstate: active\nupdated: 2026-09-23\n---\n# T\n\n## Queue\n- [ ] **A1** In.\n\n## Notes\n- [ ] **A2** Out.\n";
-        let t = parse_thing("T", src);
+        let t = parse_strand("T", src);
         assert_eq!(t.counts.queue, 1);
         assert_eq!(t.items.len(), 1);
     }
@@ -1360,7 +1360,7 @@ mod tests {
     #[test]
     fn a_later_heading_outside_the_queue_opens_nothing() {
         let src = "---\ngroup: tag1\nstate: active\nupdated: 2026-09-23\n---\n# T\n\n## Queue\n- [ ] **A1** In.\n\n## Running\n### Later\n- [ ] **A2** Out.\n";
-        let t = parse_thing("T", src);
+        let t = parse_strand("T", src);
         assert_eq!(t.counts.later, 0);
         assert_eq!(t.counts.running, 0);
         assert_eq!(t.items.len(), 1);
@@ -1374,9 +1374,9 @@ mod tests {
 
     #[test]
     fn finding_parse_covers_frontmatter_h1_queue_and_a_missing_id() {
-        let t = parse_thing("None", "just prose\n");
+        let t = parse_strand("None", "just prose\n");
         assert_eq!(codes(&t.findings), vec![PARSE, PARSE, PARSE]);
-        let t = parse_thing("Messy-Thing", MESSY);
+        let t = parse_strand("Messy-Strand", MESSY);
         assert!(t
             .findings
             .iter()
@@ -1385,8 +1385,8 @@ mod tests {
 
     #[test]
     fn finding_group_and_state_reject_a_value_outside_the_set() {
-        let mut t = parse_thing("Messy-Thing", MESSY);
-        audit_thing(&mut t, &fixture_root(), "2026-09-23");
+        let mut t = parse_strand("Messy-Strand", MESSY);
+        audit_strand(&mut t, &fixture_root(), "2026-09-23");
         assert!(codes(&t.findings).contains(&GROUP));
         assert!(
             !codes(&t.findings).contains(&STATE),
@@ -1394,16 +1394,16 @@ mod tests {
         );
 
         let src = "---\ngroup: tag1\nstate: paused\nupdated: 2026-09-23\n---\n# T\n\n## Queue\n- [ ] **A1** In.\n";
-        let mut t = parse_thing("T", src);
-        audit_thing(&mut t, &fixture_root(), "2026-09-23");
+        let mut t = parse_strand("T", src);
+        audit_strand(&mut t, &fixture_root(), "2026-09-23");
         assert_eq!(codes(&t.findings), vec![STATE]);
     }
 
     #[test]
     fn finding_updated_invalid_catches_a_future_date() {
         let src = "---\ngroup: tag1\nstate: active\nupdated: 2027-01-01\n---\n# T\n\n## Queue\n- [ ] **A1** In.\n";
-        let mut t = parse_thing("T", src);
-        audit_thing(&mut t, &fixture_root(), "2026-09-23");
+        let mut t = parse_strand("T", src);
+        audit_strand(&mut t, &fixture_root(), "2026-09-23");
         assert!(t
             .findings
             .iter()
@@ -1412,38 +1412,38 @@ mod tests {
 
     #[test]
     fn finding_updated_behind_compares_with_running_and_done() {
-        let mut t = parse_thing("Messy-Thing", MESSY);
-        audit_thing(&mut t, &fixture_root(), "2026-09-23");
+        let mut t = parse_strand("Messy-Strand", MESSY);
+        audit_strand(&mut t, &fixture_root(), "2026-09-23");
         assert!(codes(&t.findings).contains(&UPDATED_BEHIND));
     }
 
     #[test]
     fn finding_updated_stale_and_dormant_candidate_are_exclusive() {
         let src = "---\ngroup: tag1\nstate: active\nupdated: 2026-09-01\n---\n# T\n\n## Queue\n- [ ] **A1** In.\n";
-        let mut stale = parse_thing("T", src);
-        audit_thing(&mut stale, &fixture_root(), "2026-09-23");
+        let mut stale = parse_strand("T", src);
+        audit_strand(&mut stale, &fixture_root(), "2026-09-23");
         assert!(codes(&stale.findings).contains(&UPDATED_STALE));
         assert!(!codes(&stale.findings).contains(&DORMANT_CANDIDATE));
 
         let src = src.replace("2026-09-01", "2026-01-01");
-        let mut old = parse_thing("T", &src);
-        audit_thing(&mut old, &fixture_root(), "2026-09-23");
+        let mut old = parse_strand("T", &src);
+        audit_strand(&mut old, &fixture_root(), "2026-09-23");
         assert!(codes(&old.findings).contains(&DORMANT_CANDIDATE));
         assert!(!codes(&old.findings).contains(&UPDATED_STALE));
     }
 
     #[test]
     fn finding_link_dead_and_queue_archived() {
-        let mut t = parse_thing("Messy-Thing", MESSY);
-        audit_thing(&mut t, &fixture_root(), "2026-09-23");
+        let mut t = parse_strand("Messy-Strand", MESSY);
+        audit_strand(&mut t, &fixture_root(), "2026-09-23");
         assert!(codes(&t.findings).contains(&LINK_DEAD));
         assert!(codes(&t.findings).contains(&QUEUE_ARCHIVED));
     }
 
     #[test]
     fn finding_running_silent_covers_both_an_old_date_and_no_date() {
-        let mut t = parse_thing("Messy-Thing", MESSY);
-        audit_thing(&mut t, &fixture_root(), "2026-09-23");
+        let mut t = parse_strand("Messy-Strand", MESSY);
+        audit_strand(&mut t, &fixture_root(), "2026-09-23");
         let silent: Vec<&str> = t
             .findings
             .iter()
@@ -1458,27 +1458,27 @@ mod tests {
     #[test]
     fn finding_running_silent_spares_a_prompt_launched_three_days_ago() {
         let src = "---\ngroup: tag1\nstate: active\nupdated: 2026-09-23\n---\n# T\n\n## Queue\n- [ ] **A1** In.\n\n## Running\n- [ ] **B1** Out. Launched 2026-09-20.\n";
-        let mut t = parse_thing("T", src);
-        audit_thing(&mut t, &fixture_root(), "2026-09-23");
+        let mut t = parse_strand("T", src);
+        audit_strand(&mut t, &fixture_root(), "2026-09-23");
         assert!(!codes(&t.findings).contains(&RUNNING_SILENT));
     }
 
     #[test]
     fn finding_checked_not_moved() {
-        let t = parse_thing("Messy-Thing", MESSY);
+        let t = parse_strand("Messy-Strand", MESSY);
         assert!(codes(&t.findings).contains(&CHECKED_NOT_MOVED));
     }
 
     #[test]
     fn finding_no_next() {
-        let mut t = parse_thing("Messy-Thing", MESSY);
-        audit_thing(&mut t, &fixture_root(), "2026-09-23");
+        let mut t = parse_strand("Messy-Strand", MESSY);
+        audit_strand(&mut t, &fixture_root(), "2026-09-23");
         assert!(codes(&t.findings).contains(&NO_NEXT));
     }
 
     #[test]
     fn finding_dup_id() {
-        let t = parse_thing("Messy-Thing", MESSY);
+        let t = parse_strand("Messy-Strand", MESSY);
         assert!(codes(&t.findings).contains(&DUP_ID));
     }
 
@@ -1507,8 +1507,8 @@ mod tests {
     fn finding_too_many() {
         // Twenty-one active notes in one temporary vault: the only finding that
         // is about the board rather than about any note on it.
-        let root = std::env::temp_dir().join(format!("things-many-{}", std::process::id()));
-        let dir = root.join(THINGS_DIR);
+        let root = std::env::temp_dir().join(format!("strands-many-{}", std::process::id()));
+        let dir = root.join(STRANDS_DIR);
         std::fs::create_dir_all(&dir).unwrap();
         for n in 0..21 {
             std::fs::write(
@@ -1526,7 +1526,7 @@ mod tests {
     fn every_finding_code_is_raised_by_the_fixtures() {
         let snap = snapshot(&fixture_root(), "2026-09-23");
         let mut raised: Vec<&str> = snap
-            .things
+            .strands
             .iter()
             .flat_map(|t| t.findings.iter().map(|f| f.code))
             .chain(snap.global_findings.iter().map(|f| f.code))
@@ -1544,8 +1544,8 @@ mod tests {
 
     #[test]
     fn a_clean_note_has_no_findings() {
-        let mut t = parse_thing("Clean-Thing", CLEAN);
-        audit_thing(&mut t, &fixture_root(), "2026-09-23");
+        let mut t = parse_strand("Clean-Strand", CLEAN);
+        audit_strand(&mut t, &fixture_root(), "2026-09-23");
         assert_eq!(t.findings, Vec::new(), "the clean fixture must stay clean");
     }
 
@@ -1553,18 +1553,18 @@ mod tests {
     fn sort_is_updated_descending_then_title_ascending() {
         let snap = snapshot(&fixture_root(), "2026-09-23");
         let order: Vec<(&str, &str)> = snap
-            .things
+            .strands
             .iter()
             .map(|t| (t.updated.as_str(), t.title.as_str()))
             .collect();
         assert_eq!(
             order,
             vec![
-                ("2026-09-23", "Alpha Thing"),
-                ("2026-09-23", "Clean Thing"),
-                ("2026-09-01", "Messy Thing"),
-                ("2026-01-01", "Dormant Thing"),
-                ("", "Broken Thing"),
+                ("2026-09-23", "Alpha Strand"),
+                ("2026-09-23", "Clean Strand"),
+                ("2026-09-01", "Messy Strand"),
+                ("2026-01-01", "Dormant Strand"),
+                ("", "Broken Strand"),
             ],
             "newest first, then title; an unparseable date sorts last"
         );
@@ -1573,7 +1573,7 @@ mod tests {
     #[test]
     fn a_done_note_is_off_the_board_but_not_out_of_the_audit() {
         let snap = snapshot(&fixture_root(), "2026-09-23");
-        assert!(!snap.things.iter().any(|t| t.state == "done"));
+        assert!(!snap.strands.iter().any(|t| t.state == "done"));
         assert!(snap
             .global_findings
             .iter()
@@ -1581,9 +1581,9 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_things_directory_is_an_empty_snapshot() {
+    fn a_missing_strands_directory_is_an_empty_snapshot() {
         let snap = snapshot(Path::new("/nonexistent/notes/root"), "2026-09-23");
-        assert_eq!(snap.things, Vec::new());
+        assert_eq!(snap.strands, Vec::new());
         assert_eq!(snap.counts, SnapshotCounts::default());
     }
 
@@ -1597,7 +1597,7 @@ mod tests {
             .keys()
             .map(|k| k.as_str())
             .collect();
-        assert_eq!(top, vec!["counts", "global_findings", "things"]);
+        assert_eq!(top, vec!["counts", "global_findings", "strands"]);
         assert_eq!(
             value["counts"]
                 .as_object()
@@ -1608,11 +1608,11 @@ mod tests {
             vec!["active", "dormant", "waiting"]
         );
 
-        let clean = value["things"]
+        let clean = value["strands"]
             .as_array()
             .unwrap()
             .iter()
-            .find(|t| t["slug"] == "Clean-Thing")
+            .find(|t| t["slug"] == "Clean-Strand")
             .unwrap();
         assert_eq!(
             clean
@@ -1655,21 +1655,21 @@ mod tests {
         );
 
         // `waiting` and `next` are null when absent, never missing.
-        let broken = value["things"]
+        let broken = value["strands"]
             .as_array()
             .unwrap()
             .iter()
-            .find(|t| t["slug"] == "Broken-Thing")
+            .find(|t| t["slug"] == "Broken-Strand")
             .unwrap();
         assert!(broken["waiting"].is_null());
         assert!(broken["next"].is_null());
 
         // A note finding carries a line; a global one does not.
-        let messy = value["things"]
+        let messy = value["strands"]
             .as_array()
             .unwrap()
             .iter()
-            .find(|t| t["slug"] == "Messy-Thing")
+            .find(|t| t["slug"] == "Messy-Strand")
             .unwrap();
         assert!(messy["findings"][0]["line"].is_number());
         assert_eq!(
@@ -1691,11 +1691,11 @@ mod tests {
         let a = render_report(&snap, "2026-09-23");
         let b = render_report(&snapshot(&fixture_root(), "2026-09-23"), "2026-09-23");
         assert_eq!(a, b);
-        assert!(
-            a.starts_with("# Things audit 2026-09-23\n\nActive 3, waiting 1, dormant 0, findings ")
-        );
-        assert!(a.contains(" · Messy Thing · "));
-        assert!(a.contains("(Things/Messy-Thing.md)"));
+        assert!(a.starts_with(
+            "# Strands audit 2026-09-23\n\nActive 3, waiting 1, dormant 0, findings "
+        ));
+        assert!(a.contains(" · Messy Strand · "));
+        assert!(a.contains("(Strands/Messy-Strand.md)"));
     }
 
     #[test]
@@ -1711,33 +1711,33 @@ mod tests {
 
     #[test]
     fn report_says_so_when_there_is_nothing_to_say() {
-        let snap = ThingsSnapshot {
+        let snap = StrandsSnapshot {
             counts: SnapshotCounts {
                 active: 3,
                 waiting: 0,
                 dormant: 0,
             },
-            ..ThingsSnapshot::default()
+            ..StrandsSnapshot::default()
         };
         assert_eq!(
             render_report(&snap, "2026-09-23"),
-            "# Things audit 2026-09-23\n\nActive 3, waiting 0, dormant 0, findings 0.\n\nNo findings.\n"
+            "# Strands audit 2026-09-23\n\nActive 3, waiting 0, dormant 0, findings 0.\n\nNo findings.\n"
         );
     }
 
     // ---- The writer --------------------------------------------------------
 
-    /// A temporary vault repo whose `vault/Things/` is a copy of the fixtures.
+    /// A temporary vault repo whose `vault/Strands/` is a copy of the fixtures.
     fn temp_vault(tag: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!(
-            "things-writer-{tag}-{}-{:?}",
+            "strands-writer-{tag}-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));
         std::fs::remove_dir_all(&root).ok();
         let notes = root.join(crate::config::VAULT_SUBDIR);
-        std::fs::create_dir_all(notes.join(THINGS_DIR)).unwrap();
-        std::fs::write(notes.join(THINGS_DIR).join("Clean-Thing.md"), CLEAN).unwrap();
+        std::fs::create_dir_all(notes.join(STRANDS_DIR)).unwrap();
+        std::fs::write(notes.join(STRANDS_DIR).join("Clean-Strand.md"), CLEAN).unwrap();
         root
     }
 
@@ -1763,19 +1763,19 @@ mod tests {
         let zone = SchedulerZone::hours_east(2);
         let clock = SchedulerClock::frozen(zone, at(zone, 2026, 9, 23, 3, 21));
 
-        let first = run_things_audit(&cfg, &clock);
+        let first = run_strands_audit(&cfg, &clock);
         let AuditWrite::Wrote(path) = first else {
             panic!("expected a write, got {first:?}");
         };
-        assert!(path.ends_with("Inbox/2026-09-23-things-audit.md"));
+        assert!(path.ends_with("Inbox/2026-09-23-strands-audit.md"));
         let written = std::fs::read_to_string(&path).unwrap();
-        assert!(written.starts_with("# Things audit 2026-09-23\n"));
+        assert!(written.starts_with("# Strands audit 2026-09-23\n"));
 
         // The idempotency guarantee: a second pass on the same day leaves the
         // file it found exactly as it was.
         std::fs::write(&path, "hand edited\n").unwrap();
         assert_eq!(
-            run_things_audit(&cfg, &clock),
+            run_strands_audit(&cfg, &clock),
             AuditWrite::AlreadyThere(path.clone())
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "hand edited\n");
@@ -1788,7 +1788,7 @@ mod tests {
         let cfg = cfg_at(&root);
         let zone = SchedulerZone::hours_east(2);
         assert_eq!(
-            run_things_audit(
+            run_strands_audit(
                 &cfg,
                 &SchedulerClock::frozen(zone, at(zone, 2026, 9, 23, 3, 19))
             ),
@@ -1798,7 +1798,7 @@ mod tests {
         // the hour is the scheduler's, never the fixture's.
         let east = SchedulerZone::hours_east(4);
         assert!(matches!(
-            run_things_audit(
+            run_strands_audit(
                 &cfg,
                 &SchedulerClock::frozen(east, at(zone, 2026, 9, 23, 3, 19))
             ),
@@ -1808,16 +1808,16 @@ mod tests {
     }
 
     #[test]
-    fn writer_skips_a_vault_with_no_things_directory() {
-        let root = std::env::temp_dir().join(format!("things-nodir-{}", std::process::id()));
+    fn writer_skips_a_vault_with_no_strands_directory() {
+        let root = std::env::temp_dir().join(format!("strands-nodir-{}", std::process::id()));
         std::fs::create_dir_all(root.join(crate::config::VAULT_SUBDIR)).unwrap();
         let zone = SchedulerZone::hours_east(2);
         assert_eq!(
-            run_things_audit(
+            run_strands_audit(
                 &cfg_at(&root),
                 &SchedulerClock::frozen(zone, at(zone, 2026, 9, 23, 4, 0))
             ),
-            AuditWrite::NoThingsDir
+            AuditWrite::NoStrandsDir
         );
         std::fs::remove_dir_all(&root).ok();
     }
@@ -1826,7 +1826,7 @@ mod tests {
 
     #[test]
     fn slug_guard_rejects_a_separator_a_traversal_and_a_dot_file() {
-        assert!(is_safe_slug("Clean-Thing"));
+        assert!(is_safe_slug("Clean-Strand"));
         assert!(!is_safe_slug(""));
         assert!(!is_safe_slug("a/b"));
         assert!(!is_safe_slug("a\\b"));

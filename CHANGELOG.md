@@ -16,39 +16,39 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Bridge 0.147.0] - 2026-09-23
 
-**Work state had no machine readable home, so nothing could check it.** A thing's status
+**Work state had no machine readable home, so nothing could check it.** A strand's status
 lived in prose spread over series indexes, drafts and whatever the last turn remembered. A
 prompt could be launched and never come back, a queue line could point at a draft that had
 already been archived, and a note could go a fortnight without an edit, and all three stayed
 invisible until somebody re read everything by hand. The vault now keeps one status note per
-piece of work under `vault/Things/` in a fixed format, and this release gives the bridge a
+piece of work under `vault/Strands/` in a fixed format, and this release gives the bridge a
 parser for it, a route that serves it to the phone, and a nightly audit that says whether the
 notes are still true.
 
 ### Added
 
-- **`GET /jesse/things`**: every Things note whose state is not `done`, parsed, sorted by
+- **`GET /jesse/strands`**: every Strands note whose state is not `done`, parsed, sorted by
   `updated` descending then title, each with its next step (the first unchecked Queue item
   above `### Later`), its section counts and its audit findings, plus the global findings
   and the board counts. Bearer auth, the shared limiter, and a strong ETag computed without
   `generated_at`, exactly as `/jesse/today` does, so an unchanged poll costs a `304`.
-- **`GET /jesse/things/:slug`**: one note's markdown beside its parsed form. `404` for an
+- **`GET /jesse/strands/:slug`**: one note's markdown beside its parsed form. `404` for an
   unknown slug and for any slug carrying a path separator or `..`, rejected before a path is
   composed.
-- **The nightly audit file, `vault/Inbox/YYYY-MM-DD-things-audit.md`, at 03:20 in the
+- **The nightly audit file, `vault/Inbox/YYYY-MM-DD-strands-audit.md`, at 03:20 in the
   scheduler's zone** (profile aware), and once at startup when today's file is missing and
   03:20 has passed. It is the only file this feature writes: it never overwrites the day's
-  file, never modifies a Things note and never calls the network. A vault with no `Things/`
+  file, never modifies a Strands note and never calls the network. A vault with no `Strands/`
   gets nothing written and one logged line.
 - **Finding codes, one implementation for both outputs:** `PARSE`, `GROUP`, `STATE`,
   `UPDATED-INVALID`, `UPDATED-BEHIND`, `UPDATED-STALE`, `DORMANT-CANDIDATE`, `LINK-DEAD`,
   `QUEUE-ARCHIVED`, `RUNNING-SILENT`, `CHECKED-NOT-MOVED`, `NO-NEXT`, `DUP-ID`,
   `ORPHAN-DRAFT`, `UNOWNED-PROMPT`, `TOO-MANY` and `DONE-NOT-ARCHIVED`.
-- **The `things_audit` example** (`bridge/examples/things_audit.rs`, given a notes root)
+- **The `strands_audit` example** (`bridge/examples/strands_audit.rs`, given a notes root)
   prints the report for a vault and writes nothing, which is how the rules were first run
   against the live vault.
 
-The new `things` module is namespaced (`crate::things`) rather than poured into the flat
+The new `strands` module is namespaced (`crate::strands`) rather than poured into the flat
 crate namespace: its finding codes are short generic names that would collide with the turn
 path's. `today.rs`, the schedule chain, the ledger and every permission allowlist are
 unchanged.

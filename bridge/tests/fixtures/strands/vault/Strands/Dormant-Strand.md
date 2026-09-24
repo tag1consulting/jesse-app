@@ -3,7 +3,7 @@ group: tag1
 state: active
 updated: 2026-01-01
 ---
-# Dormant Thing
+# Dormant Strand
 
 **Now:** Nothing has happened here since January.
 

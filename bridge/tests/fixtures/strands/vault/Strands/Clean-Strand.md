@@ -4,9 +4,9 @@ state: active
 updated: 2026-09-23
 repos: [jeremyandrews/argus]
 ---
-# Clean Thing
+# Clean Strand
 
-**Now:** One sentence saying where the thing stands today.
+**Now:** One sentence saying where the strand stands today.
 **Waiting on:** you: create the empty jeremyandrews/argus repository (boarded on the Network dashboard).
 
 ## Queue
@@ -23,7 +23,7 @@ repos: [jeremyandrews/argus]
 - [x] 2026-09-19 **A1** Try it, session 1: 0 stories, workers wedge, ten findings.
 
 ## Decisions
-- 2026-09-21 Clean Thing goes live from its own tree.
+- 2026-09-21 Clean Strand goes live from its own tree.
 
 ## Links
 [[todo-list/Projects/drafts/2026-09-23-guest-budget#Goal]] · [[todo-list/Projects/drafts/2026-09-22-wedge]]

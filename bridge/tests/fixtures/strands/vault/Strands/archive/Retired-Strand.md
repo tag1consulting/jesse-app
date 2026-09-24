@@ -3,6 +3,6 @@ group: nonsense
 state: done
 updated: not a date
 ---
-# Retired Thing
+# Retired Strand
 
 Archived notes are never parsed.

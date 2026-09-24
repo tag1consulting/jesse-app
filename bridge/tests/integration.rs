@@ -10232,15 +10232,15 @@ async fn persona_endpoint_returns_the_pack_without_its_content() {
     );
 }
 
-// ---- GET /jesse/things and /jesse/things/:slug ----------------------------------------
+// ---- GET /jesse/strands and /jesse/strands/:slug ----------------------------------------
 //
 // Driven through the real router against a temporary copy of the fixture vault. The
 // route reads the scheduler's live clock, so these assert status, shape and the ETag
 // contract, never a date-dependent finding: those are pinned by the unit tests in
-// `things.rs`, which pass the date in.
+// `strands.rs`, which pass the date in.
 
-/// Copy `tests/fixtures/things/vault` into a fresh temp vault repo's `vault/`.
-fn things_state() -> (AppState, std::path::PathBuf) {
+/// Copy `tests/fixtures/strands/vault` into a fresh temp vault repo's `vault/`.
+fn strands_state() -> (AppState, std::path::PathBuf) {
     fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
         std::fs::create_dir_all(to).unwrap();
         for entry in std::fs::read_dir(from).unwrap() {
@@ -10255,7 +10255,7 @@ fn things_state() -> (AppState, std::path::PathBuf) {
     }
     let root = make_diet_vault();
     copy_tree(
-        &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/things/vault"),
+        &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/strands/vault"),
         &root.join("vault"),
     );
     let cfg = Config {
@@ -10265,7 +10265,7 @@ fn things_state() -> (AppState, std::path::PathBuf) {
     (AppState::new(cfg), root)
 }
 
-fn things_request(path: &str, auth: Option<&str>, if_none_match: Option<&str>) -> Request<Body> {
+fn strands_request(path: &str, auth: Option<&str>, if_none_match: Option<&str>) -> Request<Body> {
     let mut b = Request::builder().method("GET").uri(path);
     if let Some(a) = auth {
         b = b.header("authorization", a);
@@ -10290,10 +10290,10 @@ fn keys(v: &Value) -> Vec<&str> {
 
 #[tokio::test]
 async fn things_no_auth_is_401() {
-    let (st, _root) = things_state();
-    for path in ["/jesse/things", "/jesse/things/Clean-Thing"] {
+    let (st, _root) = strands_state();
+    for path in ["/jesse/strands", "/jesse/strands/Clean-Strand"] {
         let resp = app(st.clone())
-            .oneshot(things_request(path, None, None))
+            .oneshot(strands_request(path, None, None))
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{path}");
@@ -10301,11 +10301,11 @@ async fn things_no_auth_is_401() {
 }
 
 #[tokio::test]
-async fn things_list_serves_the_contract_json() {
-    let (st, _root) = things_state();
+async fn strands_list_serves_the_contract_json() {
+    let (st, _root) = strands_state();
     let resp = app(st)
-        .oneshot(things_request(
-            "/jesse/things",
+        .oneshot(strands_request(
+            "/jesse/strands",
             Some("Bearer test-token"),
             None,
         ))
@@ -10317,18 +10317,21 @@ async fn things_list_serves_the_contract_json() {
 
     assert_eq!(
         keys(&body),
-        vec!["counts", "generated_at", "global_findings", "things"]
+        vec!["counts", "generated_at", "global_findings", "strands"]
     );
     // An RFC 3339 instant with the scheduler zone's offset.
     assert!(body["generated_at"].as_str().unwrap().len() >= 20);
     assert_eq!(keys(&body["counts"]), vec!["active", "dormant", "waiting"]);
 
-    let things = body["things"].as_array().unwrap();
+    let strands = body["strands"].as_array().unwrap();
     assert!(
-        !things.iter().any(|t| t["state"] == "done"),
+        !strands.iter().any(|t| t["state"] == "done"),
         "a done note is off the board"
     );
-    let clean = things.iter().find(|t| t["slug"] == "Clean-Thing").unwrap();
+    let clean = strands
+        .iter()
+        .find(|t| t["slug"] == "Clean-Strand")
+        .unwrap();
     assert_eq!(
         keys(clean),
         vec![
@@ -10336,7 +10339,7 @@ async fn things_list_serves_the_contract_json() {
             "updated", "waiting",
         ]
     );
-    assert_eq!(clean["title"], "Clean Thing");
+    assert_eq!(clean["title"], "Clean Strand");
     assert_eq!(clean["group"], "personal");
     assert_eq!(clean["state"], "active");
     assert_eq!(clean["updated"], "2026-09-23");
@@ -10355,17 +10358,20 @@ async fn things_list_serves_the_contract_json() {
         clean["counts"],
         serde_json::json!({ "queue": 2, "later": 1, "running": 1, "done": 2 })
     );
-    let broken = things.iter().find(|t| t["slug"] == "Broken-Thing").unwrap();
+    let broken = strands
+        .iter()
+        .find(|t| t["slug"] == "Broken-Strand")
+        .unwrap();
     assert!(broken["waiting"].is_null() && broken["next"].is_null());
     assert!(!body["global_findings"].as_array().unwrap().is_empty());
 }
 
 #[tokio::test]
-async fn things_slug_serves_markdown_beside_the_parsed_thing() {
-    let (st, root) = things_state();
+async fn strands_slug_serves_markdown_beside_the_parsed_strand() {
+    let (st, root) = strands_state();
     let resp = app(st)
-        .oneshot(things_request(
-            "/jesse/things/Clean-Thing",
+        .oneshot(strands_request(
+            "/jesse/strands/Clean-Strand",
             Some("Bearer test-token"),
             None,
         ))
@@ -10373,28 +10379,28 @@ async fn things_slug_serves_markdown_beside_the_parsed_thing() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
-    assert_eq!(keys(&body), vec!["generated_at", "markdown", "thing"]);
+    assert_eq!(keys(&body), vec!["generated_at", "markdown", "strand"]);
     assert_eq!(
         body["markdown"].as_str().unwrap(),
-        std::fs::read_to_string(root.join("vault/Things/Clean-Thing.md")).unwrap()
+        std::fs::read_to_string(root.join("vault/Strands/Clean-Strand.md")).unwrap()
     );
-    assert_eq!(body["thing"]["slug"], "Clean-Thing");
-    assert_eq!(body["thing"]["next"]["id"], "A1d");
+    assert_eq!(body["strand"]["slug"], "Clean-Strand");
+    assert_eq!(body["strand"]["next"]["id"], "A1d");
 }
 
 #[tokio::test]
 async fn things_slug_is_404_when_unknown_or_carrying_a_path() {
-    let (st, _root) = things_state();
+    let (st, _root) = strands_state();
     for path in [
-        "/jesse/things/No-Such-Thing",
-        "/jesse/things/..",
-        "/jesse/things/a%2Fb",
-        "/jesse/things/..%2FToday",
-        "/jesse/things/archive%2FRetired-Thing",
-        "/jesse/things/a/b",
+        "/jesse/strands/No-Such-Strand",
+        "/jesse/strands/..",
+        "/jesse/strands/a%2Fb",
+        "/jesse/strands/..%2FToday",
+        "/jesse/strands/archive%2FRetired-Strand",
+        "/jesse/strands/a/b",
     ] {
         let resp = app(st.clone())
-            .oneshot(things_request(path, Some("Bearer test-token"), None))
+            .oneshot(strands_request(path, Some("Bearer test-token"), None))
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{path}");
@@ -10402,26 +10408,26 @@ async fn things_slug_is_404_when_unknown_or_carrying_a_path() {
 }
 
 #[tokio::test]
-async fn things_etag_moves_with_a_note_and_not_otherwise() {
-    let (st, root) = things_state();
-    for path in ["/jesse/things", "/jesse/things/Alpha-Thing"] {
+async fn strands_etag_moves_with_a_note_and_not_otherwise() {
+    let (st, root) = strands_state();
+    for path in ["/jesse/strands", "/jesse/strands/Alpha-Strand"] {
         let first = app(st.clone())
-            .oneshot(things_request(path, Some("Bearer test-token"), None))
+            .oneshot(strands_request(path, Some("Bearer test-token"), None))
             .await
             .unwrap();
         let tag = etag_of(&first);
         let again = app(st.clone())
-            .oneshot(things_request(path, Some("Bearer test-token"), None))
+            .oneshot(strands_request(path, Some("Bearer test-token"), None))
             .await
             .unwrap();
         assert_eq!(etag_of(&again), tag, "{path}: nothing changed, same tag");
         let cached = app(st.clone())
-            .oneshot(things_request(path, Some("Bearer test-token"), Some(&tag)))
+            .oneshot(strands_request(path, Some("Bearer test-token"), Some(&tag)))
             .await
             .unwrap();
         assert_eq!(cached.status(), StatusCode::NOT_MODIFIED, "{path}");
 
-        let note = root.join("vault/Things/Alpha-Thing.md");
+        let note = root.join("vault/Strands/Alpha-Strand.md");
         let src = std::fs::read_to_string(&note).unwrap();
         std::fs::write(
             &note,
@@ -10429,7 +10435,7 @@ async fn things_etag_moves_with_a_note_and_not_otherwise() {
         )
         .unwrap();
         let changed = app(st.clone())
-            .oneshot(things_request(path, Some("Bearer test-token"), Some(&tag)))
+            .oneshot(strands_request(path, Some("Bearer test-token"), Some(&tag)))
             .await
             .unwrap();
         assert_eq!(changed.status(), StatusCode::OK, "{path}");

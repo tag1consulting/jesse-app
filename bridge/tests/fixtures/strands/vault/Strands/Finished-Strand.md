@@ -3,7 +3,7 @@ group: perseido
 state: done
 updated: 2026-09-20
 ---
-# Finished Thing
+# Finished Strand
 
 **Now:** Shipped.
 

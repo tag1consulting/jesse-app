@@ -3,7 +3,7 @@ group: hobby
 state: active
 updated: 2026-09-01
 ---
-# Messy Thing
+# Messy Strand
 
 **Now:** Halfway through, see [[todo-list/Projects/Missing-Note]].
 **Waiting on:** provider key.

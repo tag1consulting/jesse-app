@@ -1,5 +1,5 @@
 ---
-thing: Clean-Thing
+strand: Clean-Strand
 ---
 # Guest budget probe
 

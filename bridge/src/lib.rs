@@ -161,12 +161,12 @@ mod slots;
 mod sse;
 mod startup;
 mod state;
-// THE THINGS BOARD, namespaced rather than flattened, for the sentinel's reason: its finding
+// THE STRANDS BOARD, namespaced rather than flattened, for the sentinel's reason: its finding
 // codes (`PARSE`, `STATE`, `GROUP`) and its `snapshot` are short, generic names that would
 // collide with the turn path's if poured into the flat namespace. Reached as
-// `crate::things::…` by the router and `main`, and as `jesse_bridge::things::…` by the
-// `things_audit` example.
-pub mod things;
+// `crate::strands::…` by the router and `main`, and as `jesse_bridge::strands::…` by the
+// `strands_audit` example.
+pub mod strands;
 mod titlestore;
 mod today;
 mod todaybrief;
