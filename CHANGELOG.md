@@ -14,6 +14,29 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [Bridge 0.147.1] - 2026-09-24
+
+**A default feature test build was never compiled anywhere, so from 0.145.0 on nothing
+reported that it was broken.** 0.145.0 added an assertion to the Codex harness tests that
+checks the `Replies` child's argv carries no message send tool, using
+`is_message_send_tool`. That function lived in `probe.rs`, which is compiled only under
+`containment-probe`, while the test module that called it is compiled on every test build.
+Every CI test and clippy step enables the feature, and the release build compiles no tests,
+so the assertion went green in CI and a bare `cargo test --lib` failed to compile with
+`cannot find function is_message_send_tool` on every machine.
+
+### Fixed
+
+- **`is_message_send_tool` and `MESSAGE_SEND_MARKERS` moved from `probe.rs` to
+  `containment.rs`**, which is always compiled, unchanged: the same markers, matched against
+  the bare tool name after `mcp__<server>__`. The Codex assertion still runs on every build;
+  it was not gated to make the error go away. A unit test now covers the function directly.
+- **CI runs `cargo test --lib` on the default feature set** beside the feature enabled Test
+  step, so a test that reaches a feature gated item fails the merge instead of every
+  developer's next build.
+
+No behaviour change in the serving binary.
+
 ## [Bridge 0.147.0] - 2026-09-23
 
 **Work state had no machine readable home, so nothing could check it.** A strand's status

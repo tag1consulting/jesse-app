@@ -167,6 +167,13 @@ jobs:
       - name: Test
         run: cargo test --features containment-probe
 
+      # The library tests AGAIN, on the default feature set. Every other test build here
+      # enables the feature, so a test that reached a feature gated item compiled green
+      # under it and broke every default test build (0.145.0 to 0.147.0), with nothing
+      # reporting it. This is the build a developer gets from a bare `cargo test --lib`.
+      - name: Test (default features)
+        run: cargo test --lib
+
       - name: Clippy
         run: cargo clippy --all-targets --features containment-probe -- -D warnings
 

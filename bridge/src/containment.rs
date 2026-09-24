@@ -1786,6 +1786,35 @@ pub fn render_results(r: &BatteryResults) -> String {
     s
 }
 
+/// The tool-name markers that identify a SEND or COMPOSE tool, per server.
+///
+/// Substrings rather than exact names on purpose: the point is to catch a tool this project
+/// has never seen — the one a server version bump starts advertising — and an exact list can
+/// only ever recognise what was true when it was written. The cost of a substring is a false
+/// POSITIVE, which fails the gate and is read by a human; the cost of an exact list is a false
+/// negative, which is a send tool nobody noticed.
+///
+/// Each list is checked against the BARE tool name, so `conversations_replies` (a granted READ
+/// tool) does not match `reply_to`, and `get_message_context` does not match `send`.
+const MESSAGE_SEND_MARKERS: &[(&str, &[&str])] = &[
+    ("slack", &["add_message", "post_", "send", "reply_to"]),
+    ("whatsapp", &["send_"]),
+    ("imcp", &["send", "compose"]),
+    ("google", &["send_", "draft", "reply", "forward"]),
+    ("google-perseido", &["send_", "draft", "reply", "forward"]),
+    ("fastmail", &["send", "draft", "reply", "forward", "submit"]),
+];
+
+/// Whether a wire tool name (`mcp__<server>__<tool>`) is a send/compose tool of a message
+/// server.
+pub fn is_message_send_tool(wire_name: &str) -> bool {
+    MESSAGE_SEND_MARKERS.iter().any(|(server, markers)| {
+        wire_name
+            .strip_prefix(&format!("mcp__{server}__"))
+            .is_some_and(|tool| markers.iter().any(|m| tool.contains(m)))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2408,5 +2437,30 @@ mod tests {
         let open = r.known_open();
         assert_eq!(open.len(), 1);
         assert!(open[0].contains("network_outbound"), "{open:?}");
+    }
+
+    /// A send tool on every message server is caught, and the read tools whose names sit
+    /// closest to a marker are not: the markers match the BARE tool name, never the server.
+    #[test]
+    fn is_message_send_tool_reads_the_bare_tool_name_per_server() {
+        for send in [
+            "mcp__slack__conversations_add_message",
+            "mcp__whatsapp__send_message",
+            "mcp__imcp__messages_send",
+            "mcp__google__send_gmail_message",
+            "mcp__google-perseido__draft_gmail_message",
+            "mcp__fastmail__submit_email",
+        ] {
+            assert!(is_message_send_tool(send), "{send} is a send tool");
+        }
+        for read in [
+            "mcp__slack__conversations_replies",
+            "mcp__whatsapp__get_message_context",
+            "send_message",
+            "slack__send_message",
+            "mcp__unknown__send_message",
+        ] {
+            assert!(!is_message_send_tool(read), "{read} is not a send tool");
+        }
     }
 }
