@@ -14,6 +14,84 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [Bridge 0.148.1] - 2026-09-24
+
+**The ambient `opus` entry describes Claude Opus 5.5.** Anthropic released Opus 5.5 on
+2026-09-22 (`claude-opus-5-5`, 1M context as the standard window, 128K output). Everything
+the bridge said about Opus was Opus 5's: the price deck, the effort scale and its default,
+the pin advice, the example config. None of the pin mechanism changes.
+
+**Operators:** pin it with `JESSE_MODEL_OPUS_MODEL=claude-opus-5-5` plus
+`JESSE_MODEL_OPUS_VERSION=5.5` in the launch environment, loaded by plist bootout and
+bootstrap, not kickstart.
+
+**What the login served, measured on 2026-09-24** on the pinned CLI (2.1.281) with every
+API-key variable removed:
+
+- `ANTHROPIC_MODEL=claude-opus-5-5`: `apiKeySource: "none"`, init model `claude-opus-5-5`,
+  the response's model `claude-opus-5-5`, usage billed to `claude-opus-5-5` with a
+  1,000,000-token context window.
+- `ANTHROPIC_MODEL=claude-opus-5-5[1m]`: accepted, and served the same `claude-opus-5-5`
+  (the response's model) with the same 1,000,000-token window. There is no separate 1M
+  variant, so pin the plain slug.
+- Unpinned, the CLI's own default is now `claude-opus-5-5` as well.
+
+**The effort scale was re-measured, not copied.** It uses the same procedure as 0.131.0: one
+hard reasoning prompt, each level the CLI accepts, two samples per level, output tokens from
+the result event. The first sweep's two `low` samples wrote tool calls as text into a
+tool-less turn and measured nothing. So the sweep was re-run with one sentence added to the
+prompt telling the model it has no tools. Every sample in the second sweep is a single turn
+with the correct answer:
+
+| level | sweep 2 | sweep 1 | declared |
+|-|-|-|-|
+| `low` | 3,547 / 2,728 | (tool-call text, discarded) | no |
+| `medium` (default) | 4,418 / 4,327 | 4,076 / 4,967 | yes |
+| `high` | 6,514 / 5,312 | 5,846 / 5,532 | yes |
+| `xhigh` | 8,220 / 6,647 | 10,509 / (did not finish) | no |
+| `max` | 34,436 / 33,839 | 32,052 / 23,028 | yes |
+
+`high` sat above `medium` in all four samples of both sweeps, and `max` ran five to eight
+times `medium`. `low` has only one clean sweep, and in it `xhigh` all but touched `high`
+(6,647 against 6,514). Neither cleared the bar, and both stay re-declarable from
+`JESSE_MODEL_OPUS_EFFORT`.
+
+**The default is `medium`, captured on the wire.** With no `--effort` the CLI sends
+`output_config.effort = "medium"` for `claude-opus-5-5`, pinned or as the unpinned default,
+and still `"high"` for `claude-fable-5-1`. This was captured against a local listener and
+nothing was sent to a provider. The CLI's default is per model, so the rule "an env override
+must include `high`" becomes "must include the built-in's own default". That is `medium` for
+opus and `high` for every other entry, as before.
+
+### Changed
+- Opus price deck: `OPUS_*_PER_M` ($5 / $0.50 / $25) is now `OPUS_5_5_*_PER_M` = $4.00 in /
+  $0.20 cached / $20.00 out (Anthropic pricing, 2026-09-22). Cache reads are 0.05x input, so
+  the "about a tenth" rule the old comment stated no longer holds; the Fable comment that
+  leaned on it is corrected. The cost badge for ambient opus and the shadow audit's
+  Opus-equivalent and judge-spend figures now use this deck.
+- `opus` effort scale: `high, max` (default `high`) is now `medium, high, max` (default
+  `medium`). A turn at `medium` sends no `--effort`, so its argv is unchanged. A turn at
+  `high` now sends `--effort high`.
+- `effort_from_env` requires the built-in's default rather than a fixed `high`. Entries with
+  no built-in scale still default to `high`.
+- Doc comments (`effort_from_env` table with the Opus 5.5 row and the Opus 5 row marked
+  superseded, `opus_env_entry`), `jesse.example.toml` and `bridge/README.md` name Opus 5.5.
+
+### Tests
+- The pin tests (`config.rs`, `routing.rs`, `harness/claude_code.rs`) pin `claude-opus-5-5`
+  with label `Claude Opus 5.5`. `opus_pins_a_login_model_only_when_asked` also proves that an
+  arbitrary slug flows through unchanged, so the pin stays a pass-through, not a whitelist.
+- New `the_opus_deck_is_opus_5_5s`: the fixture, the env entry and `ActiveModel::ambient` all
+  carry (4.00, 0.20, 20.00).
+- `built_in_effort_scales_are_the_measured_ones_and_env_overridable` checks the new opus
+  scale. It also checks that an opus override without `medium` is refused and one with it is
+  taken.
+- Recomputed, not loosened: the 1M/1M/1M usage vector costs 4.00 + 0.20 + 20.00 = 24.20 on
+  Opus 5.5 (was 5.00 + 0.50 + 25.00 = 30.50), in `shadow.rs` and `tests/shadow_audit.rs`.
+
+**Containment: nothing moves.** `--effort` is outside `capability_args`. No record,
+acceptance, tool grant or MCP set is touched, and no harness code changed beyond comments.
+
 ## [App 1.0 (155)] - 2026-09-24
 
 **A ticked item with a note sprang back open, and the note was gone.** On 2026-09-23 the

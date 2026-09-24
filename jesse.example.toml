@@ -282,11 +282,12 @@ Answer the question I asked, not the one you wish I had asked.
 # billing relationship:
 #
 #   * `opus`  — the ambient default. Unset, it sets nothing on the child and runs whatever
-#               the CLI's default is (measured 2026-09-10: `claude-opus-5[1m]`, the
-#               1M-context variant), exactly as it always has.
-#                   JESSE_MODEL_OPUS_MODEL=claude-opus-5[1m]   # pin it (sent as ANTHROPIC_MODEL)
-#                   JESSE_MODEL_OPUS_VERSION=5                 # picker reads "Claude Opus 5"
-#               Pin the [1m] form: the bare `claude-opus-5` narrows the window.
+#               the CLI's default is (measured 2026-09-24: `claude-opus-5-5`), exactly as
+#               it always has.
+#                   JESSE_MODEL_OPUS_MODEL=claude-opus-5-5     # pin it (sent as ANTHROPIC_MODEL)
+#                   JESSE_MODEL_OPUS_VERSION=5.5               # picker reads "Claude Opus 5.5"
+#               Pin the plain slug: 1M is Opus 5.5's standard window, and the login serves
+#               the same model with the same window for `claude-opus-5-5[1m]`.
 #   * `fable` — Claude Fable on the same login (kind "subscription"). ARMED BY ITS SLUG,
 #               because there is no token to set:
 #                   JESSE_MODEL_FABLE_MODEL=claude-fable-5-1

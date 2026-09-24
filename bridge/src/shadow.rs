@@ -120,17 +120,22 @@ pub const GEMINI_3P5_FLASH_LITE_IN_PER_M: f64 = 0.30;
 pub const GEMINI_3P5_FLASH_LITE_CACHED_PER_M: f64 = 0.03;
 pub const GEMINI_3P5_FLASH_LITE_OUT_PER_M: f64 = 2.50;
 
-/// Opus prices: $5 in / $25 out; cache reads about a tenth of input ($0.50).
-pub const OPUS_IN_PER_M: f64 = 5.00;
-pub const OPUS_CACHED_PER_M: f64 = 0.50;
-pub const OPUS_OUT_PER_M: f64 = 25.00;
+/// Claude Opus 5.5 prices: $4 in / $0.20 cached / $20 out (Anthropic pricing, 2026-09-22). The
+/// deck of the ambient `opus` entry, and the fixed Opus side of the shadow audit.
+///
+/// **The cached rate is NOT a tenth of input**: cache reads on Opus 5.5 are priced at 0.05x
+/// input. The Opus 5 deck this replaced ($5 / $0.50 / $25) did follow the tenth rule, so a deck
+/// derived from it would read $0.40 and over-report every cache read two-fold.
+pub const OPUS_5_5_IN_PER_M: f64 = 4.00;
+pub const OPUS_5_5_CACHED_PER_M: f64 = 0.20;
+pub const OPUS_5_5_OUT_PER_M: f64 = 20.00;
 
 /// Claude Fable 5.1 prices: $10 in / $0.25 cached / $50 out (Anthropic pricing page,
 /// 2026-09-10). The DEFAULT deck for the `fable` registry entry, overridable via
 /// `JESSE_MODEL_FABLE_PRICE_{IN,CACHED,OUT}`.
 ///
-/// **The cached rate is NOT a tenth of input**, unlike Opus's two lines up: cache hits on
-/// Fable 5.1 are priced at 0.025x input, and a deck derived by the usual rule would read
+/// **The cached rate is NOT a tenth of input**, and not Opus 5.5's 0.05x either: cache hits on
+/// Fable 5.1 are priced at 0.025x input, and a deck derived by the old tenth rule would read
 /// $1.00 and over-report every cache read four-fold. On the subscription login none of this
 /// is billed per token; the badge reports what the turn would have cost on the metered API,
 /// the same thing it reports for ambient Opus.
@@ -196,7 +201,7 @@ impl ShadowUsage {
     /// production path, so the audit compares the two decks against the one token
     /// vector that is always present: the shadow turn's.)
     pub fn opus_cost(&self) -> f64 {
-        self.cost(OPUS_IN_PER_M, OPUS_CACHED_PER_M, OPUS_OUT_PER_M)
+        self.cost(OPUS_5_5_IN_PER_M, OPUS_5_5_CACHED_PER_M, OPUS_5_5_OUT_PER_M)
     }
 }
 
@@ -1284,8 +1289,8 @@ mod tests {
         };
         // Fireworks: 1M in @1.40 + 1M cached @0.14 + 1M out @4.40 = 5.94.
         assert!((u.fw_glm_cost() - (1.40 + 0.14 + 4.40)).abs() < 1e-9);
-        // Opus: 1M in @5 + 1M cached @0.50 + 1M out @25 = 30.50.
-        assert!((u.opus_cost() - (5.0 + 0.50 + 25.0)).abs() < 1e-9);
+        // Opus 5.5: 1M in @4 + 1M cached @0.20 + 1M out @20 = 24.20.
+        assert!((u.opus_cost() - (4.0 + 0.20 + 20.0)).abs() < 1e-9);
         // Empty usage costs nothing.
         assert_eq!(ShadowUsage::default().fw_glm_cost(), 0.0);
     }

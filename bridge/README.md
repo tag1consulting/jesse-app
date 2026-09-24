@@ -3168,7 +3168,8 @@ position-swapped `claude -p` calls** per pair: the shadow side wins a pair only 
 wins **both** orderings; disagreement is a tie. A line-count **watermark** plus a
 judged sidecar keep judging incremental and the log append-only. The note reports
 W/L/T today and cumulative, per-side latency percentiles, measured Fireworks cost vs
-the same turns on Opus, a judge-spend estimate, and **tripwires** (any injection-style
+the same turns on Opus (the Opus 5.5 deck: $4.00 in / $0.20 cached / $20.00 out per
+million), a judge-spend estimate, and **tripwires** (any injection-style
 leak in a shadow answer, any shadow-child write attempt, or Fireworks spend above
 $5/day) — each instructing the operator to **disarm the triple**. The audit only
 **reports**; it never routes.
