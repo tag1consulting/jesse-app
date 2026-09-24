@@ -132,6 +132,106 @@ final class VaultBrowserModelTests: XCTestCase {
         XCTAssertEqual(model.recents.first?.title, "Terrasole", "titles, not file names")
     }
 
+    // MARK: - Narrowing to one folder
+
+    /// WITH NOTHING TYPED, the recents are the folder's recents — and the picker has a
+    /// list to offer, filled by the same `refresh()` without being asked separately.
+    func testPickingAFolderNarrowsTheRecentsAndFillsThePicker() async throws {
+        let model = VaultBrowserModel(source: try makeSource())
+        await model.indexer.reindexNow()
+        model.refresh()
+        XCTAssertEqual(model.recents.count, 5, "the whole vault, to begin with")
+
+        model.folder = "Workshop"
+
+        XCTAssertEqual(Set(model.recents.map(\.path)),
+                       ["Workshop/Kiln-Rebuild.md", "Workshop/Overview.md"])
+        XCTAssertEqual(model.folders.map(\.path),
+                       ["Bicycle", "People", "Suppliers", "Workshop"])
+        XCTAssertEqual(model.folders.first { $0.path == "Workshop" }?.noteCount, 2)
+        XCTAssertNil(model.lastError)
+    }
+
+    /// WITH A QUERY TYPED, the same choice narrows the hits. `overview` is the ambiguous
+    /// pair's word: it is in two notes in two folders, which is what makes this a claim
+    /// about the folder and not about the query.
+    func testPickingAFolderNarrowsTheTypedQueryToo() async throws {
+        let model = VaultBrowserModel(source: try makeSource(), debounce: .zero)
+        await model.indexer.reindexNow()
+        model.refresh()
+
+        model.query = "overview"
+        model.search()
+        await model.awaitPendingSearch()
+        XCTAssertEqual(Set(model.hits.map(\.path)),
+                       ["Workshop/Overview.md", "Bicycle/Overview.md"])
+
+        model.folder = "Bicycle"
+        await model.awaitPendingSearch()
+
+        XCTAssertEqual(model.hits.map(\.path), ["Bicycle/Overview.md"])
+    }
+
+    /// AND BACK. Clearing the folder restores both states, so the narrowing is a view of
+    /// the vault rather than a door that shuts behind you.
+    func testClearingTheFolderRestoresTheWholeVaultInBothStates() async throws {
+        let model = VaultBrowserModel(source: try makeSource(), debounce: .zero)
+        await model.indexer.reindexNow()
+        model.refresh()
+        model.query = "overview"
+        model.search()
+        await model.awaitPendingSearch()
+
+        model.folder = "Bicycle"
+        await model.awaitPendingSearch()
+        XCTAssertEqual(model.hits.count, 1)
+
+        model.folder = nil
+        await model.awaitPendingSearch()
+
+        XCTAssertEqual(Set(model.hits.map(\.path)),
+                       ["Workshop/Overview.md", "Bicycle/Overview.md"])
+        model.query = ""
+        model.search()
+        model.refresh()
+        XCTAssertEqual(model.recents.count, 5)
+    }
+
+    /// **A FOLDER CAN GO.** It is deleted in Obsidian and the next reindex notices. The
+    /// tab must widen back and say why, rather than showing an empty list with no reason
+    /// given — which is what a narrowing to a folder that no longer exists looks like.
+    func testAFolderDeletedFromTheVaultClearsTheNarrowingAndSaysSo() async throws {
+        let model = VaultBrowserModel(source: try makeSource())
+        await model.indexer.reindexNow()
+        model.folder = "Bicycle"
+        XCTAssertEqual(model.recents.map(\.path), ["Bicycle/Overview.md"])
+
+        try FileManager.default.removeItem(at: root.appendingPathComponent("Bicycle"))
+        await model.indexer.reindexNow()
+        model.refresh()
+
+        XCTAssertNil(model.folder, "the narrowing is gone with the folder")
+        XCTAssertEqual(model.lastError,
+                       "Bicycle is not in the vault any more, so every note is showing.")
+        XCTAssertEqual(model.recents.count, 4, "and the whole vault is showing")
+    }
+
+    /// The two narrowings are EXCLUSIVE: picking a folder drops the curated scope, and
+    /// picking a scope drops the folder. Neither is ever silently intersected with the
+    /// other.
+    func testAScopeAndAFolderAreNeverHeldAtOnce() async throws {
+        let model = VaultBrowserModel(source: try makeSource())
+        await model.indexer.reindexNow()
+        model.refresh()
+
+        model.scope = .strands
+        model.folder = "Workshop"
+        XCTAssertEqual(model.scope, .all, "the folder replaced the curated scope")
+
+        model.scope = .strands
+        XCTAssertNil(model.folder, "and the scope replaced the folder")
+    }
+
     func testTypingAQueryAnswersThroughTheModelTheScreenDrives() async throws {
         let model = VaultBrowserModel(source: try makeSource(), debounce: .zero)
         await model.indexer.reindexNow()

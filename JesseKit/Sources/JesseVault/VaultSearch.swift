@@ -144,13 +144,32 @@ public struct VaultSearcher: Sendable {
     /// after ranking would return the top fifty of the vault and show whichever of them
     /// happened to be in the folder.
     private let scope: VaultSearchScope
+    /// The chosen folder as a path PREFIX (`Strands/`), or nil for no folder narrowing.
+    /// Stored with the trailing slash already on, which is the whole reason `Work` cannot
+    /// match `Workshop/`.
+    ///
+    /// Held on the searcher rather than passed to each call, exactly as `scope` is, and
+    /// for a reason worth more than the symmetry: `search(_:expander:)` widens by calling
+    /// `base` once per alternate term, so a folder that lived in the argument list could
+    /// be supplied to the typed query and forgotten on the widening — and an alternate
+    /// term would quietly return notes from outside the folder the screen says it is
+    /// showing. Held here, that bug cannot be written.
+    private let folderPrefix: String?
 
     public init(index: VaultIndex, expansionThreshold: Int = 5, limit: Int = 50,
-                scope: VaultSearchScope = .all) {
+                scope: VaultSearchScope = .all, folder: String? = nil) {
         self.index = index
         self.expansionThreshold = expansionThreshold
         self.limit = limit
         self.scope = scope
+        self.folderPrefix = folder.map { $0.hasSuffix("/") ? $0 : $0 + "/" }
+    }
+
+    /// Whether one path survives BOTH narrowings. The scope and the folder are set
+    /// exclusively by the screen today, but nothing here depends on that.
+    private func includes(_ path: String) -> Bool {
+        if let folderPrefix, !path.hasPrefix(folderPrefix) { return false }
+        return scope.includes(path)
     }
 
     /// The typed query alone — no model, no expansion. This is the call whose latency the
@@ -165,8 +184,8 @@ public struct VaultSearcher: Sendable {
         // and re-ranking both happen after SQL: taking exactly `limit` from SQLite would
         // mean a file's second-best chunk crowding out another file's only one.
         let raw = index.search(expression: expression, limit: limit * 4,
-                               underPrefix: scope.pathPrefix)
-            .filter { scope.includes($0.path) }
+                               underPrefix: folderPrefix ?? scope.pathPrefix)
+            .filter { includes($0.path) }
         let ranked = VaultSearchQuery.ranked(VaultSearchQuery.collapsedByFile(raw),
                                              tokens: tokens, limit: limit)
         return VaultSearchOutcome(hits: ranked,

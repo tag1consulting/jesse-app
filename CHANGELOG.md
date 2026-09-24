@@ -14,6 +14,65 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [App 1.0 (154)] - 2026-09-24
+
+**The Vault tab could look at 7,600 notes or at 7,600 notes.** The folder is the first
+thing a person knows about the note they are after — the status notes are under
+`Strands/`, the pending work is under `Projects/drafts/` — and the tab had no way to say
+so. The only narrowing available was to type a word that happened to appear in the path,
+which searches the body of every note in the vault for it, and the recents list could not
+be narrowed at all.
+
+A folder button in the toolbar now picks one folder, and both halves of the screen answer
+under it: the recents list and every search, until it is cleared. The whole vault stays
+the default. The scope lasts for the launch and is deliberately not persisted — a
+narrowing remembered across launches is a search that silently answers a narrower
+question than the one that was typed, weeks after the person who chose it has forgotten
+choosing it.
+
+The folder list is DERIVED rather than stored, which is the decision worth recording. The
+obvious implementation is a `folders` table kept by the indexer; it would cost a schema
+change, and a schema change costs every device on the previous version a full rebuild of
+its index — 7,600 notes re-read and re-chunked — to learn a value that is a pure function
+of a column those devices already carry. Folding the paths in memory is microseconds.
+No schema change, no migration, every existing database keeps working.
+
+### Added
+
+- **`VaultFolderTree`**, pure: every folder implied by a set of note paths, with the
+  number of notes under each at any depth. A note at the vault root belongs to no folder.
+  The order is case insensitive first and case sensitive second, so it is total and
+  cannot change between two calls.
+- **`VaultIndex.folders()`** — `allPaths()` through that fold.
+- **`folder` on `VaultSearcher`**, held on the value rather than passed per call. That is
+  load bearing: the expansion tier widens by calling `base` once per alternate term the
+  on-device model offers, so a folder living in an argument list could be given to the
+  typed query and forgotten on the widening, and an alternate term would return notes
+  from outside the folder the screen says it is showing.
+- **`folder` and `folders` on `VaultBrowserModel`.** Setting the folder re-answers both
+  states at once. An in-flight search is discarded if the folder changed under it, the
+  same way one is already discarded when the query does.
+- **The folder sheet**: "All folders" first with the vault's total, then every folder with
+  its count, a filter field, and a checkmark on the one in force. The toolbar button names
+  the folder it is holding, the recents heading reads "Recently changed in Strands", and
+  an empty result says "No note under Strands has all of those words" rather than claiming
+  the vault has no such note.
+
+### Changed
+
+- **A folder that is deleted from the vault clears the narrowing and says so**, rather
+  than leaving the tab showing an empty list with no reason given.
+- **The scope segments and a picked folder are exclusive.** A segment is a curated view
+  (`Strands` drops its own archive and orders by each note's `updated:` stamp); a picked
+  folder is the raw folder. Holding both would show the intersection of two things the
+  screen states separately, and the commonest intersection is empty. Picking either drops
+  the other, and only one of the two controls is on screen at a time.
+
+The path predicate itself needed nothing new: `recentFiles(limit:underPrefix:)` and
+`search(expression:limit:underPrefix:)` already bind a prefix in SQL with `LIKE … ESCAPE`,
+already escape a `%` or `_` in a folder name, and already carry the trailing slash that
+keeps `Work` from matching `Workshop/`. What changed is who supplies that prefix.
+
 ## [App 1.0 (153)] - 2026-09-24
 
 **Offline, a question the device could have answered was refused by a coin flip, the
