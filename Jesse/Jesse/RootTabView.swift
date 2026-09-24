@@ -78,7 +78,11 @@ struct RootTabView: View {
     /// (`Tab.allCases.first`).
     static let defaultTab: Tab = .chats
 
-    @State private var selection: Tab = RootTabView.defaultTab
+    /// The tab that is up. `defaultTab` at launch — unless a UI test has armed the
+    /// thread-landing seam, which starts the app on the tab it names so the push it then
+    /// fires arrives from somewhere other than Chats. Nil, and so `defaultTab`, in every
+    /// ordinary launch; see `ThreadLandingUITestSeam`.
+    @State private var selection: Tab = ThreadLandingUITestSeam.startTab ?? RootTabView.defaultTab
 
     /// Read twice below: to repaint the icon badge on the way to the background, and to
     /// settle a workout burst whose window ran out while the app was suspended.
@@ -198,6 +202,10 @@ struct RootTabView: View {
             // A no-op once anything has loaded, so it cannot fight a live fetch.
             todayModel.primeFromCache()
             connectTheWatch()
+            // A no-op unless a UI test armed it (see `ThreadLandingUITestSeam`): seeds one
+            // conversation and posts the tap that must land on it. Here because this is the
+            // first moment the shell exists, which is what a tapped notification meets.
+            ThreadLandingUITestSeam.arm(context: context)
             buildTheReplayer()
             todayModel.refreshPending()
             healthModel.refreshPending()
@@ -336,7 +344,10 @@ struct RootTabView: View {
     private func view(for tab: Tab) -> some View {
         switch tab {
         case .chats:
-            ContentView()
+            // The binding is the whole of the tab-landing plumbing: a conversation opened
+            // from a notification, Siri, the wake capture or a shared recording selects
+            // this tab before it pushes, because the pushed detail hides the bar below.
+            ContentView(selectedTab: $selection)
         case .health:
             HealthTabView(isActive: selection == .health, model: healthModel,
                           onReplay: replayNow)
