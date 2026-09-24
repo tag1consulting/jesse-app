@@ -179,7 +179,9 @@ public final class IntentReplayer {
         // to, not the day the run started on. A run that straddles the morning rebuild is
         // exactly when that matters.
         guard let live = await fetch(client) else { return .deferred }
-        guard let etag = live.etag, !etag.isEmpty else { return .deferred }
+        // The WRITE tag: the one that moves when `Today.md` moves and not when a
+        // background brief, a glance or a postponement lands. See `TodaySnapshot`.
+        guard let etag = live.writeTag, !etag.isEmpty else { return .deferred }
 
         let sameDay = (live.date ?? "") == intent.dayDate
         // THE RESOLUTION RULE. On the same day the id is still authoritative — it is a
@@ -234,16 +236,21 @@ public final class IntentReplayer {
             return .refused(Self.goneNotice)
         case .preconditionFailed:
             guard allowRefetch else { return .refused(Self.busyNotice) }
-            guard let live = await fetch(client), let etag = live.etag, !etag.isEmpty
-            else { return .deferred }
             // The refetch may have landed on a NEW day, which changes the answer rather
             // than merely the tag — so the whole decision is re-made rather than the tag
-            // swapped underneath it.
-            guard (live.date ?? "") == sendDay, live.item(id: itemId) != nil else {
+            // swapped underneath it. `StalePrecondition` is that decision, and the live
+            // path in `TodayDashboardModel` reaches it through the same function: two
+            // definitions of "stale" is how the two came to disagree in the first place.
+            switch StalePrecondition.verdict(after: await fetch(client), day: sendDay,
+                                             itemId: itemId) {
+            case .retry(let etag):
+                return await send(intent, itemId: itemId, day: sendDay, ifMatch: etag,
+                                  client: client, allowRefetch: false)
+            case .dayMovedOn:
                 return .refused(Self.movedUnderUsNotice)
+            case .noAnswer:
+                return .deferred
             }
-            return await send(intent, itemId: itemId, day: sendDay, ifMatch: etag,
-                              client: client, allowRefetch: false)
         case .preconditionRequired:
             // We sent no tag at all — a client bug, not a race. Leave it queued rather
             // than burn the intent on it.

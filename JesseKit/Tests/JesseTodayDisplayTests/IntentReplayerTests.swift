@@ -391,6 +391,20 @@ final class IntentReplayerTests: XCTestCase {
         XCTAssertEqual(client.fetchCount, 2)
     }
 
+    /// The replayer sends the WRITE tag, like every other path: the cache tag also moves
+    /// when a background brief lands, and a queue that sent it would earn a `412` on a
+    /// day file nothing had touched.
+    func testTheReplayerSendsTheDocumentTag() async {
+        let client = ReplayClient()
+        client.fetches = [.snapshot(Fixt.snapshot(etag: "\"tag-a\"", documentEtag: "\"doc-a\""))]
+        let store = FakeStore([captured(.check, id: Fixt.ada, lead: "Reply to Ada.")])
+
+        let outcomes = await makeReplayer(client, store).replayAll()
+
+        XCTAssertEqual(outcomes, [.applied])
+        XCTAssertEqual(client.checkLog.map(\.ifMatch), ["\"doc-a\""])
+    }
+
     /// A `412` whose refetch lands on a NEW day is a day change, not a tag problem —
     /// the whole decision is re-made rather than the tag swapped underneath it.
     func testAStaleTagWhoseRefetchLandsOnANewDayRefuses() async {

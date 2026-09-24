@@ -1146,6 +1146,57 @@ impl BriefRecord {
     }
 }
 
+/// A recorded `done` verdict, the shape the sweep writes when it judges an item
+/// finished — test-only, and in THIS module rather than in the test that wants it
+/// because the record's shape is this module's to state.
+///
+/// It exists for one caller in `todaywrite`'s tests: the one that proves a brief
+/// landing here does not refuse a tap that was made against the untouched day file.
+#[cfg(test)]
+pub(crate) fn done_verdict_record(reason: &str) -> BriefRecord {
+    fn said(text: &str) -> Answer {
+        Answer {
+            text: text.to_string(),
+            known: true,
+        }
+    }
+    BriefRecord {
+        status: BriefStatus::Ok,
+        brief: Some(TodayItemBrief {
+            about: said("A thing."),
+            origin: said("An email from Dana Whitfield on 2026-09-02."),
+            due: said("No due date is recorded."),
+            priority: said("Someone is blocked until it is done."),
+            priority_level: PriorityLevel::ThisWeek,
+            progress: said("Nothing recorded yet."),
+            done: said("The form is signed."),
+            contacts: said("Dana Whitfield knows the filing."),
+            people: vec![],
+            relevance: Relevance {
+                verdict: BriefVerdict::Done,
+                reason: reason.to_string(),
+                evidence_source: None,
+                evidence_date: None,
+                confidence: Confidence::Low,
+            },
+            more: None,
+            sources: vec![],
+            message_citations: vec![],
+            channels_searched: vec![],
+            messages_searched_at: None,
+            inputs_hash: "h".to_string(),
+            generated_at: "2026-09-23T00:00:00Z".to_string(),
+            harness: "claude-code".to_string(),
+            model: "test".to_string(),
+        }),
+        failure: None,
+        inputs_hash: "h".to_string(),
+        auto_close_blocked: false,
+        citations_dropped: 0,
+        stale_reason: None,
+    }
+}
+
 /// The per-item brief cache: `<state_dir>/today-briefs.json`.
 ///
 /// Loaded fresh per read exactly like [`crate::today::GlanceStore`], because

@@ -75,7 +75,11 @@ enum Fixt {
 
     /// The whole day, shaped like the real fixture: a standing lead item, a Do Now
     /// section, an Errands section, and one briefing section with two glanceables.
-    static func snapshot(etag: String = "\"tag-1\"", pending: Bool? = nil) -> TodaySnapshot {
+    /// `documentEtag` defaults to nil, which is what an older bridge sends: the
+    /// fallback in `TodaySnapshot.writeTag` is then what every existing test exercises,
+    /// and the tests that are ABOUT the two tags pass both.
+    static func snapshot(etag: String = "\"tag-1\"", documentEtag: String? = nil,
+                         pending: Bool? = nil) -> TodaySnapshot {
         TodaySnapshot(
             title: "Today: Tuesday, March 3, 2026",
             date: "2026-03-03",
@@ -105,6 +109,7 @@ enum Fixt {
             ],
             counts: TodayCounts(open: 5, done: 1, reportsUnseen: 2),
             etag: etag,
+            documentEtag: documentEtag,
             pending: pending)
     }
 

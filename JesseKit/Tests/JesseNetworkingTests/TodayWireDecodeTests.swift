@@ -204,6 +204,24 @@ final class TodayWireDecodeTests: XCTestCase {
                           "the document changed, so the strong etag must have too")
     }
 
+    /// The two tags, and the fallback. `documentEtag` is what a mutation sends as
+    /// `If-Match`; `etag` stays the cache tag. A bridge older than 0.148.0 sends only
+    /// `etag`, and `writeTag` falls back to it rather than leaving a mutation with no
+    /// precondition to send — which the bridge would answer `428`.
+    func testTheDocumentTagDecodesAndWriteTagFallsBackWithoutIt() throws {
+        let both = try TodaySnapshot.decode(from: Data("""
+        {"title":"Today","missing":false,"etag":"\\"cache\\"","documentEtag":"\\"doc\\""}
+        """.utf8))
+        XCTAssertEqual(both.documentEtag, "\"doc\"")
+        XCTAssertEqual(both.writeTag, "\"doc\"", "a mutation sends the document tag")
+        XCTAssertEqual(both.etag, "\"cache\"", "and the cache tag is untouched by it")
+
+        // The shipped fixtures predate the field, which is exactly the older-bridge shape.
+        let older = try snapshot("today-full")
+        XCTAssertNil(older.documentEtag)
+        XCTAssertEqual(older.writeTag, older.etag)
+    }
+
     // MARK: - Degradation
 
     /// An empty day file: `200` with `missing: true`, which the client renders as an

@@ -8740,6 +8740,96 @@ async fn today_glance_marks_a_report_row_seen_under_a_date_scoped_key() {
     let _ = std::fs::remove_dir_all(&vault);
 }
 
+// ---- The two tags, end to end ---------------------------------------------
+
+/// **THE 2026-09-23 BUG, over real HTTP.**
+///
+/// The unit tests in `todaywrite` call the mutation function directly; this one goes
+/// through the router, the bearer check, the `If-Match` header and the real day file, so
+/// it also covers the header parsing that sits between them.
+///
+/// A glance stands in for the background brief that actually caused it. Both are
+/// hydration: neither writes a byte of `Today.md`, and both used to move the only tag the
+/// app had to send back — so the tap that followed was refused and the evidence note
+/// typed with it was thrown away.
+#[tokio::test]
+async fn today_a_glance_moves_the_cache_tag_but_a_tap_under_the_document_tag_still_lands() {
+    let (st, vault) = today_write_state();
+    let day = vault.join("vault/Today.md");
+    let (snapshot, etag) = today_snapshot(&st).await;
+    let document = snapshot["documentEtag"].as_str().unwrap().to_string();
+    assert_ne!(document, etag, "two tags, not one value under two names");
+    let id = id_of(&snapshot, "Reply to Ada");
+    let report_id = snapshot["sections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|s| s["reports"].as_array().unwrap().iter())
+        .next()
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let resp = app(st.clone())
+        .oneshot(today_glance_request(
+            Some("Bearer test-token"),
+            Some(&document),
+            &format!(r#"{{"id":"{report_id}","glancedAt":1772000000000}}"#),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "a glance takes the tag too");
+
+    // The screen's tag moved, because the screen renders the cleared dot. The
+    // document's did not, because no byte of the file changed.
+    let (after_glance, moved_etag) = today_snapshot(&st).await;
+    assert_ne!(moved_etag, etag, "the cache tag MUST move");
+    assert_eq!(
+        after_glance["documentEtag"].as_str().unwrap(),
+        document,
+        "and the document tag must not"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&day).unwrap(),
+        FIX_TODAY_MD,
+        "nothing wrote to the day file"
+    );
+
+    // The tap the user made BEFORE the glance landed, carrying the tag they were
+    // handed. Before `documentEtag` this was a 412 and the note below was lost.
+    let note = "n".repeat(300);
+    let resp = app(st.clone())
+        .oneshot(today_check_request(
+            Some("Bearer test-token"),
+            &id,
+            Some(&document),
+            &format!(r#"{{"checked":true,"evidence":"{note}","at":"2026-03-03T09:30:00Z"}}"#),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // …and the response hands back the tag of the document AFTER the write, so the next
+    // tap from the same screen needs no round trip in between.
+    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let next = body["documentEtag"].as_str().unwrap();
+    assert_ne!(next, document, "the document changed, so its tag did");
+    let (fresh, _) = today_snapshot(&st).await;
+    assert_eq!(fresh["documentEtag"].as_str().unwrap(), next);
+
+    let written = std::fs::read_to_string(&day).unwrap();
+    assert!(
+        written.contains("* [x] **Reply to Ada"),
+        "the box is ticked: {written}"
+    );
+    assert!(
+        written.contains(&note),
+        "and all 300 characters of the note are in the file"
+    );
+    let _ = std::fs::remove_dir_all(&vault);
+}
+
 // ---- POST /jesse/today/items/{id}/defer — postponed for today --------------
 //
 // The second mutation that touches no vault content. What these pin is the part
