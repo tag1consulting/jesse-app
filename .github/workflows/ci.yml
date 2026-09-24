@@ -1,5 +1,12 @@
 name: CI
 
+# EXPERIMENT, NOT A DECISION: every Linux job here runs on `ks-arm64` — the
+# self-hosted runner scale set on the k3s cluster — instead of `ubuntu-latest`.
+# That changes the ARCHITECTURE the gate tests from amd64 to aarch64. A green
+# run here says the code builds and passes on arm64; it says nothing about
+# amd64, which is what this repo's CI has always covered. Do not read this
+# branch as evidence the move is safe to keep.
+#
 # THIS WORKFLOW IS LINUX-ONLY, AND IT IS THE GATE ON EVERY PR.
 #
 # The Swift/macOS half of CI is NOT here — it lives in ios-ci.yml, which runs
@@ -40,12 +47,34 @@ jobs:
   # "CI is red" stop telling you which one. Nothing about the bridge changes either way.
   agent:
     name: agent (build, test, clippy, fmt)
-    runs-on: ubuntu-latest
+    runs-on: ks-arm64
     steps:
       - uses: actions/checkout@v7
 
+      # The cluster runner image is minimal — git, node, curl, jq and nothing
+      # else — so what a build needs is installed here rather than assumed.
+      # GitHub's hosted image already has these, where the step costs a few
+      # seconds and installs nothing, so it is correct on either runner.
+      # `build-essential` for the linker and C runtime every Rust build needs.
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends build-essential
+
       - name: Install Rust toolchain
-        run: rustup component add clippy rustfmt
+        run: |
+          # The cluster runners (`ks-arm64`) run GitHub's own `actions-runner`
+          # image, which carries git, node, curl, jq and nothing else — no
+          # rustup. GitHub's hosted images carry one. Install it when it is
+          # missing so the same step works on both, then add the components as
+          # before.
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+              | sh -s -- -y --default-toolchain stable --profile minimal
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+            export PATH="$HOME/.cargo/bin:$PATH"
+          fi
+          rustup component add clippy rustfmt
 
       - name: Cache cargo
         uses: actions/cache@v6
@@ -54,7 +83,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-agent-${{ hashFiles('Cargo.lock') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-agent-${{ hashFiles('Cargo.lock') }}
 
       # `--locked` for the same reason it is on the bridge's release build: the lock must be
       # the one that ships, not one CI quietly regenerated. See that step's comment.
@@ -83,12 +112,34 @@ jobs:
   # binary with `--mock`, so there is no network and no model in any of it.
   eval:
     name: eval (build, test, clippy, fmt)
-    runs-on: ubuntu-latest
+    runs-on: ks-arm64
     steps:
       - uses: actions/checkout@v7
 
+      # The cluster runner image is minimal — git, node, curl, jq and nothing
+      # else — so what a build needs is installed here rather than assumed.
+      # GitHub's hosted image already has these, where the step costs a few
+      # seconds and installs nothing, so it is correct on either runner.
+      # `build-essential` for the linker and C runtime every Rust build needs.
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends build-essential
+
       - name: Install Rust toolchain
-        run: rustup component add clippy rustfmt
+        run: |
+          # The cluster runners (`ks-arm64`) run GitHub's own `actions-runner`
+          # image, which carries git, node, curl, jq and nothing else — no
+          # rustup. GitHub's hosted images carry one. Install it when it is
+          # missing so the same step works on both, then add the components as
+          # before.
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+              | sh -s -- -y --default-toolchain stable --profile minimal
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+            export PATH="$HOME/.cargo/bin:$PATH"
+          fi
+          rustup component add clippy rustfmt
 
       - name: Cache cargo
         uses: actions/cache@v6
@@ -97,7 +148,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-eval-${{ hashFiles('Cargo.lock') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-eval-${{ hashFiles('Cargo.lock') }}
 
       # `--locked`, as on the other two builds — see the bridge's release step.
       - name: Build
@@ -117,7 +168,7 @@ jobs:
 
   bridge:
     name: bridge (build, test, clippy, guards, audit, coverage)
-    runs-on: ubuntu-latest
+    runs-on: ks-arm64
     defaults:
       run:
         working-directory: bridge
@@ -130,8 +181,39 @@ jobs:
         with:
           fetch-depth: 0
 
+      # The cluster runner image is minimal — git, node, curl, jq and nothing
+      # else — so what a build needs is installed here rather than assumed.
+      # GitHub's hosted image already has these, where the step costs a few
+      # seconds and installs nothing, so it is correct on either runner.
+      # `cmake` because whisper-rs builds whisper.cpp through it (see bridge/Cargo.toml),
+      # and `build-essential` for the C/C++ compiler that build then drives.
+      #
+      # `libclang-dev` is NOT optional here, and the comment in bridge/Cargo.toml
+      # saying bindgen "falls back to the crate's bundled bindings when libclang
+      # is not present" is only true on x86_64. whisper-rs-sys 0.15.0 ships
+      # pre-generated bindings for a handful of targets, aarch64-unknown-linux-gnu
+      # is not among them, so on an arm64 runner bindgen actually runs and the
+      # build script panics with "Unable to find libclang". The hosted image
+      # happens to carry libclang, which is why this never surfaced before.
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends build-essential cmake libclang-dev
+
       - name: Install Rust toolchain
-        run: rustup component add clippy rustfmt llvm-tools-preview
+        run: |
+          # The cluster runners (`ks-arm64`) run GitHub's own `actions-runner`
+          # image, which carries git, node, curl, jq and nothing else — no
+          # rustup. GitHub's hosted images carry one. Install it when it is
+          # missing so the same step works on both, then add the components as
+          # before.
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+              | sh -s -- -y --default-toolchain stable --profile minimal
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+            export PATH="$HOME/.cargo/bin:$PATH"
+          fi
+          rustup component add clippy rustfmt llvm-tools-preview
 
       - name: Cache cargo
         uses: actions/cache@v6
@@ -140,7 +222,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             bridge/target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('bridge/Cargo.lock') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('bridge/Cargo.lock') }}
 
       # The SERVING binary, built exactly as a deploy builds it: without
       # `containment-probe`. The probe prompts, the battery runner and its loopback
@@ -229,8 +311,16 @@ jobs:
       - name: Install gitleaks
         working-directory: ${{ github.workspace }}
         run: |
-          curl -sSL https://github.com/gitleaks/gitleaks/releases/download/v8.18.4/gitleaks_8.18.4_linux_x64.tar.gz \
-            | tar -xz -C /usr/local/bin gitleaks
+          # The release has one tarball per architecture and the runner is no
+          # longer always x86_64: `ks-arm64` is aarch64. Derive it rather than
+          # hardcode, so this step is right on either runner.
+          case "$(uname -m)" in
+            x86_64)  GITLEAKS_ARCH=x64 ;;
+            aarch64) GITLEAKS_ARCH=arm64 ;;
+            *) echo "no gitleaks build for $(uname -m)" >&2; exit 1 ;;
+          esac
+          curl -sSL "https://github.com/gitleaks/gitleaks/releases/download/v8.18.4/gitleaks_8.18.4_linux_${GITLEAKS_ARCH}.tar.gz" \
+            | sudo tar -xz -C /usr/local/bin gitleaks
           gitleaks version
 
       - name: Source guards (incl. R5 personal-infra + gitleaks)
@@ -246,7 +336,7 @@ jobs:
   # sees. Neither shows up until a gate fails on code nobody touched.
   ios-deployment-target:
     name: iOS deployment target rule
-    runs-on: ubuntu-latest
+    runs-on: ks-arm64
     steps:
       - uses: actions/checkout@v7
 
