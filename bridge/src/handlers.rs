@@ -2718,6 +2718,11 @@ pub fn app(state: AppState) -> Router {
         // neither is a markdown edit. See `today::GlanceStore` / `today::DeferStore`.
         .route("/jesse/today/glance", post(jesse_today_glance))
         .route("/jesse/today/items/:id/defer", post(jesse_today_defer))
+        // The Strands board, read only: every status note under `Strands/`, parsed and
+        // audited, under the same strong ETag posture as /jesse/today. Keyed by slug, and a
+        // slug is a file stem and nothing else. See `strands`.
+        .route("/jesse/strands", get(crate::strands::jesse_strands))
+        .route("/jesse/strands/:slug", get(crate::strands::jesse_strand))
         // The conversation surface: the bridge's own thread identity, keyed on a stable
         // UUID registered at accept time rather than on a CLI transcript filename.
         .route("/jesse/conversations", get(jesse_conversations))
