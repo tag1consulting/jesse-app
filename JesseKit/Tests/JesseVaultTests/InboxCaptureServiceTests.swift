@@ -21,7 +21,8 @@ final class InboxCaptureServiceTests: XCTestCase {
     private let when = Date(timeIntervalSince1970: 1_790_166_720)
     private let rome = TimeZone(identifier: "Europe/Rome")!
 
-    override func setUpWithError() throws {
+    override func setUp() async throws {
+        try await super.setUp()
         suiteName = "jesse.capture.tests.\(UUID().uuidString)"
         defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
         vault = FileManager.default.temporaryDirectory
@@ -34,10 +35,11 @@ final class InboxCaptureServiceTests: XCTestCase {
         log = OfflineWriteLog(directory: support)
     }
 
-    override func tearDownWithError() throws {
+    override func tearDown() async throws {
         defaults.removePersistentDomain(forName: suiteName)
         try? FileManager.default.removeItem(at: vault)
         try? FileManager.default.removeItem(at: support)
+        try await super.tearDown()
     }
 
     /// A service pointed at the temporary vault, with a folder bookmark really taken.

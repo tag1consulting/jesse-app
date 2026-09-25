@@ -276,6 +276,7 @@ final class VaultNoteRenderingTests: XCTestCase {
 
     // MARK: - The missing-link caption reaches into a table
 
+    @MainActor
     func testAnUnresolvedLinkInsideATableCellIsStillCaptioned() {
         let block = document("| A |\n|---|\n| [[Nowhere]] |").blocks[0]
         XCTAssertEqual(VaultNoteReaderView.missingCaption(block, resolved: [:]),
@@ -297,6 +298,7 @@ final class VaultNoteRenderingTests: XCTestCase {
         XCTAssertNil(VaultNoteDocument.blockID(forLine: 1, in: []))
     }
 
+    @MainActor
     func testTheScrollAnchorKeepsRawLinesAndBlocksApart() {
         XCTAssertNotEqual(VaultNoteReaderView.anchorID(3, raw: true),
                           VaultNoteReaderView.anchorID(3, raw: false))

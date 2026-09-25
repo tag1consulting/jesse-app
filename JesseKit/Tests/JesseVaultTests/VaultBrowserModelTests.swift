@@ -18,8 +18,8 @@ final class VaultBrowserModelTests: XCTestCase {
     private var root: URL!
     private var databaseDirectory: URL!
 
-    override func setUpWithError() throws {
-        try super.setUpWithError()
+    override func setUp() async throws {
+        try await super.setUp()
         suiteName = "jesse.vault.browser.tests.\(UUID().uuidString)"
         defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
         root = VaultFixture.makeDirectory()
@@ -27,11 +27,11 @@ final class VaultBrowserModelTests: XCTestCase {
         VaultFixture.writeCorpus(in: root)
     }
 
-    override func tearDown() {
+    override func tearDown() async throws {
         defaults.removePersistentDomain(forName: suiteName)
         VaultFixture.cleanUp(root)
         VaultFixture.cleanUp(databaseDirectory)
-        super.tearDown()
+        try await super.tearDown()
     }
 
     /// A source over a folder this "device" has adopted for real.

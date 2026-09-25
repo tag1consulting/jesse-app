@@ -9,15 +9,15 @@ final class VaultNoteEditorModelTests: XCTestCase {
     private var stash: VaultEditStash!
     private let note = "# Kiln\n\nThe arch is sound.\n"
 
-    override func setUp() {
-        super.setUp()
+    override func setUp() async throws {
+        try await super.setUp()
         stashDirectory = VaultFixture.makeDirectory()
         stash = VaultEditStash(directory: stashDirectory)
     }
 
-    override func tearDown() {
+    override func tearDown() async throws {
         VaultFixture.cleanUp(stashDirectory)
-        super.tearDown()
+        try await super.tearDown()
     }
 
     private func makeModel(_ writer: any VaultNoteWriting,

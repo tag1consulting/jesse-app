@@ -78,38 +78,59 @@ public final class FoundationVaultAnswerSession: VaultAnswerGenerating, @uncheck
         }
     }
 
-    // MARK: - Reading an error without naming a deprecated case
+    // MARK: - Reading an error without naming its type
     //
     // The context-window condition is reported two different ways by two different SDK
     // vintages: `LanguageModelError.contextSizeExceeded` from 27, and the older
-    // `LanguageModelSession.GenerationError.exceededContextWindowSize` before it. Every
-    // case of that older enum is `@available(deprecated: 27.0)`, so PATTERN MATCHING one
-    // is a deprecation warning — and this repository builds shipping code with warnings
-    // as errors, with the app's deployment target raised to the newest runtime by the
-    // local gate. Naming the case is therefore not available, and dropping the older
-    // spelling would silently lose the retry on a device running 26.
+    // `LanguageModelSession.GenerationError.exceededContextWindowSize` before it. NEITHER
+    // can be spelled here, for opposite reasons:
     //
-    // So the new enum is matched properly when it exists, and the old one by its CASE
-    // NAME through `Mirror`, which is what an enum with an associated value puts in its
-    // single child's label. Reflection for a string is not elegant; it is the honest way
-    // to read a case the compiler will not let this file spell.
+    // - Every case of the older enum is `@available(deprecated: 27.0)`, so pattern
+    //   matching one is a deprecation warning under the 27 SDK, and shipping code builds
+    //   with warnings as errors.
+    // - `LanguageModelError` does not exist before the 27 SDK, and an
+    //   `if #available(iOS 27.0, macOS 27.0, *)` around it does not help: that is a
+    //   RUNTIME check, and the compiler must still resolve every name inside it. Naming
+    //   the type broke `swift build` under SDK 26.2 (the Studio) and 26.6 (the hosted
+    //   runner's `latest-stable`) alike.
+    //
+    // A compile-time SDK check is not available either. Swift has no `#if sdk(>=27)`;
+    // `#if compiler(...)` tracks the Swift version, which moves within an SDK major, and
+    // `canImport(FoundationModels, _version:)` needs a module version for the 27 SDK that
+    // no toolchain this repository builds with can show.
+    //
+    // So both are read by NAME: the case label from `Mirror` (or, for a case without an
+    // associated value, its default description), and for the newer spelling the type's
+    // name too. Nothing here names a type an SDK might lack or deprecate, so this file
+    // compiles identically on every SDK and loses the retry on none.
 
     /// Whether `error` is the model saying the prompt did not fit.
     static func isContextWindow(_ error: any Error) -> Bool {
-        if #available(iOS 27.0, macOS 27.0, *) {
-            if let modern = error as? LanguageModelError,
-               case .contextSizeExceeded = modern {
-                return true
-            }
-        }
-        return caseName(of: error) == "exceededContextWindowSize"
+        let name = caseName(of: error)
+        if name == "exceededContextWindowSize" { return true }
+        return name == "contextSizeExceeded"
+            && String(describing: type(of: error)) == "LanguageModelError"
     }
 
-    /// The case name of an enum error with an associated value, or nil.
+    /// The case name of an enum error, or nil.
+    ///
+    /// A case with an associated value puts its name in its single child's label. A case
+    /// without one has no child, and its default description is the bare case name. That
+    /// description is trusted only when it is a bare identifier, since a type may replace
+    /// it with a sentence of its own. (Asking whether the type conforms to
+    /// `CustomStringConvertible` cannot answer that: every error on Darwin bridges to
+    /// `NSError`, which does.)
     static func caseName(of error: any Error) -> String? {
         let mirror = Mirror(reflecting: error)
         guard mirror.displayStyle == .enum else { return nil }
-        return mirror.children.first?.label
+        if let label = mirror.children.first?.label { return label }
+        guard mirror.children.isEmpty else { return nil }
+        let described = String(describing: error)
+        let identifier = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "_"))
+        guard let first = described.unicodeScalars.first,
+              !CharacterSet.decimalDigits.contains(first),
+              described.unicodeScalars.allSatisfy(identifier.contains) else { return nil }
+        return described
     }
 
     /// One short line for an error whose `localizedDescription` is routinely empty.
