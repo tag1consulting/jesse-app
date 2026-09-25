@@ -14,6 +14,34 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [Bridge 0.152.1] - 2026-09-25
+
+**`Most recent` on the Strands board lists strands in the order they were last touched,
+newest first, including among strands touched on the same day.**
+
+**Root cause: a day granular `updated` key tied on active days, and the title tiebreak made
+the board alphabetical.** `updated` is a frontmatter day with no time, so on a busy day most
+or all strands carried today's date, the primary key tied across the board, and the title
+tiebreak decided the whole order.
+
+### Fixed
+
+- **The strand sort** in `GET /jesse/strands` is now `updated` day descending, then the
+  note file's modification time descending, then title, then slug. The mtime is read from
+  the metadata of the note `snapshot()` just read and stays off the wire. `updated` still
+  leads, so a note a tool merely touched on an earlier day never outranks a newer day. A
+  note whose mtime cannot be read sorts after the rest of its day. Git commit time was not
+  used: the Studio's 15 minute autocommit batches changes, and would tie again.
+- **The ETag moves on a reorder alone**, now pinned by a test: touching a note without
+  changing a byte reorders the board and changes the tag.
+
+## [App 1.0 (163)] - 2026-09-25
+
+**The Strands board's comments and tests follow the bridge's new order** (bridge 0.152.1):
+`updated` day, then last modified, then title. No behaviour change in the app, which keeps
+the server's order under both lenses; a new `StrandsBoardTests` case asserts `Most recent`
+and `By group` both keep arrival order for rows sharing a day.
+
 ## [App 1.0 (162)] - 2026-09-25
 
 **A Today item opens the strand it belongs to, and a strand's note lists the Today items

@@ -10553,6 +10553,77 @@ async fn things_slug_is_404_when_unknown_or_carrying_a_path() {
     }
 }
 
+/// Touching a note without changing a byte of it reorders the board, and a
+/// reorder alone moves the tag: the tag is computed over the serialized body,
+/// and the body is the order.
+#[tokio::test]
+async fn strands_touch_reorders_the_day_and_moves_the_tag() {
+    let (st, root) = strands_state();
+    let touch = |slug: &str, secs: u64| {
+        std::fs::File::options()
+            .write(true)
+            .open(root.join(format!("vault/Strands/{slug}.md")))
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(secs))
+            .unwrap();
+    };
+    // The four fixture notes that share `updated: 2026-09-23`, in a known order.
+    touch("Alpha-Strand", 1_000);
+    touch("Clean-Strand", 4_000);
+    touch("Rough-Strand", 3_000);
+    touch("Tidy-Strand", 2_000);
+
+    let fetch = |inm: Option<String>| {
+        let st = st.clone();
+        async move {
+            app(st)
+                .oneshot(strands_request(
+                    "/jesse/strands",
+                    Some("Bearer test-token"),
+                    inm.as_deref(),
+                ))
+                .await
+                .unwrap()
+        }
+    };
+    let first_four = |body: &Value| -> Vec<String> {
+        body["strands"].as_array().unwrap()[..4]
+            .iter()
+            .map(|t| t["slug"].as_str().unwrap().to_string())
+            .collect()
+    };
+
+    let first = fetch(None).await;
+    let tag = etag_of(&first);
+    let body: Value = serde_json::from_str(&body_string(first).await).unwrap();
+    assert_eq!(
+        first_four(&body),
+        vec![
+            "Clean-Strand",
+            "Rough-Strand",
+            "Tidy-Strand",
+            "Alpha-Strand"
+        ],
+        "one shared day: last touched first"
+    );
+
+    touch("Alpha-Strand", 5_000);
+    let moved = fetch(Some(tag.clone())).await;
+    assert_eq!(moved.status(), StatusCode::OK, "a reorder is not a 304");
+    assert_ne!(etag_of(&moved), tag, "a reorder alone moves the tag");
+    let body: Value = serde_json::from_str(&body_string(moved).await).unwrap();
+    assert_eq!(
+        first_four(&body),
+        vec![
+            "Alpha-Strand",
+            "Clean-Strand",
+            "Rough-Strand",
+            "Tidy-Strand"
+        ],
+        "the note touched again moves to the top"
+    );
+}
+
 #[tokio::test]
 async fn strands_etag_moves_with_a_note_and_not_otherwise() {
     let (st, root) = strands_state();

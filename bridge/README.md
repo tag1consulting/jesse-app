@@ -2062,7 +2062,7 @@ the screen and the nightly file can never disagree.
 
 | Route | Returns |
 | --- | --- |
-| `GET /jesse/strands` | `{ generated_at, strands: [...], global_findings: [...], counts: { active, waiting, dormant, unstranded } }`. Every note whose state is not `done`, sorted by `updated` descending, then title. Each strand carries `slug`, `title`, `group`, `state`, `updated`, `repos`, `now`, `waiting` (`{ text, jeremy }` or null), `next` (`{ id, text, link, waits_on }` or null), `counts` (`queue`, `later`, `running`, `done`) and its `findings` (`{ code, message, line }`). |
+| `GET /jesse/strands` | `{ generated_at, strands: [...], global_findings: [...], counts: { active, waiting, dormant, unstranded } }`. Every note whose state is not `done`, sorted by `updated` day descending, then the note file's last modification time descending, then title, so strands sharing a day list newest touch first. Each strand carries `slug`, `title`, `group`, `state`, `updated`, `repos`, `now`, `waiting` (`{ text, jeremy }` or null), `next` (`{ id, text, link, waits_on }` or null), `counts` (`queue`, `later`, `running`, `done`) and its `findings` (`{ code, message, line }`). |
 | `GET /jesse/strands/:slug` | `{ generated_at, markdown, strand }` for one note. `404` for an unknown slug, and for any slug carrying `/`, `\` or `..`, before a path is built. |
 
 Both take the bearer token and the shared limiter, and both carry a strong

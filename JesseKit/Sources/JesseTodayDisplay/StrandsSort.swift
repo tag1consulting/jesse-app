@@ -9,18 +9,22 @@ import JesseNetworking
 //
 // `TodaySortKey` has three cases and the day's default is FILE ORDER, because the day
 // file's order is the day's own argument and a client must not overrule it. A strand
-// board has no such argument: the bridge sorts it by `updated` descending and that is
-// a derived fact, not an editorial one. So the two lenses share nothing but the idea
-// of grouping by project, and folding them into one enum would put `File order` and
-// `Oldest first` in a menu where neither means anything.
+// board has no such argument: the bridge sorts it by `updated` descending, then by the
+// note's last modification time, and that is a derived fact, not an editorial one. So
+// the two lenses share nothing but the idea of grouping by project, and folding them
+// into one enum would put `File order` and `Oldest first` in a menu where neither
+// means anything.
 //
 // Neither lens here writes. There is no reorder on this screen at all — a strand's
-// order is its `updated` stamp, and the way to change that is to do some work.
+// order is its `updated` day and when its note was last touched, and the way to change
+// that is to do some work.
 
 /// How the strand rows are ordered.
 public enum StrandsSortKey: String, CaseIterable, Identifiable, Equatable, Hashable, Sendable {
-    /// The server's order: `updated` descending, then title. The default, and the only
-    /// one that answers "what has moved".
+    /// The server's order: `updated` day descending, then last modified descending,
+    /// then title. The default, and the only one that answers "what has moved".
+    /// `updated` is only a day, so without the bridge's mtime key an active day ties
+    /// across the board and reads as alphabetical.
     case mostRecent
     /// Grouped under the five Dashboard project headings, unfiled last.
     case group
@@ -81,8 +85,8 @@ public enum StrandsSemantics {
     /// Two rules hold under BOTH lenses, which is why they live here rather than in
     /// either branch:
     ///
-    ///   * **Server order is the tiebreak, always.** The bridge sorts by `updated`
-    ///     descending then title, so decorating with the arrival index and comparing on
+    ///   * **Server order is the tiebreak, always.** The bridge sorts by `updated` day
+    ///     descending, then last modified, then title, so decorating with the arrival index and comparing on
     ///     it last makes every lens a pure, stable function of the snapshot. Swift's
     ///     `sorted(by:)` is not stable, and a board where five strands share a group
     ///     would otherwise shuffle those five on every redraw.
