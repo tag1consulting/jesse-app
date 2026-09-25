@@ -423,15 +423,19 @@ public final class VaultIndex: @unchecked Sendable {
     /// `VaultWikiLink.resolve(target:among:)` — exact path, unique basename, unique
     /// case-folded basename — as SQL rather than over an array of 7,600 strings.
     public func resolve(target rawTarget: String) -> String? {
-        let target = VaultWikiLink.normalized(rawTarget)
+        // The same prefix rule as `VaultWikiLink.resolve`: the workspace name comes off,
+        // and a stray note under a literal `todo-list/` folder is never an answer.
+        let target = VaultWikiLink.withoutWorkspacePrefix(VaultWikiLink.normalized(rawTarget))
         guard !target.isEmpty else { return nil }
         return locked {
             if exists(path: target + ".md") { return target + ".md" }
             let wanted = VaultWikiLink.fileName(for: target)
             let exact = paths(whereColumn: "basename", equals: wanted)
+                .filter { !VaultWikiLink.isStrayWorkspacePath($0) }
             if exact.count == 1 { return exact[0] }
             if exact.count > 1 { return nil }
             let folded = paths(whereColumn: "basename_lower", equals: wanted.lowercased())
+                .filter { !VaultWikiLink.isStrayWorkspacePath($0) }
             return folded.count == 1 ? folded[0] : nil
         }
     }

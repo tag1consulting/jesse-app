@@ -1,7 +1,10 @@
 import SwiftUI
 import SwiftData
 import JesseCore
+import JesseNetworking
 import JesseSpeech
+import JesseTodayDisplay
+import JesseVault
 
 // Thread history + concurrent threads. The thread list is the root; each thread
 // is a SwiftData-persisted conversation. Runs are owned by an app-scoped
@@ -35,6 +38,16 @@ struct JesseApp: App {
         // waiting to be picked up is the whole point of it — and is swept by its own
         // age and orphan rules from `ContentView`.
         RecordingWorkingCopy.standard().purge()
+
+        // A tick of a strand step in the vault reader is reported to the bridge, which
+        // starts the turn that closes it; see `StrandTickReport`. The client is rebuilt
+        // per send so a re-pair is picked up without a relaunch.
+        Task {
+            await StrandTickOutbox.shared.configure { @MainActor in
+                JesseBridgeClient(config: ConfigStore.load())
+            }
+            await StrandTickOutbox.shared.flush()
+        }
 
         let box = IntentReplayerBox()
         _replayerBox = State(initialValue: box)

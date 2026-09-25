@@ -84,6 +84,32 @@ final class VaultWikiLinkTests: XCTestCase {
                        "spelling the path is how a reader disambiguates, and it still works")
     }
 
+    /// THE STRAY FILE. Tapping an unresolved `[[todo-list/…]]` link in Obsidian creates an
+    /// empty note at that literal path, and Sync copies it everywhere. It must never be the
+    /// answer: not by exact path (it would open the empty file), and not as a second file
+    /// with the draft's name (it would make the real draft ambiguous).
+    func testAStrayTodoListFileIsNeverTheAnswer() {
+        let withStrays = [
+            "Projects/drafts/2026-09-17-0856-Permesso-Kits.md",
+            "todo-list/Projects/drafts/2026-09-17-0856-Permesso-Kits.md",
+            "Projects/drafts/archive/2026-09-17-1455-talk-outline-v4.md",
+            "todo-list/Projects/drafts/archive/2026-09-17-1455-talk-outline-v4.md",
+        ]
+        XCTAssertEqual(
+            VaultWikiLink.resolve(target: "todo-list/Projects/drafts/2026-09-17-0856-Permesso-Kits",
+                                  among: withStrays),
+            "Projects/drafts/2026-09-17-0856-Permesso-Kits.md")
+        // A draft archived since the link was written: found by name, the stray ignored.
+        XCTAssertEqual(
+            VaultWikiLink.resolve(target: "todo-list/Projects/drafts/2026-09-17-1455-talk-outline-v4",
+                                  among: withStrays),
+            "Projects/drafts/archive/2026-09-17-1455-talk-outline-v4.md")
+        // Only the stray exists: nothing, rather than an empty note.
+        XCTAssertNil(VaultWikiLink.resolve(
+            target: "todo-list/Projects/drafts/Gone",
+            among: ["todo-list/Projects/drafts/Gone.md"]))
+    }
+
     func testAMissingTargetResolvesToNothing() {
         XCTAssertNil(VaultWikiLink.resolve(target: "Nowhere", among: paths))
         XCTAssertNil(VaultWikiLink.resolve(target: "", among: paths))

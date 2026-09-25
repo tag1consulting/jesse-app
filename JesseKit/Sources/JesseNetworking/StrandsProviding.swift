@@ -12,6 +12,11 @@ import Foundation
 // ticking a checkbox in the note, which the vault reader already does through the
 // guarded write — a second write path to the same lines, over the network, is how two
 // spellings of "tick a box" end up disagreeing about what was ticked.
+//
+// `postStrandTick` is not one. It edits nothing: it tells the bridge that the reader
+// wrote a tick into this device's copy, so the bridge can start the turn that closes the
+// step on the Studio. See `StrandTickReport` in JesseVault for why the write alone never
+// got there.
 
 /// The outcome of `GET /jesse/strands`.
 public enum StrandsFetchResult: Equatable, Sendable {
@@ -71,6 +76,27 @@ extension JesseBridgeClient: StrandsProviding {
             throw JesseError.decoding
         }
         return detail
+    }
+
+    /// `POST /jesse/strands/{slug}/ticks` — the reader wrote a tick (or an untick) of step
+    /// `id` into this device's copy of the note. Answers the bridge's one word state
+    /// (`pending`, `cancelled`, `already_fired`, `nothing`, `done`).
+    ///
+    /// `404` is thrown as `JesseError.badResponse(404, …)` like any other status: the
+    /// caller decides that a note or step the bridge does not have is not worth resending.
+    public func postStrandTick(slug: String, id: String, checked: Bool) async throws -> String {
+        guard var req = todayRequest("/jesse/strands/\(Self.pathEscaped(slug))/ticks",
+                                     method: "POST") else {
+            throw JesseError.notConfigured
+        }
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = try JSONSerialization.data(withJSONObject: ["id": id, "checked": checked])
+        let (data, http) = try await todaySend(req)
+        guard (200..<300).contains(http.statusCode) else {
+            throw JesseError.badResponse(http.statusCode, Self.bodyText(data))
+        }
+        let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        return object?["state"] as? String ?? ""
     }
 
     /// Decode a board, preferring the ETag the body carries and falling back to the
