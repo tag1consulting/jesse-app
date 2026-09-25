@@ -14,6 +14,39 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [Bridge 0.151.0] - 2026-09-25
+
+**The strands audit flags an idle strand instead of counting strands, and stops calling a
+cited report a launched prompt.** Two findings reported things that were not problems.
+
+**Root cause one: a fixed count cap flagged a number the operator changes on purpose.**
+`TOO-MANY` fired when more than 20 strands were active. Strands are split to focus and
+joined back when the focus is spent, so the count swings by design and a cap on it is
+noise. What does signal a problem is a split nobody has touched in weeks.
+
+**Root cause two: `QUEUE-ARCHIVED` treated every archived link on an open line as a
+launched prompt.** An open line that cited the archived report its findings came from (a
+live Argus note, line B12, "No prompt yet.") was flagged as a prompt that ran and was
+never recorded.
+
+### Added
+
+- **`ROLLUP-CANDIDATE`**: a note that is not done and has not been edited in over 21 days.
+  It names the parent it should join back into, read from a v2 `## Vault` bullet labelled
+  `parent` whose link is under `Strands/`; a note without one is told it is top level and
+  can join another top level strand or go dormant. Raised alongside `UPDATED-STALE` and
+  `DORMANT-CANDIDATE`, never instead of them. The parent stays off the wire.
+
+### Changed
+
+- **`QUEUE-ARCHIVED` is raised only for an archived prompt**: a target whose file name,
+  lowercased, contains `prompt`. `UNOWNED-PROMPT` and `QUEUE-ARCHIVED` now share that one
+  predicate, so the two cannot disagree about what a prompt is.
+
+### Removed
+
+- **`TOO-MANY`** and its 20 strand cap. The snapshot counts are unchanged.
+
 ## [App 1.0 (160)] - 2026-09-25
 
 **`JesseKit` did not compile on any toolchain this repository builds with.**

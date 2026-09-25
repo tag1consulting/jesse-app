@@ -12,7 +12,7 @@ updated: 2026-09-01
 - [x] **C1** Checked but never moved.
 - [ ] A line with no bold id at all.
 - [x] **C1** The same id again.
-- [x] **C2** Launched already, the prompt is archived. [[todo-list/Projects/drafts/archive/2026-09-10-old]]
+- [x] **C2** Launched already, the prompt is archived. [[todo-list/Projects/drafts/archive/2026-09-09-old-prompt]]
 ### Later
 - [ ] **C9** Someday.
 

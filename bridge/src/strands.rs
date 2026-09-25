@@ -39,7 +39,9 @@ pub const STRANDS_DIR: &str = "Strands";
 
 /// The path segment that marks a note, a draft or a research file as retired.
 /// A Strands note under it is not parsed at all, and a link INTO it from a live
-/// queue line is [`QUEUE_ARCHIVED`] (the item was launched and never moved).
+/// queue line is [`QUEUE_ARCHIVED`] when the target is a prompt (see
+/// [`names_a_prompt`]): the prompt was launched and the line never moved. An
+/// archived report or draft cited from an open line is only a citation.
 pub const ARCHIVE_SEGMENT: &str = "archive";
 
 /// The five groups a note may declare. Anything else is [`GROUP`].
@@ -66,9 +68,14 @@ const STALE_DAYS: i64 = 14;
 /// An active note that has not been edited in this many days is not active.
 const DORMANT_DAYS: i64 = 90;
 
-/// More active strands than a person can hold. Past this the board is a list,
-/// not a plan.
-const MAX_ACTIVE: usize = 20;
+/// A note that is not done and has not been edited in this many days is a
+/// candidate to join back into its parent (or, at the top level, to join
+/// another strand or go dormant). The operator splits a strand to focus and
+/// joins it back when the focus is spent; three weeks untouched means the split
+/// no longer pays for its own note. The operator's ruling, and the reason the
+/// audit watches idleness rather than how many strands exist: that count swings
+/// by design.
+const ROLLUP_DAYS: i64 = 21;
 
 // ---- Finding codes ---------------------------------------------------------
 //
@@ -92,7 +99,7 @@ pub const NO_NEXT: &str = "NO-NEXT";
 pub const DUP_ID: &str = "DUP-ID";
 pub const ORPHAN_DRAFT: &str = "ORPHAN-DRAFT";
 pub const UNOWNED_PROMPT: &str = "UNOWNED-PROMPT";
-pub const TOO_MANY: &str = "TOO-MANY";
+pub const ROLLUP_CANDIDATE: &str = "ROLLUP-CANDIDATE";
 pub const DONE_NOT_ARCHIVED: &str = "DONE-NOT-ARCHIVED";
 pub const NOW_LONG: &str = "NOW-LONG";
 pub const FORMAT_V1: &str = "FORMAT-V1";
@@ -115,7 +122,7 @@ pub const FINDING_CODES: [&str; 19] = [
     DUP_ID,
     ORPHAN_DRAFT,
     UNOWNED_PROMPT,
-    TOO_MANY,
+    ROLLUP_CANDIDATE,
     DONE_NOT_ARCHIVED,
     NOW_LONG,
     FORMAT_V1,
@@ -275,6 +282,12 @@ pub struct Strand {
     link_refs: Vec<LinkRef>,
     #[serde(skip)]
     pub layout: StrandLayout,
+    /// The slug of the strand this one was split out of: the first v2
+    /// `## Vault` bullet labelled exactly `parent` whose link is under
+    /// `Strands/`. Off the wire; the audit uses it to name where an idle split
+    /// should join back. Always `None` for a v1 note.
+    #[serde(skip)]
+    pub parent: Option<String>,
 }
 
 /// Everything `GET /jesse/strands` serves, and everything the nightly file
@@ -309,8 +322,9 @@ impl StrandsSnapshot {
 ///
 /// Raises the findings that are a function of the document alone: [`PARSE`],
 /// [`FORMAT_V1`], [`NOW_LONG`], [`DUP_ID`], [`CHECKED_NOT_MOVED`] and
-/// [`QUEUE_ARCHIVED`] (a link target that names `archive/` is archived whether
-/// or not the file is there). Everything that needs the vault, a calendar or the
+/// [`QUEUE_ARCHIVED`] (an open line's link to a prompt under `archive/`, which
+/// is archived whether or not the file is there; an archived report or draft
+/// cited from an open line is not a launched prompt and raises nothing). Everything that needs the vault, a calendar or the
 /// other notes is [`audit_strand`].
 ///
 /// Two layouts parse. A note with an H2 `## Queue` is **v1** and carries a
@@ -340,8 +354,9 @@ impl StrandsSnapshot {
 /// with an optional `### Later` and then an optional `### Done` under it. An
 /// unchecked line that says `Launched YYYY-MM-DD.` is running. `## Research`,
 /// `## Vault` and `## Status` hold plain bullets whose links must resolve, and
-/// `## Decisions` holds dated lines. The next step is the first unchecked, not
-/// running Drafts line above `### Later`.
+/// `## Decisions` holds dated lines. A `## Vault` bullet labelled `parent`
+/// whose link is under `Strands/` names the strand this one was split from. The
+/// next step is the first unchecked, not running Drafts line above `### Later`.
 pub fn parse_strand(slug: &str, src: &str) -> Strand {
     let lines: Vec<&str> = src.lines().collect();
     let mut strand = Strand {
@@ -392,6 +407,7 @@ pub fn parse_strand(slug: &str, src: &str) -> Strand {
 
     // 2 to 5. One pass over the body.
     let mut section: Option<Section> = None;
+    let mut in_vault = false;
     for (idx, raw) in lines.iter().enumerate().skip(body_start) {
         let line_no = idx + 1;
         let text = raw.trim_end();
@@ -403,6 +419,7 @@ pub fn parse_strand(slug: &str, src: &str) -> Strand {
             continue;
         }
         if let Some(rest) = heading_level(text, 2) {
+            in_vault = v2 && rest == "Vault";
             section = match (v2, rest) {
                 (false, "Queue") => Some(Section::Item(StrandSection::Queue)),
                 (false, "Running") => Some(Section::Item(StrandSection::Running)),
@@ -414,6 +431,7 @@ pub fn parse_strand(slug: &str, src: &str) -> Strand {
             continue;
         }
         if let Some(rest) = heading_level(text, 3) {
+            in_vault = false;
             section = match (rest, section) {
                 ("Later", Some(Section::Item(StrandSection::Queue))) => {
                     Some(Section::Item(StrandSection::Later))
@@ -462,6 +480,9 @@ pub fn parse_strand(slug: &str, src: &str) -> Strand {
             None => continue,
             Some(Section::Checked) => {
                 push_link_refs(&mut strand.link_refs, text, line_no, false);
+                if in_vault && strand.parent.is_none() {
+                    strand.parent = parent_slug(text);
+                }
                 continue;
             }
             Some(Section::Item(section)) => section,
@@ -566,11 +587,17 @@ pub fn parse_strand(slug: &str, src: &str) -> Strand {
         }
     }
     for reference in &strand.link_refs {
-        if reference.in_queue && is_archived(&reference.target) {
+        if reference.in_queue
+            && is_archived(&reference.target)
+            && names_a_prompt(&resolve_target(&reference.target))
+        {
             strand.findings.push(Finding::at(
                 QUEUE_ARCHIVED,
                 reference.line,
-                format!("queue link points into archive: {}", reference.target),
+                format!(
+                    "queue link points to an archived prompt: {}",
+                    reference.target
+                ),
             ));
         }
     }
@@ -762,6 +789,21 @@ fn wiki_targets(s: &str) -> Vec<String> {
     out
 }
 
+/// The parent slug a `## Vault` bullet names: `- parent [[…/Strands/Slug]]`,
+/// the label exactly `parent` and the target under `Strands/`. Anything else is
+/// `None`, so an unlabelled or differently labelled link is never a parent.
+fn parent_slug(line: &str) -> Option<String> {
+    let rest = line.trim_start().strip_prefix("- ")?;
+    let (label, _) = rest.split_once("[[")?;
+    if label.trim() != "parent" {
+        return None;
+    }
+    let resolved = resolve_target(wiki_targets(rest).first()?);
+    let file = resolved.strip_prefix(&format!("{STRANDS_DIR}/"))?;
+    let stem = Path::new(file).file_stem()?.to_str()?;
+    (!stem.is_empty()).then(|| stem.to_string())
+}
+
 fn push_link_refs(out: &mut Vec<LinkRef>, line: &str, line_no: usize, in_queue: bool) {
     for target in wiki_targets(line) {
         out.push(LinkRef {
@@ -805,6 +847,15 @@ pub fn resolve_target(target: &str) -> String {
 
 fn is_archived(target: &str) -> bool {
     resolve_target(target).contains(&format!("/{ARCHIVE_SEGMENT}/"))
+}
+
+/// Whether a file is a prompt, by its name: the file name, lowercased, contains
+/// `prompt`. The one predicate behind both [`UNOWNED_PROMPT`] and
+/// [`QUEUE_ARCHIVED`], so the two can never disagree about what a prompt is.
+fn names_a_prompt(path: &str) -> bool {
+    path.rsplit('/')
+        .next()
+        .is_some_and(|name| name.to_lowercase().contains("prompt"))
 }
 
 fn clip(s: &str) -> String {
@@ -902,6 +953,22 @@ pub fn audit_strand(strand: &mut Strand, notes_root: &Path, today: &str) {
                     UPDATED_STALE,
                     1,
                     format!("active and untouched for {age} days"),
+                ));
+            }
+            // Alongside the two above, never instead of them: they say the
+            // note is behind, this one says the split may have run its course.
+            if strand.state != "done" && age > ROLLUP_DAYS {
+                strand.findings.push(Finding::at(
+                    ROLLUP_CANDIDATE,
+                    1,
+                    match &strand.parent {
+                        Some(parent) => format!(
+                            "untouched for {age} days: a candidate to join back into {parent}"
+                        ),
+                        None => format!(
+                            "top level and untouched for {age} days: join another top level strand, or let it go dormant"
+                        ),
+                    },
                 ));
             }
         }
@@ -1025,15 +1092,6 @@ pub fn snapshot(notes_root: &Path, today: &str) -> StrandsSnapshot {
         waiting: strands.iter().filter(|t| t.state == "waiting").count(),
         dormant: strands.iter().filter(|t| t.state == "dormant").count(),
     };
-    if counts.active > MAX_ACTIVE {
-        global.push(Finding::global(
-            TOO_MANY,
-            format!(
-                "{} active strands, more than the {MAX_ACTIVE} a board can hold",
-                counts.active
-            ),
-        ));
-    }
 
     StrandsSnapshot {
         strands,
@@ -1067,7 +1125,7 @@ fn scan_owned_files(notes_root: &Path, strands: &[Strand]) -> Vec<Finding> {
             };
             match frontmatter_value(&src, "strand") {
                 None => {
-                    if name.to_lowercase().contains("prompt") {
+                    if names_a_prompt(name) {
                         out.push(Finding::global(
                             UNOWNED_PROMPT,
                             format!("{rel} has no strand: key"),
@@ -1630,6 +1688,7 @@ mod tests {
                 (Some(1), FORMAT_V1),
                 (Some(1), GROUP),
                 (Some(1), NO_NEXT),
+                (Some(1), ROLLUP_CANDIDATE),
                 (Some(1), UPDATED_BEHIND),
                 (Some(1), UPDATED_STALE),
                 (Some(8), LINK_DEAD),
@@ -1720,6 +1779,88 @@ mod tests {
     }
 
     #[test]
+    fn finding_queue_archived_is_raised_for_a_prompt_and_not_for_a_cited_report() {
+        let src = "---\ngroup: tag1\nstate: active\nupdated: 2026-09-23\n---\n# T\n\n**Now:** x\n\n## Drafts\n- [ ] **B12** Admin findings. No prompt yet. [[todo-list/Projects/drafts/archive/2026-09-23-2035-one-real-cycle-report]]\n- [ ] **B13** Relaunch. [[todo-list/Projects/drafts/archive/2026-09-23-2040-relaunch-prompt.md]]\n";
+        let t = parse_strand("T", src);
+        let archived: Vec<usize> = t
+            .findings
+            .iter()
+            .filter(|f| f.code == QUEUE_ARCHIVED)
+            .filter_map(|f| f.line)
+            .collect();
+        assert_eq!(archived, vec![12], "only the prompt link: {:?}", t.findings);
+    }
+
+    /// A v2 note in `state`, last edited `updated`, audited on the fixture date
+    /// with `vault` as its Vault section.
+    fn aged(state: &str, updated: &str, vault: &str) -> Strand {
+        let src = format!(
+            "---\ngroup: tag1\nstate: {state}\nupdated: {updated}\n---\n# T\n\n**Now:** x\n\n## Drafts\n- [ ] **A1** In.\n\n## Vault\n{vault}\n"
+        );
+        let mut t = parse_strand("T", &src);
+        audit_strand(&mut t, Path::new("/nonexistent"), "2026-09-23");
+        t
+    }
+
+    fn rollup(t: &Strand) -> Option<&str> {
+        t.findings
+            .iter()
+            .find(|f| f.code == ROLLUP_CANDIDATE)
+            .map(|f| f.message.as_str())
+    }
+
+    #[test]
+    fn parent_is_the_first_vault_bullet_labelled_parent_under_strands() {
+        let t = aged(
+            "active",
+            "2026-09-23",
+            "- [[todo-list/Strands/Other]]\n- see [[todo-list/Strands/Other]]\n- parent [[todo-list/Projects/Jesse]]\n- parent [[todo-list/Strands/Jesse]]\n- parent [[todo-list/Strands/Second]]",
+        );
+        assert_eq!(t.parent.as_deref(), Some("Jesse"));
+        let v1 = parse_strand(
+            "T",
+            "---\ngroup: tag1\nstate: active\nupdated: 2026-09-23\n---\n# T\n\n## Queue\n- [ ] **A1** In.\n\n## Vault\n- parent [[todo-list/Strands/Jesse]]\n",
+        );
+        assert_eq!(v1.parent, None, "a v1 note has no parent");
+    }
+
+    #[test]
+    fn finding_rollup_candidate_names_the_parent_past_21_days() {
+        let parent = "- parent [[todo-list/Strands/Jesse]]";
+        let t = aged("active", "2026-09-01", parent);
+        assert_eq!(
+            rollup(&t),
+            Some("untouched for 22 days: a candidate to join back into Jesse")
+        );
+        assert!(
+            codes(&t.findings).contains(&UPDATED_STALE),
+            "raised alongside UPDATED-STALE, not instead of it"
+        );
+        assert_eq!(rollup(&aged("active", "2026-09-02", parent)), None);
+    }
+
+    #[test]
+    fn finding_rollup_candidate_at_the_top_level_says_so() {
+        let t = aged("waiting", "2026-09-01", "");
+        assert_eq!(
+            rollup(&t),
+            Some("top level and untouched for 22 days: join another top level strand, or let it go dormant")
+        );
+    }
+
+    #[test]
+    fn finding_rollup_candidate_spares_done_but_not_dormant() {
+        assert_eq!(rollup(&aged("done", "2026-06-15", "")), None);
+        assert!(rollup(&aged("dormant", "2026-06-15", "")).is_some());
+        let old = aged("active", "2026-06-15", "");
+        assert!(rollup(&old).is_some());
+        assert!(
+            codes(&old.findings).contains(&DORMANT_CANDIDATE),
+            "raised alongside DORMANT-CANDIDATE, not instead of it"
+        );
+    }
+
+    #[test]
     fn finding_running_silent_covers_both_an_old_date_and_no_date() {
         let mut t = parse_strand("Messy-Strand", MESSY);
         audit_strand(&mut t, &fixture_root(), "2026-09-23");
@@ -1783,37 +1924,14 @@ mod tests {
     }
 
     #[test]
-    fn finding_too_many() {
-        // Twenty-one active notes in one temporary vault: the only finding that
-        // is about the board rather than about any note on it.
-        let root = std::env::temp_dir().join(format!("strands-many-{}", std::process::id()));
-        let dir = root.join(STRANDS_DIR);
-        std::fs::create_dir_all(&dir).unwrap();
-        for n in 0..21 {
-            std::fs::write(
-                dir.join(format!("T{n:02}.md")),
-                "---\ngroup: tag1\nstate: active\nupdated: 2026-09-23\n---\n# T\n\n## Queue\n- [ ] **A1** In.\n",
-            )
-            .unwrap();
-        }
-        let snap = snapshot(&root, "2026-09-23");
-        assert!(codes(&snap.global_findings).contains(&TOO_MANY));
-        std::fs::remove_dir_all(&root).ok();
-    }
-
-    #[test]
     fn every_finding_code_is_raised_by_the_fixtures() {
         let snap = snapshot(&fixture_root(), "2026-09-23");
-        let mut raised: Vec<&str> = snap
+        let raised: Vec<&str> = snap
             .strands
             .iter()
             .flat_map(|t| t.findings.iter().map(|f| f.code))
             .chain(snap.global_findings.iter().map(|f| f.code))
             .collect();
-        // TOO-MANY has its own test: it needs twenty-one notes, and putting
-        // twenty-one fixtures on disk to raise it would make every other
-        // assertion here read against a board nobody would keep.
-        raised.push(TOO_MANY);
         for code in FINDING_CODES {
             assert!(raised.contains(&code), "no fixture raises {code}");
         }
