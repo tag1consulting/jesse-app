@@ -1369,7 +1369,7 @@ pub async fn jesse_strand(
 
 /// A slug that can only ever name a file directly inside `Strands/`: no
 /// separator, no traversal, no dot-file, no empty string.
-fn is_safe_slug(slug: &str) -> bool {
+pub(crate) fn is_safe_slug(slug: &str) -> bool {
     !slug.is_empty()
         && !slug.starts_with('.')
         && !slug.contains("..")

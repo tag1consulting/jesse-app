@@ -542,6 +542,7 @@ async fn main() {
     // in the scheduler's zone (an away profile moves it), and at startup when today's file
     // is missing and the hour has passed. It writes one Inbox file and nothing else.
     jesse_bridge::strands::spawn_strands_audit(state.clone());
+    jesse_bridge::strandticks::spawn_strand_ticks(state.clone());
     axum::serve(listener, app(state))
         .await
         .expect("server error");

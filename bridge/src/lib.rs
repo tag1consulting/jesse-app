@@ -167,6 +167,8 @@ mod state;
 // `crate::strands::…` by the router and `main`, and as `jesse_bridge::strands::…` by the
 // `strands_audit` example.
 pub mod strands;
+// A ticked strand step starting one agent turn. Namespaced beside `strands`, which it reads.
+pub mod strandticks;
 mod titlestore;
 mod today;
 mod todaybrief;

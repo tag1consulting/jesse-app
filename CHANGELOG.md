@@ -14,6 +14,59 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [Bridge 0.150.0] - 2026-09-25
+
+**A ticked strand step now starts the turn that closes it.** Until now a tick was only a
+checkbox. Nothing on the bridge noticed, so no draft was archived, the line never moved to
+Done and the status line went stale until somebody did it by hand. The nightly audit
+counted a checked Queue line (`CHECKED-NOT-MOVED`) and reported it the next morning.
+
+**Why the tick of 2026-09-24 missed the note.** Jeremy ticked Family P1 in the phone's
+vault reader at 18:43. The phone's own write log shows the tick was written, but
+`vault/Strands/Family.md` on the Studio never changed. The reader writes into Obsidian's
+folder on the phone, and the only thing that carries a file from there to the Studio is
+Obsidian iOS's Sync. Obsidian does not see a file another app changed inside its folder,
+so it never sent this one, and it was syncing that same minute (it uploaded a stray file
+at 18:43). The app counted the local write as the tick landing, and nothing told the
+bridge.
+
+**Why empty files keep appearing under `vault/todo-list/`.** Vault links are written from
+the workspace root (`[[todo-list/Projects/drafts/…]]`), but Obsidian's vault root is
+`vault/`, and no plugin maps the prefix. Obsidian cannot resolve such a link, and tapping
+an unresolved link makes Obsidian create an empty note at the literal path. Four such files
+have appeared (2026-09-03, 2026-09-23, and twice on 2026-09-24). The first predates any
+vault reader in the app. The app's only file-creating write is an `Inbox/` capture, and its
+link resolver (`VaultWikiLink`) already maps the prefix, so Obsidian is the only client
+that makes them.
+
+### Added
+
+- **`strandticks`**, a tick detector with two sources and one ledger:
+  - **A scan** of `vault/Strands/*.md` every 20 seconds, using `strands::parse_strand`, the
+    same parser the board and the audit use.
+  - **`POST /jesse/strands/:slug/ticks`**, `{ id, checked }`, so the app can report the
+    tick it wrote without depending on Obsidian Sync.
+
+  Either source starts one `tell` turn whose message is exactly
+  `Jeremy ticked <ID> in Strands/<Note>`. The turn is flagged for the completion push, so
+  the reply arrives on the phone as a conversation that can be answered there.
+- **Once per tick.** A tick settles for 90 seconds, and an untick inside that window
+  cancels it. Fired steps are persisted to `<state_dir>/strand-ticks.json` and never fire
+  twice, including after a restart or when a sync merge brings the checked line back.
+  One tick turn runs at a time. The first scan with no ledger seeds the lines already
+  checked instead of firing a turn for each.
+- **Why a scan.** It compares states, so it cannot miss an event, and it needs no new
+  dependency. A file watch would still need the same comparison behind it, plus handling
+  for rename-over writes and a watcher that silently stops. The autocommit diff is 15
+  minutes late and runs outside the bridge, and a check on each `GET /jesse/strands` would
+  wait for a phone to poll.
+- **Tests.** A fixture note with a checked Queue line produces exactly one trigger, and
+  unticking before the trigger produces none. Also covered: Later and Running lines count
+  and Done does not; first-scan seeding; an app report fires once even when the file never
+  changes, and not again when sync delivers the `[x]`; an app untick cancels; one turn at
+  a time; the ledger survives a restart; archived and hidden notes are skipped; and the
+  route's `pending`, `cancelled`, `done` and `404` answers.
+
 ## [App 1.0 (157)] - 2026-09-24
 
 **A note marked up for review rendered its marks as punctuation: readable, and invisible.**

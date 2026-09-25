@@ -1354,6 +1354,15 @@ impl Config {
             .map(|d| PathBuf::from(d).join("artifacts"))
     }
 
+    /// The strand tick ledger: every strand step that has started its turn, and the
+    /// ticks still settling (a sibling of `device.json`), or `None` when persistence
+    /// is disabled. See [`crate::strandticks`].
+    pub fn strand_ticks_file(&self) -> Option<PathBuf> {
+        self.state_dir
+            .as_deref()
+            .map(|d| PathBuf::from(d).join("strand-ticks.json"))
+    }
+
     /// The file the registered APNs device token is persisted to (sibling of the
     /// `jobs/` dir), or `None` when persistence is disabled. One file, one token.
     pub fn device_file(&self) -> Option<PathBuf> {
