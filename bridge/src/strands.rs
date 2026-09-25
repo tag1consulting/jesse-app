@@ -104,10 +104,11 @@ pub const DONE_NOT_ARCHIVED: &str = "DONE-NOT-ARCHIVED";
 pub const NOW_LONG: &str = "NOW-LONG";
 pub const FORMAT_V1: &str = "FORMAT-V1";
 pub const UNSTRANDED: &str = "UNSTRANDED";
+pub const PARENT_MISSING: &str = "PARENT-MISSING";
 
 /// Every code this module can raise, in the order the module documents them.
 /// Used by the test that asserts each one has a fixture and a name.
-pub const FINDING_CODES: [&str; 20] = [
+pub const FINDING_CODES: [&str; 21] = [
     PARSE,
     GROUP,
     STATE,
@@ -128,6 +129,7 @@ pub const FINDING_CODES: [&str; 20] = [
     NOW_LONG,
     FORMAT_V1,
     UNSTRANDED,
+    PARENT_MISSING,
 ];
 
 /// The longest `**Now:**` a v2 note may carry, in characters. Now is the line
@@ -268,6 +270,13 @@ pub struct Strand {
     pub next: Option<StrandNext>,
     pub counts: StrandCounts,
     pub findings: Vec<Finding>,
+    /// The slug of the live strand this one sits under, or `null` at the top
+    /// level. Set by [`resolve_parents`] from [`Strand::declared_parent`]; a
+    /// declared parent that is not a live served note (archived, done, missing,
+    /// or the note itself) is `null` here and a [`PARENT_MISSING`] finding, so a
+    /// client can build the tree from this key alone and never meets a slug it
+    /// cannot find on the board.
+    pub parent: Option<String>,
 
     /// The note's path relative to the notes root (`Strands/Argus.md`). Off the
     /// wire because a client addresses a note by slug and never by path, and in
@@ -284,12 +293,16 @@ pub struct Strand {
     link_refs: Vec<LinkRef>,
     #[serde(skip)]
     pub layout: StrandLayout,
-    /// The slug of the strand this one was split out of: the first v2
-    /// `## Vault` bullet labelled exactly `parent` whose link is under
-    /// `Strands/`. Off the wire; the audit uses it to name where an idle split
-    /// should join back. Always `None` for a v1 note.
+    /// The slug of the strand this one was split out of, as the note declares
+    /// it: the first v2 `## Vault` bullet labelled exactly `parent` whose link
+    /// is under `Strands/`. Off the wire, where [`Strand::parent`] carries it
+    /// once resolved; the audit uses it to name where an idle split should join
+    /// back. Always `None` for a v1 note.
     #[serde(skip)]
-    pub parent: Option<String>,
+    pub declared_parent: Option<String>,
+    /// The 1-based line of that bullet, for the [`PARENT_MISSING`] finding.
+    #[serde(skip)]
+    parent_line: usize,
     /// The note file's last modification time, read from the metadata of the
     /// path `snapshot()` just read. The board's second sort key: `updated` is a
     /// day, so on an active day it ties across the board and only this says
@@ -493,8 +506,9 @@ pub fn parse_strand(slug: &str, src: &str) -> Strand {
             None => continue,
             Some(Section::Checked) => {
                 push_link_refs(&mut strand.link_refs, text, line_no, false);
-                if in_vault && strand.parent.is_none() {
-                    strand.parent = parent_slug(text);
+                if in_vault && strand.declared_parent.is_none() {
+                    strand.declared_parent = parent_slug(text);
+                    strand.parent_line = line_no;
                 }
                 continue;
             }
@@ -974,7 +988,7 @@ pub fn audit_strand(strand: &mut Strand, notes_root: &Path, today: &str) {
                 strand.findings.push(Finding::at(
                     ROLLUP_CANDIDATE,
                     1,
-                    match &strand.parent {
+                    match &strand.declared_parent {
                         Some(parent) => format!(
                             "untouched for {age} days: a candidate to join back into {parent}"
                         ),
@@ -1090,6 +1104,10 @@ pub fn snapshot(notes_root: &Path, today: &str) -> StrandsSnapshot {
     }
 
     let mut strands: Vec<Strand> = parsed.into_iter().filter(|t| t.state != "done").collect();
+    let live: Vec<String> = strands.iter().map(|t| t.slug.clone()).collect();
+    for strand in &mut strands {
+        resolve_parents(strand, &live);
+    }
     strands.sort_by(board_order);
 
     global.extend(scan_owned_files(notes_root, &strands));
@@ -1106,6 +1124,50 @@ pub fn snapshot(notes_root: &Path, today: &str) -> StrandsSnapshot {
         global_findings: global,
         counts,
     }
+}
+
+/// Set [`Strand::parent`] from the declared parent when `live` serves it, and
+/// otherwise leave it `None` and raise [`PARENT_MISSING`] on the bullet's line.
+/// `live` is every slug the board serves: not done and not archived. A note that
+/// names itself is not a parent either; longer loops are the client's to break,
+/// since only the whole set can see them.
+pub fn resolve_parents(strand: &mut Strand, live: &[String]) {
+    let Some(declared) = strand.declared_parent.clone() else {
+        return;
+    };
+    if declared != strand.slug && live.contains(&declared) {
+        strand.parent = Some(declared);
+        return;
+    }
+    let why = match declared == strand.slug {
+        true => "names itself",
+        false => "is not a live strand (archived, done or missing)",
+    };
+    strand.findings.push(Finding::at(
+        PARENT_MISSING,
+        strand.parent_line,
+        format!("parent {declared} {why}; shown at the top level"),
+    ));
+    strand.findings.sort_by_key(|f| (f.line, f.code));
+}
+
+/// Every slug the board serves: each note directly under `Strands/` whose
+/// frontmatter state is not `done`. What [`jesse_strand`] resolves one note's
+/// parent against, so the single note and the board can never disagree.
+fn live_slugs(notes_root: &Path) -> Vec<String> {
+    let Ok(rd) = std::fs::read_dir(notes_root.join(STRANDS_DIR)) else {
+        return Vec::new();
+    };
+    rd.filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.is_file() && p.extension().is_some_and(|x| x == "md"))
+        .filter(|p| {
+            std::fs::read_to_string(p)
+                .map(|src| frontmatter_value(&src, "state").as_deref() != Some("done"))
+                .unwrap_or(false)
+        })
+        .filter_map(|p| p.file_stem().and_then(|s| s.to_str()).map(str::to_string))
+        .collect()
 }
 
 /// The board's order: newest `updated` day first, then last modified first
@@ -1494,6 +1556,7 @@ pub async fn jesse_strand(
     let (today, generated_at) = zoned_now(&st);
     let mut strand = parse_strand(&slug, &markdown);
     audit_strand(&mut strand, &notes_root, &today);
+    resolve_parents(&mut strand, &live_slugs(&notes_root));
     let value = json!({ "markdown": markdown, "strand": strand });
     Ok(strands_response(&headers, value, &generated_at))
 }
@@ -1889,12 +1952,12 @@ mod tests {
             "2026-09-23",
             "- [[todo-list/Strands/Other]]\n- see [[todo-list/Strands/Other]]\n- parent [[todo-list/Projects/Jesse]]\n- parent [[todo-list/Strands/Jesse]]\n- parent [[todo-list/Strands/Second]]",
         );
-        assert_eq!(t.parent.as_deref(), Some("Jesse"));
+        assert_eq!(t.declared_parent.as_deref(), Some("Jesse"));
         let v1 = parse_strand(
             "T",
             "---\ngroup: tag1\nstate: active\nupdated: 2026-09-23\n---\n# T\n\n## Queue\n- [ ] **A1** In.\n\n## Vault\n- parent [[todo-list/Strands/Jesse]]\n",
         );
-        assert_eq!(v1.parent, None, "a v1 note has no parent");
+        assert_eq!(v1.declared_parent, None, "a v1 note has no parent");
     }
 
     #[test]
@@ -1931,6 +1994,113 @@ mod tests {
             codes(&old.findings).contains(&DORMANT_CANDIDATE),
             "raised alongside DORMANT-CANDIDATE, not instead of it"
         );
+    }
+
+    // ---- The parent on the wire -------------------------------------------
+
+    fn served<'a>(snap: &'a StrandsSnapshot, slug: &str) -> &'a Strand {
+        snap.strands.iter().find(|t| t.slug == slug).unwrap()
+    }
+
+    #[test]
+    fn a_child_serves_its_parents_slug_and_a_top_level_strand_serves_null() {
+        let snap = snapshot(&fixture_root(), "2026-09-23");
+        assert_eq!(
+            served(&snap, "Tidy-Strand").parent.as_deref(),
+            Some("Alpha-Strand")
+        );
+        assert!(!codes(&served(&snap, "Tidy-Strand").findings).contains(&PARENT_MISSING));
+        let clean = served(&snap, "Clean-Strand");
+        assert_eq!(clean.parent, None);
+        assert!(!codes(&clean.findings).contains(&PARENT_MISSING));
+        let value = serde_json::to_value(&snap).unwrap();
+        let wire = |slug: &str| {
+            value["strands"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["slug"] == slug)
+                .unwrap()["parent"]
+                .clone()
+        };
+        assert_eq!(wire("Tidy-Strand"), json!("Alpha-Strand"));
+        assert!(
+            wire("Clean-Strand").is_null(),
+            "null at the top level, never missing"
+        );
+    }
+
+    #[test]
+    fn a_done_parent_serves_null_and_a_parent_missing_finding() {
+        let snap = snapshot(&fixture_root(), "2026-09-23");
+        let rough = served(&snap, "Rough-Strand");
+        assert_eq!(rough.parent, None);
+        let found: Vec<&Finding> = rough
+            .findings
+            .iter()
+            .filter(|f| f.code == PARENT_MISSING)
+            .collect();
+        assert_eq!(found.len(), 1, "{:?}", rough.findings);
+        assert_eq!(found[0].line, Some(18), "on the parent bullet");
+        assert!(
+            found[0].message.contains("Finished-Strand"),
+            "{:?}",
+            found[0]
+        );
+    }
+
+    #[test]
+    fn an_archived_missing_or_self_parent_serves_null_with_the_finding() {
+        let root = scratch_root("parents");
+        write_note(&root, "Kept", "Kept", "2026-09-23", 1_000);
+        let child = |parent: &str| {
+            format!("---\ngroup: tag1\nstate: active\nupdated: 2026-09-23\n---\n# C\n\n**Now:** x\n\n## Drafts\n- [ ] **A1** In.\n\n## Vault\n- parent [[todo-list/Strands/{parent}]]\n")
+        };
+        std::fs::create_dir_all(root.join(STRANDS_DIR).join(ARCHIVE_SEGMENT)).unwrap();
+        std::fs::write(root.join("Strands/archive/Gone.md"), child("Kept")).unwrap();
+        std::fs::write(root.join("Strands/Under-Kept.md"), child("Kept")).unwrap();
+        std::fs::write(root.join("Strands/Under-Archived.md"), child("Gone")).unwrap();
+        std::fs::write(root.join("Strands/Under-Nothing.md"), child("Nowhere")).unwrap();
+        std::fs::write(root.join("Strands/Loop.md"), child("Loop")).unwrap();
+        let snap = snapshot(&root, "2026-09-23");
+        assert_eq!(served(&snap, "Under-Kept").parent.as_deref(), Some("Kept"));
+        for slug in ["Under-Archived", "Under-Nothing", "Loop"] {
+            let t = served(&snap, slug);
+            assert_eq!(t.parent, None, "{slug}");
+            assert_eq!(
+                codes(&t.findings)
+                    .iter()
+                    .filter(|c| **c == PARENT_MISSING)
+                    .count(),
+                1,
+                "{slug}: {:?}",
+                t.findings
+            );
+        }
+        assert!(live_slugs(&root).contains(&"Kept".to_string()));
+        assert!(!live_slugs(&root).contains(&"Gone".to_string()));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn the_etag_moves_when_a_parent_changes() {
+        let root = scratch_root("parent-etag");
+        write_note(&root, "One", "One", "2026-09-23", 1_000);
+        write_note(&root, "Two", "Two", "2026-09-23", 1_000);
+        let path = root.join("Strands/Child.md");
+        let child = |parent: &str| {
+            format!("---\ngroup: tag1\nstate: active\nupdated: 2026-09-23\n---\n# Child\n\n**Now:** x\n\n## Drafts\n- [ ] **A1** In.\n\n## Vault\n- parent [[todo-list/Strands/{parent}]]\n")
+        };
+        let tag = || strong_etag(&serde_json::to_string(&snapshot(&root, "2026-09-23")).unwrap());
+        std::fs::write(&path, child("One")).unwrap();
+        set_mtime(&path, 2_000);
+        let before = tag();
+        assert_eq!(tag(), before, "stable when nothing changed");
+        // Same length, same mtime: only the parent differs.
+        std::fs::write(&path, child("Two")).unwrap();
+        set_mtime(&path, 2_000);
+        assert_ne!(tag(), before, "a new parent is a new body");
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -2221,8 +2391,8 @@ mod tests {
                 .map(|k| k.as_str())
                 .collect::<Vec<_>>(),
             vec![
-                "counts", "findings", "group", "next", "now", "repos", "slug", "state", "title",
-                "updated", "waiting",
+                "counts", "findings", "group", "next", "now", "parent", "repos", "slug", "state",
+                "title", "updated", "waiting",
             ]
         );
         assert_eq!(

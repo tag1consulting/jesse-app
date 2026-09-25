@@ -2062,7 +2062,7 @@ the screen and the nightly file can never disagree.
 
 | Route | Returns |
 | --- | --- |
-| `GET /jesse/strands` | `{ generated_at, strands: [...], global_findings: [...], counts: { active, waiting, dormant, unstranded } }`. Every note whose state is not `done`, sorted by `updated` day descending, then the note file's last modification time descending, then title, so strands sharing a day list newest touch first. Each strand carries `slug`, `title`, `group`, `state`, `updated`, `repos`, `now`, `waiting` (`{ text, jeremy }` or null), `next` (`{ id, text, link, waits_on }` or null), `counts` (`queue`, `later`, `running`, `done`) and its `findings` (`{ code, message, line }`). |
+| `GET /jesse/strands` | `{ generated_at, strands: [...], global_findings: [...], counts: { active, waiting, dormant, unstranded } }`. Every note whose state is not `done`, sorted by `updated` day descending, then the note file's last modification time descending, then title, so strands sharing a day list newest touch first. Each strand carries `slug`, `title`, `group`, `state`, `updated`, `repos`, `now`, `waiting` (`{ text, jeremy }` or null), `next` (`{ id, text, link, waits_on }` or null), `parent` (the slug of the live strand this one sits under, or null at the top level), `counts` (`queue`, `later`, `running`, `done`) and its `findings` (`{ code, message, line }`). |
 | `GET /jesse/strands/:slug` | `{ generated_at, markdown, strand }` for one note. `404` for an unknown slug, and for any slug carrying `/`, `\` or `..`, before a path is built. |
 
 Both take the bearer token and the shared limiter, and both carry a strong
@@ -2084,7 +2084,9 @@ archived report raises nothing), `RUNNING-SILENT` (over 3 days, or undated),
 `CHECKED-NOT-MOVED`, `NO-NEXT`, `DUP-ID`, and the global `ORPHAN-DRAFT` and
 `UNOWNED-PROMPT` (both over `Projects/drafts/` and `Projects/Research/`, not their
 `archive/`) and `DONE-NOT-ARCHIVED`, plus `FORMAT-V1` (the note still uses the v1 layout) and
-`NOW-LONG` (a v2 note whose Now is over 280 characters), and the global `UNSTRANDED`
+`NOW-LONG` (a v2 note whose Now is over 280 characters), `PARENT-MISSING` (the note's
+`parent` bullet names a strand that is archived, done, missing or the note itself, so
+`parent` serves null and the strand sits at the top level), and the global `UNSTRANDED`
 (below). The grammar is documented on `strands::parse_strand`.
 
 **Today items and their strand.** Every item `GET /jesse/today` serves carries
@@ -2111,7 +2113,8 @@ audit reports no `FORMAT-V1`.
 
 **Dry run.** `cargo run --example strands_audit -- ~/jesse/vault` prints the
 report the nightly writer would write, and writes nothing. `--items` prints every
-Today item's lead with its derived strand instead.
+Today item's lead with its derived strand instead, and `--parents` every live strand
+with the `parent` it serves, then each `PARENT-MISSING`.
 
 **A tick starts a turn.** A Queue, Later or Running line that becomes `[x]` starts one
 agent turn whose whole message is `Jeremy ticked <ID> in Strands/<Note>` (a `tell`, on the

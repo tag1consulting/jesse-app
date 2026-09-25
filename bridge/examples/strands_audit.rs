@@ -1,6 +1,6 @@
 //! Print the nightly Strands audit for a vault, writing nothing.
 //!
-//!     cargo run --example strands_audit -- ~/jesse/vault [YYYY-MM-DD] [--items]
+//!     cargo run --example strands_audit -- ~/jesse/vault [YYYY-MM-DD] [--items | --parents]
 //!
 //! The argument is the NOTES root (the directory that holds `Strands/`), not the vault
 //! repository above it. The date defaults to today on the host clock. This is the same
@@ -13,22 +13,25 @@
 //! never which strand an item derives.
 //!
 //! `--items` prints every Today item's lead with its derived strand (or `null`) instead
-//! of the report.
+//! of the report. `--parents` prints every live strand with the `parent` it serves (or
+//! `null`), then each `PARENT-MISSING` finding.
 
 use std::path::PathBuf;
 
 fn main() {
     let mut items = false;
+    let mut parents = false;
     let mut positional: Vec<String> = Vec::new();
     for arg in std::env::args().skip(1) {
         match arg.as_str() {
             "--items" => items = true,
+            "--parents" => parents = true,
             _ => positional.push(arg),
         }
     }
     let mut args = positional.into_iter();
     let Some(root) = args.next() else {
-        eprintln!("usage: strands_audit <notes root> [YYYY-MM-DD] [--items]");
+        eprintln!("usage: strands_audit <notes root> [YYYY-MM-DD] [--items | --parents]");
         std::process::exit(2);
     };
     let date = args
@@ -57,6 +60,22 @@ fn main() {
         return;
     }
     let mut snapshot = jesse_bridge::strands::snapshot(&root, &date);
+    if parents {
+        for strand in &snapshot.strands {
+            let parent = strand.parent.as_deref().unwrap_or("null");
+            println!("{} [{}] → {parent}", strand.slug, strand.state);
+        }
+        let missing = snapshot.strands.iter().flat_map(|t| {
+            t.findings
+                .iter()
+                .filter(|f| f.code == jesse_bridge::strands::PARENT_MISSING)
+                .map(move |f| (t, f))
+        });
+        for (strand, finding) in missing {
+            println!("PARENT-MISSING {}: {}", strand.path, finding.message);
+        }
+        return;
+    }
     jesse_bridge::strands::add_unstranded(&mut snapshot, &day);
     print!("{}", jesse_bridge::strands::render_report(&snapshot, &date));
 }
