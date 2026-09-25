@@ -315,6 +315,76 @@ final class VaultNoteEditorModelTests: XCTestCase {
         XCTAssertEqual(second.text, note)
     }
 
+    // MARK: - Marks
+
+    /// A mark is an ordinary edit as far as everything downstream is concerned: it makes
+    /// the note dirty, Save writes it through the same guarded `replace`, and the mark's own
+    /// characters arrive on disk untouched.
+    func testApplyingAMarkMakesTheModelDirtyAndSavesTheCharacters() async {
+        let writer = FakeNoteWriter(text: note)
+        let model = makeModel(writer)
+        await model.load()
+        XCTAssertFalse(model.isDirty)
+
+        // "sound" in "The arch is sound."
+        let selection = NSRange(location: (note as NSString).range(of: "sound").location,
+                                length: 5)
+        let edit = VaultAnnotationMarkup.edit(.substitution, selection: selection,
+                                              in: model.text, field: "cracked")
+        guard let edit else { return XCTFail("expected an edit") }
+        model.text = edit.applied(to: model.text)
+
+        XCTAssertTrue(model.isDirty)
+        XCTAssertTrue(model.canSave)
+
+        await model.save()
+        XCTAssertTrue(model.didSave)
+        XCTAssertEqual(writer.writes.count, 1)
+        XCTAssertEqual(writer.writes.first?.kind, .edit)
+        XCTAssertEqual(writer.diskText, "# Kiln\n\nThe arch is {~~sound~>cracked~~}.\n")
+    }
+
+    /// THE FILE'S OWN LINE ENDINGS, on a mark as on anything else. A text view hands back
+    /// LF; a note that arrived as CRLF has to go back as CRLF, or an annotation on one line
+    /// reports as a change to every line.
+    func testAMarkSavedIntoACRLFNoteKeepsItsLineEndings() async {
+        let crlf = "# Kiln\r\n\r\nThe arch is sound.\r\n"
+        let writer = FakeNoteWriter(text: crlf)
+        let model = makeModel(writer)
+        await model.load()
+
+        let selection = NSRange(location: (model.text as NSString).range(of: "sound").location,
+                                length: 5)
+        let edit = VaultAnnotationMarkup.edit(.highlight, selection: selection,
+                                              in: model.text, field: "Is it?")
+        guard let edit else { return XCTFail("expected an edit") }
+        model.text = edit.applied(to: model.text)
+        await model.save()
+
+        XCTAssertEqual(writer.diskText,
+                       "# Kiln\r\n\r\nThe arch is {==sound==}{>>Is it?<<}.\r\n")
+        XCTAssertFalse(model.isDirty, "the saved text is the new baseline")
+    }
+
+    /// The four automatic substitutions are off, which is what keeps a mark's own
+    /// characters intact: no smart quote, no dash substitution, no ellipsis.
+    func testAMarksCharactersSurviveASaveByteForByte() async {
+        let writer = FakeNoteWriter(text: note)
+        let model = makeModel(writer)
+        await model.load()
+        let marks = [VaultAnnotationMarkup.highlight("a", comment: "b").text,
+                     VaultAnnotationMarkup.comment("c").text,
+                     VaultAnnotationMarkup.substitution(old: "d", new: "e").text,
+                     VaultAnnotationMarkup.insertion("f").text,
+                     VaultAnnotationMarkup.deletion("g").text].joined(separator: " ")
+        model.text = note + marks + "\n"
+        await model.save()
+
+        XCTAssertTrue(writer.diskText.hasSuffix(marks + "\n"))
+        XCTAssertEqual(Array(writer.diskText.utf8.suffix(marks.utf8.count + 1)),
+                       Array((marks + "\n").utf8))
+    }
+
     func testTheStashKeyIsPathSafeForALongNoteName() {
         let path = "Knowledge/People/Tag1/" + String(repeating: "A very long name ", count: 20) + ".md"
         let url = stash.url(forPath: path)
