@@ -2723,6 +2723,10 @@ pub fn app(state: AppState) -> Router {
         // slug is a file stem and nothing else. See `strands`.
         .route("/jesse/strands", get(crate::strands::jesse_strands))
         .route("/jesse/strands/:slug", get(crate::strands::jesse_strand))
+        .route(
+            "/jesse/strands/:slug/ticks",
+            post(crate::strandticks::jesse_strand_tick),
+        )
         // The conversation surface: the bridge's own thread identity, keyed on a stable
         // UUID registered at accept time rather than on a CLI transcript filename.
         .route("/jesse/conversations", get(jesse_conversations))

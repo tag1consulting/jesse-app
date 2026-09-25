@@ -136,6 +136,12 @@ pub struct AppState {
     // `JESSE_SPEECH=off`. Its pipeline is handed none of the rest of this struct — see
     // `crate::speech`.
     pub speech: Arc<crate::speech::SpeechService>,
+    // THE STRAND TICK LEDGER: which ticked strand steps have started their turn, which
+    // are still settling, and the tick turn in flight. Shared by the scan task `main`
+    // spawns and `POST /jesse/strands/{slug}/ticks`. Persisted to
+    // `<state_dir>/strand-ticks.json`; in memory with no state dir. See
+    // [`crate::strandticks`].
+    pub strand_ticks: Arc<crate::strandticks::TickLedger>,
 }
 
 impl AppState {
@@ -148,6 +154,7 @@ impl AppState {
         let retrieval_grace = Duration::from_secs(cfg.retrieval_grace_secs);
         let jobs_dir = cfg.jobs_dir();
         let device_file = cfg.device_file();
+        let strand_ticks = Arc::new(crate::strandticks::TickLedger::new(cfg.strand_ticks_file()));
         let titles_file = cfg.titles_file();
         let flags_file = cfg.flags_file();
         let conversations_file = cfg.conversations_file();
@@ -225,6 +232,7 @@ impl AppState {
             profile,
             scheduler,
             artifacts,
+            strand_ticks,
         };
         // GIVE THE IN-PROCESS HARNESS ITS BROKER. This is the first point in the process where
         // both exist: the harness registry is built inside `Config::from_env`, and the broker

@@ -97,6 +97,7 @@ change lives in one focused module:
 | `schedule` | the `[[schedule]]` config: parse, validate (per-entry disable vs. startup error), and DST-correct next-fire / catch-up resolution. Pure — no clock of its own |
 | `schedstate` | the scheduler's persisted per-job record (`<state-dir>/schedule.json`): last due/fire/completion, outcome, reason, duration, job id |
 | `strands` (namespaced) | the `Strands/` status notes: the line based parser, the one audit function (every finding code), the sort, the nightly report renderer and writer, and the two `/jesse/strands` routes. See "The Strands board" below |
+| `strandticks` (namespaced) | a ticked strand step starting one agent turn: the 20 second scan of `Strands/`, the once-only ledger, and `POST /jesse/strands/:slug/ticks`. See "The Strands board" below |
 | `scheduler` | the tick task, the `SchedulerClock` (the one instant + zone every calendar decision reads), chain execution under the one-scheduled-turn-at-a-time lock, single flight, the `expect_output` contract, the pushes, hot reload, and the `/jesse/schedule` routes |
 | `containment` | the containment RECORD: the `(capability, MCP set)` rows, the verdict/scoring rules, and the committed file's TOML shape (`bridge/containment.toml`). Always compiled — the startup gate reads it |
 | `probe` | the LIVE battery behind it: the adversarial probes, their ground-truth checks, the scratch worlds and the runner. Behind the `containment-probe` feature, so none of it is compiled into the serving binary; run by the `containment-probe` bin |
@@ -2096,6 +2097,25 @@ audit reports no `FORMAT-V1`.
 
 **Dry run.** `cargo run --example strands_audit -- ~/jesse/vault` prints the
 report the nightly writer would write, and writes nothing.
+
+**A tick starts a turn.** A Queue, Later or Running line that becomes `[x]` starts one
+agent turn whose whole message is `Jeremy ticked <ID> in Strands/<Note>` (a `tell`, on the
+active model). The vault skill does the closing: archive the draft, move the line to Done,
+rewrite the status line, ask one question if it has to. The bridge never edits a strand
+note or a draft. Ticks arrive two ways and share one ledger, keyed on (note, step id):
+
+| Source | How it is seen |
+| --- | --- |
+| The note on this machine | `strandticks` re-parses `vault/Strands/*.md` every 20 seconds with the board's own parser. Covers a tick made in Obsidian here, and one Obsidian Sync carries in. |
+| The app | `POST /jesse/strands/:slug/ticks` with `{ "id": "P1", "checked": true }`, sent by the reader after it writes a tick into the phone's copy. `202` with `{ "state" }`: `pending`, `cancelled` (an untick took back a pending tick), `already_fired`, `nothing`, or `done` (the step is already in Done here). `404` for an unknown note or step, or a slug carrying a path. |
+
+A tick settles for 90 seconds before its turn starts, and an untick inside that window
+(in the file or reported by the app) cancels it. A step fires once: fired steps are kept
+in `<state_dir>/strand-ticks.json` for 90 days, so a checked copy brought back by a sync
+merge or a restart is ignored. One tick turn runs at a time, so two ticks in one note are
+never two agents editing the same file. The first scan on a bridge with no ledger records
+every line already checked without firing. The turn is flagged for the completion push,
+so its reply arrives on the phone as a conversation that can be answered there.
 
 ## Scheduled turns (`[[schedule]]`, `GET /jesse/schedule`)
 
