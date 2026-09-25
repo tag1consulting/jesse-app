@@ -110,10 +110,20 @@ public struct VaultNoteDocument: Equatable, Sendable {
     /// file as text with line numbers without re-reading or re-splitting it. Frontmatter
     /// included: in raw, the file is the file.
     public let rawLines: [String]
+    /// How many CriticMarkup marks are waiting in this note: the count the reader offers to
+    /// send for review, and the reason it offers at all.
+    ///
+    /// Computed ONCE, at parse, over the same block texts the renderer scans and with the
+    /// same scanner, so the number and the page cannot tell two stories. Not a computed
+    /// property: the reader's body reads it, and a full scan of a 200 KB note on every
+    /// evaluation of that body would be a scroll the annotations feature paid for.
+    ///
+    /// Defaulted, so a hand-built document (a test, a preview) is unchanged.
+    public let annotationCount: Int
 
     public init(path: String, title: String, frontmatter: [String], blocks: [VaultNoteBlock],
                 wikiTargets: [String], truncated: Bool, modified: Date? = nil,
-                rawLines: [String] = []) {
+                rawLines: [String] = [], annotationCount: Int = 0) {
         self.path = path
         self.title = title
         self.frontmatter = frontmatter
@@ -122,6 +132,7 @@ public struct VaultNoteDocument: Equatable, Sendable {
         self.truncated = truncated
         self.modified = modified
         self.rawLines = rawLines
+        self.annotationCount = annotationCount
     }
 
     /// The file's name, which is what a title bar shows. The path is a caption: a vault
@@ -167,7 +178,20 @@ public struct VaultNoteDocument: Equatable, Sendable {
             wikiTargets: VaultWikiLink.targets(in: text),
             truncated: truncated,
             modified: modified,
-            rawLines: lines)
+            rawLines: lines,
+            annotationCount: VaultAnnotationMarkup.count(in: markable(blocks)))
+    }
+
+    /// Every string in this note that can carry a mark.
+    ///
+    /// A code block's text is EXCLUDED, and for the reason its links are: a brace inside a
+    /// fence is a character somebody typed, the renderer draws it as code rather than as a
+    /// mark, and counting it would offer to send a Blade template for review.
+    static func markable(_ blocks: [VaultNoteBlock]) -> [String] {
+        blocks.flatMap { block -> [String] in
+            if case .code = block.kind { return [] }
+            return block.inlineTexts
+        }
     }
 
     /// The first `byteLimit` UTF-8 bytes, cut on a CHARACTER boundary.

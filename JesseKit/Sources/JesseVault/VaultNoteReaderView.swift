@@ -284,7 +284,13 @@ public struct VaultNoteReaderView: View {
     @State private var landedOn: Int?
     /// Which oversized tables the reader has asked to see in full, by block id.
     @State private var expandedTables: Set<Int> = []
+    /// The review request, and the one line it leaves behind.
+    @State private var review = VaultNoteReviewModel()
     @Environment(\.openURL) private var openURL
+    /// How this shell starts a conversation, and whether its bridge is there. Nil in a
+    /// preview and in any window nobody wired, where a review request goes to the vault
+    /// instead of nowhere.
+    @Environment(\.vaultReview) private var reviewAction
     private let preferences: VaultReaderPreferences
     /// Pushing another note is the STACK's business, not this view's: it is handed a way to
     /// navigate so the same view works in a `NavigationStack`, in a Mac window and in a
@@ -307,6 +313,10 @@ public struct VaultNoteReaderView: View {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 10) {
                     header
+                    if let document = model.document, document.annotationCount > 0,
+                       !isReadOnly {
+                        reviewRow(count: document.annotationCount)
+                    }
                     // WHERE THE CAPTURE WENT, in the same badge the composer's local turn
                     // uses. A sheet that simply closes is indistinguishable from a sheet
                     // that was cancelled, and a capture is exactly the thing a person needs
@@ -497,6 +507,42 @@ public struct VaultNoteReaderView: View {
             }
         }
     }
+
+    /// HOW MANY MARKS ARE WAITING, and the one button that asks for them to be answered.
+    ///
+    /// Shown only when there is something to answer and the note is one this app may write
+    /// to. `Today.md` is rewritten by the bridge (`VaultWriteExemption`), so a review
+    /// request against it would ask for edits to a file whose next regeneration would
+    /// discard them.
+    @ViewBuilder
+    private func reviewRow(count: Int) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 10) {
+                Label(VaultAnnotationMarkup.countCaption(count), systemImage: "quote.bubble")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Button("Send to Jesse") {
+                    Task {
+                        await review.send(path: route.path, review: reviewAction)
+                        if let badge = review.badge { captured = badge }
+                    }
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(review.busy)
+                .accessibilityIdentifier(Self.sendIdentifier)
+            }
+            if let status = review.status {
+                Text(status)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    /// The Send button's UI-test handle.
+    public static let sendIdentifier = "vault.reader.sendAnnotations"
 
     /// "Local copy — modified 12 Sept at 09:14". Said on every note, not only a stale one:
     /// a badge that appears sometimes is a badge nobody reads.
