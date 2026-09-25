@@ -10411,7 +10411,10 @@ async fn strands_list_serves_the_contract_json() {
     );
     // An RFC 3339 instant with the scheduler zone's offset.
     assert!(body["generated_at"].as_str().unwrap().len() >= 20);
-    assert_eq!(keys(&body["counts"]), vec!["active", "dormant", "waiting"]);
+    assert_eq!(
+        keys(&body["counts"]),
+        vec!["active", "dormant", "unstranded", "waiting"]
+    );
 
     let strands = body["strands"].as_array().unwrap();
     assert!(
@@ -10454,6 +10457,59 @@ async fn strands_list_serves_the_contract_json() {
         .unwrap();
     assert!(broken["waiting"].is_null() && broken["next"].is_null());
     assert!(!body["global_findings"].as_array().unwrap().is_empty());
+}
+
+/// The chip and the audit read one derivation: the item `GET /jesse/today` serves with a
+/// strand is not listed by `GET /jesse/strands`, and the one it serves with `null` is.
+#[tokio::test]
+async fn the_today_chip_and_the_unstranded_list_agree() {
+    let (st, root) = strands_state();
+    std::fs::write(
+        root.join("vault/Today.md"),
+        "# Today\n\n## Do Now\n\n\
+         * [ ] **Probe the guest budget.** [[todo-list/Projects/drafts/2026-09-23-guest-budget]] [[todo-list/Dashboard/Tag1]] (Added 2026-09-23)\n\
+         * [ ] **Nobody claims this.** [[todo-list/Projects/Demo/Nobody]] [[todo-list/Dashboard/Tag1]] (Added 2026-09-23)\n",
+    )
+    .unwrap();
+
+    let resp = app(st.clone())
+        .oneshot(strands_request(
+            "/jesse/today",
+            Some("Bearer test-token"),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let today: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let items = today["sections"][0]["items"].as_array().unwrap();
+    assert_eq!(
+        items[0]["strand"],
+        serde_json::json!({ "slug": "Clean-Strand", "title": "Clean Strand" })
+    );
+    assert!(items[1]["strand"].is_null());
+
+    let resp = app(st)
+        .oneshot(strands_request(
+            "/jesse/strands",
+            Some("Bearer test-token"),
+            None,
+        ))
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let unstranded: Vec<&Value> = body["global_findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["code"] == "UNSTRANDED")
+        .collect();
+    assert_eq!(unstranded.len(), 1);
+    assert_eq!(
+        unstranded[0]["message"],
+        "Nobody claims this. · Projects/Demo/Nobody"
+    );
+    assert_eq!(body["counts"]["unstranded"], 1);
 }
 
 #[tokio::test]
