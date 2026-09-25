@@ -14,6 +14,41 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [App 1.0 (161)] - 2026-09-25
+
+**The Vault tab's Strands scope is the record of every strand, and it can be read one
+section at a time.** The Today board still answers "what runs next"; this scope now
+answers "what happened", archived strands included.
+
+**Root cause: the Strands scope listed the same live notes as the board, so finished work
+and decisions across strands had no place in the app.** `VaultSearchScope.strands`
+excluded `Strands/archive/`, and the board omits a finished strand too, so once a strand
+was archived nothing in the app could find it. Search returned one hit per note, which
+suits finding a note and cannot answer "every decision about the bridge", where the answer
+is many lines from many notes.
+
+### Added
+
+- **Section chips under the Strands scope**: All, Decisions, Done, Status, Drafts, Later.
+  Any chip but All turns results into lines of that section, one row per line and not
+  one per note, with the strand as a caption and the line's date first. Decisions, Done
+  and Status read newest first; Drafts and Later keep the search ranking. The index
+  already recorded the innermost `##` or `###` heading of every chunk, so a line under
+  `### Done` is found by its own heading; the chunker and the index schema are unchanged.
+- **The cross strand log**: a section chip with nothing typed shows that section's newest
+  50 dated lines across every strand, newest first.
+- **One strand at a time**: a searchable picker of every note under `Strands/`, the
+  archive included and marked, held as a removable token beside the chips. Recents,
+  search and the chips all apply within it. `VaultBrowserModel.showStrand(_:section:)`
+  opens the tab already narrowed, for a later change to call.
+
+### Changed
+
+- **Archived strands are in the Strands scope**, listed below the live ones under their
+  own collapsed Archived header. Every strand row shows its `state:` as a caption when it
+  is not `active`.
+- Tapping a line opens the note in the reader, scrolled to that line.
+
 ## [Bridge 0.151.0] - 2026-09-25
 
 **The strands audit flags an idle strand instead of counting strands, and stops calling a

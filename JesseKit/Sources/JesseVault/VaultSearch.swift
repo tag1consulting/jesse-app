@@ -155,21 +155,60 @@ public struct VaultSearcher: Sendable {
     /// term would quietly return notes from outside the folder the screen says it is
     /// showing. Held here, that bug cannot be written.
     private let folderPrefix: String?
+    /// The one strand note the Strands scope is narrowed to, as a vault relative path,
+    /// or nil for every strand. Held here for `folderPrefix`'s reason.
+    private let strandPath: String?
 
     public init(index: VaultIndex, expansionThreshold: Int = 5, limit: Int = 50,
-                scope: VaultSearchScope = .all, folder: String? = nil) {
+                scope: VaultSearchScope = .all, folder: String? = nil,
+                strand: String? = nil) {
         self.index = index
         self.expansionThreshold = expansionThreshold
         self.limit = limit
         self.scope = scope
         self.folderPrefix = folder.map { $0.hasSuffix("/") ? $0 : $0 + "/" }
+        self.strandPath = strand
     }
 
-    /// Whether one path survives BOTH narrowings. The scope and the folder are set
+    /// Whether one path survives every narrowing. The scope and the folder are set
     /// exclusively by the screen today, but nothing here depends on that.
     private func includes(_ path: String) -> Bool {
+        if let strandPath, path != strandPath { return false }
         if let folderPrefix, !path.hasPrefix(folderPrefix) { return false }
         return scope.includes(path)
+    }
+
+    /// The prefix the SQL is narrowed by: the strand's own path when one is held (a path
+    /// ending `.md` is a prefix of nothing but itself), else the folder, else the scope.
+    private var sqlPrefix: String? { strandPath ?? folderPrefix ?? scope.pathPrefix }
+
+    /// **One section, as lines**: every line under `section` that answers `query`, one
+    /// row each and NOT collapsed by file, in `VaultStrandRecord.ordered`'s order. With
+    /// nothing typed, the section's newest dated lines instead: the log.
+    ///
+    /// The index still decides which chunks match, with the same prefix terms and the
+    /// same bm25 as `base`, so a line result is never something the plain search would
+    /// not have found; the line filter only says WHERE in the chunk it is. No expansion
+    /// tier: alternate terms widen a thin list of notes, and a section is already one
+    /// small folder read in full.
+    public func sectionLines(_ query: String, section: VaultStrandSection) -> [VaultSectionLine] {
+        let prefix = sqlPrefix ?? VaultStrandRecord.folder
+        let chunks = index.chunks(underPrefix: prefix).filter { includes($0.path) }
+        guard let expression = VaultSearchQuery.matchExpression(query) else {
+            return VaultStrandRecord.log(chunks, section: section)
+        }
+        // Every matching chunk in the folder, not a top fifty: the section filter runs
+        // after SQL, and a cap before it would drop a decision because some other
+        // section of the same notes ranked higher.
+        let matched = index.search(expression: expression, limit: max(chunks.count, limit),
+                                   underPrefix: prefix)
+        var scores: [String: Double] = [:]
+        for hit in matched where includes(hit.path) {
+            scores["\(hit.path)#\(hit.line)"] = hit.score
+        }
+        return VaultStrandRecord.search(chunks, scores: scores,
+                                        tokens: VaultSearchQuery.tokens(query),
+                                        section: section, limit: limit)
     }
 
     /// The typed query alone — no model, no expansion. This is the call whose latency the
@@ -184,7 +223,7 @@ public struct VaultSearcher: Sendable {
         // and re-ranking both happen after SQL: taking exactly `limit` from SQLite would
         // mean a file's second-best chunk crowding out another file's only one.
         let raw = index.search(expression: expression, limit: limit * 4,
-                               underPrefix: folderPrefix ?? scope.pathPrefix)
+                               underPrefix: sqlPrefix)
             .filter { includes($0.path) }
         let ranked = VaultSearchQuery.ranked(VaultSearchQuery.collapsedByFile(raw),
                                              tokens: tokens, limit: limit)

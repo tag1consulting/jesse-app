@@ -40,9 +40,9 @@ final class VaultScopeTests: XCTestCase {
         let scope = VaultSearchScope.strands
         XCTAssertTrue(scope.includes("Strands/Kiln-Rebuild.md"))
         XCTAssertFalse(scope.includes("Projects/Kiln-Rebuild.md"))
-        // A finished strand is MOVED to the archive, and a board that listed its own
-        // archive would grow without bound while saying less every month.
-        XCTAssertFalse(scope.includes("Strands/archive/Old-Thing.md"))
+        // A finished strand is MOVED to the archive, and the scope is the record of
+        // every strand, so the archive is in it; the board is what leaves it out.
+        XCTAssertTrue(scope.includes("Strands/archive/Old-Thing.md"))
         XCTAssertTrue(VaultSearchScope.all.includes("Strands/archive/Old-Thing.md"))
         XCTAssertTrue(VaultSearchScope.all.includes("anything/at/all.md"))
     }
@@ -87,8 +87,8 @@ final class VaultScopeTests: XCTestCase {
         XCTAssertTrue(index.search(expression: "bisque", limit: 200).count > 1)
     }
 
-    /// The searcher carries the scope into the query and drops the archive from what
-    /// comes back.
+    /// The searcher carries the scope into the query, and a finished strand in the
+    /// archive is found like a live one.
     func testTheSearcherHonoursTheScope() throws {
         VaultFixture.write("# Live\n\nThe bisque schedule.", to: "Strands/Live.md", in: root)
         VaultFixture.write("# Done\n\nThe bisque schedule.",
@@ -99,7 +99,8 @@ final class VaultScopeTests: XCTestCase {
         try reindex(index)
 
         let scoped = VaultSearcher(index: index, scope: .strands).base("bisque")
-        XCTAssertEqual(scoped.hits.map(\.path), ["Strands/Live.md"])
+        XCTAssertEqual(Set(scoped.hits.map(\.path)),
+                       ["Strands/Live.md", "Strands/archive/Done.md"])
 
         let all = VaultSearcher(index: index, scope: .all).base("bisque")
         XCTAssertEqual(Set(all.hits.map(\.path)),

@@ -11,7 +11,8 @@ import Foundation
 // The scope set is deliberately TINY and deliberately not user defined. A general
 // folder picker would be a different feature (and a worse one: the vault's folders are
 // a filing system, not a set of views), whereas `Strands/` is the one folder whose
-// contents are a board rather than a pile.
+// contents are a record rather than a pile: every strand, finished ones included, each
+// with a dated log of what was decided and done (`VaultStrandRecord`).
 
 /// Which part of the vault the tab is looking at.
 public enum VaultSearchScope: String, CaseIterable, Identifiable, Equatable, Hashable, Sendable {
@@ -35,19 +36,14 @@ public enum VaultSearchScope: String, CaseIterable, Identifiable, Equatable, Has
         }
     }
 
-    /// The prefix under it that is excluded. A strand that is finished is MOVED to
-    /// `Strands/archive/`, and a board that listed its own archive would grow without
-    /// bound while saying less every month.
-    public var excludedPrefix: String? {
-        switch self {
-        case .all: return nil
-        case .strands: return "Strands/archive/"
-        }
-    }
-
     /// Whether one vault relative path is in scope.
+    ///
+    /// The archive is IN. `Strands/archive/` was once excluded so that this scope listed
+    /// the same live notes as the Today board, which left finished strands, and every
+    /// decision recorded in them, with no place in the app at all. The board answers
+    /// "what runs next"; this scope is the record, and a record keeps what is finished.
+    /// The screen still separates the two: archived notes sit under their own header.
     public func includes(_ path: String) -> Bool {
-        if let excluded = excludedPrefix, path.hasPrefix(excluded) { return false }
         guard let prefix = pathPrefix else { return true }
         return path.hasPrefix(prefix)
     }
