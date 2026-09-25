@@ -14,6 +14,27 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [Bridge 0.153.0] - 2026-09-25
+
+**Every strand on `GET /jesse/strands` names its parent, so the app can draw the strands as
+the tree they form in the vault.** Each strand object now carries `parent`: the slug of the
+live strand it sits under, or `null` at the top level.
+
+**Root cause: strands form a tree in the vault, but the wire carried it flat.** A note
+names its parent in a `## Vault` bullet labelled `parent`, and the bridge already parsed
+that bullet for the rollup finding, but kept it off the wire, so no client could nest a
+strand under the one it was split from.
+
+### Added
+
+- **`parent` on every strand** in `GET /jesse/strands` and `GET /jesse/strands/:slug`,
+  resolved against the strands the board serves: a parent that is archived, `done`, missing,
+  or the note itself serves `null`. Part of the body, so a changed parent moves the ETag.
+- **`PARENT-MISSING`**, a note finding on the parent bullet's line, raised whenever a
+  declared parent resolves to `null`, naming the unresolved target. Also in the nightly file.
+- **`strands_audit --parents`**: the dry run example prints every live strand with the
+  `parent` it serves, then each `PARENT-MISSING`.
+
 ## [Bridge 0.152.1] - 2026-09-25
 
 **`Most recent` on the Strands board lists strands in the order they were last touched,

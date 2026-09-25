@@ -597,7 +597,7 @@ impl StrandTable {
                     false => parsed.title.clone(),
                 },
                 slug: parsed.slug,
-                parent: parsed.parent,
+                parent: parsed.declared_parent,
                 targets: parsed.targets.iter().map(|t| note_key(t)).collect(),
             });
         }

@@ -10428,10 +10428,23 @@ async fn strands_list_serves_the_contract_json() {
     assert_eq!(
         keys(clean),
         vec![
-            "counts", "findings", "group", "next", "now", "repos", "slug", "state", "title",
-            "updated", "waiting",
+            "counts", "findings", "group", "next", "now", "parent", "repos", "slug", "state",
+            "title", "updated", "waiting",
         ]
     );
+    assert!(clean["parent"].is_null(), "a top level strand serves null");
+    let tidy = strands.iter().find(|t| t["slug"] == "Tidy-Strand").unwrap();
+    assert_eq!(tidy["parent"], "Alpha-Strand");
+    let rough = strands
+        .iter()
+        .find(|t| t["slug"] == "Rough-Strand")
+        .unwrap();
+    assert!(rough["parent"].is_null(), "a done parent serves null");
+    assert!(rough["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|f| f["code"] == "PARENT-MISSING"));
     assert_eq!(clean["title"], "Clean Strand");
     assert_eq!(clean["group"], "personal");
     assert_eq!(clean["state"], "active");
@@ -10532,6 +10545,34 @@ async fn strands_slug_serves_markdown_beside_the_parsed_strand() {
     );
     assert_eq!(body["strand"]["slug"], "Clean-Strand");
     assert_eq!(body["strand"]["next"]["id"], "A1d");
+}
+
+/// The single note resolves its parent against the same live set the board serves.
+#[tokio::test]
+async fn strands_slug_serves_the_resolved_parent() {
+    let (st, _root) = strands_state();
+    for (slug, parent) in [
+        ("Tidy-Strand", serde_json::json!("Alpha-Strand")),
+        ("Rough-Strand", Value::Null),
+        ("Clean-Strand", Value::Null),
+    ] {
+        let resp = app(st.clone())
+            .oneshot(strands_request(
+                &format!("/jesse/strands/{slug}"),
+                Some("Bearer test-token"),
+                None,
+            ))
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert_eq!(body["strand"]["parent"], parent, "{slug}");
+        let missing = body["strand"]["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["code"] == "PARENT-MISSING");
+        assert_eq!(missing, slug == "Rough-Strand", "{slug}");
+    }
 }
 
 #[tokio::test]

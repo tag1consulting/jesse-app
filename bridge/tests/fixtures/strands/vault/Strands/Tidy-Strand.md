@@ -23,7 +23,7 @@ repos: [jeremyandrews/tidy]
 - 2026-09-21 [[todo-list/Projects/Research/2026-09-21-Tidy-Survey|Survey]]
 
 ## Vault
-- [[todo-list/Strands/Alpha-Strand]]
+- parent [[todo-list/Strands/Alpha-Strand]]
 
 ## Decisions
 - 2026-09-21 The fix lands before the second run.
