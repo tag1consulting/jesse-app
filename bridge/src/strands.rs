@@ -290,6 +290,14 @@ pub struct Strand {
     /// should join back. Always `None` for a v1 note.
     #[serde(skip)]
     pub parent: Option<String>,
+    /// The note file's last modification time, read from the metadata of the
+    /// path `snapshot()` just read. The board's second sort key: `updated` is a
+    /// day, so on an active day it ties across the board and only this says
+    /// which note was touched last. Off the wire because the order already
+    /// carries it. `None` when the metadata cannot be read, or for a note
+    /// parsed from a string.
+    #[serde(skip)]
+    pub modified: Option<SystemTime>,
 }
 
 /// Everything `GET /jesse/strands` serves, and everything the nightly file
@@ -1062,6 +1070,7 @@ pub fn snapshot(notes_root: &Path, today: &str) -> StrandsSnapshot {
             continue;
         };
         let mut strand = parse_strand(slug, &src);
+        strand.modified = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
         audit_strand(&mut strand, notes_root, today);
         parsed.push(strand);
     }
@@ -1081,14 +1090,7 @@ pub fn snapshot(notes_root: &Path, today: &str) -> StrandsSnapshot {
     }
 
     let mut strands: Vec<Strand> = parsed.into_iter().filter(|t| t.state != "done").collect();
-    // Newest first, then by title so the order is total and a redeploy cannot
-    // reshuffle two notes edited on the same day.
-    strands.sort_by(|a, b| {
-        b.updated
-            .cmp(&a.updated)
-            .then_with(|| a.title.cmp(&b.title))
-            .then_with(|| a.slug.cmp(&b.slug))
-    });
+    strands.sort_by(board_order);
 
     global.extend(scan_owned_files(notes_root, &strands));
 
@@ -1104,6 +1106,23 @@ pub fn snapshot(notes_root: &Path, today: &str) -> StrandsSnapshot {
         global_findings: global,
         counts,
     }
+}
+
+/// The board's order: newest `updated` day first, then last modified first
+/// within the day, then title, then slug, so the order is total.
+///
+/// `updated` leads because it is bumped by a real event, so a note merely
+/// touched by a tool on an earlier day never outranks one with a newer day. The
+/// mtime breaks the tie `updated` leaves on any active day, when most notes
+/// carry today's date and a title tiebreak alone reads as alphabetical. `None`
+/// sorts below `Some`, so a note whose mtime could not be read falls after the
+/// rest of its day rather than failing the snapshot.
+fn board_order(a: &Strand, b: &Strand) -> std::cmp::Ordering {
+    b.updated
+        .cmp(&a.updated)
+        .then_with(|| b.modified.cmp(&a.modified))
+        .then_with(|| a.title.cmp(&b.title))
+        .then_with(|| a.slug.cmp(&b.slug))
 }
 
 /// [`snapshot`] plus the [`UNSTRANDED`] findings from the day file: what the
@@ -2017,26 +2036,136 @@ mod tests {
         );
     }
 
+    /// A scratch notes root with an empty `Strands/`, unique per call.
+    fn scratch_root(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "jesse-strands-{tag}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join(STRANDS_DIR)).unwrap();
+        root
+    }
+
+    /// Write `Strands/<slug>.md` stamped `updated`, titled `title`, and set its
+    /// mtime to `secs` past the epoch explicitly rather than sleeping.
+    fn write_note(root: &Path, slug: &str, title: &str, updated: &str, secs: u64) {
+        let path = root.join(STRANDS_DIR).join(format!("{slug}.md"));
+        std::fs::write(
+            &path,
+            format!("---\ngroup: tag1\nstate: active\nupdated: {updated}\n---\n# {title}\n\n## Queue\n- [ ] **A1** In.\n"),
+        )
+        .unwrap();
+        set_mtime(&path, secs);
+    }
+
+    fn set_mtime(path: &Path, secs: u64) {
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(UNIX_EPOCH + Duration::from_secs(secs))
+            .unwrap();
+    }
+
+    fn titles(snap: &StrandsSnapshot) -> Vec<&str> {
+        snap.strands.iter().map(|t| t.title.as_str()).collect()
+    }
+
     #[test]
-    fn sort_is_updated_descending_then_title_ascending() {
-        let snap = snapshot(&fixture_root(), "2026-09-23");
-        let order: Vec<(&str, &str)> = snap
-            .strands
-            .iter()
-            .map(|t| (t.updated.as_str(), t.title.as_str()))
-            .collect();
+    fn sort_within_a_day_is_last_modified_first() {
+        let root = scratch_root("mtime");
+        write_note(&root, "Alpha", "Alpha", "2026-09-24", 1_000);
+        write_note(&root, "Bravo", "Bravo", "2026-09-24", 3_000);
+        write_note(&root, "Charlie", "Charlie", "2026-09-24", 2_000);
+        assert_eq!(
+            titles(&snapshot(&root, "2026-09-24")),
+            vec!["Bravo", "Charlie", "Alpha"],
+            "one shared day: newest touch first, not alphabetical"
+        );
+
+        // Touch the oldest again: it moves to the top.
+        set_mtime(&root.join(STRANDS_DIR).join("Alpha.md"), 4_000);
+        assert_eq!(
+            titles(&snapshot(&root, "2026-09-24")),
+            vec!["Alpha", "Bravo", "Charlie"]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn sort_day_outranks_last_modified() {
+        let root = scratch_root("day");
+        // Touched last, but on an older day: stays below the newer day.
+        write_note(&root, "Old-Day", "Old Day", "2026-09-23", 9_000);
+        write_note(&root, "New-Day", "New Day", "2026-09-24", 1_000);
+        assert_eq!(
+            titles(&snapshot(&root, "2026-09-24")),
+            vec!["New Day", "Old Day"],
+            "updated is the primary key; the mtime only breaks its ties"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn sort_equal_mtime_falls_back_to_title() {
+        let root = scratch_root("equal");
+        write_note(&root, "Zulu", "Zulu", "2026-09-24", 5_000);
+        write_note(&root, "Mike", "Mike", "2026-09-24", 5_000);
+        write_note(&root, "Kilo", "Kilo", "2026-09-24", 5_000);
+        assert_eq!(
+            titles(&snapshot(&root, "2026-09-24")),
+            vec!["Kilo", "Mike", "Zulu"]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn sort_unreadable_mtime_sorts_after_its_day_then_by_title() {
+        let day = |slug: &str, updated: &str, secs: Option<u64>| Strand {
+            slug: slug.to_string(),
+            title: slug.to_string(),
+            updated: updated.to_string(),
+            modified: secs.map(|s| UNIX_EPOCH + Duration::from_secs(s)),
+            ..Strand::default()
+        };
+        let mut strands = [
+            day("Yankee", "2026-09-24", None),
+            day("Xray", "2026-09-24", None),
+            day("Whiskey", "2026-09-24", Some(1)),
+            day("Victor", "2026-09-23", Some(9_000)),
+            day("Uniform", "", Some(9_000)),
+        ];
+        strands.sort_by(board_order);
+        let order: Vec<&str> = strands.iter().map(|t| t.slug.as_str()).collect();
         assert_eq!(
             order,
+            vec!["Whiskey", "Xray", "Yankee", "Victor", "Uniform"],
+            "no mtime sorts after its day's readable ones, then by title; an empty day sorts last"
+        );
+    }
+
+    #[test]
+    fn fixture_board_is_grouped_by_day_newest_first() {
+        // The fixture's mtimes come from the checkout, so only the day order is
+        // pinned here; the within-day order is pinned by the tests above.
+        let snap = snapshot(&fixture_root(), "2026-09-23");
+        let days: Vec<&str> = snap.strands.iter().map(|t| t.updated.as_str()).collect();
+        assert_eq!(
+            days,
             vec![
-                ("2026-09-23", "Alpha Strand"),
-                ("2026-09-23", "Clean Strand"),
-                ("2026-09-23", "Rough Strand"),
-                ("2026-09-23", "Tidy Strand"),
-                ("2026-09-01", "Messy Strand"),
-                ("2026-01-01", "Dormant Strand"),
-                ("", "Broken Strand"),
+                "2026-09-23",
+                "2026-09-23",
+                "2026-09-23",
+                "2026-09-23",
+                "2026-09-01",
+                "2026-01-01",
+                "",
             ],
-            "newest first, then title; an unparseable date sorts last"
+            "newest day first; an unparseable date sorts last"
         );
     }
 

@@ -50,7 +50,7 @@ final class StrandsBoardTests: XCTestCase {
     }
 
     /// **Server order is the tiebreak, under both lenses.** The bridge sorts by
-    /// `updated` descending then title; a lens reorders, and within a tie it must not
+    /// `updated` descending, then last modified, then title; a lens reorders, and within a tie it must not
     /// shuffle, because a board that reshuffled its tied rows on every redraw reads as
     /// the screen twitching.
     func testGroupingIsStableWithinAGroup() {
@@ -87,6 +87,20 @@ final class StrandsBoardTests: XCTestCase {
         XCTAssertEqual(groups.count, 1)
         XCTAssertNil(groups.first?.title)
         XCTAssertEqual(groups.first?.strands.map(\.slug), ["newest", "older"])
+    }
+
+    /// Rows sharing one `updated` day arrive in the bridge's last modified order,
+    /// which is not alphabetical, and BOTH lenses must keep it. A client re-sort by
+    /// title here would bring back the alphabetical board the bridge's mtime key
+    /// exists to remove.
+    func testBothLensesKeepArrivalOrderWithinADay() {
+        let board = [strand("Zulu", group: .tag1, updated: "2026-09-24"),
+                     strand("Alpha", group: .tag1, updated: "2026-09-24"),
+                     strand("Mike", group: .tag1, updated: "2026-09-24")]
+        for key in StrandsSortKey.allCases {
+            let rows = StrandsSemantics.grouped(board, by: key).first?.strands ?? []
+            XCTAssertEqual(rows.map(\.slug), ["Zulu", "Alpha", "Mike"], "under \(key.label)")
+        }
     }
 
     // MARK: - What a row says
