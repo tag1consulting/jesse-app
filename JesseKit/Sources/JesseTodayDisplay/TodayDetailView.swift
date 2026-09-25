@@ -26,6 +26,9 @@ public struct TodayDetailView: View {
     private let isReadOnly: Bool
     private let onOpenLink: (TodayLinkOrigin) -> Void
     private let onCloseAsStale: (TodayItem, String) -> Void
+    /// The shell's strand opener, the same one the day's rows use. `nil` draws no strand
+    /// chip rather than one that does nothing.
+    private let strandOpener: StrandOpener?
 
     /// The source note starts CLOSED. That is the whole change in posture: this page used
     /// to be the note, and the note is now the citation under the answer.
@@ -34,12 +37,14 @@ public struct TodayDetailView: View {
     public init(model: TodayDetailModel, item: TodayItem,
                 isReadOnly: Bool = false,
                 onOpenLink: @escaping (TodayLinkOrigin) -> Void = { _ in },
-                onCloseAsStale: @escaping (TodayItem, String) -> Void = { _, _ in }) {
+                onCloseAsStale: @escaping (TodayItem, String) -> Void = { _, _ in },
+                strandOpener: StrandOpener? = nil) {
         self.model = model
         self.item = item
         self.isReadOnly = isReadOnly
         self.onOpenLink = onOpenLink
         self.onCloseAsStale = onCloseAsStale
+        self.strandOpener = strandOpener
     }
 
     private var role: TodayProjectRole { TodayProjectPalette.role(for: item.project) }
@@ -91,6 +96,12 @@ public struct TodayDetailView: View {
                     .fixedSize(horizontal: false, vertical: true)
                 HStack(spacing: 8) {
                     TodayProjectChip(project: item.project)
+                    if let strand = item.strand, let strandOpener {
+                        TodayStrandChip(strand: strand,
+                                        isOpening: strandOpener.opening == strand.slug) {
+                            strandOpener.open($0)
+                        }
+                    }
                     if let path = model.note?.path ?? model.localNote?.path {
                         Text(path)
                             .font(.caption2)
@@ -99,6 +110,12 @@ public struct TodayDetailView: View {
                             .truncationMode(.head)
                             .accessibilityLabel("From \(path)")
                     }
+                }
+                if let notice = strandOpener?.notice {
+                    Label(notice, systemImage: "info.circle")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
                 if model.note?.truncated == true {
                     // Said out loud, and not in a `footer:` — a long footer ellipsises on

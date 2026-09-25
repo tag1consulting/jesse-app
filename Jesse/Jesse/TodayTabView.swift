@@ -36,6 +36,23 @@ struct TodayTabView: View {
     /// per-row Retry, which has to look like it did something.
     var onReplay: () -> Void = {}
 
+    /// **The one strand opener** for this tab: a Today row's strand chip, the item
+    /// detail's and a board row all open a strand through it, and the one sheet it
+    /// presents is attached below, outside the stack, so it can rise over a pushed item
+    /// as well as over the list. The note on THIS iPhone when it holds one, the bridge's
+    /// bytes only when it does not.
+    @State private var strandOpener: StrandOpener
+
+    init(isActive: Bool, model: TodayDashboardModel, strands: StrandsModel? = nil,
+         onReplay: @escaping () -> Void = {}) {
+        self.isActive = isActive
+        _model = Bindable(model)
+        self.strands = strands
+        self.onReplay = onReplay
+        _strandOpener = State(initialValue: StrandOpener(localNotes: VaultLocalNoteProvider(),
+                                                         remote: strands))
+    }
+
     @Environment(RunCoordinator.self) private var coordinator
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.modelContext) private var context
@@ -117,10 +134,7 @@ struct TodayTabView: View {
                           onTellFallback: tellFallback,
                           onOpenLocalDayFile: Self.hasVaultFolder ? { openedDayFile = true } : nil,
                           strands: strands,
-                          // The strand board opens a note the same way the day's rows
-                          // do: the copy on THIS iPhone when it holds one, and the
-                          // bridge's bytes only when it does not.
-                          localNotes: VaultLocalNoteProvider())
+                          strandOpener: strandOpener)
                 // The day file's own title is a sentence ("Today: Monday, August 10,
                 // 2026"), which a large title truncates to "Today: Monday, Augus…" on
                 // a phone. Inline fits it and buys back the vertical space the list
@@ -141,7 +155,8 @@ struct TodayTabView: View {
                     TodayDetailView(model: detailModel, item: item,
                                     isReadOnly: model.isReadOnly,
                                     onOpenLink: openLink,
-                                    onCloseAsStale: closeAsStale)
+                                    onCloseAsStale: closeAsStale,
+                                    strandOpener: strandOpener)
                         .navigationTitle("Item")
                         .navigationBarTitleDisplayMode(.inline)
                 }
@@ -152,6 +167,11 @@ struct TodayTabView: View {
                     AwayProfileBanner(configuration: ConfigStore.opsConfiguration(),
                                       alwaysShowName: true)
                 }
+        }
+        // A strand's note, with the open items that name it above it. A line there
+        // lands on that item's detail, pushed once the sheet has gone.
+        .strandNoteSheet(strandOpener, day: model.snapshot, onOpenLink: openLink) { item in
+            openedItem = item
         }
         .sheet(isPresented: $openedDayFile) {
             // A SHEET rather than a push, and the stack is INSIDE `VaultNoteStack`: the day

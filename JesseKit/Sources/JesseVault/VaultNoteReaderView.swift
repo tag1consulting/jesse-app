@@ -296,12 +296,18 @@ public struct VaultNoteReaderView: View {
     /// navigate so the same view works in a `NavigationStack`, in a Mac window and in a
     /// preview.
     private let onOpenNote: (VaultNoteRoute) -> Void
+    /// Whatever the presenter puts above the note, or nothing. Opaque on purpose: this
+    /// target depends on nothing, so a caller's own view (the strand sheet's `On Today`
+    /// block) arrives erased rather than as a type this file would have to import.
+    private let accessory: AnyView?
 
     public init(route: VaultNoteRoute,
                 model: VaultNoteReaderModel? = nil,
                 preferences: VaultReaderPreferences = VaultReaderPreferences(),
+                accessory: AnyView? = nil,
                 onOpenNote: @escaping (VaultNoteRoute) -> Void = { _ in }) {
         self.route = route
+        self.accessory = accessory
         _model = State(initialValue: model ?? VaultNoteReaderModel())
         self.preferences = preferences
         _mode = State(initialValue: preferences.mode)
@@ -312,6 +318,9 @@ public struct VaultNoteReaderView: View {
         ScrollViewReader { scroller in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 10) {
+                    if let accessory {
+                        accessory
+                    }
                     header
                     if let document = model.document, document.annotationCount > 0,
                        !isReadOnly {
@@ -958,16 +967,23 @@ public struct VaultNoteStack: View {
     /// shell because the shell would have to wrap this in a second `NavigationStack` to hang
     /// a toolbar on it, and nested stacks are how a toolbar quietly stops rendering.
     private let onDone: (() -> Void)?
+    /// Shown above the ROOT note only: it is about the note the stack was opened on, and a
+    /// note pushed from one of its links is a different note.
+    private let rootAccessory: AnyView?
     @State private var pushed: [VaultNoteRoute] = []
 
-    public init(path: String, line: Int? = nil, onDone: (() -> Void)? = nil) {
+    public init(path: String, line: Int? = nil, rootAccessory: AnyView? = nil,
+                onDone: (() -> Void)? = nil) {
         root = VaultNoteRoute(path: path, line: line)
+        self.rootAccessory = rootAccessory
         self.onDone = onDone
     }
 
     public var body: some View {
         NavigationStack(path: $pushed) {
-            VaultNoteReaderView(route: root) { next in pushed.append(next) }
+            VaultNoteReaderView(route: root, accessory: rootAccessory) { next in
+                pushed.append(next)
+            }
                 .navigationDestination(for: VaultNoteRoute.self) { route in
                     VaultNoteReaderView(route: route) { next in pushed.append(next) }
                 }

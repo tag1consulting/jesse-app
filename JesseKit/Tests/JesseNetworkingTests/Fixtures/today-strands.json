@@ -1,0 +1,360 @@
+{
+  "title": "Today, Wednesday September 23, 2026",
+  "date": "2026-09-23",
+  "narrative": null,
+  "leadItems": [],
+  "sections": [
+    {
+      "name": "Do Now",
+      "kind": "tasks",
+      "prose": [],
+      "items": [
+        {
+          "id": "80323265faa2",
+          "checked": false,
+          "lead": "A direct strand link wins.",
+          "text": "* [ ] **A direct strand link wins.** [[todo-list/Projects/Demo/Only-Child]] [[todo-list/Strands/Other-Strand]] [[todo-list/Dashboard/Tag1]] (Added 2026-09-23)",
+          "links": [
+            {
+              "target": "todo-list/Projects/Demo/Only-Child",
+              "kind": "wiki"
+            },
+            {
+              "target": "todo-list/Strands/Other-Strand",
+              "kind": "wiki"
+            },
+            {
+              "target": "todo-list/Dashboard/Tag1",
+              "kind": "wiki"
+            }
+          ],
+          "addedDate": "2026-09-23",
+          "updatedDate": null,
+          "appCompleted": null,
+          "sectionName": "Do Now",
+          "project": "tag1",
+          "strand": {
+            "slug": "Other-Strand",
+            "title": "Other Strand"
+          },
+          "deferred": false,
+          "deferredMs": 0,
+          "relevance": null,
+          "range": {
+            "start": 50,
+            "end": 209
+          }
+        },
+        {
+          "id": "9a6b1b59b2e4",
+          "checked": false,
+          "lead": "A note one strand links.",
+          "text": "* [ ] **A note one strand links.** [[todo-list/Projects/Demo/Only-Child]] [[todo-list/Dashboard/Tag1]] (Added 2026-09-23)",
+          "links": [
+            {
+              "target": "todo-list/Projects/Demo/Only-Child",
+              "kind": "wiki"
+            },
+            {
+              "target": "todo-list/Dashboard/Tag1",
+              "kind": "wiki"
+            }
+          ],
+          "addedDate": "2026-09-23",
+          "updatedDate": null,
+          "appCompleted": null,
+          "sectionName": "Do Now",
+          "project": "tag1",
+          "strand": {
+            "slug": "Child-Strand",
+            "title": "Child Strand"
+          },
+          "deferred": false,
+          "deferredMs": 0,
+          "relevance": null,
+          "range": {
+            "start": 209,
+            "end": 331
+          }
+        },
+        {
+          "id": "065fe73dec3e",
+          "checked": false,
+          "lead": "A note the parent and the child both link.",
+          "text": "* [ ] **A note the parent and the child both link.** [[todo-list/Projects/Demo/Shared-Family]] [[todo-list/Dashboard/Tag1]] (Added 2026-09-23)",
+          "links": [
+            {
+              "target": "todo-list/Projects/Demo/Shared-Family",
+              "kind": "wiki"
+            },
+            {
+              "target": "todo-list/Dashboard/Tag1",
+              "kind": "wiki"
+            }
+          ],
+          "addedDate": "2026-09-23",
+          "updatedDate": null,
+          "appCompleted": null,
+          "sectionName": "Do Now",
+          "project": "tag1",
+          "strand": {
+            "slug": "Child-Strand",
+            "title": "Child Strand"
+          },
+          "deferred": false,
+          "deferredMs": 0,
+          "relevance": null,
+          "range": {
+            "start": 331,
+            "end": 474
+          }
+        },
+        {
+          "id": "94126f3bacd9",
+          "checked": false,
+          "lead": "A note three generations link.",
+          "text": "* [ ] **A note three generations link.** [[todo-list/Projects/Demo/Three-Generations]] (Added 2026-09-23)",
+          "links": [
+            {
+              "target": "todo-list/Projects/Demo/Three-Generations",
+              "kind": "wiki"
+            }
+          ],
+          "addedDate": "2026-09-23",
+          "updatedDate": null,
+          "appCompleted": null,
+          "sectionName": "Do Now",
+          "project": "unfiled",
+          "strand": {
+            "slug": "Grandchild-Strand",
+            "title": "Grandchild Strand"
+          },
+          "deferred": false,
+          "deferredMs": 0,
+          "relevance": null,
+          "range": {
+            "start": 474,
+            "end": 580
+          }
+        },
+        {
+          "id": "8fb7aedf7e73",
+          "checked": false,
+          "lead": "A note two unrelated strands link.",
+          "text": "* [ ] **A note two unrelated strands link.** [[todo-list/Projects/Demo/Shared-Unrelated]] [[todo-list/Dashboard/Tag1]] (Added 2026-09-23)",
+          "links": [
+            {
+              "target": "todo-list/Projects/Demo/Shared-Unrelated",
+              "kind": "wiki"
+            },
+            {
+              "target": "todo-list/Dashboard/Tag1",
+              "kind": "wiki"
+            }
+          ],
+          "addedDate": "2026-09-23",
+          "updatedDate": null,
+          "appCompleted": null,
+          "sectionName": "Do Now",
+          "project": "tag1",
+          "strand": null,
+          "deferred": false,
+          "deferredMs": 0,
+          "relevance": null,
+          "range": {
+            "start": 580,
+            "end": 718
+          }
+        },
+        {
+          "id": "cfeaf3fc0cdf",
+          "checked": false,
+          "lead": "Only a topic home and the day file.",
+          "text": "* [ ] **Only a topic home and the day file.** [[todo-list/Dashboard/Tag1]] [[todo-list/Today]] (Added 2026-09-23)",
+          "links": [
+            {
+              "target": "todo-list/Dashboard/Tag1",
+              "kind": "wiki"
+            },
+            {
+              "target": "todo-list/Today",
+              "kind": "wiki"
+            }
+          ],
+          "addedDate": "2026-09-23",
+          "updatedDate": null,
+          "appCompleted": null,
+          "sectionName": "Do Now",
+          "project": "tag1",
+          "strand": null,
+          "deferred": false,
+          "deferredMs": 0,
+          "relevance": null,
+          "range": {
+            "start": 718,
+            "end": 832
+          }
+        },
+        {
+          "id": "95ded616bbbe",
+          "checked": false,
+          "lead": "A note only a done strand links.",
+          "text": "* [ ] **A note only a done strand links.** [[todo-list/Projects/Demo/Finished-Only]] [[todo-list/Strands/Finished-Strand]] (Added 2026-09-23)",
+          "links": [
+            {
+              "target": "todo-list/Projects/Demo/Finished-Only",
+              "kind": "wiki"
+            },
+            {
+              "target": "todo-list/Strands/Finished-Strand",
+              "kind": "wiki"
+            }
+          ],
+          "addedDate": "2026-09-23",
+          "updatedDate": null,
+          "appCompleted": null,
+          "sectionName": "Do Now",
+          "project": "unfiled",
+          "strand": null,
+          "deferred": false,
+          "deferredMs": 0,
+          "relevance": null,
+          "range": {
+            "start": 832,
+            "end": 974
+          }
+        },
+        {
+          "id": "69be0933e28e",
+          "checked": false,
+          "lead": "A note only an archived strand links.",
+          "text": "* [ ] **A note only an archived strand links.** [[vault/Projects/Demo/Archived-Only.md]] [[todo-list/Strands/archive/Old-Strand]] (Added 2026-09-23)",
+          "links": [
+            {
+              "target": "vault/Projects/Demo/Archived-Only.md",
+              "kind": "wiki"
+            },
+            {
+              "target": "todo-list/Strands/archive/Old-Strand",
+              "kind": "wiki"
+            }
+          ],
+          "addedDate": "2026-09-23",
+          "updatedDate": null,
+          "appCompleted": null,
+          "sectionName": "Do Now",
+          "project": "unfiled",
+          "strand": null,
+          "deferred": false,
+          "deferredMs": 0,
+          "relevance": null,
+          "range": {
+            "start": 974,
+            "end": 1123
+          }
+        },
+        {
+          "id": "a2e9db172514",
+          "checked": true,
+          "lead": "A checked item with no strand.",
+          "text": "* [x] **A checked item with no strand.** [[todo-list/Projects/Demo/Nobody]] (Added 2026-09-23)",
+          "links": [
+            {
+              "target": "todo-list/Projects/Demo/Nobody",
+              "kind": "wiki"
+            }
+          ],
+          "addedDate": "2026-09-23",
+          "updatedDate": null,
+          "appCompleted": null,
+          "sectionName": "Do Now",
+          "project": "unfiled",
+          "strand": null,
+          "deferred": false,
+          "deferredMs": 0,
+          "relevance": null,
+          "range": {
+            "start": 1123,
+            "end": 1218
+          }
+        },
+        {
+          "id": "bcb49252f13a",
+          "checked": false,
+          "lead": "The same note by its vault spelling and a heading.",
+          "text": "* [ ] **The same note by its vault spelling and a heading.** [[vault/Projects/Demo/Other-Only.md#Part]] (Added 2026-09-23)",
+          "links": [
+            {
+              "target": "vault/Projects/Demo/Other-Only.md#Part",
+              "kind": "wiki"
+            }
+          ],
+          "addedDate": "2026-09-23",
+          "updatedDate": null,
+          "appCompleted": null,
+          "sectionName": "Do Now",
+          "project": "unfiled",
+          "strand": {
+            "slug": "Other-Strand",
+            "title": "Other Strand"
+          },
+          "deferred": false,
+          "deferredMs": 0,
+          "relevance": null,
+          "range": {
+            "start": 1218,
+            "end": 1341
+          }
+        }
+      ],
+      "reports": [],
+      "range": {
+        "start": 39,
+        "end": 1342
+      }
+    },
+    {
+      "name": "Done Today",
+      "kind": "tasks",
+      "prose": [],
+      "items": [
+        {
+          "id": "921bf2b7a751",
+          "checked": false,
+          "lead": "An unchecked line under Done.",
+          "text": "* [ ] **An unchecked line under Done.** [[todo-list/Projects/Demo/Nobody]] (Added 2026-09-23)",
+          "links": [
+            {
+              "target": "todo-list/Projects/Demo/Nobody",
+              "kind": "wiki"
+            }
+          ],
+          "addedDate": "2026-09-23",
+          "updatedDate": null,
+          "appCompleted": null,
+          "sectionName": "Done Today",
+          "project": "unfiled",
+          "strand": null,
+          "deferred": false,
+          "deferredMs": 0,
+          "relevance": null,
+          "range": {
+            "start": 1357,
+            "end": 1451
+          }
+        }
+      ],
+      "reports": [],
+      "range": {
+        "start": 1342,
+        "end": 1451
+      }
+    }
+  ],
+  "counts": {
+    "open": 10,
+    "done": 1,
+    "reportsUnseen": 0
+  },
+  "missing": false
+}

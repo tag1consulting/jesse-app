@@ -20,7 +20,9 @@ import JesseVault
 //
 // ## What a tap opens, and why it is the vault reader
 //
-// A strand note is a NOTE: its `## Queue` is a list of checkboxes, and ticking one is
+// A tap hands the strand to the shell's `StrandOpener`, the one definition of opening a
+// strand, which the Today rows and the item detail use too; the shell attaches the one
+// sheet it presents (`strandNoteSheet`). A strand note is a NOTE: its `## Queue` is a list of checkboxes, and ticking one is
 // how the next step becomes the last step. The device already has a reader that ticks a
 // box through a stamped, guarded write (`VaultNoteReaderView`), so a tap opens that and
 // nothing new is built. The bridge's markdown is the fallback for a device with no
@@ -32,33 +34,25 @@ import JesseVault
 public struct StrandsListView: View {
     @Bindable private var model: StrandsModel
 
-    /// The local copy of the vault, when this device holds one. `nil` in a shell with no
-    /// folder story and in every preview, where a tap falls straight through to the
-    /// bridge's markdown rather than being offered and inert.
-    private let localNotes: (any TodayLocalNoteProviding)?
+    /// The shell's opener: the same one a Today row's strand chip and the item detail
+    /// use, so the board and the chip can never open a strand two different ways.
+    @Bindable private var opener: StrandOpener
 
-    /// What a link inside the fetched markdown does. Handed through from the shell so a
-    /// chip in the fallback reader behaves as every other link chip in the app does.
-    private let onOpenLink: (TodayLinkOrigin) -> Void
+    /// How many open Today items name a strand, by slug. The count behind a row's
+    /// `N on Today` caption, filtered from the day the app already holds.
+    private let onTodayCount: (String) -> Int
 
-    /// The note currently open, if any.
-    @State private var openedNote: StrandNoteSource?
-    /// The strand whose slug is being resolved right now, so the row can say it is
-    /// working and a second tap cannot start a second resolve.
-    @State private var opening: String?
     /// The strand whose findings sheet is up.
     @State private var findingsFor: Strand?
-    /// The one line answer to a tap that could not open anything.
-    @State private var notice: String?
     /// Which project groups are collapsed. Only `Dormant` starts that way.
     @State private var collapsed: Set<String> = ["dormant"]
 
     public init(model: StrandsModel,
-                localNotes: (any TodayLocalNoteProviding)? = nil,
-                onOpenLink: @escaping (TodayLinkOrigin) -> Void = { _ in }) {
+                opener: StrandOpener,
+                onTodayCount: @escaping (String) -> Int = { _ in 0 }) {
         self.model = model
-        self.localNotes = localNotes
-        self.onOpenLink = onOpenLink
+        self.opener = opener
+        self.onTodayCount = onTodayCount
     }
 
     public var body: some View {
@@ -91,9 +85,6 @@ public struct StrandsListView: View {
             await model.load()
         }
         .refreshable { await model.refresh() }
-        .sheet(item: $openedNote) { source in
-            noteSheet(source)
-        }
         .sheet(item: $findingsFor) { strand in
             StrandFindingsSheet(strand: strand) { findingsFor = nil }
         }
@@ -110,8 +101,8 @@ public struct StrandsListView: View {
     @ViewBuilder
     private func list(_ groups: [StrandsGroup]) -> some View {
         List {
-            if let notice {
-                TodayNoticeRow(message: notice) { self.notice = nil }
+            if let notice = opener.notice {
+                TodayNoticeRow(message: notice) { opener.notice = nil }
                     .listRowSeparator(.hidden)
             }
             if model.isReadOnly {
@@ -153,61 +144,14 @@ public struct StrandsListView: View {
     private func row(_ strand: Strand) -> some View {
         StrandRow(strand: strand,
                   referenceDay: model.referenceDay,
-                  isOpening: opening == strand.slug,
-                  onOpen: { open(strand) },
+                  onTodayCaption: StrandOnToday.caption(count: onTodayCount(strand.slug)),
+                  isOpening: opener.opening == strand.slug,
+                  onOpen: { opener.open(slug: strand.slug, title: strand.title) },
                   onShowFindings: { findingsFor = strand })
     }
 
     private func toggleCollapsed(_ id: String) {
         if collapsed.contains(id) { collapsed.remove(id) } else { collapsed.insert(id) }
-    }
-
-    // MARK: - Opening a note
-
-    /// **What tapping a strand means**, in one place: the note on THIS device when it is
-    /// here, the bridge's copy when it is not, and an honest line when neither answered.
-    private func open(_ strand: Strand) {
-        guard opening == nil else { return }
-        opening = strand.slug
-        notice = nil
-        Task {
-            defer { opening = nil }
-            // `Strands/<slug>` is an exact relative path, so the resolver's first step
-            // settles it; the basename steps below it are what cover a vault whose
-            // folder is one level in from the workspace root.
-            let target = "\(Strand.directory)/\(strand.slug)"
-            if let local = await localNotes?.localNote(forTargets: [target]) {
-                openedNote = .local(path: local.path, title: strand.title)
-                return
-            }
-            if let markdown = await model.markdown(forSlug: strand.slug) {
-                openedNote = .remote(slug: strand.slug, title: strand.title,
-                                     markdown: markdown)
-                return
-            }
-            notice = Self.couldNotOpen(strand.title)
-        }
-    }
-
-    /// What a tap says when neither the device nor the bridge could produce the note.
-    /// It names both halves, because which one failed is what tells the reader what to
-    /// do about it.
-    static func couldNotOpen(_ title: String) -> String {
-        "\(title) isn't in this copy of the vault, and the bridge couldn't be reached for it."
-    }
-
-    @ViewBuilder
-    private func noteSheet(_ source: StrandNoteSource) -> some View {
-        switch source {
-        case .local(let path, _):
-            // The reader the Vault tab pushes, in a stack of its own, so following a
-            // wiki link out of a strand note PUSHES rather than replaces. Checkboxes
-            // and the editor come with it.
-            VaultNoteStack(path: path) { openedNote = nil }
-        case .remote(_, let title, let markdown):
-            StrandRemoteNoteView(title: title, markdown: markdown,
-                                 onOpenLink: onOpenLink) { openedNote = nil }
-        }
     }
 }
 
@@ -219,14 +163,15 @@ public struct StrandsListView: View {
 /// (one a path this device can write to, one a copy of the bytes it cannot) and the
 /// difference is exactly what decides whether the reader offers a checkbox.
 public enum StrandNoteSource: Equatable, Identifiable, Sendable {
-    /// The note in the Obsidian copy on this device, by vault relative path.
-    case local(path: String, title: String)
+    /// The note in the Obsidian copy on this device, by vault relative path. The slug
+    /// rides along because the sheet's `On Today` block filters by it.
+    case local(path: String, slug: String, title: String)
     /// The bridge's copy, read only.
     case remote(slug: String, title: String, markdown: String)
 
     public var id: String {
         switch self {
-        case .local(let path, _): return "local:\(path)"
+        case .local(let path, _, _): return "local:\(path)"
         case .remote(let slug, _, _): return "remote:\(slug)"
         }
     }
@@ -239,6 +184,8 @@ struct StrandRow: View {
     let strand: Strand
     /// The day every `updated` stamp is measured against.
     let referenceDay: String
+    /// `N on Today`, or nil when no open Today item names this strand.
+    var onTodayCaption: String? = nil
     let isOpening: Bool
     let onOpen: () -> Void
     let onShowFindings: () -> Void
@@ -267,6 +214,11 @@ struct StrandRow: View {
                             .lineLimit(2)
                             .multilineTextAlignment(.leading)
                             .fixedSize(horizontal: false, vertical: true)
+                    }
+                    if let onTodayCaption {
+                        Label(onTodayCaption, systemImage: "checklist")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
                     }
                     if strand.isWaitingOnYou {
                         // The one gate the reader can clear personally, said out loud.
@@ -429,6 +381,8 @@ struct StrandFindingsSheet: View {
 struct StrandRemoteNoteView: View {
     let title: String
     let markdown: String
+    /// The `On Today` block, above the provenance line.
+    var onToday: AnyView? = nil
     let onOpenLink: (TodayLinkOrigin) -> Void
     let onDone: () -> Void
 
@@ -436,6 +390,9 @@ struct StrandRemoteNoteView: View {
         NavigationStack {
             ScrollView {
                 VStack(alignment: .leading, spacing: 10) {
+                    if let onToday {
+                        onToday
+                    }
                     Label(Self.provenance, systemImage: "antenna.radiowaves.left.and.right")
                         .font(.caption)
                         .foregroundStyle(.secondary)

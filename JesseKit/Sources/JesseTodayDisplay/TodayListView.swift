@@ -72,9 +72,11 @@ public struct TodayListView: View {
     /// caller of this view unchanged.
     private let strands: StrandsModel?
 
-    /// The local copy of the vault, handed to the strand board so a tap opens the note
-    /// on this device rather than a copy fetched over the network.
-    private let localNotes: (any TodayLocalNoteProviding)?
+    /// **The one strand opener**, owned by the shell, which also attaches the one sheet
+    /// it presents (`strandNoteSheet`). A row's strand chip and a board row both open
+    /// through it. `nil` in a shell, preview or test with none: the rows then carry no
+    /// strand chip and the board is not drawn.
+    private let strandOpener: StrandOpener?
 
     /// Which segment is showing, remembered on this device. `@AppStorage` rather than a
     /// value the shell threads through: it is view state with nothing behind it, and
@@ -104,10 +106,10 @@ public struct TodayListView: View {
                 onTellFallback: ((PendingIntentRecord) -> Void)? = nil,
                 onOpenLocalDayFile: (() -> Void)? = nil,
                 strands: StrandsModel? = nil,
-                localNotes: (any TodayLocalNoteProviding)? = nil) {
+                strandOpener: StrandOpener? = nil) {
         self.model = model
         self.strands = strands
-        self.localNotes = localNotes
+        self.strandOpener = strandOpener
         self.isProcessing = isProcessing
         self.selection = selection
         self.opensOnDoubleTap = opensOnDoubleTap
@@ -128,22 +130,24 @@ public struct TodayListView: View {
     /// The segment on screen. Falls back to Today for a stored value this build does
     /// not know, and is pinned to Today whenever there is no board to show at all.
     private var segment: TodaySegment {
-        guard strands != nil else { return .today }
+        guard strands != nil, strandOpener != nil else { return .today }
         return TodaySegment(rawValue: storedSegment) ?? .today
     }
 
     public var body: some View {
         Group {
-            if let strands {
+            if let strands, let strandOpener {
                 VStack(spacing: 0) {
                     segmentPicker
                     Divider()
                     switch segment {
                     case .today: day
                     case .strands:
-                        StrandsListView(model: strands,
-                                        localNotes: localNotes,
-                                        onOpenLink: onOpenLink)
+                        StrandsListView(model: strands, opener: strandOpener,
+                                        onTodayCount: { [model] slug in
+                                            StrandOnToday.items(forSlug: slug,
+                                                                in: model.snapshot).count
+                                        })
                             .navigationTitle("Strands")
                     }
                 }
@@ -271,6 +275,11 @@ public struct TodayListView: View {
         List(selection: selection) {
             if let notice = model.notice {
                 TodayNoticeRow(message: notice) { model.dismissNotice() }
+                    .listRowSeparator(.hidden)
+            }
+            // A strand chip that could open nothing says so here, where it was tapped.
+            if let strandOpener, let notice = strandOpener.notice {
+                TodayNoticeRow(message: notice) { strandOpener.notice = nil }
                     .listRowSeparator(.hidden)
             }
             if model.isReadOnly || model.isPendingReplay {
@@ -463,7 +472,9 @@ public struct TodayListView: View {
             onOpen: { onOpenDetail(item) },
             onDiscuss: { onDiscuss(item) },
             onPropagate: { onPropagate(item, model.evidence(for: item)) },
-            onOpenLink: onOpenLink)
+            onOpenLink: onOpenLink,
+            onOpenStrand: strandOpener.map { opener in { opener.open($0) } },
+            openingStrand: strandOpener?.opening)
         // Swipe carries the actions worth a one-handed gesture; the long-press menu
         // and the ellipsis carry the complete set including all four moves. A swipe
         // slot cannot open a submenu, so putting every move here would mean four

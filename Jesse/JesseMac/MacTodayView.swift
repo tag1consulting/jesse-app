@@ -45,6 +45,11 @@ struct MacTodayView: View {
     /// route, writes nothing, and shares only the on-disk cache.
     @State private var strands: StrandsModel
 
+    /// **The one strand opener** for this tab, as on the iPhone: a row's strand chip, the
+    /// item detail's and a board row all open through it, into the one sheet attached
+    /// below. The note on THIS Mac when it holds one, the bridge's copy when it does not.
+    @State private var strandOpener: StrandOpener
+
     /// The note behind whichever item is open. ONE model for the whole tab, not one per
     /// pushed screen: it holds the per-item cache, and a fresh model per push would
     /// re-read a note that was on screen thirty seconds ago.
@@ -104,9 +109,12 @@ struct MacTodayView: View {
         _model = State(initialValue: TodayDashboardModel(makeClient: {
             JesseBridgeClient(config: configStore.config, snapshotCache: SnapshotCache.shared)
         }, cache: SnapshotCache.shared))
-        _strands = State(initialValue: StrandsModel(makeClient: {
+        let strands = StrandsModel(makeClient: {
             JesseBridgeClient(config: configStore.config, snapshotCache: SnapshotCache.shared)
-        }, cache: SnapshotCache.shared))
+        }, cache: SnapshotCache.shared)
+        _strands = State(initialValue: strands)
+        _strandOpener = State(initialValue: StrandOpener(localNotes: VaultLocalNoteProvider(),
+                                                         remote: strands))
         // `localNotes` is the offline half, the same one the iPhone passes: with the bridge
         // unreachable the item's own wiki link is resolved against the Obsidian copy of the
         // vault on THIS Mac and the note is read from there.
@@ -135,9 +143,7 @@ struct MacTodayView: View {
                           onProcessUpdates: processUpdates,
                           onOpenLocalDayFile: Self.hasVaultFolder ? { openedDayFile = true } : nil,
                           strands: strands,
-                          // A strand's note opens from the copy on THIS Mac when it holds
-                          // one, exactly as a day row's note does.
-                          localNotes: VaultLocalNoteProvider())
+                          strandOpener: strandOpener)
                 // DECLARATION ORDER IS LEFT-TO-RIGHT, ordered by clicks per day: Settings
                 // is opened least often, Refresh far more, so Refresh sits to its right.
                 // These two are the shell's half of this screen's toolbar and always
@@ -165,9 +171,16 @@ struct MacTodayView: View {
                     TodayDetailView(model: detailModel, item: item,
                                     isReadOnly: model.isReadOnly,
                                     onOpenLink: openLink,
-                                    onCloseAsStale: closeAsStale)
+                                    onCloseAsStale: closeAsStale,
+                                    strandOpener: strandOpener)
                         .navigationTitle("Item")
                 }
+        }
+        // A strand's note, with the open items that name it above it. A line there
+        // selects that item and opens its detail, once the sheet has gone.
+        .strandNoteSheet(strandOpener, day: model.snapshot, onOpenLink: openLink) { item in
+            selection = item.id
+            openedItem = item
         }
         .sheet(isPresented: $openedDayFile) {
             // Its own stack inside the sheet, so a wiki link inside the day file pushes
