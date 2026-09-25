@@ -46,6 +46,12 @@ public struct StrandsListView: View {
     @State private var findingsFor: Strand?
     /// Which project groups are collapsed. Only `Dormant` starts that way.
     @State private var collapsed: Set<String> = ["dormant"]
+    /// Which `Tree` parents are collapsed, by slug, remembered on this device. Every
+    /// parent starts expanded, so a new strand's subtree is never hidden by default.
+    @AppStorage(StrandsListView.collapsedTreeKey) private var collapsedTreeStored = ""
+
+    /// The stored key for the collapsed `Tree` parents.
+    public static let collapsedTreeKey = "strands.tree.collapsed"
 
     public init(model: StrandsModel,
                 opener: StrandOpener,
@@ -134,6 +140,13 @@ public struct StrandsListView: View {
                     withAnimation(.snappy) { toggleCollapsed(group.id) }
                 }
             }
+        } else if let treeRows = group.treeRows {
+            let folded = StrandsSemantics.decodeCollapsed(collapsedTreeStored)
+            Section {
+                ForEach(StrandsSemantics.visibleTreeRows(treeRows, collapsed: folded)) {
+                    treeRow($0, isCollapsed: folded.contains($0.strand.slug))
+                }
+            }
         } else {
             Section {
                 ForEach(group.strands) { row($0) }
@@ -141,10 +154,51 @@ public struct StrandsListView: View {
         }
     }
 
-    private func row(_ strand: Strand) -> some View {
+    /// A `Tree` row: indented by depth, with a disclosure control of its own OUTSIDE the
+    /// row's combined accessibility element, so the chevron stays a separate control and
+    /// the row's tap still opens the note.
+    private func treeRow(_ tree: StrandsTreeRow, isCollapsed: Bool) -> some View {
+        HStack(alignment: .top, spacing: 2) {
+            Group {
+                if tree.hasChildren {
+                    Button {
+                        withAnimation(.snappy) { toggleTree(tree.strand.slug) }
+                    } label: {
+                        Image(systemName: "chevron.down")
+                            .font(.caption2)
+                            .rotationEffect(.degrees(isCollapsed ? -90 : 0))
+                            .frame(width: 20, height: 24)
+                            .contentShape(.rect)
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.secondary)
+                    .accessibilityLabel(tree.strand.title)
+                    .accessibilityHint(isCollapsed ? "Expand" : "Collapse")
+                } else {
+                    Color.clear.frame(width: 20, height: 24)
+                }
+            }
+            .padding(.leading, CGFloat(tree.depth) * Self.treeIndent)
+            row(tree.strand,
+                insideCaption: tree.hasChildren && isCollapsed
+                    ? StrandsSemantics.insideCaption(tree.descendants) : nil)
+        }
+    }
+
+    /// One level of the tree, in points.
+    static let treeIndent: CGFloat = 16
+
+    private func toggleTree(_ slug: String) {
+        var folded = StrandsSemantics.decodeCollapsed(collapsedTreeStored)
+        if folded.contains(slug) { folded.remove(slug) } else { folded.insert(slug) }
+        collapsedTreeStored = StrandsSemantics.encodeCollapsed(folded)
+    }
+
+    private func row(_ strand: Strand, insideCaption: String? = nil) -> some View {
         StrandRow(strand: strand,
                   referenceDay: model.referenceDay,
                   onTodayCaption: StrandOnToday.caption(count: onTodayCount(strand.slug)),
+                  insideCaption: insideCaption,
                   isOpening: opener.opening == strand.slug,
                   onOpen: { opener.open(slug: strand.slug, title: strand.title) },
                   onShowFindings: { findingsFor = strand })
@@ -186,6 +240,8 @@ struct StrandRow: View {
     let referenceDay: String
     /// `N on Today`, or nil when no open Today item names this strand.
     var onTodayCaption: String? = nil
+    /// `N inside`, on a collapsed `Tree` parent only.
+    var insideCaption: String? = nil
     let isOpening: Bool
     let onOpen: () -> Void
     let onShowFindings: () -> Void
@@ -217,6 +273,11 @@ struct StrandRow: View {
                     }
                     if let onTodayCaption {
                         Label(onTodayCaption, systemImage: "checklist")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                    if let insideCaption {
+                        Label(insideCaption, systemImage: "list.bullet.indent")
                             .font(.caption2)
                             .foregroundStyle(.secondary)
                     }
@@ -279,7 +340,9 @@ struct StrandRow: View {
     /// One sentence for a screen reader — the row's content, computed where a test can
     /// reach it.
     private var accessibilityLabel: String {
-        StrandsSemantics.rowAccessibilityLabel(strand, today: referenceDay)
+        let sentence = StrandsSemantics.rowAccessibilityLabel(strand, today: referenceDay)
+        guard let insideCaption else { return sentence }
+        return "\(sentence), \(insideCaption)"
     }
 }
 
@@ -417,24 +480,28 @@ struct StrandRemoteNoteView: View {
 
 // MARK: - The sort control
 
-/// The board's lens, as a menu. Two entries, and neither writes anything.
+/// The board's lens, as a menu. Up to three entries, and none writes anything.
 public struct StrandsSortMenu: View {
     @Binding private var selection: StrandsSortKey
+    /// The lenses this board offers. `Tree` is absent from an older bridge's board.
+    private let available: [StrandsSortKey]
 
-    public init(selection: Binding<StrandsSortKey>) {
+    public init(selection: Binding<StrandsSortKey>,
+                available: [StrandsSortKey] = StrandsSortKey.allCases) {
         self._selection = selection
+        self.available = available
     }
 
     public var body: some View {
         Menu {
             Picker("Order", selection: $selection) {
-                ForEach(StrandsSortKey.allCases) { key in
+                ForEach(available) { key in
                     Label(key.label, systemImage: key.symbol).tag(key)
                 }
             }
             .pickerStyle(.inline)
         } label: {
-            Image(systemName: selection.isGrouped
+            Image(systemName: selection != .mostRecent
                   ? "line.3.horizontal.decrease.circle.fill"
                   : "line.3.horizontal.decrease.circle")
         }

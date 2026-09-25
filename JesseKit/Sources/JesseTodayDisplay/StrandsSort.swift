@@ -28,6 +28,10 @@ public enum StrandsSortKey: String, CaseIterable, Identifiable, Equatable, Hasha
     case mostRecent
     /// Grouped under the five Dashboard project headings, unfiled last.
     case group
+    /// Every strand under its parent, as the vault files them: top level strands in
+    /// server order, each followed by its children, one indent per level. Offered only
+    /// when the bridge serves `parent`.
+    case tree
 
     public var id: String { rawValue }
 
@@ -35,6 +39,7 @@ public enum StrandsSortKey: String, CaseIterable, Identifiable, Equatable, Hasha
         switch self {
         case .mostRecent: return "Most recent"
         case .group: return "By group"
+        case .tree: return "Tree"
         }
     }
 
@@ -42,11 +47,38 @@ public enum StrandsSortKey: String, CaseIterable, Identifiable, Equatable, Hasha
         switch self {
         case .mostRecent: return "clock"
         case .group: return "folder"
+        case .tree: return "list.bullet.indent"
         }
     }
 
     /// Whether this lens groups the list under headings.
     public var isGrouped: Bool { self == .group }
+
+    /// The lenses a board can be shown in. `Tree` needs the bridge's `parent`, and a
+    /// bridge that predates it would put every strand at the top level, which is the
+    /// flat list again under a name that promises more; so it is not offered at all.
+    public static func available(servesParents: Bool) -> [StrandsSortKey] {
+        allCases.filter { $0 != .tree || servesParents }
+    }
+}
+
+/// One row of the `Tree` lens: a strand, how deep it sits, and how much is under it.
+public struct StrandsTreeRow: Equatable, Identifiable, Sendable {
+    public var strand: Strand
+    /// 0 at the top level, one more per parent above it.
+    public var depth: Int
+    /// Every strand under this one, at any depth. What a collapsed row's caption counts.
+    public var descendants: Int
+
+    public var id: String { strand.slug }
+    /// Whether the row has a subtree to collapse.
+    public var hasChildren: Bool { descendants > 0 }
+
+    public init(strand: Strand, depth: Int, descendants: Int) {
+        self.strand = strand
+        self.depth = depth
+        self.descendants = descendants
+    }
 }
 
 /// One rendered section of the board: a heading (nil for the ungrouped list) and its
@@ -55,18 +87,23 @@ public struct StrandsGroup: Equatable, Identifiable, Sendable {
     /// The project this group is, or nil for the flat `Most recent` list and for the
     /// dormant group (which is keyed by `isDormant` instead).
     public var project: TodayProject?
-    /// The collapsed group at the bottom, which both lenses have.
+    /// The collapsed group at the bottom, which every lens has.
     public var isDormant: Bool
     public var strands: [Strand]
+    /// The `Tree` lens's rows, in the same order as `strands`, with their depth. Nil
+    /// under every other lens and for the dormant group, which is never nested.
+    public var treeRows: [StrandsTreeRow]?
 
     public var id: String {
         isDormant ? "dormant" : (project?.rawValue ?? "all")
     }
 
-    public init(project: TodayProject? = nil, isDormant: Bool = false, strands: [Strand]) {
+    public init(project: TodayProject? = nil, isDormant: Bool = false, strands: [Strand],
+                treeRows: [StrandsTreeRow]? = nil) {
         self.project = project
         self.isDormant = isDormant
         self.strands = strands
+        self.treeRows = treeRows
     }
 
     /// What the heading says, or nil where the list has none.
@@ -82,7 +119,7 @@ public enum StrandsSemantics {
 
     /// **The list, as the screen should draw it**, under one lens.
     ///
-    /// Two rules hold under BOTH lenses, which is why they live here rather than in
+    /// Two rules hold under EVERY lens, which is why they live here rather than in
     /// either branch:
     ///
     ///   * **Server order is the tiebreak, always.** The bridge sorts by `updated` day
@@ -112,11 +149,99 @@ public enum StrandsSemantics {
                 let rows = live.filter { $0.group == project }
                 if !rows.isEmpty { groups.append(StrandsGroup(project: project, strands: rows)) }
             }
+        case .tree:
+            let rows = tree(live)
+            if !rows.isEmpty {
+                groups.append(StrandsGroup(strands: rows.map(\.strand), treeRows: rows))
+            }
         }
         if !dormant.isEmpty {
             groups.append(StrandsGroup(isDormant: true, strands: dormant))
         }
         return groups
+    }
+
+    /// **The `Tree` lens**: every strand once, each followed by its subtree, one level
+    /// deeper per parent.
+    ///
+    /// Siblings, the top level included, keep server order, which is recency: a parent
+    /// sits where its own `updated` puts it, never lifted by a busy child. A strand whose
+    /// parent is not in `strands` (nil, unresolved by the bridge, or dormant and so
+    /// sunk into its own group) is top level. A loop, which the bridge should never
+    /// send, is broken where the walk would repeat: the first looping strand in server
+    /// order is drawn at the top level and the rest of the loop nests under it, so
+    /// every strand still appears exactly once.
+    public nonisolated static func tree(_ strands: [Strand]) -> [StrandsTreeRow] {
+        let slugs = Set(strands.map(\.slug))
+        var children: [String: [Strand]] = [:]
+        var roots: [Strand] = []
+        for strand in strands {
+            if let parent = strand.parent, parent != strand.slug, slugs.contains(parent) {
+                children[parent, default: []].append(strand)
+            } else {
+                roots.append(strand)
+            }
+        }
+
+        var rows: [StrandsTreeRow] = []
+        var placed: Set<String> = []
+        // Depth first, recursion free: the size of a subtree is only known once it has
+        // been walked, so a row is appended at once and its count filled in afterwards.
+        func walk(_ root: Strand) {
+            var stack: [(strand: Strand, depth: Int, done: Bool)] = [(root, 0, false)]
+            var open: [Int] = []
+            while let (strand, depth, done) = stack.popLast() {
+                if done {
+                    let index = open.removeLast()
+                    rows[index].descendants = rows.count - index - 1
+                    continue
+                }
+                guard placed.insert(strand.slug).inserted else { continue }
+                open.append(rows.count)
+                rows.append(StrandsTreeRow(strand: strand, depth: depth, descendants: 0))
+                stack.append((strand, depth, true))
+                for child in (children[strand.slug] ?? []).reversed()
+                where !placed.contains(child.slug) {
+                    stack.append((child, depth + 1, false))
+                }
+            }
+        }
+        roots.forEach(walk)
+        // Anything still unplaced sits on a loop, or under one.
+        for strand in strands where !placed.contains(strand.slug) {
+            walk(strand)
+        }
+        return rows
+    }
+
+    /// The `Tree` rows left on screen once the collapsed parents have folded away their
+    /// subtrees. A collapsed row itself stays, and so does everything outside it.
+    public nonisolated static func visibleTreeRows(_ rows: [StrandsTreeRow],
+                                                   collapsed: Set<String>) -> [StrandsTreeRow] {
+        var out: [StrandsTreeRow] = []
+        var index = 0
+        while index < rows.count {
+            let row = rows[index]
+            out.append(row)
+            let folded = row.hasChildren && collapsed.contains(row.strand.slug)
+            index += folded ? row.descendants + 1 : 1
+        }
+        return out
+    }
+
+    /// A collapsed parent's caption: how many strands it holds, at every depth.
+    public nonisolated static func insideCaption(_ descendants: Int) -> String {
+        "\(descendants) inside"
+    }
+
+    /// The collapsed parents as stored on the device: slugs joined by newlines, which a
+    /// file stem cannot contain. `@AppStorage` holds a string, not a set.
+    public nonisolated static func decodeCollapsed(_ stored: String) -> Set<String> {
+        Set(stored.split(separator: "\n").map(String.init))
+    }
+
+    public nonisolated static func encodeCollapsed(_ slugs: Set<String>) -> String {
+        slugs.sorted().joined(separator: "\n")
     }
 
     /// The `Next:` line of a row, or nil when the strand has no next step.

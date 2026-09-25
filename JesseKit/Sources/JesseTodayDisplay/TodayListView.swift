@@ -188,7 +188,9 @@ public struct TodayListView: View {
                 }
             } else if let strands {
                 ToolbarItem(placement: .primaryAction) {
-                    StrandsSortMenu(selection: Bindable(strands).sortKey)
+                    StrandsSortMenu(selection: Binding(get: { strands.effectiveSortKey },
+                                                       set: { strands.sortKey = $0 }),
+                                    available: strands.availableSortKeys)
                 }
             }
         }

@@ -93,6 +93,32 @@ final class StrandsWireDecodeTests: XCTestCase {
 
     /// Every optional as an explicit `null` — which is what the bridge sends, since none
     /// of the three carries `skip_serializing_if`.
+    /// `parent`: a slug, a `null` (top level on a bridge that serves the key), or no key
+    /// at all (a bridge that predates it). The last two both decode to nil, and only the
+    /// last hides the `Tree` lens, so the decode keeps them apart.
+    func testParentDecodesAsASlugANullOrAnAbsence() throws {
+        let board = """
+        { "strands": [
+            { "slug": "Strands-System", "parent": "Jesse" },
+            { "slug": "Tag1", "parent": null }
+        ] }
+        """
+        let snap = try StrandsSnapshot.decode(from: Data(board.utf8))
+        let child = try XCTUnwrap(snap.strand(slug: "Strands-System"))
+        XCTAssertEqual(child.parent, "Jesse")
+        XCTAssertTrue(child.servesParent)
+        let top = try XCTUnwrap(snap.strand(slug: "Tag1"))
+        XCTAssertNil(top.parent)
+        XCTAssertTrue(top.servesParent, "an explicit null is a top level strand")
+        XCTAssertTrue(snap.servesParents)
+
+        let older = try StrandsSnapshot.decode(from: Data(fullBoard.utf8))
+        XCTAssertTrue(older.strands.allSatisfy { $0.parent == nil && !$0.servesParent },
+                      "a bridge with no parent key decodes, every parent nil")
+        XCTAssertFalse(older.servesParents)
+        XCTAssertFalse(StrandsSnapshot().servesParents, "an empty board has no tree")
+    }
+
     func testExplicitNullsAreAbsences() throws {
         let snap = try StrandsSnapshot.decode(from: Data(fullBoard.utf8))
         let system = try XCTUnwrap(snap.strand(slug: "Strands-System"))

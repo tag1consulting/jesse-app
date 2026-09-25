@@ -14,6 +14,31 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [App 1.0 (164)] - 2026-09-25
+
+**The Strands board can show the strands as a tree** (needs bridge 0.153.0): `Tree`, a third
+entry in the board's sort menu beside `Most recent` and `By group`, nests every strand under
+its parent, so Tag1 holds Jesse and Jesse holds Strands System.
+
+**Root cause: strands form a tree in the vault but the board could only show them flat.**
+Each note names its parent, but the wire carried no parent until bridge 0.153.0, so the app
+had nothing to nest by and offered only a flat list or a list grouped by project.
+
+### Added
+
+- **`parent` on `Strand`**, decoded tolerantly: a slug, or nil for a `null` or an absent
+  key. The decode records whether the key was sent at all, and an older bridge that sends
+  none hides `Tree` rather than drawing every strand at the top level.
+- **The `Tree` lens**: top level strands in the board's recency order, each followed by its
+  children one indent deeper per level, children in recency order too. A parent's place is
+  its own `updated`, never its children's. A strand whose parent the bridge could not
+  resolve (`PARENT-MISSING`) sits at the top level with its warning glyph; a loop is broken
+  where the walk would repeat, so every strand appears once. Dormant strands stay in the
+  collapsed `Dormant` group and are never nested.
+- **Collapse per parent**: a chevron on every parent row folds its subtree, remembered per
+  slug on the device, expanded by default. A collapsed parent says `N inside`, counting
+  every strand beneath it. The same list serves the Mac Today tab.
+
 ## [Bridge 0.153.0] - 2026-09-25
 
 **Every strand on `GET /jesse/strands` names its parent, so the app can draw the strands as
