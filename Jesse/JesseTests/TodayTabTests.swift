@@ -4,6 +4,7 @@ import SwiftData
 import JesseCore
 import JesseNetworking
 import JesseTodayDisplay
+import JesseVault
 
 /// The iOS Today tab: the tab itself, the number on it, what its two conversation
 /// actions actually send, and what a tap does with no bridge in reach.
@@ -238,6 +239,63 @@ final class TodayTabTests: XCTestCase {
 
         XCTAssertEqual(fake.sent.count, 2)
         XCTAssertEqual(fake.sent.last?.text, "Second")
+    }
+
+    // MARK: - A strand discussion opens; it does not fire
+
+    /// **Discuss this strand** is staged exactly as an item discussion is: an Ask thread, an
+    /// empty composer, the strand's own frozen prompt held for the first send, and nothing
+    /// sent on the long press.
+    ///
+    /// It matters more here than for an item, because this prompt GRANTS A WRITE to the
+    /// strand's note. A turn fired on the gesture would be a write Jeremy never asked for,
+    /// before he had said a word.
+    func testAStrandDiscussionOpensAThreadAndFiresNoTurn() async throws {
+        let context = try Self.makeContext()
+        let fake = CapturingClient()
+        let coordinator = RunCoordinator(
+            config: { JesseConfig(host: "studio", port: 8765, token: "tok") },
+            makeClient: { _ in fake })
+        let existing = try context.fetch(FetchDescriptor<JesseThread>()).count
+        let target = StrandMenuTarget(slug: "Jesse", title: "Jesse App", path: "Strands/Jesse.md")
+
+        let thread = TodayThreadOpener.stage(.discuss(strand: target), coordinator: coordinator)
+
+        XCTAssertEqual(thread.mode, JesseMode.ask.rawValue)
+        XCTAssertTrue(thread.turns.isEmpty, "an empty composer, not a sent prompt")
+        XCTAssertFalse(coordinator.isRunning(thread.id), "no turn was started on the press")
+        XCTAssertEqual(coordinator.attachedContext(for: thread.id),
+                       StrandDiscuss.prompt(slug: "Jesse", title: "Jesse App",
+                                            path: "Strands/Jesse.md"),
+                       "the strand's note, and the frozen framing, wait for the first send")
+        XCTAssertEqual(try context.fetch(FetchDescriptor<JesseThread>()).count, existing,
+                       "an abandoned discussion leaves no empty thread behind")
+        await Self.settle()
+        XCTAssertTrue(fake.sent.isEmpty, "nothing reached the bridge")
+    }
+
+    /// The first send carries the strand context ahead of what was typed, composed by the
+    /// SAME rule an item discussion uses: one definition of "context first, question after".
+    func testTheFirstSendOfAStrandDiscussionCarriesTheStrandContext() async throws {
+        let context = try Self.makeContext()
+        let fake = CapturingClient()
+        let coordinator = RunCoordinator(
+            config: { JesseConfig(host: "studio", port: 8765, token: "tok") },
+            makeClient: { _ in fake })
+        let target = StrandMenuTarget(slug: "Jesse", title: "Jesse App", path: "Strands/Jesse.md")
+        let thread = TodayThreadOpener.stage(.discuss(strand: target), coordinator: coordinator)
+
+        coordinator.send(thread: thread, text: "K7 is merged.", voice: false, context: context)
+        await Self.settle()
+
+        XCTAssertEqual(fake.sent.count, 1)
+        XCTAssertEqual(fake.sent.first?.text,
+                       TodayThreadContext.firstMessage(
+                           context: StrandDiscuss.prompt(slug: "Jesse", title: "Jesse App",
+                                                         path: "Strands/Jesse.md"),
+                           typed: "K7 is merged."))
+        XCTAssertEqual(fake.sent.first?.mode, .ask)
+        XCTAssertNil(coordinator.attachedContext(for: thread.id), "consumed by the first send")
     }
 
     // MARK: - Propagate still fires on tap

@@ -1,6 +1,7 @@
 import Foundation
 import JesseCore
 import JesseNetworking
+import JesseVault
 
 // WHICH turn a Today-tab gesture sends, and in which mode.
 //
@@ -69,6 +70,23 @@ public struct TodayTurn: Equatable, Sendable {
     /// similarly-worded lines apart.
     public static func processUpdates(items: [TodayItem]) -> TodayTurn {
         TodayTurn(mode: .tell, text: TodayProcessUpdates.prompt(items: items.map(\.text)))
+    }
+
+    /// "Discuss this strand with me."
+    ///
+    /// ATTACHED and ASK, for the same two reasons an item discussion is: there is nothing
+    /// for the agent to do until Jeremy has said what his question or his update is, and a
+    /// conversation about work in progress must not become task work nobody asked for.
+    ///
+    /// It is a `TodayTurn` rather than a type of its own because a turn is a turn: the two
+    /// shells already know how to stage one and how to fire one, and a second value type
+    /// meaning the same thing would double both dispatch sites. What the strand does NOT
+    /// share is the prompt — `StrandDiscuss.prompt` grants a bounded permission to write to
+    /// the one note, which no Today prompt does.
+    public static func discuss(strand: StrandMenuTarget) -> TodayTurn {
+        TodayTurn(mode: .ask, text: StrandDiscuss.prompt(slug: strand.slug,
+                                                         title: strand.title,
+                                                         path: strand.path))
     }
 
     /// What a tapped link chip should do, when the answer is "a conversation".

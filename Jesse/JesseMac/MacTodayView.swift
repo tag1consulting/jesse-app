@@ -182,6 +182,13 @@ struct MacTodayView: View {
             selection = item.id
             openedItem = item
         }
+        // `Discuss this strand`, for the board's rows. Injected HERE rather than on the tab
+        // shell because it opens a conversation, and the thread that conversation needs
+        // while its sheet is up is held by this screen. It reaches the same staging and the
+        // same sheet an item's Discuss does.
+        .environment(\.strandDiscuss, StrandDiscussAction { target in
+            discuss(.discuss(strand: target))
+        })
         .sheet(isPresented: $openedDayFile) {
             // Its own stack inside the sheet, so a wiki link inside the day file pushes
             // rather than replacing what is on screen. The Done button is the stack's own,
@@ -321,13 +328,17 @@ struct MacTodayView: View {
 
 /// A Today conversation, in a sheet.
 ///
+/// Internal, not private: the shell presents the same sheet for a strand discussion, which
+/// is the same act started from a different row, and a second sheet type for it would be a
+/// second set of frame numbers to keep in step.
+///
 /// The same `MacThreadDetailView` the Chats tab's detail pane uses, so a discussion
 /// opened from the day has the full composer — the mode picker, the per-conversation
 /// model picker, and the Return-sends AppKit text view. A macOS sheet has no
 /// swipe-to-dismiss, so it carries the Done button it needs to be closable at all, and
 /// a minimum size, because a sheet sizes to its content and a transcript has no
 /// intrinsic one.
-private struct MacTodayConversationSheet: View {
+struct MacTodayConversationSheet: View {
     let thread: JesseThread
     let onDone: () -> Void
 

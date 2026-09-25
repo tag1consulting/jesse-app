@@ -173,6 +173,14 @@ struct TodayTabView: View {
         .strandNoteSheet(strandOpener, day: model.snapshot, onOpenLink: openLink) { item in
             openedItem = item
         }
+        // `Discuss this strand`, for the board's rows. Injected HERE rather than at the
+        // app's root because it opens a conversation, and the thread that conversation
+        // needs while its sheet is up is held by this screen (the root holds no model
+        // objects: see `UnreadBadgeShellTests`). It reaches the same staging and the same
+        // sheet an item's Discuss does, so the two are one behaviour with two prompts.
+        .environment(\.strandDiscuss, StrandDiscussAction { target in
+            discuss(.discuss(strand: target))
+        })
         .sheet(isPresented: $openedDayFile) {
             // A SHEET rather than a push, and the stack is INSIDE `VaultNoteStack`: the day
             // file is not part of the day's navigation (it is the document the day was parsed
