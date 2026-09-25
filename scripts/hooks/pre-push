@@ -45,6 +45,13 @@ done
 if [ -z "$base" ]; then
   base="$(git rev-parse --verify --quiet '@{u}' || true)"
 fi
+# A NEW branch has no remote sha and no upstream yet, and the HEAD~1 fallback below
+# then measures only its last commit: a branch whose last commit touches only
+# scripts/ pushed its app changes with the macOS checks skipped as "no changes".
+# What the remote does not have yet is everything since the integration branch.
+if [ -z "$base" ]; then
+  base="$(git merge-base HEAD "${VERSION_GUARD_UPSTREAM:-origin/main}" 2>/dev/null || true)"
+fi
 if [ -z "$base" ]; then
   base="HEAD~1"
 fi

@@ -73,6 +73,13 @@ and is counted in the final line. On a macOS 26 host the checks are unchanged. T
 also the guard against the next SDK 27 only symbol: the Studio's SDK 26.2 is the oldest
 SDK anything builds with, and its gate now reaches a verdict instead of being bypassed.
 
+**The pre-push hook checks a new branch against `main`.** When a branch was pushed for
+the first time, it had no remote sha and no upstream, so the hook fell back to `HEAD~1`
+and measured only the last commit. If that commit touched only `scripts/`, the macOS
+checks were skipped as "no changes under Jesse/ or JesseKit/", even though the branch
+carried app changes. The version guard also saw only that one commit. A new branch is
+now measured from its merge base with `origin/main`.
+
 ## [App 1.0 (159)] - 2026-09-25
 
 **The reader could show a mark, and the only way to make one was to type braces by hand.**
