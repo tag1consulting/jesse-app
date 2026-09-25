@@ -22,8 +22,31 @@
 #                                 guard — the blunt instrument, avoid it
 #     JESSE_SKIP_MAC_CI=1 git push  skip only this script, keep the version guard
 #
-# Exits non-zero on the first failing check and prints a PASS/FAIL summary of
-# everything it got through.
+# Exits non-zero on the first failing check and prints a PASS/FAIL/SKIP summary
+# of everything it got through.
+#
+# AN OLDER HOST (macOS below 26) cannot run everything CI runs, and pretending
+# otherwise made this gate fail on every push from such a machine, so pushes went
+# out with --no-verify and the gate checked nothing at all. On such a host:
+#
+#   * JesseKit still BUILDS on the host, shipping code and tests, with warnings
+#     as errors. Its tests cannot LOAD there (the bundle targets macOS 26 and
+#     links FoundationModels), so they RUN on the iOS simulator instead, from a
+#     synced copy of the package whose iOS minimum is lowered to fit the runtime.
+#     The tracked Package.swift is never edited.
+#   * The iOS app is BUILT for the generic simulator destination and its test
+#     stage is skipped. No concrete simulator is eligible: JesseKit's iOS minimum
+#     is above the newest runtime such a host's Xcode carries, and a
+#     command-line IPHONEOS_DEPLOYMENT_TARGET does not change eligibility.
+#   * The Mac test stage is skipped: xcodebuild will not run a macOS 26 test
+#     host on an older macOS. The Mac BUILD still runs.
+#   * The watch stages run as they do in CI.
+#   * Tests that fail only on this path, for a reason written next to each in
+#     OLD_HOST_KNOWN_FAILURES below, are skipped by name.
+#
+# Every one of these is printed as SKIP in the summary. The nightly ios-ci.yml
+# run, on macOS 26, is what still covers them. On a macOS 26 host none of this
+# applies and the checks are exactly CI's.
 #
 # Requires: Xcode (not just Command Line Tools), and `jq`.
 
@@ -63,6 +86,23 @@ fi
 
 echo "local-ci-macos: $(xcodebuild -version | head -1), DEVELOPER_DIR=$(xcode-select -p)"
 
+HOST_OS="$(sw_vers -productVersion)"
+if [ "${HOST_OS%%.*}" -lt 26 ]; then
+  OLD_HOST=yes
+  echo "local-ci-macos: host is macOS ${HOST_OS}, older than 26 — some checks run on a"
+  echo "                simulator or are skipped; each is marked SKIP in the summary."
+else
+  OLD_HOST=no
+fi
+
+# Tests skipped on an older host only, each with the reason it fails there and not
+# in CI. Anything added here must fail on untouched main on such a host first.
+#
+#   ArtifactFileTypeTests...EveryAcceptedMime — `text/markdown` has no declared
+#     UTType on the iOS simulator, so the type is dynamic there. CI runs JesseKit
+#     on macOS, where it is declared.
+KIT_SIM_SKIPS="JesseNetworkingTests/ArtifactFileTypeTests/testPreviewItemCarriesATypeAndATitleForEveryAcceptedMime"
+
 # --- Step plumbing ---------------------------------------------------------
 
 RESULTS=""
@@ -78,6 +118,23 @@ summary() {
 
 record() { RESULTS="${RESULTS}  $1  $2 ($3s)
 "; }
+
+SKIPS=0
+
+# A check this host cannot perform, recorded as such rather than as a pass.
+skip_step() {
+  echo ""
+  echo "==> $1"
+  echo "SKIPPED: $2"
+  record "SKIP" "$1 — $2" 0
+  SKIPS=$((SKIPS + 1))
+}
+
+# A test skipped inside a step that otherwise ran.
+note_known_skip() {
+  record "SKIP" "known on this host: $1" 0
+  SKIPS=$((SKIPS + 1))
+}
 
 run_step() {
   name="$1"; shift
@@ -102,9 +159,52 @@ run_step() {
 #    it is where most of the shared logic lives. Warnings-as-errors, symmetric
 #    with the app build below.
 jessekit() {
+  if [ "$OLD_HOST" = no ]; then
+    ( cd "$ROOT/JesseKit" \
+      && swift build -Xswiftc -warnings-as-errors \
+      && swift test -Xswiftc -warnings-as-errors )
+    return
+  fi
+  # `--build-tests` is what `swift test` would have compiled; a plain build skips
+  # the test targets and misses a test file that no longer compiles.
   ( cd "$ROOT/JesseKit" \
     && swift build -Xswiftc -warnings-as-errors \
-    && swift test -Xswiftc -warnings-as-errors )
+    && swift build --build-tests -Xswiftc -warnings-as-errors ) || return 1
+  jessekit_on_simulator
+}
+
+# The package's tests on the iOS simulator, for a host that cannot load them. The
+# copy is synced (mtimes kept, so the build stays incremental) and only the copy's
+# iOS minimum is lowered: xcodebuild decides destination eligibility from
+# Package.swift, and a command-line IPHONEOS_DEPLOYMENT_TARGET does not change it.
+jessekit_on_simulator() {
+  resolve_sim "iOS" "iPhone" "jesse-local-ci-iphone" || return 1
+  kit_copy="$ROOT/Jesse/build/JesseKitSimulator"
+  mkdir -p "$kit_copy"
+  rsync -a --delete --exclude .build --exclude .swiftpm "$ROOT/JesseKit/" "$kit_copy/" || return 1
+  pkg_ios="$(sed -n 's/.*\.iOS("\([0-9.]*\)").*/\1/p' "$kit_copy/Package.swift" | head -1)"
+  if [ -z "$pkg_ios" ]; then
+    echo "No .iOS(\"…\") platform in JesseKit/Package.swift." >&2
+    return 1
+  fi
+  kit_ios="$(printf '%s\n%s\n' "$pkg_ios" "$SIM_VER" | sort -V | head -1)"
+  sed -i '' "s/\.iOS(\"${pkg_ios}\")/.iOS(\"${kit_ios}\")/" "$kit_copy/Package.swift"
+  echo "JesseKit on the simulator: package ships iOS ${pkg_ios}, simulator runs ${SIM_VER} -> testing at ${kit_ios}"
+
+  skip_args=""
+  for t in $KIT_SIM_SKIPS; do
+    skip_args="${skip_args} -skip-testing:${t}"
+    note_known_skip "$t"
+  done
+  fresh_bundle ResultKit.xcresult
+  # shellcheck disable=SC2086 # skip_args is a list of words by construction
+  ( cd "$kit_copy" && xcodebuild test \
+      -scheme JesseKit-Package \
+      -destination "$SIM_DEST" \
+      -derivedDataPath "$ROOT/Jesse/build/DerivedDataKit" \
+      -resultBundlePath "$ROOT/Jesse/build/ResultKit.xcresult" \
+      $skip_args \
+      CODE_SIGNING_ALLOWED=NO )
 }
 
 # Simulator resolution mirrors the workflow's jq query exactly: newest available
@@ -213,6 +313,18 @@ ios_test() {
       CODE_SIGNING_ALLOWED=NO )
 }
 
+# An older host's compile check of the iOS app: every source, warnings as errors,
+# at the target the app ships, with no simulator to be eligible for.
+ios_build_generic() {
+  ( cd "$ROOT/Jesse" && xcodebuild build \
+      -scheme Jesse \
+      -destination "generic/platform=iOS Simulator" \
+      -derivedDataPath build/DerivedData \
+      SWIFT_TREAT_WARNINGS_AS_ERRORS=YES \
+      SWIFT_SUPPRESS_WARNINGS=NO \
+      CODE_SIGNING_ALLOWED=NO )
+}
+
 watch_build() {
   ( cd "$ROOT/Jesse" && xcodebuild build \
       -scheme "Jesse Watch App" \
@@ -258,7 +370,14 @@ mac_test() {
 # Same assertion here.
 report_counts() {
   rc=0
-  for pair in "JesseTests:Result.xcresult" "JesseWatchTests:ResultWatch.xcresult" "JesseMacTests:ResultMac.xcresult"; do
+  if [ "$OLD_HOST" = yes ]; then
+    # The iOS and Mac suites did not run here; the JesseKit suite ran on the
+    # simulator rather than through `swift test`, so it gets the zero-test check.
+    suites="JesseKitTests:ResultKit.xcresult JesseWatchTests:ResultWatch.xcresult"
+  else
+    suites="JesseTests:Result.xcresult JesseWatchTests:ResultWatch.xcresult JesseMacTests:ResultMac.xcresult"
+  fi
+  for pair in $suites; do
     label="${pair%%:*}"; bundle="$ROOT/Jesse/build/${pair#*:}"
     if [ ! -d "$bundle" ]; then
       echo "No result bundle at ${bundle}" >&2
@@ -279,17 +398,34 @@ report_counts() {
   return $rc
 }
 
-run_step "JesseKit package (build + test, warnings-as-errors)" jessekit
-run_step "Resolve iOS simulator"                               resolve_ios_sim
-run_step "iOS build (warnings-as-errors)"                      ios_build
-run_step "iOS test"                                            ios_test
+if [ "$OLD_HOST" = yes ]; then
+  run_step "JesseKit package (host build + tests, warnings-as-errors; tests on iOS sim)" jessekit
+else
+  run_step "JesseKit package (build + test, warnings-as-errors)" jessekit
+fi
+if [ "$OLD_HOST" = yes ]; then
+  run_step "iOS build (generic simulator, warnings-as-errors)" ios_build_generic
+  skip_step "iOS test" "no iOS simulator on this host is eligible for JesseKit's iOS minimum"
+else
+  run_step "Resolve iOS simulator"                             resolve_ios_sim
+  run_step "iOS build (warnings-as-errors)"                    ios_build
+  run_step "iOS test"                                          ios_test
+fi
 run_step "Resolve watchOS simulator"                           resolve_watch_sim
 run_step "watch build (warnings-as-errors)"                    watch_build
 run_step "watch test"                                          watch_test
 run_step "Mac build (warnings-as-errors)"                      mac_build
-run_step "Mac test"                                            mac_test
-run_step "Test counts (all three suites ran)"                  report_counts
+if [ "$OLD_HOST" = yes ]; then
+  skip_step "Mac test" "xcodebuild cannot run a macOS 26 test host on macOS ${HOST_OS}"
+else
+  run_step "Mac test"                                          mac_test
+fi
+run_step "Test counts (every suite that ran, ran tests)"       report_counts
 
 summary
 echo ""
-echo "local-ci-macos: ALL CHECKS PASSED — this is what the nightly would run."
+if [ "$SKIPS" -gt 0 ]; then
+  echo "local-ci-macos: ALL CHECKS PASSED, ${SKIPS} SKIPPED on macOS ${HOST_OS} (listed above) — the nightly ios-ci.yml covers those."
+else
+  echo "local-ci-macos: ALL CHECKS PASSED — this is what the nightly would run."
+fi

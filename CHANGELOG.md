@@ -52,6 +52,27 @@ failure above stopped the build first. Their sync `setUp`/`tearDown` overrides a
 `async throws` forms this suite already uses elsewhere, and the individual test methods
 that touch `VaultNoteReaderView` statics are `@MainActor`.
 
+**The pre-push gate can pass on the Studio again.** `scripts/local-ci-macos.sh` failed on
+any host older than macOS 26, even with the code fixed. There, `swift test` cannot load a
+bundle that targets macOS 26 and links `FoundationModels`. No iOS 26.3 simulator is
+eligible for JesseKit's iOS 26.5 minimum. And `xcodebuild` will not run the Mac test host.
+The result was that app pushes went out with `--no-verify`, so nothing checked them. On
+such a host the script now:
+
+- builds JesseKit and its tests on the host with warnings as errors;
+- runs the JesseKit tests on the iOS simulator, from a synced copy of the package whose
+  iOS minimum is lowered to fit the runtime (the tracked `Package.swift` is never
+  edited);
+- builds the iOS app for the generic simulator with warnings as errors;
+- skips the iOS and Mac test stages;
+- skips one test by name that fails only on the simulator: the text/markdown case of
+  `ArtifactFileTypeTests`.
+
+The watch stages and the Mac build run as before. Every skip prints as SKIP in the summary
+and is counted in the final line. On a macOS 26 host the checks are unchanged. This is
+also the guard against the next SDK 27 only symbol: the Studio's SDK 26.2 is the oldest
+SDK anything builds with, and its gate now reaches a verdict instead of being bypassed.
+
 ## [App 1.0 (159)] - 2026-09-25
 
 **The reader could show a mark, and the only way to make one was to type braces by hand.**
