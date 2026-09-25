@@ -65,10 +65,22 @@ public final class StrandsModel {
         case content([StrandsGroup])
     }
 
+    /// The lenses this board can offer: `Tree` only when the bridge serves `parent`.
+    public var availableSortKeys: [StrandsSortKey] {
+        StrandsSortKey.available(servesParents: snapshot?.servesParents ?? false)
+    }
+
+    /// The lens actually drawn: the chosen one while it is offered, `Most recent`
+    /// otherwise. A `Tree` chosen against a newer bridge and then served by an older one
+    /// falls back rather than drawing a tree with no branches.
+    public var effectiveSortKey: StrandsSortKey {
+        availableSortKeys.contains(sortKey) ? sortKey : .mostRecent
+    }
+
     /// The board, under the lens, as groups.
     public var groups: [StrandsGroup] {
         guard let snapshot else { return [] }
-        return StrandsSemantics.grouped(snapshot.strands, by: sortKey)
+        return StrandsSemantics.grouped(snapshot.strands, by: effectiveSortKey)
     }
 
     public var displayState: DisplayState {

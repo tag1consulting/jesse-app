@@ -183,13 +183,22 @@ public struct Strand: Decodable, Equatable, Hashable, Identifiable, Sendable {
     public var next: StrandNext?
     public var counts: StrandCounts
     public var findings: [StrandFinding]
+    /// The slug of the live strand this one sits under, or nil at the top level. Only
+    /// ever the bridge's word: the app never reads a note to find it. A declared parent
+    /// the bridge could not resolve arrives as nil with a `PARENT-MISSING` finding.
+    public var parent: String?
+    /// Whether the bridge sent `parent` at all, `null` included. False only from a
+    /// bridge that predates the key, and what hides the `Tree` lens rather than drawing
+    /// every strand at the top level as if the vault had no tree.
+    public var servesParent: Bool
 
     public var id: String { slug }
 
     public init(slug: String, title: String = "", group: TodayProject = .unfiled,
                 state: StrandState = .active, updated: String = "", repos: [String] = [],
                 now: String? = nil, waiting: StrandWaiting? = nil, next: StrandNext? = nil,
-                counts: StrandCounts = StrandCounts(), findings: [StrandFinding] = []) {
+                counts: StrandCounts = StrandCounts(), findings: [StrandFinding] = [],
+                parent: String? = nil, servesParent: Bool = true) {
         self.slug = slug
         self.title = title
         self.group = group
@@ -201,10 +210,13 @@ public struct Strand: Decodable, Equatable, Hashable, Identifiable, Sendable {
         self.next = next
         self.counts = counts
         self.findings = findings
+        self.parent = parent
+        self.servesParent = servesParent
     }
 
     private enum CodingKeys: String, CodingKey {
-        case slug, title, group, state, updated, repos, now, waiting, next, counts, findings
+        case slug, title, group, state, updated, repos, now, waiting, next, counts, findings,
+             parent
     }
 
     public init(from decoder: any Decoder) throws {
@@ -222,6 +234,10 @@ public struct Strand: Decodable, Equatable, Hashable, Identifiable, Sendable {
         next = try c.decodeIfPresent(StrandNext.self, forKey: .next)
         counts = try c.decodeIfPresent(StrandCounts.self, forKey: .counts) ?? StrandCounts()
         findings = try c.decodeIfPresent([StrandFinding].self, forKey: .findings) ?? []
+        // `contains` before the decode: an absent key and a `null` both decode to nil,
+        // and only the first means the bridge cannot say.
+        servesParent = c.contains(.parent)
+        parent = try c.decodeIfPresent(String.self, forKey: .parent)
     }
 
     /// The vault path of the note itself. One function, because the list, the reader and
@@ -277,6 +293,10 @@ public struct StrandsSnapshot: Decodable, Equatable, Sendable {
     public static func decode(from data: Data) throws -> StrandsSnapshot {
         try JSONDecoder().decode(StrandsSnapshot.self, from: data)
     }
+
+    /// Whether this bridge serves `parent`, which is what the `Tree` lens needs. False
+    /// for an empty board too, where there is no tree to draw.
+    public var servesParents: Bool { strands.contains { $0.servesParent } }
 
     /// The strand with `slug`, or nil.
     public func strand(slug: String) -> Strand? {
