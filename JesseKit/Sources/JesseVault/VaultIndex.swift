@@ -491,6 +491,30 @@ public final class VaultIndex: @unchecked Sendable {
         }
     }
 
+    /// Every chunk under one path prefix, bodies included, in file and line order: what
+    /// the Strands scope's section view splits into lines. Unranked and unlimited on
+    /// purpose, so it is only asked of a small folder; `Strands/` is a few hundred chunks.
+    public func chunks(underPrefix prefix: String) -> [VaultStoredChunk] {
+        locked {
+            var out: [VaultStoredChunk] = []
+            let sql = """
+                SELECT path, title, heading, line_start, body FROM chunks
+                 WHERE path LIKE ? ESCAPE '\\'
+                 ORDER BY path, line_start;
+                """
+            guard let stmt = try? prepare(sql) else { return [] }
+            defer { sqlite3_finalize(stmt) }
+            bind(stmt, 1, Self.likePrefix(prefix))
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                out.append(VaultStoredChunk(path: text(stmt, 0), title: text(stmt, 1),
+                                            heading: text(stmt, 2),
+                                            lineStart: Int(sqlite3_column_int64(stmt, 3)),
+                                            body: text(stmt, 4)))
+            }
+            return out
+        }
+    }
+
     // MARK: - Writing
 
     /// Bring the index into line with `scan`, reading only what changed.

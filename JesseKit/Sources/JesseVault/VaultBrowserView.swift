@@ -39,8 +39,71 @@ public final class VaultBrowserModel {
             // would show the intersection of two things the screen states separately,
             // and the commonest intersection is empty.
             if newValue != .all { folderStorage = nil }
+            // The chips and the strand token belong to the Strands scope and are drawn
+            // only under it, so leaving it drops them rather than leaving a narrowing
+            // held that no control on screen admits to.
+            if newValue != .strands {
+                sectionStorage = .all
+                strandStorage = nil
+            }
             reanswer()
         }
+    }
+
+    /// **The section chip.** `.all` is the scope's ordinary one-row-per-note view; any
+    /// other section turns every result into LINES of that section (`sectionLines`).
+    /// Choosing one moves the tab to the Strands scope, the only one it means anything in.
+    public var section: VaultStrandSection {
+        get { sectionStorage }
+        set {
+            guard newValue != sectionStorage else { return }
+            sectionStorage = newValue
+            if newValue != .all { moveToStrands() }
+            reanswer()
+        }
+    }
+
+    /// **The one strand the scope is narrowed to**, as a vault relative path under
+    /// `Strands/` (the archive included), or nil for every strand. Per launch, for
+    /// `scope`'s reason.
+    public var strand: String? {
+        get { strandStorage }
+        set {
+            guard newValue != strandStorage else { return }
+            strandStorage = newValue
+            if newValue != nil { moveToStrands() }
+            reanswer()
+        }
+    }
+
+    /// Whether results are lines of one section rather than notes.
+    public var isSectionMode: Bool { scopeStorage == .strands && sectionStorage != .all }
+
+    /// **Open the tab already narrowed**: one strand by its slug (`Jesse`, or
+    /// `Strands/archive/Dev-Agents-On-K3s`), and optionally one section of it. The
+    /// entry point for anything outside this view that wants to show a strand's record.
+    ///
+    /// Returns false, and changes nothing, when no strand note has that slug, so a
+    /// caller holding a stale name cannot leave the tab narrowed to nothing.
+    @discardableResult
+    public func showStrand(_ slug: String, section: VaultStrandSection = .all) -> Bool {
+        if strandNotes.isEmpty { refresh() }
+        guard let path = VaultStrandRecord.path(forSlug: slug,
+                                                among: strandNotes.map(\.path)) else {
+            return false
+        }
+        query = ""
+        moveToStrands()
+        sectionStorage = section
+        strandStorage = path
+        reanswer()
+        return true
+    }
+
+    /// The scope a chip or a strand implies, set without the scope setter's own reset.
+    private func moveToStrands() {
+        scopeStorage = .strands
+        folderStorage = nil
     }
 
     /// **The folder the tab is narrowed to**, or nil for the whole vault. A vault
@@ -58,7 +121,11 @@ public final class VaultBrowserModel {
         set {
             guard newValue != folderStorage else { return }
             folderStorage = newValue
-            if newValue != nil { scopeStorage = .all }
+            if newValue != nil {
+                scopeStorage = .all
+                sectionStorage = .all
+                strandStorage = nil
+            }
             reanswer()
         }
     }
@@ -73,8 +140,14 @@ public final class VaultBrowserModel {
     /// more rows than there are files.
     public private(set) var folders: [VaultFolderCount] = []
 
+    /// Every note under `Strands/`, the archive included, by title: what the strand
+    /// picker lists and what `showStrand` resolves a slug against. Refilled by `refresh()`.
+    public private(set) var strandNotes: [VaultIndexedFile] = []
+
     private var scopeStorage: VaultSearchScope = .all
     private var folderStorage: String?
+    private var sectionStorage: VaultStrandSection = .all
+    private var strandStorage: String?
 
     /// Both states re-answer at once, because both are narrowed by the same choice and a
     /// screen showing a new folder's recents beside the old folder's hits is a screen
@@ -90,6 +163,15 @@ public final class VaultBrowserModel {
 
     public private(set) var hits: [VaultSearchHit] = []
     public private(set) var recents: [VaultIndexedFile] = []
+    /// Under the Strands scope, the notes in `Strands/archive/`, kept out of `recents`
+    /// so the screen can put them under their own collapsed header. Always empty under
+    /// any other scope or folder.
+    public private(set) var archivedRecents: [VaultIndexedFile] = []
+    /// Each strand note's `state:` frontmatter, keyed by path, for the caption a row
+    /// shows when it is not `active`. Filled by the same pass that reads `updated:`.
+    public private(set) var strandStates: [String: String] = [:]
+    /// Section mode's rows: the matching lines, or with nothing typed the section's log.
+    public private(set) var sectionLines: [VaultSectionLine] = []
     /// Set when expansion terms actually contributed a hit the typed query missed.
     public private(set) var expansionCaption: String?
     public private(set) var isSearching = false
@@ -131,6 +213,8 @@ public final class VaultBrowserModel {
         folderStatus = source.folderStatus
         guard folderStatus.isReady else {
             recents = []
+            archivedRecents = []
+            strandNotes = []
             folders = []
             counts = VaultIndexCounts()
             return
@@ -150,14 +234,37 @@ public final class VaultBrowserModel {
                 folderStorage = nil
                 lastError = "\(held) is not in the vault any more, so every note is showing."
             }
-            // Asked for more than are shown when a scope excludes a subfolder, so the
-            // thirty are thirty after `Strands/archive/` is dropped rather than before.
+            strandNotes = index.recentFiles(limit: 1_000, underPrefix: VaultStrandRecord.folder)
+                .sorted {
+                    $0.title.localizedStandardCompare($1.title) == .orderedAscending
+                }
+            // A HELD STRAND CAN GO, for a folder's reason: renamed, or deleted. Widen to
+            // every strand and say so rather than show one empty row.
+            if let held = strandStorage, counts.fileCount > 0,
+               !strandNotes.contains(where: { $0.path == held }) {
+                strandStorage = nil
+                lastError = "\(VaultStrandRecord.slug(of: held)) is not in the vault any more, so every strand is showing."
+            }
             let scope = self.scopeStorage
-            let prefix = folderPrefix ?? scope.pathPrefix
-            let wanted = prefix == nil ? 30 : 60
-            recents = Array(index.recentFiles(limit: wanted, underPrefix: prefix)
-                .filter { scope.includes($0.path) }
-                .prefix(30))
+            if scope == .strands, folderStorage == nil {
+                // EVERY strand, not a recent thirty: the scope is the record, and the
+                // archive under its header is only useful whole. Two dozen live notes
+                // and a growing archive, all from one indexed prefix query.
+                let all = strandNotes.filter { note in strandStorage.map { note.path == $0 } ?? true }
+                    .sorted { $0.modified > $1.modified }
+                if strandStorage != nil {
+                    recents = all
+                    archivedRecents = []
+                } else {
+                    recents = all.filter { !VaultStrandRecord.isArchived($0.path) }
+                    archivedRecents = all.filter { VaultStrandRecord.isArchived($0.path) }
+                }
+            } else {
+                let prefix = folderPrefix ?? scope.pathPrefix
+                recents = Array(index.recentFiles(limit: 30, underPrefix: prefix)
+                    .filter { scope.includes($0.path) })
+                archivedRecents = []
+            }
         } catch {
             lastError = VaultIndexer.describe(error)
             return
@@ -175,27 +282,33 @@ public final class VaultBrowserModel {
     /// a list the user has since switched back to `All`.
     private func applyFrontmatterOrder(for scope: VaultSearchScope) {
         let files = recents
-        guard !files.isEmpty else { return }
+        let archived = archivedRecents
+        guard !(files.isEmpty && archived.isEmpty) else { return }
         let source = self.source
         Task { [weak self] in
-            let stamps = await Task.detached { () -> [String: String] in
+            typealias Stamps = (updated: [String: String], state: [String: String])
+            let stamps = await Task.detached { () -> Stamps in
                 // EVERY read inside one `withAccess`: the security scope it opens is
                 // closed the moment the closure returns, so carrying the root out and
                 // reading afterwards would read a folder nothing is entitled to.
-                (try? source.vaultFolder.withAccess { root -> [String: String] in
-                    var out: [String: String] = [:]
+                (try? source.vaultFolder.withAccess { root -> Stamps in
+                    var updated: [String: String] = [:]
+                    var state: [String: String] = [:]
                     let reader = VaultFile(root: root)
-                    for file in files {
-                        guard let text = try? reader.read(relativePath: file.path),
-                              let updated = VaultFrontmatter.value(for: "updated", in: text)
+                    for file in files + archived {
+                        guard let text = try? reader.read(relativePath: file.path)
                         else { continue }
-                        out[file.path] = updated
+                        updated[file.path] = VaultFrontmatter.value(for: "updated", in: text)
+                        state[file.path] = VaultFrontmatter.value(for: "state", in: text)
                     }
-                    return out
-                }) ?? [:]
+                    return (updated, state)
+                }) ?? ([:], [:])
             }.value
-            guard let self, self.scope == scope, self.recents == files else { return }
-            self.recents = VaultStrandOrder.ordered(files, updated: stamps)
+            guard let self, self.scope == scope, self.recents == files,
+                  self.archivedRecents == archived else { return }
+            self.recents = VaultStrandOrder.ordered(files, updated: stamps.updated)
+            self.archivedRecents = VaultStrandOrder.ordered(archived, updated: stamps.updated)
+            self.strandStates = stamps.state
         }
     }
 
@@ -204,6 +317,11 @@ public final class VaultBrowserModel {
         let typed = query
         searchTask?.cancel()
         let trimmed = typed.trimmingCharacters(in: .whitespacesAndNewlines)
+        if isSectionMode {
+            searchSection(typed)
+            return
+        }
+        sectionLines = []
         guard !trimmed.isEmpty else {
             hits = []
             expansionCaption = nil
@@ -215,19 +333,56 @@ public final class VaultBrowserModel {
         isSearching = true
         let scope = self.scopeStorage
         let folder = self.folderStorage
+        let strand = self.strandStorage
         let source = self.source
         let expander = self.expander
         let debounce = self.debounce
         searchTask = Task { [weak self] in
             try? await Task.sleep(for: debounce)
             if Task.isCancelled { return }
-            let outcome: VaultSearchOutcome? = await Task.detached { [scope, folder] in
+            let outcome: VaultSearchOutcome? = await Task.detached { [scope, folder, strand] in
                 guard let index = try? source.index() else { return nil }
-                return await VaultSearcher(index: index, scope: scope, folder: folder)
+                return await VaultSearcher(index: index, scope: scope, folder: folder,
+                                           strand: strand)
                     .search(typed, expander: expander)
             }.value
             if Task.isCancelled { return }
-            self?.apply(outcome, for: typed, scope: scope, folder: folder)
+            self?.apply(outcome, for: typed, scope: scope, folder: folder, strand: strand)
+        }
+    }
+
+    /// Section mode's search, and its empty-query log, through one path: both read the
+    /// same folder and both are stale the moment the section, the strand or the query
+    /// moves. Not debounced when nothing is typed, because a chip tap is not typing.
+    private func searchSection(_ typed: String) {
+        hits = []
+        expansionCaption = nil
+        guard folderStatus.isReady else {
+            sectionLines = []
+            return
+        }
+        isSearching = true
+        let section = sectionStorage
+        let strand = strandStorage
+        let source = self.source
+        let debounce = typed.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? Duration.zero : self.debounce
+        searchTask = Task { [weak self] in
+            if debounce > .zero { try? await Task.sleep(for: debounce) }
+            if Task.isCancelled { return }
+            let started = Date()
+            let lines: [VaultSectionLine] = await Task.detached {
+                guard let index = try? source.index() else { return [] }
+                return VaultSearcher(index: index, scope: .strands, strand: strand)
+                    .sectionLines(typed, section: section)
+            }.value
+            if Task.isCancelled { return }
+            guard let self, typed == self.query, self.scopeStorage == .strands,
+                  section == self.sectionStorage, strand == self.strandStorage else { return }
+            self.isSearching = false
+            self.appliedQuery = typed
+            self.sectionLines = lines
+            self.lastSearchSeconds = Date().timeIntervalSince(started)
         }
     }
 
@@ -238,7 +393,7 @@ public final class VaultBrowserModel {
     }
 
     private func apply(_ outcome: VaultSearchOutcome?, for typed: String,
-                       scope: VaultSearchScope, folder: String?) {
+                       scope: VaultSearchScope, folder: String?, strand: String?) {
         // The user has typed on since this search started: its answer is about a question
         // nobody is asking any more.
         guard typed == query else { return }
@@ -246,7 +401,8 @@ public final class VaultBrowserModel {
         // search for the whole vault landing on a screen that now says one folder puts
         // rows from outside that folder under a heading naming it, which reads as the
         // narrowing being broken rather than as a stale answer.
-        guard scope == scopeStorage, folder == folderStorage else { return }
+        guard scope == scopeStorage, folder == folderStorage, strand == strandStorage,
+              !isSectionMode else { return }
         isSearching = false
         appliedQuery = typed
         guard let outcome else {
@@ -269,6 +425,12 @@ public struct VaultBrowserView: View {
     /// FOLDERS by name, and it is reset every time the sheet opens so that a sheet never
     /// opens already hiding most of what it is there to show.
     @State private var folderFilter = ""
+    @State private var isPickingStrand = false
+    /// The strand picker's own filter, reset on every open for `folderFilter`'s reason.
+    @State private var strandFilter = ""
+    /// The Archived header starts closed: the record is there when asked for, and the
+    /// live strands stay the first thing on the screen.
+    @State private var showsArchived = false
 
     public init(model: VaultBrowserModel = VaultBrowserModel()) {
         _model = State(initialValue: model)
@@ -292,6 +454,9 @@ public struct VaultBrowserView: View {
                 }
                 .sheet(isPresented: $isPickingFolder) {
                     folderPicker
+                }
+                .sheet(isPresented: $isPickingStrand) {
+                    strandPicker
                 }
         }
         .onChange(of: model.query) { _, _ in model.search() }
@@ -350,8 +515,11 @@ public struct VaultBrowserView: View {
                     folderScopeRow(folder)
                 } else {
                     scopeControl
+                    if model.scope == .strands { strandControls }
                 }
-                if model.query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                if model.isSectionMode {
+                    sectionContent
+                } else if model.query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     Section {
                         if model.recents.isEmpty, let folder = model.folder {
                             // A folder with nothing in it must still say something: an
@@ -366,6 +534,17 @@ public struct VaultBrowserView: View {
                         }
                     } header: {
                         Text(Self.recentsHeading(model.scope, folder: model.folder))
+                    }
+                    if !model.archivedRecents.isEmpty {
+                        Section {
+                            if showsArchived {
+                                ForEach(model.archivedRecents, id: \.path) { file in
+                                    recentRow(file)
+                                }
+                            }
+                        } header: {
+                            archivedHeader
+                        }
                     }
                 } else if model.hits.isEmpty {
                     Section {
@@ -391,6 +570,254 @@ public struct VaultBrowserView: View {
         #else
         .listStyle(.plain)
         #endif
+    }
+
+    /// Section mode: the section's lines, one row each. With nothing typed, its log.
+    @ViewBuilder
+    private var sectionContent: some View {
+        let typed = !model.query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        Section {
+            if model.sectionLines.isEmpty {
+                Text(model.isSearching
+                     ? "Searching…"
+                     : Self.emptySectionSentence(model.section, typed: typed))
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+            ForEach(model.sectionLines) { line in
+                lineRow(line)
+            }
+        } header: {
+            Text(Self.sectionHeading(model.section, typed: typed,
+                                     count: model.sectionLines.count,
+                                     strand: model.strand.map(strandTitle)))
+        }
+    }
+
+    /// What a section view is called. Named for what it is: with nothing typed, the
+    /// newest lines of a log; with a query, a count of lines, not of notes.
+    nonisolated static func sectionHeading(_ section: VaultStrandSection, typed: Bool,
+                                           count: Int, strand: String? = nil) -> String {
+        let place = strand.map { "in \($0)" } ?? "across strands"
+        if typed {
+            let lines = count == 1 ? "1 line" : "\(count) lines"
+            return "\(lines) in \(section.label) \(place)"
+        }
+        return "Latest \(section.label) \(place)"
+    }
+
+    nonisolated static func emptySectionSentence(_ section: VaultStrandSection,
+                                                 typed: Bool) -> String {
+        typed
+            ? "No line under \(section.label) has all of those words."
+            : "No dated line under \(section.label) yet."
+    }
+
+    /// The caption a strand row carries when its `state:` is not `active`, or nil.
+    nonisolated static func stateCaption(_ state: String?) -> String? {
+        guard let state = state?.trimmingCharacters(in: .whitespaces), !state.isEmpty,
+              state.lowercased() != "active" else { return nil }
+        return state.lowercased()
+    }
+
+    private func strandTitle(_ path: String) -> String {
+        model.strandNotes.first { $0.path == path }?.title ?? VaultStrandRecord.slug(of: path)
+    }
+
+    private var archivedHeader: some View {
+        Button {
+            showsArchived.toggle()
+        } label: {
+            HStack(spacing: 6) {
+                Image(systemName: showsArchived ? "chevron.down" : "chevron.right")
+                    .font(.caption)
+                Text("Archived")
+                Text("\(model.archivedRecents.count)")
+                    .monospacedDigit()
+                    .foregroundStyle(.secondary)
+                Spacer()
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(showsArchived ? "Hide archived strands" : "Show archived strands")
+    }
+
+    /// The Strands scope's own row: one chip per section and the strand token. Shown
+    /// only under the Strands scope, and the only controls this scope adds.
+    private var strandControls: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            // The strand token LEADS the row: the chips fill a phone's width, and a
+            // narrowing scrolled off the edge is a narrowing nobody can see is held.
+            HStack(spacing: 6) {
+                if let strand = model.strand {
+                    strandToken(strand)
+                } else {
+                    chip("Strand", systemImage: "line.3.horizontal.decrease", isOn: false) {
+                        strandFilter = ""
+                        isPickingStrand = true
+                    }
+                    .accessibilityLabel("Pick one strand")
+                }
+                Divider().frame(height: 18)
+                ForEach(VaultStrandSection.allCases) { section in
+                    chip(section.label, isOn: model.section == section) {
+                        model.section = section
+                    }
+                    .accessibilityLabel("Section: \(section.label)")
+                    .accessibilityAddTraits(model.section == section ? [.isSelected] : [])
+                }
+            }
+            .padding(.vertical, 2)
+        }
+        .listRowSeparator(.hidden)
+    }
+
+    private func chip(_ title: String, systemImage: String? = nil, isOn: Bool,
+                      action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack(spacing: 4) {
+                if let systemImage { Image(systemName: systemImage) }
+                Text(title)
+            }
+            .font(.caption)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 5)
+            .foregroundStyle(isOn ? Color.white : Color.primary)
+            .background(Capsule().fill(isOn ? Color.accentColor : Color.secondary.opacity(0.15)))
+        }
+        .buttonStyle(.plain)
+    }
+
+    /// The held strand, and the way out of it. Tapping the name reopens the picker.
+    private func strandToken(_ path: String) -> some View {
+        HStack(spacing: 4) {
+            Button {
+                strandFilter = ""
+                isPickingStrand = true
+            } label: {
+                Text(strandTitle(path)).lineLimit(1)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Strand: \(strandTitle(path)). Change")
+            Button {
+                model.strand = nil
+            } label: {
+                Image(systemName: "xmark.circle.fill")
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Show every strand")
+        }
+        .font(.caption)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 5)
+        .foregroundStyle(Color.white)
+        .background(Capsule().fill(Color.accentColor))
+    }
+
+    private var filteredStrands: [VaultIndexedFile] {
+        let filter = strandFilter.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !filter.isEmpty else { return model.strandNotes }
+        return model.strandNotes.filter {
+            $0.title.localizedCaseInsensitiveContains(filter)
+                || $0.path.localizedCaseInsensitiveContains(filter)
+        }
+    }
+
+    /// Every note under `Strands/`, the archive included and marked, by title.
+    private var strandPicker: some View {
+        NavigationStack {
+            List {
+                folderPickerRow(name: "All strands", count: model.strandNotes.count,
+                                isSelected: model.strand == nil) {
+                    model.strand = nil
+                    isPickingStrand = false
+                }
+                ForEach(filteredStrands, id: \.path) { note in
+                    strandPickerRow(note)
+                }
+            }
+            .navigationTitle("Strand")
+            .searchable(text: $strandFilter, prompt: "Filter strands")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Done") { isPickingStrand = false }
+                }
+            }
+        }
+        #if os(macOS)
+        .frame(minWidth: 360, minHeight: 420)
+        #endif
+    }
+
+    private func strandPickerRow(_ note: VaultIndexedFile) -> some View {
+        let isSelected = model.strand == note.path
+        let archived = VaultStrandRecord.isArchived(note.path)
+        return Button {
+            model.strand = note.path
+            isPickingStrand = false
+        } label: {
+            HStack {
+                Text(note.title)
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+                if archived {
+                    Text("archived")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer(minLength: 8)
+                Image(systemName: "checkmark")
+                    .font(.caption)
+                    .opacity(isSelected ? 1 : 0)
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(archived ? "\(note.title), archived" : note.title)
+        .accessibilityAddTraits(isSelected ? [.isSelected] : [])
+    }
+
+    /// One line of a section: the date first, then the line, the strand as caption.
+    private func lineRow(_ line: VaultSectionLine) -> some View {
+        Button {
+            path.append(VaultNoteRoute(path: line.path, line: line.line))
+        } label: {
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    if let date = line.date {
+                        Text(date)
+                            .font(.callout.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                    }
+                    Text(Self.lineText(line.text))
+                        .font(.callout)
+                        .foregroundStyle(.primary)
+                        .lineLimit(4)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                HStack(spacing: 4) {
+                    Text(line.title)
+                    if VaultStrandRecord.isArchived(line.path) {
+                        Text("·")
+                        Text("archived")
+                    }
+                }
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("\(line.date.map { "\($0), " } ?? "")\(line.text), \(line.title)")
+    }
+
+    /// A line's inline markdown, rendered: a strand line is full of `**U1**` and
+    /// backticks, and showing them raw would be the one unrendered text on the screen.
+    nonisolated static func lineText(_ text: String) -> AttributedString {
+        (try? AttributedString(markdown: text,
+                               options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)))
+            ?? AttributedString(text)
     }
 
     static func resultsHeading(_ count: Int) -> String {
@@ -591,6 +1018,12 @@ public struct VaultBrowserView: View {
                     .font(.body)
                     .foregroundStyle(.primary)
                 HStack(spacing: 6) {
+                    if model.scope == .strands,
+                       let caption = Self.stateCaption(model.strandStates[file.path]) {
+                        Text(caption)
+                            .foregroundStyle(.primary)
+                        Text("·")
+                    }
                     Text(file.path)
                         .lineLimit(1)
                         .truncationMode(.head)
