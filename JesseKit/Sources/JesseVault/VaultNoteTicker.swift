@@ -51,9 +51,12 @@ public enum VaultTickOutcome: Equatable, Sendable {
 /// Ticking one box in one note, through whatever can write.
 public struct VaultNoteTicker: Sendable {
     private let writer: any VaultNoteWriting
+    /// Where a tick of a strand step is reported. Nil only in a test that is not about it.
+    private let strandTicks: StrandTickOutbox?
 
-    public init(writer: any VaultNoteWriting) {
+    public init(writer: any VaultNoteWriting, strandTicks: StrandTickOutbox? = .shared) {
         self.writer = writer
+        self.strandTicks = strandTicks
     }
 
     /// Set the box on 1-based `line` of `path` to `checked`, given the text and stamp the
@@ -73,6 +76,7 @@ public struct VaultNoteTicker: Sendable {
         do {
             let written = try await writer.replace(path: path, expected: stamp,
                                                    with: edited, kind: kind)
+            await report(path: path, text: edited, line: line, checked: checked)
             return .written(text: edited, stamp: written)
         } catch VaultFileError.changedSinceRead {
             return await retry(path: path, line: line, to: checked, kind: kind)
@@ -99,6 +103,23 @@ public struct VaultNoteTicker: Sendable {
             // see the file comment on why there is no second retry.
             return .stale
         }
+        await report(path: path, text: edited, line: line, checked: checked)
         return .written(text: edited, stamp: written)
+    }
+
+    /// A WRITE IS NOT A TICK LANDING, when the note is a strand. The file just written is
+    /// this device's copy, and on the phone that copy reaches the Studio only if Obsidian
+    /// iOS notices another app changed it, which it does not. So the tick is also reported
+    /// to the bridge, which starts the turn that closes the step there.
+    ///
+    /// Queued before this returns, sent after: the glyph must not wait on the network,
+    /// and a report that cannot be sent now is sent by the next flush.
+    private func report(path: String, text: String, line: Int, checked: Bool) async {
+        guard let strandTicks,
+              let tick = StrandTickReport.forTick(path: path, text: text, line: line,
+                                                  checked: checked)
+        else { return }
+        await strandTicks.enqueue(tick)
+        Task { await strandTicks.flush() }
     }
 }

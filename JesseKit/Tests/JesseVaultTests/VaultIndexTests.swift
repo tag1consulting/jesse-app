@@ -380,6 +380,25 @@ final class VaultIndexTests: XCTestCase {
         XCTAssertNil(index.resolve(target: "Overview"), "and the ambiguous one still refuses")
     }
 
+    /// The empty note Obsidian leaves at a literal `todo-list/…` path is indexed like any
+    /// file, and must still never be what a link resolves to — in SQL exactly as in the
+    /// pure resolver.
+    func testTheIndexNeverResolvesALinkToAStrayTodoListFile() throws {
+        VaultFixture.writeCorpus(in: root)
+        _ = VaultFixture.write("", to: "todo-list/Suppliers/Terrasole.md", in: root)
+        let index = try makeIndex()
+        try reindex(index)
+        let paths = index.allPaths()
+        XCTAssertTrue(paths.contains("todo-list/Suppliers/Terrasole.md"), "the stray is indexed")
+
+        for target in ["todo-list/Suppliers/Terrasole", "Terrasole", "terrasole"] {
+            XCTAssertEqual(index.resolve(target: target), "Suppliers/Terrasole.md",
+                           "target \(target)")
+            XCTAssertEqual(index.resolve(target: target),
+                           VaultWikiLink.resolve(target: target, among: paths))
+        }
+    }
+
     /// Reopening the same database sees what the last run wrote. Obvious, and the thing
     /// that would silently break if the schema were recreated on every open.
     func testTheIndexSurvivesBeingClosedAndReopened() throws {

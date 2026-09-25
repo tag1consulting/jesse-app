@@ -14,6 +14,62 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [App 1.0 (158)] - 2026-09-25
+
+**A strand step ticked on the phone never reached the Studio, and this build reports it.**
+On 2026-09-24 at 18:43, Family P1 was ticked in the vault reader. The write succeeded and
+the phone's write log recorded it, but `Strands/Family.md` on the Studio never changed.
+
+**The root cause.** The reader writes into Obsidian's folder on the phone, and the only
+thing that carries that file to the Studio is Obsidian iOS's Sync. Obsidian does not notice
+a file another app changed inside its folder, so Sync never sent it, even though Sync was
+running at that minute. The app treated the write as the tick landing, and nothing else
+told the bridge.
+
+**The fix.** `VaultNoteTicker` still writes the tick through the same guarded write. When
+the line is a strand step, it now also reports it to `POST /jesse/strands/{slug}/ticks`
+(bridge 0.150.0), which starts the turn that closes the step on the Studio. The report
+goes through an outbox that is persisted before anything is sent and sent in order, so an
+untick never overtakes its tick. It is emptied only when the bridge answers, which means a
+tick made offline is delivered on the next launch or the next note opened. The Strands
+screen still has no write path of its own.
+
+**The stray `vault/todo-list/` files, and why this build ignores them.** They come from
+Obsidian, not from this app. Tapping a `[[todo-list/…]]` link that Obsidian cannot resolve
+makes it create an empty note at the literal path, and Sync then copies that note to every
+device. The reader resolved the literal path first, so on the phone it would have opened
+the empty file instead of the draft. The stray is also a second file with the draft's name,
+which made the name-based step refuse the real draft as ambiguous. Both resolvers
+(`VaultWikiLink.resolve` and `VaultIndex.resolve`) now take the `todo-list/` prefix off
+first, the way the bridge's `today.rs` does, and never answer with a file under a literal
+`todo-list/` folder. Obsidian itself still creates these files; the proposed fix on the
+vault side is in pull request 224's description.
+
+### Added
+
+- **`StrandTickReport`**: the rule for which ticks are strand steps. A step is a checkbox
+  line with a bold id, in `Strands/<Note>.md`, whose nearest heading is `## Queue`,
+  `## Drafts`, `## Running` or `### Later`. **`StrandTickOutbox`** is the persisted queue,
+  and **`StrandTickReporting`** is its seam, which `JesseBridgeClient` implements through
+  the new `postStrandTick`.
+- Both shells configure the shared outbox at launch. The reader flushes it whenever a
+  note opens.
+
+### Tests
+
+- `StrandTickReportTests`:
+  - A tick written in `Strands/Family.md` is reported exactly once. This is the regression
+    test for the missed tick.
+  - A tick that lands on the retry is reported too.
+  - A tick that did not write reports nothing, and a tick outside a strand note reports
+    nothing.
+  - Done lines, other sections, archived notes and lines with no id are not steps; Queue,
+    Drafts, Later and Running lines are.
+  - A report that cannot be sent survives a relaunch and is sent in order.
+  - A refused report leaves the outbox.
+  - Two flushes at once send each report once.
+- `VaultWikiLinkTests.testAStrayTodoListFileIsNeverTheAnswer` and
+  `VaultIndexTests.testTheIndexNeverResolvesALinkToAStrayTodoListFile`.
 ## [Bridge 0.150.0] - 2026-09-25
 
 **A ticked strand step now starts the turn that closes it.** Until now a tick was only a

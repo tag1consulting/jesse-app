@@ -110,6 +110,9 @@ public final class VaultNoteReaderModel {
     public func load(path: String) async {
         route = path
         state = .loading
+        // A strand tick that could not reach the bridge when it was made goes now. Free
+        // when the outbox is empty, and never in the way of the read: it is not awaited.
+        Task { await StrandTickOutbox.shared.flush() }
         let started = ContinuousClock.now
         let source = self.source
         let outcome = await Self.read(path: path, source: source)

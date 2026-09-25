@@ -24,6 +24,16 @@ import Foundation
 //      the file name is what actually identifies it.
 //   3. A unique CASE-INSENSITIVE basename, for `[[perseido]]` written in a hurry.
 //
+// ## `todo-list/` is the vault's NAME, never a folder in it
+//
+// The workspace-root spelling is fixed convention, and the bridge already strips it
+// (`today.rs`). So a `todo-list/…` target is resolved as the path WITHOUT the prefix, and a
+// file that really sits under a `todo-list/` folder is never an answer: every one of those is
+// the empty note Obsidian creates when somebody taps a link it cannot resolve, and Obsidian
+// Sync carries them onto every device. Resolving the literal path first — which is what step
+// 1 used to do — opened that empty file instead of the draft, and each one is also a second
+// file with the draft's basename, which made step 2 refuse the real draft as ambiguous.
+//
 // SEVERAL MATCHES RESOLVES TO NOTHING, deliberately. Two notes named `Overview.md` in
 // different folders are two different notes, and quietly opening the alphabetically
 // first one is the failure mode that costs a reader an afternoon. Obsidian itself
@@ -68,6 +78,20 @@ public enum VaultWikiLink {
         return s.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    /// The workspace-root prefix every vault link is written with.
+    public static let workspacePrefix = "todo-list/"
+
+    /// A normalized target with the workspace prefix taken off, when it has one.
+    public static func withoutWorkspacePrefix(_ target: String) -> String {
+        target.hasPrefix(workspacePrefix) ? String(target.dropFirst(workspacePrefix.count)) : target
+    }
+
+    /// Whether a vault relative path sits under a literal `todo-list/` folder: a stray empty
+    /// note, never a resolution. See the file comment.
+    public static func isStrayWorkspacePath(_ path: String) -> Bool {
+        path.hasPrefix(workspacePrefix)
+    }
+
     /// The file name a normalized target names, with `.md` on it.
     public static func fileName(for target: String) -> String {
         let leaf = target.split(separator: "/").last.map(String.init) ?? target
@@ -82,8 +106,9 @@ public enum VaultWikiLink {
     /// same three steps as SQL over the `files` table; the two must stay in step, and the
     /// index's own test drives it over a real tree for exactly that reason.
     public static func resolve(target rawTarget: String, among paths: [String]) -> String? {
-        let target = normalized(rawTarget)
+        let target = withoutWorkspacePrefix(normalized(rawTarget))
         guard !target.isEmpty else { return nil }
+        let paths = paths.filter { !isStrayWorkspacePath($0) }
 
         // 1. The whole path, spelled out.
         let exact = target + ".md"

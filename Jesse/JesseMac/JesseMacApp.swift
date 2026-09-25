@@ -1,9 +1,11 @@
 import SwiftUI
 import SwiftData
 import JesseCore
+import JesseNetworking
 import JesseOps
 import JesseConversations
 import JesseSpeech
+import JesseTodayDisplay
 import JesseVault
 
 // The macOS Jesse client — a thin native client that talks to the SAME bridge on the
@@ -38,6 +40,15 @@ struct JesseMacApp: App {
         _configStore = State(initialValue: cfg)
         _coordinator = State(initialValue: MacCoordinator(configStore: cfg))
         store = MacModelContainer.open()
+
+        // A tick of a strand step in the vault reader is reported to the bridge, the
+        // phone's rule and the phone's reason; see `StrandTickReport`.
+        Task {
+            await StrandTickOutbox.shared.configure { @MainActor in
+                JesseBridgeClient(config: cfg.config)
+            }
+            await StrandTickOutbox.shared.flush()
+        }
     }
 
     var body: some Scene {
