@@ -647,15 +647,9 @@ public struct VaultBrowserView: View {
     /// only under the Strands scope, and the only controls this scope adds.
     private var strandControls: some View {
         ScrollView(.horizontal, showsIndicators: false) {
+            // The strand token LEADS the row: the chips fill a phone's width, and a
+            // narrowing scrolled off the edge is a narrowing nobody can see is held.
             HStack(spacing: 6) {
-                ForEach(VaultStrandSection.allCases) { section in
-                    chip(section.label, isOn: model.section == section) {
-                        model.section = section
-                    }
-                    .accessibilityLabel("Section: \(section.label)")
-                    .accessibilityAddTraits(model.section == section ? [.isSelected] : [])
-                }
-                Divider().frame(height: 18)
                 if let strand = model.strand {
                     strandToken(strand)
                 } else {
@@ -664,6 +658,14 @@ public struct VaultBrowserView: View {
                         isPickingStrand = true
                     }
                     .accessibilityLabel("Pick one strand")
+                }
+                Divider().frame(height: 18)
+                ForEach(VaultStrandSection.allCases) { section in
+                    chip(section.label, isOn: model.section == section) {
+                        model.section = section
+                    }
+                    .accessibilityLabel("Section: \(section.label)")
+                    .accessibilityAddTraits(model.section == section ? [.isSelected] : [])
                 }
             }
             .padding(.vertical, 2)
