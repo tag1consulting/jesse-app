@@ -195,6 +195,17 @@ struct RootTabView: View {
                 StoreErrorBanner()
             }
         }
+        // EVERY vault reader in this app, wherever it is presented from, gets the one thing
+        // it cannot own: a way to ask for a marked up note to be reviewed. Injected HERE
+        // rather than at each of the four places a reader is presented (this shell's Vault
+        // tab, the Chats tab's cited-note and wiki sheets, the Today tab's day file and the
+        // strand board's notes) because a sheet inherits the environment of the view it is
+        // attached to, so one value reaches all of them and no intermediate view learns
+        // about annotations. Reachability is a CLOSURE, asked at the tap: reading the probe
+        // here would make this body, which builds every tab, depend on it.
+        .environment(\.vaultReview, VaultReviewAction(
+            reachability: { RunCoordinator.reachabilityState() },
+            start: { sentence in startReview(sentence) }))
         .task {
             // The badge is read from every tab, so the day has to be restored at LAUNCH
             // rather than when the Today tab is first opened — otherwise a cold launch
@@ -254,6 +265,25 @@ struct RootTabView: View {
             // path event. It is one of the four replay triggers for that reason.
             if !todayModel.isReadOnly { replayNow() }
         }
+    }
+
+    /// Ask for a note's marks to be answered, on a conversation of its own.
+    ///
+    /// A TELL, and sent on the spot. The request is complete as it stands (the sentence
+    /// names the note and the agent's own rules say what to do with a file full of marks),
+    /// and what it asks for is work on the vault rather than a discussion, which is the
+    /// same reason a Propagate is a Tell. The shape is `TodayThreadOpener.run`'s: a fresh
+    /// thread, inserted, sent, so the conversation is in the list with its answer whenever
+    /// the Studio finishes.
+    ///
+    /// Nothing is presented. The reader this was tapped in is frequently itself inside a
+    /// sheet, and a second sheet raised from the app's root while the first is up is not
+    /// reliably presented; the reader's own status line says the request went, and the
+    /// Chats tab badges the reply like any other.
+    private func startReview(_ sentence: String) {
+        let thread = JesseThread(mode: .tell)
+        context.insert(thread)
+        coordinator.send(thread: thread, text: sentence, voice: false, context: context)
     }
 
     /// Build the wrist link once and point the WatchConnectivity delegate at it.

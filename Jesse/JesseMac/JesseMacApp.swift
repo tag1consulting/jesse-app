@@ -55,6 +55,14 @@ struct JesseMacApp: App {
         WindowGroup {
             MacShellView(storeError: store.openFailure)
                 .environment(coordinator)
+                // Every vault reader in this window, the two note sheets below included,
+                // gets the one thing it cannot own: a way to ask for a marked up note to be
+                // reviewed. Injected here rather than inside `MacShellView` because those
+                // two sheets are attached OUTSIDE it, and a sheet inherits the environment
+                // of the view it is attached to.
+                .environment(\.vaultReview, VaultReviewAction(
+                    reachability: { MacCoordinator.reachabilityState() },
+                    start: { sentence in startReview(sentence) }))
                 .task {
                     // The draft store's launch chores, in order and before any composer
                     // can restore: move anything still in the V5 SwiftData columns into
@@ -179,6 +187,26 @@ struct JesseMacApp: App {
         }
         .defaultSize(width: 520, height: 560)
         .modelContainer(store.container)
+    }
+
+    /// Ask for a note's marks to be answered, on a conversation of its own.
+    ///
+    /// A TELL, and sent on the spot: the sentence is the whole request, and what it asks
+    /// for is work on the vault rather than a discussion, which is why a Propagate is a
+    /// Tell too. The shape is `MacTodayThreadOpener.run`'s, and for the same reason: a
+    /// fresh thread per request, so one narrow turn cannot inherit another's context.
+    ///
+    /// Nothing is presented. The reader it was tapped in may itself be a sheet on this
+    /// window, and the answer arrives in the sidebar like any other conversation's.
+    private func startReview(_ sentence: String) {
+        let context = store.container.mainContext
+        let thread = JesseThread(mode: .tell)
+        context.insert(thread)
+        try? context.save()
+        Task {
+            await coordinator.send(text: sentence, mode: .tell, thread: thread,
+                                   context: context)
+        }
     }
 
     /// The reply notification's title. The shared resolution, with this surface's own

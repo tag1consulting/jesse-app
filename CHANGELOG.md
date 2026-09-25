@@ -14,6 +14,54 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [App 1.0 (159)] - 2026-09-25
+
+**The reader could show a mark, and the only way to make one was to type braces by hand.**
+Every review in this vault is CriticMarkup, and since build 157 a marked up note reads as a
+conversation: a highlight on yellow, a comment behind its marker, a rewrite with the old
+words struck and the new ones set on green. Making one was the other half of that sentence
+and it was missing. On a phone it meant typing an opening brace, two equals signs, the
+words, two equals signs and a closing brace with autocorrect switched off and no way to see
+whether the pairs matched until the note was saved and reopened. A rewrite is worse: five
+markers, one of them an arrow made of two characters, and a single mistyped tilde turns a
+proposed sentence into a paragraph of punctuation. So the feature that could be read could
+not realistically be written, and the only person marking up notes was the agent.
+
+The editor now has a bar of five buttons, one per form, over what is selected. Highlight,
+Replace and Comment ask for their words in a one field sheet (Replace opens with the
+selected words already in it, which is the common edit); Insert asks for words at the
+caret; Delete applies on the tap, because the selection is the whole of it. A selection
+that crosses a line break is REFUSED with a caption rather than clipped to its first line,
+because a mark opens and closes on one line and clipping would mark words nobody chose. The
+characters live in one pure, tested place, and the edit goes into the text view through its
+own undoable replace rather than by assigning the text: a mark on the wrong sentence is one
+press of undo, and the save path, the stamp, the conflict prompt and the truncation guard
+are all exactly what they were.
+
+The reader closes the loop. A note carrying marks says how many are waiting (a comment that
+opens with `Jesse ` is an answer, so it is not counted) and offers Send to Jesse. With the
+Studio reachable that starts a conversation whose first message is one fixed sentence naming
+the note; with the Studio asleep the same sentence is written into the vault's own Inbox for
+the morning routine, through the capture path that was already there. Either way the row
+says which happened. `Today.md` is left alone entirely: the bridge rewrites that file, so
+neither the bar nor the Send row appears on it.
+
+### Added
+
+- **The annotation bar** in the note editor: Highlight, Replace, Delete, Insert and
+  Comment, with the three that need words greyed out until something is selected, and one
+  caption saying why. An inset above the keyboard on iOS, a row over the editor on macOS.
+- **`VaultAnnotationMarkup`**, the five forms as pure functions: the characters of each
+  mark, where the caret lands afterwards, the two refusals (a selection crossing a line, a
+  form that needs a selection and has none), and the flattening of a pasted paragraph to
+  one line so nothing can break the one line rule from inside a mark.
+- **A selection and edit seam on `VaultPlainTextEditor`**: the selection goes out on every
+  change, an edit comes in behind its own token and is applied through the text view's
+  undoable replace, one turn of the main loop outside the SwiftUI update pass.
+- **An annotation count on `VaultNoteDocument`**, computed once at parse with the scanner
+  the renderer already uses, excluding code blocks and excluding answers.
+- **Send to Jesse in the reader**: the fixed request sentence, routed by reachability to a
+  conversation or to the vault's Inbox, with the destination reported in one line.
 ## [App 1.0 (158)] - 2026-09-25
 
 **A strand step ticked on the phone never reached the Studio, and this build reports it.**

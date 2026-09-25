@@ -214,6 +214,59 @@ final class VaultNoteDocumentTests: XCTestCase {
         XCTAssertTrue(VaultNoteReaderView.provenance(Date()).contains("modified"))
     }
 
+    // MARK: - The annotation count
+
+    /// THREE marks and one answer is three. The number says how much is waiting to be
+    /// looked at, and a note that has been gone through would otherwise read as having
+    /// grown work by being answered.
+    func testANoteWithThreeMarksAndOneReplyCountsThree() {
+        let note = """
+        # Kiln
+
+        The arch is {==sound==}{>>Are you sure?<<} today.
+
+        The bricks are {~~ordered~>paid for~~}.
+
+        {>>Jesse the invoice is in the drawer<<}
+        """
+        let document = VaultNoteDocument.parse(path: "Notes/Kiln.md", text: note)
+        XCTAssertEqual(document.annotationCount, 3)
+    }
+
+    func testANoteWithNoMarksCountsNothing() {
+        let document = VaultNoteDocument.parse(
+            path: "Notes/Kiln.md",
+            text: "# Kiln\n\nAn ==ordinary highlight== and a [[Link]].\n")
+        XCTAssertEqual(document.annotationCount, 0)
+    }
+
+    /// A doubled brace in a Blade template is not a deletion, and a mark inside a fence is
+    /// not a mark: the count excludes a code block exactly as the renderer does.
+    func testMarksInsideACodeBlockAreNotCounted() {
+        let note = """
+        # Technology
+
+        ```blade
+        {{-- a Blade comment --}}
+        {==not a highlight==}
+        ```
+
+        But {++this one++} is.
+        """
+        let document = VaultNoteDocument.parse(path: "Knowledge/Tech.md", text: note)
+        XCTAssertEqual(document.annotationCount, 1)
+    }
+
+    func testMarksInsideATableCellAreCounted() {
+        let note = """
+        | Room | State |
+        | --- | --- |
+        | Kiln | {>>needs sweeping<<} |
+        """
+        let document = VaultNoteDocument.parse(path: "Notes/Rooms.md", text: note)
+        XCTAssertEqual(document.annotationCount, 1)
+    }
+
     func testTheMissingLinkCaptionNamesTheFileRatherThanThePath() {
         let block = VaultNoteBlock(id: 0, kind: .paragraph,
                                    text: "See [[Projects/Deep/Nowhere]].")
