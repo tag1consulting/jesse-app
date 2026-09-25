@@ -206,6 +206,19 @@ struct RootTabView: View {
         .environment(\.vaultReview, VaultReviewAction(
             reachability: { RunCoordinator.reachabilityState() },
             start: { sentence in startReview(sentence) }))
+        // `Search this strand`, for both tabs that list a strand: only the shell can put
+        // the Vault tab on screen, and nothing about doing so touches a conversation, so
+        // this one belongs at the root.
+        //
+        // ITS SIBLING DOES NOT. `Discuss this strand` opens a conversation, and a
+        // conversation is a `JesseThread` that would have to be held somewhere while its
+        // sheet is up. This view holds NO model objects, deliberately and with a test on
+        // it (`UnreadBadgeShellTests`): a thread held here makes every save to it rebuild
+        // all four tabs. So each tab that lists a strand injects its own Discuss action,
+        // beside the sheet that presents it — `TodayTabView` and `VaultTabView`.
+        .environment(\.strandRecord, StrandRecordAction { slug, section in
+            showStrandRecord(slug, section: section)
+        })
         .task {
             // The badge is read from every tab, so the day has to be restored at LAUNCH
             // rather than when the Today tab is first opened — otherwise a cold launch
@@ -284,6 +297,17 @@ struct RootTabView: View {
         let thread = JesseThread(mode: .tell)
         context.insert(thread)
         coordinator.send(thread: thread, text: sentence, voice: false, context: context)
+    }
+
+    /// **Show one strand's record in the Vault tab**, optionally at one section.
+    ///
+    /// THE TAB FIRST, then the narrowing, for `ThreadLanding`'s reason: the screen the user
+    /// is about to read has to be the one on display when it changes underneath them. The
+    /// entry point answers false for a slug no note carries, in which case the tab is shown
+    /// as it was rather than narrowed to nothing.
+    private func showStrandRecord(_ slug: String, section: VaultStrandSection) {
+        selection = .vault
+        vaultModel.showStrand(slug, section: section)
     }
 
     /// Build the wrist link once and point the WatchConnectivity delegate at it.
@@ -388,7 +412,10 @@ struct RootTabView: View {
                          onReplay: replayNow)
                 .equatable()
         case .vault:
-            VaultBrowserView(model: vaultModel)
+            // Hosted rather than rendered bare: the host is where a strand discussion
+            // started from a `Strands/` row is staged and presented, which is a
+            // conversation and so cannot live on this view. See `VaultTabView`.
+            VaultTabView(model: vaultModel)
         }
     }
 

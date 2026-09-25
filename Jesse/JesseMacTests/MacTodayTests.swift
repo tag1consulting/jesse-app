@@ -4,6 +4,7 @@ import SwiftData
 import JesseCore
 import JesseNetworking
 import JesseTodayDisplay
+import JesseVault
 
 /// The Mac's Today tab: what its actions actually send, and on which thread.
 ///
@@ -150,6 +151,78 @@ final class MacTodayTests: XCTestCase {
         coordinator.clearAttachedContext(for: thread.id)
 
         XCTAssertNil(coordinator.attachedContext(for: thread.id))
+    }
+
+    // MARK: - A strand discussion opens; it does not fire
+
+    /// The Mac stages a strand discussion through the same shared turn the phone does: an
+    /// Ask thread, an empty composer, the strand's own frozen prompt held for the first send.
+    ///
+    /// It matters more than an item discussion does, because this prompt GRANTS A WRITE to
+    /// the strand's note: a turn fired on the secondary click would be a write Jeremy never
+    /// asked for.
+    func testAStrandDiscussionOpensAThreadAndFiresNoTurn() async throws {
+        let (coordinator, fake, context) = try Self.harness()
+        let before = try context.fetch(FetchDescriptor<JesseThread>()).count
+        let target = StrandMenuTarget(slug: "Jesse", title: "Jesse App", path: "Strands/Jesse.md")
+
+        let thread = MacTodayThreadOpener.stage(.discuss(strand: target),
+                                                coordinator: coordinator)
+
+        XCTAssertEqual(thread.mode, JesseMode.ask.rawValue)
+        XCTAssertTrue(thread.turns.isEmpty, "an empty composer, not a sent prompt")
+        XCTAssertFalse(coordinator.isRunning(thread.id))
+        XCTAssertEqual(coordinator.attachedContext(for: thread.id),
+                       StrandDiscuss.prompt(slug: "Jesse", title: "Jesse App",
+                                            path: "Strands/Jesse.md"))
+        XCTAssertEqual(try context.fetch(FetchDescriptor<JesseThread>()).count, before,
+                       "a staged thread is not in the store until it is sent to")
+        await Self.settle()
+        XCTAssertTrue(fake.sentTexts.isEmpty, "nothing reached the bridge")
+    }
+
+    /// And the first send composes it with what was typed through the SHARED rule, so the
+    /// Mac and the phone send the same bytes for the same gesture.
+    func testTheFirstSendOfAStrandDiscussionCarriesTheStrandContext() async throws {
+        let (coordinator, fake, context) = try Self.harness()
+        let target = StrandMenuTarget(slug: "Jesse", title: "Jesse App", path: "Strands/Jesse.md")
+        let thread = MacTodayThreadOpener.stage(.discuss(strand: target),
+                                                coordinator: coordinator)
+
+        await coordinator.send(text: "K7 is merged.", mode: .ask, thread: thread,
+                               context: context)
+
+        XCTAssertEqual(fake.sentTexts.first,
+                       TodayThreadContext.firstMessage(
+                           context: StrandDiscuss.prompt(slug: "Jesse", title: "Jesse App",
+                                                         path: "Strands/Jesse.md"),
+                           typed: "K7 is merged."))
+        XCTAssertEqual(fake.sentModes.first, .ask)
+        XCTAssertNil(coordinator.attachedContext(for: thread.id), "consumed by the first send")
+    }
+
+    /// The Mac shell's tabs are now SELECTABLE, which is what lets `Search this strand` from
+    /// the Today tab put the Vault tab on screen: a `TabView` with no selection cannot be
+    /// driven at all. Four distinct tags, mirroring the iPhone's bar.
+    func testTheShellsTabsAreSelectableAndMirrorThePhonesOrder() {
+        let tabs: [MacShellView.Tab] = [.chats, .today, .health, .vault]
+        XCTAssertEqual(Set(tabs).count, 4, "four distinct, hashable tabs")
+    }
+
+    /// **And the shell still holds no conversation.** The peer of the iPhone's
+    /// `UnreadBadgeShellTests` rule, asserted here for the first time because this is the
+    /// change that would have broken it: the strand discussion's thread was briefly held on
+    /// this view, which builds all four tabs, so every save to that one thread would have
+    /// re-evaluated the window. It belongs to the tab that started it
+    /// (`MacTodayView`, `MacVaultTabView`), exactly as on the phone.
+    func testTheTabShellHoldsNoConversationRows() {
+        let offenders = Mirror(reflecting: MacShellView()).children.compactMap { child -> String? in
+            let type = String(describing: type(of: child.value))
+            guard type.contains("JesseThread") else { return nil }
+            return "\(child.label ?? "an unnamed property") of type \(type)"
+        }
+        XCTAssertTrue(offenders.isEmpty,
+                      "MacShellView holds \(offenders.joined(separator: ", "))")
     }
 
     // MARK: - Propagate fires on the click

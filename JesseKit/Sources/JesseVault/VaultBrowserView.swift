@@ -432,6 +432,10 @@ public struct VaultBrowserView: View {
     /// live strands stay the first thing on the screen.
     @State private var showsArchived = false
 
+    /// The shell's "discuss this strand" action, the one thing a strand's menu needs that
+    /// this screen cannot do for itself. Nil in a preview; both shells inject it.
+    @Environment(\.strandDiscuss) private var discussAction
+
     public init(model: VaultBrowserModel = VaultBrowserModel()) {
         _model = State(initialValue: model)
     }
@@ -624,6 +628,25 @@ public struct VaultBrowserView: View {
         model.strandNotes.first { $0.path == path }?.title ?? VaultStrandRecord.slug(of: path)
     }
 
+    /// **The menu one row of this tab carries**, or nil for a row that is not a strand
+    /// note — which is most of them: this tab lists every note on the device, and only the
+    /// ones under `Strands/` (the archive included) have a strand's five actions.
+    ///
+    /// The same `StrandMenu` the Today tab's board builds, with the two actions this screen
+    /// can answer itself answered here: `Open note` pushes this tab's own reader, and the
+    /// record narrows THIS model rather than asking the shell to select a tab that is
+    /// already on screen.
+    func strandMenu(forPath notePath: String, title: String, line: Int? = nil) -> StrandMenu? {
+        guard let target = StrandMenuTarget.note(path: notePath, title: title) else {
+            return nil
+        }
+        return StrandMenu(
+            target: target,
+            onOpenNote: { path.append(VaultNoteRoute(path: notePath, line: line)) },
+            onDiscuss: discussAction.map { action in { action.start(target) } },
+            onShowRecord: { section in model.showStrand(target.slug, section: section) })
+    }
+
     private var archivedHeader: some View {
         Button {
             showsArchived.toggle()
@@ -810,6 +833,8 @@ public struct VaultBrowserView: View {
         }
         .buttonStyle(.plain)
         .accessibilityLabel("\(line.date.map { "\($0), " } ?? "")\(line.text), \(line.title)")
+        // A line of a section is still a row OF a strand, so it carries the strand's menu.
+        .strandContextMenu(strandMenu(forPath: line.path, title: line.title, line: line.line))
     }
 
     /// A line's inline markdown, rendered: a strand line is full of `**U1**` and
@@ -1036,6 +1061,7 @@ public struct VaultBrowserView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
         }
         .buttonStyle(.plain)
+        .strandContextMenu(strandMenu(forPath: file.path, title: file.title))
     }
 
     private func hitRow(_ hit: VaultSearchHit) -> some View {
@@ -1069,5 +1095,6 @@ public struct VaultBrowserView: View {
         }
         .buttonStyle(.plain)
         .accessibilityLabel("\(hit.title), line \(hit.line)")
+        .strandContextMenu(strandMenu(forPath: hit.path, title: hit.title, line: hit.line))
     }
 }

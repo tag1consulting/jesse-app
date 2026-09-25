@@ -4,6 +4,7 @@ import SwiftData
 import JesseCore
 import JesseConversations
 import JesseSearch
+import JesseTodayDisplay
 import JesseVault
 
 // The Mac shell: a NavigationSplitView with the thread list on the left and the
@@ -31,10 +32,24 @@ import JesseVault
 // started. Each tab owns its own ⌘R, which is unambiguous because only the selected
 // tab's toolbar is live — the Health tab has worked that way since it landed.
 struct MacShellView: View {
+    /// The four tabs, named so one of them can be SELECTED from code. A hand-written enum
+    /// rather than the iPhone's `RootTabView.Tab`, which lives in a target this one cannot
+    /// import; the comment above already says the two lists are kept in step by hand.
+    ///
+    /// It exists because a strand's menu can say `Search this strand` from the Today tab,
+    /// and answering that means putting the Vault tab on screen. A `TabView` with no
+    /// selection cannot be driven at all.
+    enum Tab: Hashable {
+        case chats, today, health, vault
+    }
+
     @Environment(MacCoordinator.self) private var coordinator
     @Environment(\.scenePhase) private var scenePhase
     /// Store-open failure banner, threaded down to the Chats tab.
     var storeError: Error?
+
+    /// The tab on screen. Chats leads, as on the iPhone.
+    @State private var tab: Tab = .chats
 
     /// The Vault tab's model, and with it this Mac's index. Built HERE rather than in the
     /// tab because the indexer is driven by the WINDOW becoming active, which is a fact
@@ -44,12 +59,13 @@ struct MacShellView: View {
         expander: VaultModelExpansion(FoundationModelExpander()))
 
     var body: some View {
-        TabView {
+        TabView(selection: $tab) {
             MacRootView(storeError: storeError)
                 .safeAreaInset(edge: .top, spacing: 0) {
                     AwayProfileBanner(configuration: coordinator.configStore.opsConfiguration)
                 }
                 .tabItem { Label("Chats", systemImage: "bubble.left.and.bubble.right") }
+                .tag(Tab.chats)
             MacTodayView(configStore: coordinator.configStore)
                 // The profile the day is derived in, above the day itself — the same shared
                 // banner the phone shows, from the same model.
@@ -58,13 +74,30 @@ struct MacShellView: View {
                                       alwaysShowName: true)
                 }
                 .tabItem { Label("Today", systemImage: "sunrise") }
+                .tag(Tab.today)
             MacHealthView(configStore: coordinator.configStore)
                 .tabItem { Label("Health", systemImage: "heart.text.square") }
+                .tag(Tab.health)
             // FOURTH, and last, mirroring the iPhone's bar (`RootTabView.Tab.allCases`):
             // every note on this Mac, searchable with the Studio asleep.
-            VaultBrowserView(model: vaultModel)
+            // Hosted rather than rendered bare: the host is where a strand discussion
+            // started from a `Strands/` row is staged and presented, which is a
+            // conversation and so does not belong on this shell. See `MacVaultTabView`.
+            MacVaultTabView(model: vaultModel)
                 .tabItem { Label("Vault", systemImage: "text.book.closed") }
+                .tag(Tab.vault)
         }
+        // `Search this strand`, for both tabs that list a strand: only this shell can put
+        // the Vault tab on screen, and doing so touches no conversation.
+        //
+        // ITS SIBLING DOES NOT LIVE HERE. `Discuss this strand` opens a conversation, and
+        // the thread it needs while its sheet is up is held by the tab that started it —
+        // `MacTodayView` and `MacVaultTabView` — which is where the phone holds its own,
+        // and which keeps a save to one thread from re-evaluating a body that builds all
+        // four tabs.
+        .environment(\.strandRecord, StrandRecordAction { slug, section in
+            showStrandRecord(slug, section: section)
+        })
         // The vault index's one automatic trigger, the same one the iPhone uses: the window
         // becoming active is when the synced folder may have changed behind the app's back.
         // Debounced to once per 30 seconds inside the indexer, and never on a timer.
@@ -76,6 +109,13 @@ struct MacShellView: View {
             // files the write log names, change a status, never re-append.
             Task { await InboxCaptureService.shared.verifyRecent() }
         }
+    }
+
+    /// **Show one strand's record in the Vault tab**, optionally at one section. The tab
+    /// first, then the narrowing, so the screen that changes is the one on display.
+    private func showStrandRecord(_ slug: String, section: VaultStrandSection) {
+        tab = .vault
+        vaultModel.showStrand(slug, section: section)
     }
 }
 

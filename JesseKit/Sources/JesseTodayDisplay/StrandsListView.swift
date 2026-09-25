@@ -53,6 +53,11 @@ public struct StrandsListView: View {
     /// The stored key for the collapsed `Tree` parents.
     public static let collapsedTreeKey = "strands.tree.collapsed"
 
+    /// The shell's two strand actions, read here and handed to every row's menu. Nil in a
+    /// preview, in which case those entries are listed and inert; the shells inject both.
+    @Environment(\.strandDiscuss) private var discussAction
+    @Environment(\.strandRecord) private var recordAction
+
     public init(model: StrandsModel,
                 opener: StrandOpener,
                 onTodayCount: @escaping (String) -> Int = { _ in 0 }) {
@@ -202,6 +207,32 @@ public struct StrandsListView: View {
                   isOpening: opener.opening == strand.slug,
                   onOpen: { opener.open(slug: strand.slug, title: strand.title) },
                   onShowFindings: { findingsFor = strand })
+            // A long press (a secondary click on the Mac) on ANY board row — live, dormant
+            // or nested — offers the same five things the Vault tab's Strands rows offer.
+            // Attached here rather than inside `StrandRow` so every group gets it from the
+            // one place every group is built, and so the row keeps its tap unchanged.
+            .strandContextMenu(Self.menu(for: strand, opener: opener,
+                                         discuss: discussAction, record: recordAction))
+    }
+
+    /// **The menu one board row carries.** Static and handed everything it needs, so the
+    /// test that compares this surface's menu with the Vault tab's can build the same value
+    /// the row renders without a screen.
+    ///
+    /// `Open note` is the opener the row's own tap uses, not a second way in. `Search` and
+    /// `Decisions` go through the shell, because the record lives in another tab.
+    static func menu(for strand: Strand, opener: StrandOpener,
+                     discuss: StrandDiscussAction?,
+                     record: StrandRecordAction?) -> StrandMenu {
+        // `notePath` is the wire model's own spelling of `Strands/<slug>.md`, so the
+        // convention lives in one place rather than being re-derived here.
+        let target = StrandMenuTarget(slug: strand.slug, title: strand.title,
+                                      path: strand.notePath)
+        return StrandMenu(
+            target: target,
+            onOpenNote: { opener.open(slug: strand.slug, title: strand.title) },
+            onDiscuss: discuss.map { action in { action.start(target) } },
+            onShowRecord: { section in record?.show(strand.slug, section: section) })
     }
 
     private func toggleCollapsed(_ id: String) {

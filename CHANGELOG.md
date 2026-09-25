@@ -14,6 +14,43 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [App 1.0 (165)] - 2026-09-25
+
+**A long press on a strand opens one menu, wherever the strand is listed**, and one of its
+five entries starts a conversation about that strand: `Open note`, `Discuss this strand`,
+`Search this strand`, `Decisions`, `Copy link`. The same menu on the Today tab's Strands
+board and in the Vault tab's Strands scope, on a secondary click on the Mac.
+
+**Root cause: a strand could only be opened.** A board row and a Vault row each answered
+exactly one gesture, a tap, so discussing a strand or giving an update on one meant opening
+a fresh chat and typing the strand's name into it, with nothing to tell the agent which note
+was meant.
+
+### Added
+
+- **`Discuss this strand`**: an Ask turn on a new conversation's empty composer, staged and
+  never fired, exactly as a Today item's Discuss is. Its frozen prompt names the note by
+  path, says to read it in full first and then the files its `## Drafts`, `## Research` and
+  `## Vault` sections link, and says that an update given in the conversation IS the
+  instruction to record it in that note in the same turn, without asking first. The grant is
+  bounded twice: to that one file, and to that one reason. It starts no routine and does no
+  task work that was not asked for.
+- **`Search this strand` and `Decisions`**: the Vault tab's Strands scope, narrowed to this
+  strand, with the section chip on for the second. From the board they select the Vault tab;
+  in the Vault tab they narrow it in place.
+- **`Copy link`** puts the strand's wiki link on the pasteboard, always the live spelling,
+  so a link copied off an archived note keeps working if the strand is revived.
+- **One menu definition** (`StrandMenu` in JesseVault), rendered by both surfaces from one
+  ordered list of cases, so neither can grow an entry the other lacks. A Vault row that is
+  not under `Strands/` gets no strand menu at all, and keeps the long press it had.
+- **The Mac shell's tabs are selectable**, which is what lets a board row put the Vault tab
+  on screen.
+- **Each tab presents its own discussion.** The conversation a discussion needs while its
+  sheet is up is held by the tab that started it (the Today tab, and a small Vault tab host
+  on each platform), never by the app's root, which holds no conversation at all: a thread
+  held there would re-evaluate a body that builds every tab on each save to it. The Mac now
+  asserts that rule too.
+
 ## [App 1.0 (164)] - 2026-09-25
 
 **The Strands board can show the strands as a tree** (needs bridge 0.153.0): `Tree`, a third
