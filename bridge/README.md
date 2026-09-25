@@ -2077,11 +2077,13 @@ for the day, never touches a Strands note, and never calls the network. No
 
 **Finding codes:** `PARSE`, `GROUP`, `STATE`, `UPDATED-INVALID`,
 `UPDATED-BEHIND`, `UPDATED-STALE` (active, over 14 days), `DORMANT-CANDIDATE`
-(active, over 90 days), `LINK-DEAD`, `QUEUE-ARCHIVED`, `RUNNING-SILENT` (over 3
-days, or undated), `CHECKED-NOT-MOVED`, `NO-NEXT`, `DUP-ID`, and the global
-`ORPHAN-DRAFT`, `UNOWNED-PROMPT` (both over `Projects/drafts/` and
-`Projects/Research/`, not their `archive/`), `TOO-MANY` (over 20 active) and
-`DONE-NOT-ARCHIVED`, plus `FORMAT-V1` (the note still uses the v1 layout) and
+(active, over 90 days), `ROLLUP-CANDIDATE` (not done, over 21 days; names the
+parent when there is one), `LINK-DEAD`, `QUEUE-ARCHIVED` (an open line links an
+archived prompt, a file whose name contains `prompt`; prompt links only, so a cited
+archived report raises nothing), `RUNNING-SILENT` (over 3 days, or undated),
+`CHECKED-NOT-MOVED`, `NO-NEXT`, `DUP-ID`, and the global `ORPHAN-DRAFT` and
+`UNOWNED-PROMPT` (both over `Projects/drafts/` and `Projects/Research/`, not their
+`archive/`) and `DONE-NOT-ARCHIVED`, plus `FORMAT-V1` (the note still uses the v1 layout) and
 `NOW-LONG` (a v2 note whose Now is over 280 characters). The grammar is documented on
 `strands::parse_strand`.
 
