@@ -112,19 +112,60 @@ public struct TodayLinkChip: View {
     }
 }
 
-/// An item's links, wrapped so a row with many of them grows downward instead of
-/// truncating. Nothing renders when there are none.
+/// An item's chips, wrapped so a row with many of them grows downward instead of
+/// truncating: its strand first, when it has one and the shell can open strands, then
+/// its links. Nothing renders when there are none.
 struct TodayLinkChips: View {
     let links: [TodayLink]
     let sourceText: String
+    /// The item's strand, when the chips belong to an item that has one.
+    var strand: TodayItemStrand? = nil
+    /// Opens a strand, or nil in a shell with no opener, where no strand chip is drawn
+    /// rather than one that is drawn and inert.
+    var onOpenStrand: ((TodayItemStrand) -> Void)? = nil
+    /// The slug being opened right now, so the chip that asked can say so.
+    var openingStrand: String? = nil
     let onOpen: (TodayLinkOrigin) -> Void
 
+    /// An item's chips: its strand, then its links.
+    init(item: TodayItem, onOpenStrand: ((TodayItemStrand) -> Void)?, openingStrand: String?,
+         onOpen: @escaping (TodayLinkOrigin) -> Void) {
+        let content = Self.content(item, showsStrand: onOpenStrand != nil)
+        self.links = content.links
+        self.sourceText = item.text
+        self.strand = content.strand
+        self.onOpenStrand = onOpenStrand
+        self.openingStrand = openingStrand
+        self.onOpen = onOpen
+    }
+
+    /// Links alone, for a report row or a note block, which have no strand.
+    init(links: [TodayLink], sourceText: String, onOpen: @escaping (TodayLinkOrigin) -> Void) {
+        self.links = links
+        self.sourceText = sourceText
+        self.onOpen = onOpen
+    }
+
+    /// What the chip flow holds, computed where a test can reach it: the strand chip
+    /// and, when it is shown, every link except the one to that same strand note, so a
+    /// row never shows the strand twice.
+    static func content(_ item: TodayItem,
+                        showsStrand: Bool) -> (strand: TodayItemStrand?, links: [TodayLink]) {
+        guard showsStrand, let strand = item.strand else { return (nil, item.links) }
+        return (strand, StrandOnToday.linksWithoutStrand(item))
+    }
+
     var body: some View {
-        if !links.isEmpty {
+        if strand != nil || !links.isEmpty {
             // `Layout`-free wrapping: a flexible grid with a minimum column width lets
             // chips flow onto as many rows as they need on a phone and a Mac window
             // alike, with no measurement pass of our own.
             FlowRow(spacing: 6) {
+                if let strand, let onOpenStrand {
+                    TodayStrandChip(strand: strand,
+                                    isOpening: openingStrand == strand.slug,
+                                    onOpen: onOpenStrand)
+                }
                 ForEach(links, id: \.target) {
                     TodayLinkChip(link: $0, sourceText: sourceText, onOpen: onOpen)
                 }
@@ -226,6 +267,11 @@ public struct TodayItemRow: View {
     let onDiscuss: () -> Void
     let onPropagate: () -> Void
     let onOpenLink: (TodayLinkOrigin) -> Void
+    /// Opens the item's strand. Nil where the shell holds no `StrandOpener`, and then the
+    /// row carries no strand chip.
+    let onOpenStrand: ((TodayItemStrand) -> Void)?
+    /// The slug the opener is resolving, so this row's chip can show it is working.
+    let openingStrand: String?
 
     public init(item: TodayItem, pending: Bool = false, queued: Bool = false,
                 evidence: String? = nil,
@@ -240,7 +286,9 @@ public struct TodayItemRow: View {
                 onOpen: @escaping () -> Void = {},
                 onDiscuss: @escaping () -> Void = {},
                 onPropagate: @escaping () -> Void = {},
-                onOpenLink: @escaping (TodayLinkOrigin) -> Void = { _ in }) {
+                onOpenLink: @escaping (TodayLinkOrigin) -> Void = { _ in },
+                onOpenStrand: ((TodayItemStrand) -> Void)? = nil,
+                openingStrand: String? = nil) {
         self.item = item
         self.pending = pending
         self.queued = queued
@@ -257,6 +305,8 @@ public struct TodayItemRow: View {
         self.onDiscuss = onDiscuss
         self.onPropagate = onPropagate
         self.onOpenLink = onOpenLink
+        self.onOpenStrand = onOpenStrand
+        self.openingStrand = openingStrand
     }
 
     /// Whether a pointer is over this row. Only ever true where there IS a pointer, and
@@ -304,7 +354,8 @@ public struct TodayItemRow: View {
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
-                TodayLinkChips(links: item.links, sourceText: item.text, onOpen: onOpenLink)
+                TodayLinkChips(item: item, onOpenStrand: onOpenStrand,
+                               openingStrand: openingStrand, onOpen: onOpenLink)
                 if let evidence {
                     Label(evidence, systemImage: "text.quote")
                         .font(.caption)

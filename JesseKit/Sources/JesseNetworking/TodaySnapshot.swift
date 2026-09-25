@@ -104,6 +104,11 @@ public struct TodayItem: Decodable, Equatable, Hashable, Identifiable, Sendable 
     /// its section heading and the five Dashboard pages. `.unfiled` is the honest
     /// answer for an item that declares no lineage, and is common — see `TodayProject`.
     public var project: TodayProject
+    /// The strand this item belongs to, as the bridge derived it from the item's links and
+    /// the notes under `Strands/`, or `nil` when none claims it. The client never infers a
+    /// strand itself; it reads this and filters by `strand.slug`, so the chip, the strand
+    /// note's `On Today` block and the nightly audit all rest on the one derivation.
+    public var strand: TodayItemStrand?
     /// **Postponed for today**: the user set this item aside, so it drops out of
     /// the tab badge and its section's open count until tomorrow. `deferredMs` is
     /// the client clock the claim was made on, which is how two devices converge.
@@ -128,6 +133,7 @@ public struct TodayItem: Decodable, Equatable, Hashable, Identifiable, Sendable 
                 links: [TodayLink] = [], addedDate: String? = nil, updatedDate: String? = nil,
                 appCompleted: TodayAppCompleted? = nil, sectionName: String = "",
                 project: TodayProject = .unfiled,
+                strand: TodayItemStrand? = nil,
                 deferred: Bool = false, deferredMs: UInt64 = 0,
                 relevance: TodayItemRelevance? = nil,
                 range: TodaySourceRange = TodaySourceRange(start: 0, end: 0)) {
@@ -141,6 +147,7 @@ public struct TodayItem: Decodable, Equatable, Hashable, Identifiable, Sendable 
         self.appCompleted = appCompleted
         self.sectionName = sectionName
         self.project = project
+        self.strand = strand
         self.deferred = deferred
         self.deferredMs = deferredMs
         self.relevance = relevance
@@ -155,7 +162,7 @@ public struct TodayItem: Decodable, Equatable, Hashable, Identifiable, Sendable 
     /// item it can render.
     private enum CodingKeys: String, CodingKey {
         case id, checked, lead, text, links, addedDate, updatedDate
-        case appCompleted, sectionName, project, deferred, deferredMs, relevance, range
+        case appCompleted, sectionName, project, strand, deferred, deferredMs, relevance, range
     }
 
     public init(from decoder: any Decoder) throws {
@@ -170,6 +177,9 @@ public struct TodayItem: Decodable, Equatable, Hashable, Identifiable, Sendable 
         appCompleted = try c.decodeIfPresent(TodayAppCompleted.self, forKey: .appCompleted)
         sectionName = try c.decodeIfPresent(String.self, forKey: .sectionName) ?? ""
         project = try c.decodeIfPresent(TodayProject.self, forKey: .project) ?? .unfiled
+        // A bridge before 0.152.0 sends no such key, and "no strand known" is exactly
+        // what `nil` means; so is an explicit `null` from a bridge that found none.
+        strand = try c.decodeIfPresent(TodayItemStrand.self, forKey: .strand)
         // A bridge before 0.74.0 sends neither key, and "not postponed" is the
         // correct reading of a bridge that has no idea what postponing is.
         deferred = try c.decodeIfPresent(Bool.self, forKey: .deferred) ?? false
@@ -185,6 +195,18 @@ public struct TodayItem: Decodable, Equatable, Hashable, Identifiable, Sendable 
     /// top-priority item, which the bridge refuses to move (`409`). The UI hides the
     /// move menu for it rather than offering a button that always fails.
     public var isLeadItem: Bool { sectionName.isEmpty }
+}
+
+/// The strand a Today item belongs to: the status note's slug (its file stem under
+/// `Strands/`, which is what `GET /jesse/strands/:slug` takes) and its title.
+public struct TodayItemStrand: Decodable, Equatable, Hashable, Sendable {
+    public var slug: String
+    public var title: String
+
+    public init(slug: String, title: String) {
+        self.slug = slug
+        self.title = title
+    }
 }
 
 /// One item's verdict, as the day screen sees it — a thin projection of the brief's

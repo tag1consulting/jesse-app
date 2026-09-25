@@ -14,6 +14,39 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [App 1.0 (162)] - 2026-09-25
+
+**A Today item opens the strand it belongs to, and a strand's note lists the Today items
+that belong to it.** A row whose item the bridge filed under a strand carries a chip with
+the strand's title; tapping it opens the strand's note, and that note opens with an
+`On Today` block listing today's open items on the strand, each one tap from its detail.
+
+**Root cause: Today items and strands were two unconnected lists, so an item gave no route
+to the work behind it.** A wiki chip on a row only started a conversation, and opening a
+strand's note was private to the Strands segment, so nothing on the day led to a strand and
+nothing on a strand led back to the day.
+
+### Added
+
+- **The strand chip**: first in a Today row's chip flow and beside the project chip in the
+  item detail, labelled with the strand title and the Strands board's symbol. A link chip to
+  the same strand note is dropped, so the strand never shows twice. Read from the bridge's
+  `strand` on each item (bridge 0.152.0); an older bridge sends none and the row is as it was.
+- **`On Today`** above a strand note, in the local reader and the bridge fallback alike:
+  the open items of the day the app holds whose `strand.slug` is that note's slug. Tapping
+  one closes the sheet, selects the Today segment and opens the item's detail. No items, no
+  block.
+- **`N on Today`** under a Strands row, hidden at zero.
+
+### Changed
+
+- **One strand opener**: the local note first, then the bridge's markdown, then the same
+  notice, now `StrandOpener`, owned by each shell and used by the Strands row, the Today
+  chip and the detail chip alike, with one sheet per shell. Same on macOS; the watch is
+  untouched.
+- **`VaultNoteStack` takes an optional header** shown above its root note only, which is
+  how the local reader carries the `On Today` block.
+
 ## [Bridge 0.152.0] - 2026-09-25
 
 **Every Today item names the strand it belongs to, and the nightly audit lists the open
