@@ -103,10 +103,11 @@ pub const ROLLUP_CANDIDATE: &str = "ROLLUP-CANDIDATE";
 pub const DONE_NOT_ARCHIVED: &str = "DONE-NOT-ARCHIVED";
 pub const NOW_LONG: &str = "NOW-LONG";
 pub const FORMAT_V1: &str = "FORMAT-V1";
+pub const UNSTRANDED: &str = "UNSTRANDED";
 
 /// Every code this module can raise, in the order the module documents them.
 /// Used by the test that asserts each one has a fixture and a name.
-pub const FINDING_CODES: [&str; 19] = [
+pub const FINDING_CODES: [&str; 20] = [
     PARSE,
     GROUP,
     STATE,
@@ -126,6 +127,7 @@ pub const FINDING_CODES: [&str; 19] = [
     DONE_NOT_ARCHIVED,
     NOW_LONG,
     FORMAT_V1,
+    UNSTRANDED,
 ];
 
 /// The longest `**Now:**` a v2 note may carry, in characters. Now is the line
@@ -306,6 +308,9 @@ pub struct SnapshotCounts {
     pub active: usize,
     pub waiting: usize,
     pub dormant: usize,
+    /// Open Today items no strand claims: the number of [`UNSTRANDED`]
+    /// findings, served beside the state counts so a client need not count them.
+    pub unstranded: usize,
 }
 
 impl StrandsSnapshot {
@@ -1091,6 +1096,7 @@ pub fn snapshot(notes_root: &Path, today: &str) -> StrandsSnapshot {
         active: strands.iter().filter(|t| t.state == "active").count(),
         waiting: strands.iter().filter(|t| t.state == "waiting").count(),
         dormant: strands.iter().filter(|t| t.state == "dormant").count(),
+        unstranded: 0,
     };
 
     StrandsSnapshot {
@@ -1098,6 +1104,54 @@ pub fn snapshot(notes_root: &Path, today: &str) -> StrandsSnapshot {
         global_findings: global,
         counts,
     }
+}
+
+/// [`snapshot`] plus the [`UNSTRANDED`] findings from the day file: what the
+/// route serves and what the nightly file renders.
+///
+/// The Today side is [`crate::today::build_snapshot`], the very snapshot
+/// `GET /jesse/today` serves, hydrated with the same
+/// [`crate::today::derive_strand`]. That is the whole guarantee that the audit,
+/// the route and the app's strand chip can never disagree about which items are
+/// orphans: there is one derivation and one hydrated snapshot, not a second
+/// reading of the day file here.
+pub fn snapshot_with_today(cfg: &Config, today: &str) -> StrandsSnapshot {
+    let mut snap = snapshot(&notes_root(cfg), today);
+    let (_, day, _) = build_snapshot(cfg);
+    add_unstranded(&mut snap, &day);
+    snap
+}
+
+/// Append one [`UNSTRANDED`] global finding per open Today item whose derived
+/// strand is `None`, and count them. Its message is the item's lead, then its
+/// first wiki link target (the note the item opens), so the vault side can file
+/// it without opening the day file.
+///
+/// A checked item is finished and owes no strand, and neither does an item in
+/// a `Done` section. A missing day file has no items and adds nothing.
+pub fn add_unstranded(snap: &mut StrandsSnapshot, day: &TodaySnapshot) {
+    let items = day
+        .lead_items
+        .iter()
+        .chain(day.sections.iter().flat_map(|s| s.items.iter()));
+    for item in items {
+        if item.checked || item.strand.is_some() || in_done_section(&item.section_name) {
+            continue;
+        }
+        let message = match item.links.iter().find(|l| l.kind == "wiki") {
+            Some(link) => format!("{} · {}", item.lead, vault_relative(&link.target)),
+            None => item.lead.clone(),
+        };
+        snap.global_findings
+            .push(Finding::global(UNSTRANDED, message));
+        snap.counts.unstranded += 1;
+    }
+}
+
+/// A Today section that holds finished work: `Done`, or a heading that starts
+/// with it (`Done Today`).
+fn in_done_section(section_name: &str) -> bool {
+    section_name.trim().to_lowercase().starts_with("done")
 }
 
 /// [`ORPHAN_DRAFT`] and [`UNOWNED_PROMPT`]: the live files under the owned
@@ -1272,7 +1326,7 @@ pub fn run_strands_audit(cfg: &Config, clock: &SchedulerClock) -> AuditWrite {
             return AuditWrite::Unavailable(format!("cannot create {}: {e}", parent.display()));
         }
     }
-    let body = render_report(&snapshot(&notes_root, &date), &date);
+    let body = render_report(&snapshot_with_today(cfg, &date), &date);
     match write_atomic(&path, body.as_bytes()) {
         Ok(()) => AuditWrite::Wrote(path),
         Err(e) => AuditWrite::Unavailable(format!("cannot write {}: {e}", path.display())),
@@ -1387,7 +1441,7 @@ pub async fn jesse_strands(
         ));
     }
     let (today, generated_at) = zoned_now(&st);
-    let snap = snapshot(&notes_root(&st.cfg), &today);
+    let snap = snapshot_with_today(&st.cfg, &today);
     let value = serde_json::to_value(&snap).unwrap_or_else(|_| json!({}));
     Ok(strands_response(&headers, value, &generated_at))
 }
@@ -1925,7 +1979,9 @@ mod tests {
 
     #[test]
     fn every_finding_code_is_raised_by_the_fixtures() {
-        let snap = snapshot(&fixture_root(), "2026-09-23");
+        let mut snap = snapshot(&fixture_root(), "2026-09-23");
+        // UNSTRANDED is about the day file, not a note, so it needs a day.
+        add_unstranded(&mut snap, &parse_today(ONE_OPEN_UNSTRANDED));
         let raised: Vec<&str> = snap
             .strands
             .iter()
@@ -2019,7 +2075,7 @@ mod tests {
                 .keys()
                 .map(|k| k.as_str())
                 .collect::<Vec<_>>(),
-            vec!["active", "dormant", "waiting"]
+            vec!["active", "dormant", "unstranded", "waiting"]
         );
 
         let clean = value["strands"]
@@ -2130,6 +2186,7 @@ mod tests {
                 active: 3,
                 waiting: 0,
                 dormant: 0,
+                unstranded: 0,
             },
             ..StrandsSnapshot::default()
         };
@@ -2137,6 +2194,98 @@ mod tests {
             render_report(&snap, "2026-09-23"),
             "# Strands audit 2026-09-23\n\nActive 3, waiting 0, dormant 0, findings 0.\n\nNo findings.\n"
         );
+    }
+
+    // ---- Unstranded Today items --------------------------------------------
+
+    const ONE_OPEN_UNSTRANDED: &str =
+        "# Today\n\n## Do Now\n\n* [ ] **Nobody claims this.** [[todo-list/Projects/Demo/Nobody]] [[todo-list/Dashboard/Tag1]] (Added 2026-09-23)\n";
+
+    fn unstranded_codes(snap: &StrandsSnapshot) -> Vec<&Finding> {
+        snap.global_findings
+            .iter()
+            .filter(|f| f.code == UNSTRANDED)
+            .collect()
+    }
+
+    #[test]
+    fn an_open_unstranded_item_is_exactly_one_finding_and_a_checked_one_none() {
+        let mut open = StrandsSnapshot::default();
+        add_unstranded(&mut open, &parse_today(ONE_OPEN_UNSTRANDED));
+        let found = unstranded_codes(&open);
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            found[0].message, "Nobody claims this. · Projects/Demo/Nobody",
+            "the lead, then the first wiki link target"
+        );
+        assert_eq!(found[0].line, None, "a global finding");
+        assert_eq!(open.counts.unstranded, 1, "the count matches the findings");
+
+        let mut checked = StrandsSnapshot::default();
+        add_unstranded(
+            &mut checked,
+            &parse_today(&ONE_OPEN_UNSTRANDED.replace("* [ ]", "* [x]")),
+        );
+        assert!(unstranded_codes(&checked).is_empty());
+        assert_eq!(checked.counts.unstranded, 0);
+
+        let mut done = StrandsSnapshot::default();
+        add_unstranded(
+            &mut done,
+            &parse_today(&ONE_OPEN_UNSTRANDED.replace("## Do Now", "## Done")),
+        );
+        assert!(
+            unstranded_codes(&done).is_empty(),
+            "the Done section never counts"
+        );
+
+        let mut missing = StrandsSnapshot::default();
+        add_unstranded(
+            &mut missing,
+            &TodaySnapshot {
+                missing: true,
+                ..TodaySnapshot::default()
+            },
+        );
+        assert!(
+            missing.global_findings.is_empty(),
+            "no day file adds nothing"
+        );
+    }
+
+    /// The route's and the writer's path: the fixture day file through the real
+    /// `build_snapshot`, hydrated with the same strand derivation the chip reads.
+    #[test]
+    fn the_route_lists_every_open_item_the_derivation_leaves_null() {
+        let cfg = Config {
+            vault: Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/today/strands")
+                .to_string_lossy()
+                .into_owned(),
+            ..crate::testutil::test_config()
+        };
+        let snap = snapshot_with_today(&cfg, "2026-09-23");
+        let (_, day, _) = build_snapshot(&cfg);
+        let expected: Vec<&str> = day
+            .sections
+            .iter()
+            .filter(|s| s.name == "Do Now")
+            .flat_map(|s| s.items.iter())
+            .filter(|i| !i.checked && i.strand.is_none())
+            .map(|i| i.lead.as_str())
+            .collect();
+        let found = unstranded_codes(&snap);
+        assert_eq!(found.len(), 4, "{found:?}");
+        assert_eq!(snap.counts.unstranded, found.len());
+        for (finding, lead) in found.iter().zip(&expected) {
+            assert!(finding.message.starts_with(lead), "{finding:?} vs {lead}");
+        }
+        let text = serde_json::to_string(&snap).unwrap();
+        assert!(
+            !text.contains("A checked item"),
+            "a checked item never counts"
+        );
+        assert!(!text.contains("under Done"), "a Done section never counts");
     }
 
     // ---- The writer --------------------------------------------------------
@@ -2184,6 +2333,10 @@ mod tests {
         assert!(path.ends_with("Inbox/2026-09-23-strands-audit.md"));
         let written = std::fs::read_to_string(&path).unwrap();
         assert!(written.starts_with("# Strands audit 2026-09-23\n"));
+        assert!(
+            !written.contains(UNSTRANDED),
+            "a vault with no Today.md adds no unstranded finding"
+        );
 
         // The idempotency guarantee: a second pass on the same day leaves the
         // file it found exactly as it was.
@@ -2193,6 +2346,27 @@ mod tests {
             AuditWrite::AlreadyThere(path.clone())
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "hand edited\n");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn writer_lists_the_day_files_unstranded_items() {
+        let root = temp_vault("unstranded");
+        std::fs::write(
+            root.join(crate::config::VAULT_SUBDIR).join(TODAY_FILE),
+            ONE_OPEN_UNSTRANDED,
+        )
+        .unwrap();
+        let zone = SchedulerZone::hours_east(2);
+        let clock = SchedulerClock::frozen(zone, at(zone, 2026, 9, 23, 3, 21));
+        let AuditWrite::Wrote(path) = run_strands_audit(&cfg_at(&root), &clock) else {
+            panic!("expected a write");
+        };
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            written.contains("- UNSTRANDED · Nobody claims this. · Projects/Demo/Nobody\n"),
+            "{written}"
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 

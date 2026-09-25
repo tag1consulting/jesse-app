@@ -101,6 +101,11 @@ pub struct TodayItem {
     /// and putting any of them on the wire would freeze a rendering decision
     /// into the API. See [`derive_project`] for how it is resolved.
     pub project: &'static str,
+    /// The strand this item belongs to, or `None` when none can be derived. Like
+    /// `project`, the parse alone leaves it `None` and [`hydrate`] stamps it from
+    /// the `Strands/` notes; see [`derive_strand`]. `None` is an honest answer,
+    /// and the nightly audit lists every open item that carries it.
+    pub strand: Option<TodayItemStrand>,
     /// Whether the app has **postponed this item for the day**, and the client
     /// millisecond clock that claim was made on.
     ///
@@ -502,6 +507,207 @@ fn section_tiebreak(section_name: &str, candidates: &[&'static str]) -> &'static
         }
     }
     hit.unwrap_or(PROJECT_UNFILED)
+}
+
+// ---- The strand ------------------------------------------------------------
+
+/// The strand an item belongs to: the note's slug (its file stem under
+/// `Strands/`) and its H1 title. The slug addresses the note on
+/// `GET /jesse/strands/{slug}`; the title is what a chip reads.
+#[derive(serde::Serialize, PartialEq, Eq, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct TodayItemStrand {
+    pub slug: String,
+    pub title: String,
+}
+
+/// One live strand as the derivation needs it. `targets` are [`note_key`]s, so
+/// an item's link and a note's link compare with the same normalisation.
+#[derive(Debug, Clone)]
+struct StrandEntry {
+    slug: String,
+    title: String,
+    parent: Option<String>,
+    targets: Vec<String>,
+}
+
+/// Every live strand note, read from `Strands/*.md`: the table [`derive_strand`]
+/// matches an item's links against.
+///
+/// **Live only.** `Strands/archive/` is a subdirectory and is never walked, and
+/// a note whose frontmatter says `state: done` is skipped: an item that still
+/// links a finished strand's files has no thread to go back to, and filing it
+/// under one would hide exactly the orphan the audit exists to list.
+///
+/// A missing or unreadable `Strands/` directory is an empty table, so every
+/// item derives `null` and the day still renders: the same degradation as
+/// [`ProjectRollup`].
+#[derive(Default)]
+pub struct StrandTable {
+    strands: Vec<StrandEntry>,
+}
+
+impl StrandTable {
+    /// Read the live notes under the configured vault root. The directory is a
+    /// constant joined onto the configured root and nothing in it comes from a
+    /// request, so this is not a path surface.
+    pub fn load(cfg: &Config) -> Self {
+        Self::load_from(&notes_root(cfg))
+    }
+
+    /// [`StrandTable::load`] against a notes root rather than a config: the
+    /// `strands_audit` example's entry, which has a vault path and no bridge.
+    pub fn load_from(notes_root: &Path) -> Self {
+        let dir = notes_root.join(crate::strands::STRANDS_DIR);
+        let mut paths: Vec<PathBuf> = match std::fs::read_dir(&dir) {
+            Ok(rd) => rd
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| p.is_file() && p.extension().is_some_and(|x| x == "md"))
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+        paths.sort();
+        let mut notes: Vec<(String, String)> = Vec::new();
+        for path in paths {
+            let Some(slug) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            let Ok(src) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            notes.push((slug.to_string(), src));
+        }
+        Self::from_notes(notes.iter().map(|(s, src)| (s.as_str(), src.as_str())))
+    }
+
+    /// Build the table from `(slug, markdown)` pairs, parsed with the one strand
+    /// parser, [`crate::strands::parse_strand`]. `load` is this plus the
+    /// directory walk, which keeps the derivation testable without a vault.
+    pub fn from_notes<'a>(notes: impl IntoIterator<Item = (&'a str, &'a str)>) -> Self {
+        let mut strands = Vec::new();
+        for (slug, src) in notes {
+            let parsed = crate::strands::parse_strand(slug, src);
+            if parsed.state == "done" {
+                continue;
+            }
+            strands.push(StrandEntry {
+                title: match parsed.title.is_empty() {
+                    true => parsed.slug.clone(),
+                    false => parsed.title.clone(),
+                },
+                slug: parsed.slug,
+                parent: parsed.parent,
+                targets: parsed.targets.iter().map(|t| note_key(t)).collect(),
+            });
+        }
+        Self { strands }
+    }
+
+    fn by_slug(&self, slug: &str) -> Option<&StrandEntry> {
+        self.strands
+            .iter()
+            .find(|s| s.slug.eq_ignore_ascii_case(slug))
+    }
+
+    /// Whether `slug` descends from `ancestor` through the `parent` chain. The
+    /// walk is bounded by the table's size, so a parent cycle written by hand
+    /// ends rather than spins.
+    fn descends_from(&self, slug: &str, ancestor: &str) -> bool {
+        let mut at = self.by_slug(slug).and_then(|s| s.parent.as_deref());
+        for _ in 0..self.strands.len() {
+            let Some(parent) = at else {
+                return false;
+            };
+            if parent.eq_ignore_ascii_case(ancestor) {
+                return true;
+            }
+            at = self.by_slug(parent).and_then(|s| s.parent.as_deref());
+        }
+        false
+    }
+
+    /// Re-derive every item's strand with this table in hand. The strand
+    /// counterpart of [`ProjectRollup::stamp_into`], and run beside it inside
+    /// [`hydrate`] for the reason given there.
+    pub fn stamp_into(&self, snapshot: &mut TodaySnapshot) {
+        for item in snapshot.lead_items.iter_mut().chain(
+            snapshot
+                .sections
+                .iter_mut()
+                .flat_map(|s| s.items.iter_mut()),
+        ) {
+            item.strand = derive_strand(&item.links, self);
+        }
+    }
+}
+
+/// The key of a live strand note an item links directly (`strands/<slug>`,
+/// nothing deeper, so `strands/archive/…` is never one).
+fn strand_note_slug(key: &str) -> Option<&str> {
+    key.strip_prefix("strands/").filter(|s| !s.contains('/'))
+}
+
+/// Whether a link can never place an item on a strand: one of the five
+/// Dashboard topic homes, or `Today` itself. Every item carries a topic link,
+/// and a topic is not a thread, so matching on it would put every item on
+/// whichever strand lists its topic page.
+fn never_a_strand_signal(key: &str) -> bool {
+    key == "today" || topic_home_slug(key).is_some()
+}
+
+/// **The strand derivation.** A pure function of an item's links and the
+/// strand table: no clock, no request, no section heading, no prose.
+///
+/// In order:
+///
+/// 1. A link to `Strands/<slug>` naming a live strand is the item's declared
+///    strand and wins outright (the first such link, in the item's order).
+/// 2. Otherwise every live strand whose note links one of the item's wiki
+///    targets is a candidate. A topic home or `Today` never matches (see
+///    [`never_a_strand_signal`]), and neither does a link to a strand note,
+///    which step 1 has already had its say on.
+/// 3. One candidate: that strand.
+/// 4. Several: when one candidate descends, through the `parent` chain, from
+///    every other, that deepest one wins (a note both Tag1 and Scolta list is
+///    Scolta's when Scolta was split out of Tag1). Otherwise `None`.
+/// 5. No candidates: `None`. An unmatched item is honest, not an error; the
+///    nightly audit lists it as `UNSTRANDED` so the vault side can file it.
+pub fn derive_strand(links: &[TodayLink], table: &StrandTable) -> Option<TodayItemStrand> {
+    let keys: Vec<String> = links
+        .iter()
+        .filter(|l| l.kind == "wiki")
+        .map(|l| note_key(&l.target))
+        .filter(|k| !k.is_empty())
+        .collect();
+    let chosen = keys
+        .iter()
+        .filter_map(|k| strand_note_slug(k))
+        .find_map(|slug| table.by_slug(slug))
+        .or_else(|| {
+            let signals: Vec<&String> = keys
+                .iter()
+                .filter(|k| !never_a_strand_signal(k) && strand_note_slug(k).is_none())
+                .collect();
+            let candidates: Vec<&StrandEntry> = table
+                .strands
+                .iter()
+                .filter(|s| signals.iter().any(|k| s.targets.contains(k)))
+                .collect();
+            match candidates.as_slice() {
+                [] => None,
+                [only] => Some(*only),
+                many => many.iter().copied().find(|c| {
+                    many.iter()
+                        .filter(|o| o.slug != c.slug)
+                        .all(|o| table.descends_from(&c.slug, &o.slug))
+                }),
+            }
+        })?;
+    Some(TodayItemStrand {
+        slug: chosen.slug.clone(),
+        title: chosen.title.clone(),
+    })
 }
 
 // ---- Line scanning ---------------------------------------------------------
@@ -978,6 +1184,9 @@ fn build_item(
         // [`ProjectRollup::stamp_into`], keeping this parse a pure function of
         // its own source.
         project: derive_project(&links, section_name, &ProjectRollup::default()),
+        // Nothing in the day file alone names a strand: the table lives in the
+        // `Strands/` notes, and [`StrandTable::stamp_into`] fills this in.
+        strand: None,
         links,
         updated_date: trailer_date(&text, "updated "),
         added_date,
@@ -1568,7 +1777,7 @@ pub fn build_snapshot(cfg: &Config) -> (Option<String>, TodaySnapshot, String) {
 }
 
 /// Everything that happens to a snapshot AFTER the parse: the project rollup,
-/// the glance flags and the postponements.
+/// the strand, the glance flags and the postponements.
 ///
 /// **One definition, because the etag depends on it.** `snapshot_etag` hashes the
 /// whole serialized snapshot, and the write path's `If-Match` check re-derives
@@ -1579,6 +1788,7 @@ pub fn build_snapshot(cfg: &Config) -> (Option<String>, TodaySnapshot, String) {
 /// documents cannot drift apart.
 pub fn hydrate(cfg: &Config, snapshot: &mut TodaySnapshot) {
     ProjectRollup::load(cfg).stamp_into(snapshot);
+    StrandTable::load(cfg).stamp_into(snapshot);
     GlanceStore::load(cfg.state_dir.as_deref()).merge_into(snapshot);
     DeferStore::load(cfg.state_dir.as_deref()).merge_into(snapshot);
     // The brief's verdict, on the SAME footing as the two stores above and for the same
@@ -2200,6 +2410,150 @@ mod tests {
         let reworded = PROJECTS.replacen("Added 2026-03-01", "Added 2026-03-02", 1);
         assert_ne!(PROJECTS, reworded, "the fixture really did change");
         assert_ne!(document_etag(PROJECTS), document_etag(&reworded));
+    }
+
+    // ---- The strand --------------------------------------------------------
+
+    /// The vault REPO whose `vault/` holds the invented strand fixtures: five
+    /// live and done notes, one archived, and a day file written against them.
+    fn strand_fixture_cfg() -> Config {
+        Config {
+            vault: Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/today/strands")
+                .to_string_lossy()
+                .into_owned(),
+            ..crate::testutil::test_config()
+        }
+    }
+
+    /// The fixture day file through the real `build_snapshot`, so every test
+    /// below reads the snapshot the route serves.
+    fn strands_snapshot() -> TodaySnapshot {
+        build_snapshot(&strand_fixture_cfg()).1
+    }
+
+    fn strand_of(snap: &TodaySnapshot, section_name: &str, lead_starts: &str) -> Option<String> {
+        item(section(snap, section_name), lead_starts)
+            .strand
+            .as_ref()
+            .map(|s| s.slug.clone())
+    }
+
+    #[test]
+    fn a_direct_strand_link_wins_outright() {
+        let snap = strands_snapshot();
+        assert_eq!(
+            strand_of(&snap, "Do Now", "A direct strand link wins").as_deref(),
+            Some("Other-Strand"),
+            "the Strands/ link outranks the note only Child links"
+        );
+    }
+
+    #[test]
+    fn a_note_one_strand_links_is_that_strand() {
+        let snap = strands_snapshot();
+        assert_eq!(
+            strand_of(&snap, "Do Now", "A note one strand links").as_deref(),
+            Some("Child-Strand")
+        );
+        assert_eq!(
+            strand_of(&snap, "Do Now", "The same note by its vault spelling").as_deref(),
+            Some("Other-Strand"),
+            "the vault spelling, the extension and a heading all normalise away"
+        );
+    }
+
+    #[test]
+    fn a_parent_and_child_tie_goes_to_the_deepest_descendant() {
+        let snap = strands_snapshot();
+        assert_eq!(
+            strand_of(&snap, "Do Now", "A note the parent and the child").as_deref(),
+            Some("Child-Strand")
+        );
+        assert_eq!(
+            strand_of(&snap, "Do Now", "A note three generations link").as_deref(),
+            Some("Grandchild-Strand"),
+            "the parent chain is followed past one step"
+        );
+    }
+
+    #[test]
+    fn two_unrelated_candidates_give_none() {
+        let snap = strands_snapshot();
+        assert_eq!(
+            strand_of(&snap, "Do Now", "A note two unrelated strands link"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_topic_home_or_the_day_file_never_matches() {
+        let snap = strands_snapshot();
+        assert_eq!(
+            strand_of(&snap, "Do Now", "Only a topic home and the day file"),
+            None,
+            "Parent lists Dashboard/Tag1 and Today, and neither is a thread"
+        );
+    }
+
+    #[test]
+    fn a_done_or_archived_strand_never_matches() {
+        let snap = strands_snapshot();
+        assert_eq!(
+            strand_of(&snap, "Do Now", "A note only a done strand links"),
+            None,
+            "neither the note it lists nor a direct link to it"
+        );
+        assert_eq!(
+            strand_of(&snap, "Do Now", "A note only an archived strand links"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_missing_strands_directory_stamps_none_and_never_fails_the_day() {
+        let mut snap = parse_today(include_str!(
+            "../tests/fixtures/today/strands/vault/Today.md"
+        ));
+        StrandTable::load_from(Path::new("/nonexistent/notes")).stamp_into(&mut snap);
+        assert!(snap.all_items().all(|i| i.strand.is_none()));
+        assert!(!snap.all_items().collect::<Vec<_>>().is_empty());
+    }
+
+    #[test]
+    fn the_strand_is_on_the_wire_and_folds_into_the_snapshot_etag() {
+        let snap = strands_snapshot();
+        let wire = serde_json::to_value(&snap).unwrap();
+        let items = &wire["sections"][0]["items"];
+        assert_eq!(
+            items[0]["strand"],
+            json!({ "slug": "Other-Strand", "title": "Other Strand" }),
+            "a slug and a title, and nothing else"
+        );
+        assert!(
+            items[4]["strand"].is_null(),
+            "an unmatched item is null, not absent"
+        );
+        assert!(items[4].get("strand").is_some());
+
+        let before = snapshot_etag(&snap);
+        let mut moved = snap.clone();
+        moved.sections[0].items[0].strand = Some(TodayItemStrand {
+            slug: "Child-Strand".to_string(),
+            title: "Child Strand".to_string(),
+        });
+        assert_ne!(
+            before,
+            snapshot_etag(&moved),
+            "a change of strand moves the tag"
+        );
+        assert_ne!(
+            before,
+            snapshot_etag(&parse_today(include_str!(
+                "../tests/fixtures/today/strands/vault/Today.md"
+            ))),
+            "stamping the strands must invalidate a cached snapshot"
+        );
     }
 
     #[test]

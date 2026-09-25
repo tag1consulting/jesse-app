@@ -2062,7 +2062,7 @@ the screen and the nightly file can never disagree.
 
 | Route | Returns |
 | --- | --- |
-| `GET /jesse/strands` | `{ generated_at, strands: [...], global_findings: [...], counts: { active, waiting, dormant } }`. Every note whose state is not `done`, sorted by `updated` descending, then title. Each strand carries `slug`, `title`, `group`, `state`, `updated`, `repos`, `now`, `waiting` (`{ text, jeremy }` or null), `next` (`{ id, text, link, waits_on }` or null), `counts` (`queue`, `later`, `running`, `done`) and its `findings` (`{ code, message, line }`). |
+| `GET /jesse/strands` | `{ generated_at, strands: [...], global_findings: [...], counts: { active, waiting, dormant, unstranded } }`. Every note whose state is not `done`, sorted by `updated` descending, then title. Each strand carries `slug`, `title`, `group`, `state`, `updated`, `repos`, `now`, `waiting` (`{ text, jeremy }` or null), `next` (`{ id, text, link, waits_on }` or null), `counts` (`queue`, `later`, `running`, `done`) and its `findings` (`{ code, message, line }`). |
 | `GET /jesse/strands/:slug` | `{ generated_at, markdown, strand }` for one note. `404` for an unknown slug, and for any slug carrying `/`, `\` or `..`, before a path is built. |
 
 Both take the bearer token and the shared limiter, and both carry a strong
@@ -2084,8 +2084,20 @@ archived report raises nothing), `RUNNING-SILENT` (over 3 days, or undated),
 `CHECKED-NOT-MOVED`, `NO-NEXT`, `DUP-ID`, and the global `ORPHAN-DRAFT` and
 `UNOWNED-PROMPT` (both over `Projects/drafts/` and `Projects/Research/`, not their
 `archive/`) and `DONE-NOT-ARCHIVED`, plus `FORMAT-V1` (the note still uses the v1 layout) and
-`NOW-LONG` (a v2 note whose Now is over 280 characters). The grammar is documented on
-`strands::parse_strand`.
+`NOW-LONG` (a v2 note whose Now is over 280 characters), and the global `UNSTRANDED`
+(below). The grammar is documented on `strands::parse_strand`.
+
+**Today items and their strand.** Every item `GET /jesse/today` serves carries
+`strand: { slug, title }` or `null`, stamped in `hydrate()` beside the project rollup
+by `today::derive_strand` over the live notes (not `archive/`, not `state: done`): a
+link to `Strands/<slug>` wins; otherwise the strands whose notes link one of the
+item's wiki targets are candidates, ignoring the five `Dashboard/<Topic>` pages and
+`Today`; one candidate wins, several resolve to the one that descends from all the
+others through `parent`, or to `null`. Every open item outside a `Done` section whose
+strand is `null` is one global `UNSTRANDED` finding (the lead, then the first wiki
+target), counted in `counts.unstranded`. The route and the nightly file read the same
+hydrated Today snapshot, so the chip and the audit cannot disagree. A missing
+`Today.md` adds nothing; the vault side files each orphan by linking its strand.
 
 **Two layouts.** A note with `## Queue` is v1 (`## Queue` with `### Later`, `## Running`,
 `## Done`, `## Decisions`, `## Links`) and carries `FORMAT-V1` until it is moved. A note
@@ -2098,7 +2110,8 @@ above Later, and the four counts are read off the one list. v1 parsing goes once
 audit reports no `FORMAT-V1`.
 
 **Dry run.** `cargo run --example strands_audit -- ~/jesse/vault` prints the
-report the nightly writer would write, and writes nothing.
+report the nightly writer would write, and writes nothing. `--items` prints every
+Today item's lead with its derived strand instead.
 
 **A tick starts a turn.** A Queue, Later or Running line that becomes `[x]` starts one
 agent turn whose whole message is `Jeremy ticked <ID> in Strands/<Note>` (a `tell`, on the

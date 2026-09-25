@@ -14,6 +14,36 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [Bridge 0.152.0] - 2026-09-25
+
+**Every Today item names the strand it belongs to, and the nightly audit lists the open
+items no strand claims.** An item on `GET /jesse/today` now carries `strand: { slug, title }`
+or `null`, which is what the app needs to put a strand chip on the row and a list of today's
+items on a strand note.
+
+**Root cause: Today items and strands were two unconnected lists, so an item gave no route
+to the work behind it.** A Today item knew its topic and its links; a strand note knew every
+file it tracks; nothing related the two, so the phone could not get from "do this today" to
+"where this work stands", and an item that belonged to no strand was invisible as such.
+
+### Added
+
+- **`strand` on every Today item**, derived by `derive_strand` over the live notes under
+  `Strands/` (never `Strands/archive/`, never `state: done`). A link to `Strands/<slug>`
+  wins outright; otherwise every strand whose note links one of the item's wiki targets is
+  a candidate, the five `Dashboard/<Topic>` pages and `Today` never count, and several
+  candidates resolve to the one that descends from all the others through `parent`, or to
+  `null`. Stamped inside `hydrate()` beside the project rollup, so the read and the write
+  path hash the same snapshot and `If-Match` is unaffected. A missing `Strands/` stamps
+  `null` everywhere and never fails the day.
+- **`UNSTRANDED`**, a global audit finding: one per open Today item whose strand is `null`,
+  outside a `Done` section, its message the lead and then the first wiki target. Written to
+  the nightly `Inbox/YYYY-MM-DD-strands-audit.md` and served in `global_findings` on
+  `GET /jesse/strands`, with a new `counts.unstranded`. Both read the same hydrated Today
+  snapshot the chip does, so the three cannot disagree about which items are orphans.
+- **`strands_audit --items`**: the dry run example prints every Today item with its derived
+  strand. The example's report now includes `UNSTRANDED` too.
+
 ## [App 1.0 (161)] - 2026-09-25
 
 **The Vault tab's Strands scope is the record of every strand, and it can be read one
