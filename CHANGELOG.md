@@ -14,6 +14,72 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [App 1.0 (160)] - 2026-09-25
+
+**`JesseKit` did not compile on any toolchain this repository builds with.**
+`FoundationVaultAnswerSession.isContextWindow` named `LanguageModelError` and its case
+`.contextSizeExceeded`, which exist only in the 27 SDK. `swift build` failed under SDK 26.2
+on the Studio, so every app push failed the pre-push hook. It also failed under Xcode 26.6,
+which is the hosted runner's `latest-stable`, so the nightly `ios-ci.yml` has been red since
+the 2026-09-24 run.
+
+**The root cause: a runtime availability check used where a compile-time SDK check was
+needed.** The symbol came in with #208 (App 1.0 (148)). It sat inside
+`if #available(iOS 27.0, macOS 27.0, *)`, which decides at run time which code executes.
+The compiler still has to resolve every name inside that block, so an SDK without the
+type cannot build the file at all.
+
+**The fix.** The two context-window errors are now recognised by name. For the 26
+spelling, `LanguageModelSession.GenerationError.exceededContextWindowSize`, that means its
+case label. For the 27 spelling, `LanguageModelError.contextSizeExceeded`, it means the
+type name together with the case name. So the file names no type that one SDK lacks and
+none that another deprecates. A compile-time condition was rejected: Swift has no SDK
+version check. `#if compiler(...)` tracks the Swift version, which moves within an SDK
+major, and `canImport(FoundationModels, _version:)` needs the 27 SDK's module version,
+which no toolchain here can show. The retry on a context overflow is kept on both
+vintages.
+
+`ContextWindowErrorTests` covers both vintages. It builds the real 26 error from the SDK,
+because what can fail there is reflection on Apple's type. The 27 error is a test double
+with the same type and case name, with and without an associated value. An unrelated
+error, a matching case name on a different type, and an error with its own description
+are all rejected.
+
+**Test-only isolation fixes the compile failure had hidden.** Six `JesseVaultTests` files
+added on 2026-09-23 called main-actor API from nonisolated test code, which is an error
+under `-warnings-as-errors`. No toolchain had compiled them with that flag, because the
+failure above stopped the build first. Their sync `setUp`/`tearDown` overrides are now the
+`async throws` forms this suite already uses elsewhere, and the individual test methods
+that touch `VaultNoteReaderView` statics are `@MainActor`.
+
+**The pre-push gate can pass on the Studio again.** `scripts/local-ci-macos.sh` failed on
+any host older than macOS 26, even with the code fixed. There, `swift test` cannot load a
+bundle that targets macOS 26 and links `FoundationModels`. No iOS 26.3 simulator is
+eligible for JesseKit's iOS 26.5 minimum. And `xcodebuild` will not run the Mac test host.
+The result was that app pushes went out with `--no-verify`, so nothing checked them. On
+such a host the script now:
+
+- builds JesseKit and its tests on the host with warnings as errors;
+- runs the JesseKit tests on the iOS simulator, from a synced copy of the package whose
+  iOS minimum is lowered to fit the runtime (the tracked `Package.swift` is never
+  edited);
+- builds the iOS app for the generic simulator with warnings as errors;
+- skips the iOS and Mac test stages;
+- skips one test by name that fails only on the simulator: the text/markdown case of
+  `ArtifactFileTypeTests`.
+
+The watch stages and the Mac build run as before. Every skip prints as SKIP in the summary
+and is counted in the final line. On a macOS 26 host the checks are unchanged. This is
+also the guard against the next SDK 27 only symbol: the Studio's SDK 26.2 is the oldest
+SDK anything builds with, and its gate now reaches a verdict instead of being bypassed.
+
+**The pre-push hook checks a new branch against `main`.** When a branch was pushed for
+the first time, it had no remote sha and no upstream, so the hook fell back to `HEAD~1`
+and measured only the last commit. If that commit touched only `scripts/`, the macOS
+checks were skipped as "no changes under Jesse/ or JesseKit/", even though the branch
+carried app changes. The version guard also saw only that one commit. A new branch is
+now measured from its merge base with `origin/main`.
+
 ## [App 1.0 (159)] - 2026-09-25
 
 **The reader could show a mark, and the only way to make one was to type braces by hand.**

@@ -94,6 +94,7 @@ final class VaultEditorLatencyTests: XCTestCase {
     }
 
     /// Lay the document out for real, through whichever TextKit the view is using.
+    @MainActor
     static func forceLayout(_ view: NSTextView) {
         if let layout = view.textLayoutManager, let content = layout.textContentManager {
             layout.ensureLayout(for: content.documentRange)

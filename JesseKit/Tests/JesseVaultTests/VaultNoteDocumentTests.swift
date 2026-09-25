@@ -208,6 +208,7 @@ final class VaultNoteDocumentTests: XCTestCase {
 
     /// Every note says where it came from, whether or not it is stale: a badge that appears
     /// sometimes is a badge nobody reads.
+    @MainActor
     func testTheProvenanceLineNamesTheLocalCopyAlways() {
         XCTAssertTrue(VaultNoteReaderView.provenance(nil).contains("Local copy"))
         XCTAssertTrue(VaultNoteReaderView.provenance(Date()).contains("Local copy"))
@@ -267,6 +268,7 @@ final class VaultNoteDocumentTests: XCTestCase {
         XCTAssertEqual(document.annotationCount, 1)
     }
 
+    @MainActor
     func testTheMissingLinkCaptionNamesTheFileRatherThanThePath() {
         let block = VaultNoteBlock(id: 0, kind: .paragraph,
                                    text: "See [[Projects/Deep/Nowhere]].")
