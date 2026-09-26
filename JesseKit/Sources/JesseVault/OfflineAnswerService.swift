@@ -135,9 +135,25 @@ public final class OfflineLookupDiagnostics {
     public func clear() { records = [] }
 }
 
+/// What a composer asks of the on-device path: where a send goes, and what the device makes
+/// of a question it takes.
+///
+/// A protocol over the two calls the apps actually make, so a test can drive the whole send
+/// path — routed offline, answered, refused, queued — without a vault folder, an index, or a
+/// model on the host. The production conformance is `OfflineAnswerService` below and there is
+/// no other; this exists to make the app's own behaviour testable, not to invite a second
+/// implementation of the offline pipeline.
+@MainActor
+public protocol OfflineAnswering: AnyObject {
+    /// The route one send takes.
+    func route(reachability: BridgeReachabilityState) -> OfflineSendRoute
+    /// Answer one question from the copy of the vault on this device.
+    func answer(_ question: String) async -> VaultAnswerOutcome
+}
+
 /// Gate, retrieve, answer.
 @MainActor
-public final class OfflineAnswerService {
+public final class OfflineAnswerService: OfflineAnswering {
     /// See the GOTCHA in this target's `Package.swift` comment.
     nonisolated deinit {}
 

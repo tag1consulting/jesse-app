@@ -826,9 +826,16 @@ public enum OutboxState: String {
 /// live here rather than in memory so a relaunch resumes the same schedule rather than
 /// granting a fresh budget.
 ///
+/// Not every item is a message the user typed. An OFFLINE REVIEW (`isOfflineReview`) is
+/// staged by the app itself, in the same save as the on-device reply it reports, so that what
+/// a 3B model answered while the bridge was away reaches the bridge by itself rather than
+/// riding whatever message happens to be sent next. It is an ordinary outbox item in every
+/// other respect, which is the point: one retry schedule, one reconcile pass, one per-message
+/// Retry.
+///
 /// `id` IS the wire `request_id` (the bridge's idempotency key). All properties are
 /// defaulted so existing stores lightweight-migrate, matching how `TurnAttachment`
-/// was added — including the two above, which is what makes this a lightweight migration
+/// was added — including the four above, which is what makes this a lightweight migration
 /// and not a migration plan. Registered in `AppModelContainer` via `JesseSchemaV2`.
 @Model
 public final class OutboxItem {
@@ -864,6 +871,19 @@ public final class OutboxItem {
     // that has already used four of its five attempts must not get five more because the
     // app was killed.
     public var nextRetryAt: Date?
+    // Whether this message is an OFFLINE REVIEW rather than something the user typed: the
+    // record of what the on-device model answered while the bridge was unreachable, staged
+    // the moment it answered so the existing retry schedule delivers it by itself. It needs
+    // a flag of its own because it is found by kind — a second answer on the same
+    // conversation is APPENDED to the review already staged rather than staging a second
+    // one, so a reconnect produces one review turn per conversation and not a queue of them.
+    public var isOfflineReview: Bool = false
+    // The exchanges this review is holding, JSON-encoded (`OfflineAnswerCarry.encode`).
+    // THE PAIRS ARE THE TRUTH and `text` is rendered from them, which is what makes the
+    // append possible after a relaunch: without them the only record of an earlier exchange
+    // would be the rendered text, and text cannot be appended to without reparsing it.
+    // Nil on every message that is not a review.
+    public var offlineReviewPairs: Data?
 
     @Relationship(deleteRule: .cascade, inverse: \OutboxAttachment.item)
     public var attachments: [OutboxAttachment] = []

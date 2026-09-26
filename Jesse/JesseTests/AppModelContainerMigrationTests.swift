@@ -279,6 +279,48 @@ final class AppModelContainerMigrationTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: url.path), "the on-disk file is preserved")
         XCTAssertEqual(try Data(contentsOf: url), garbage, "the on-disk file is left exactly as it was")
     }
+
+    /// The two fields an OFFLINE REVIEW adds to `OutboxItem` — `isOfflineReview` and
+    /// `offlineReviewPairs` — are defaulted, which is what makes this a lightweight migration
+    /// and not a migration plan. Defaulting is not enough on its own, though: the pairs are the
+    /// truth a second offline answer is APPENDED to, and an append after a relaunch reads them
+    /// back off disk, so they have to round-trip.
+    func testTheOfflineReviewFieldsDefaultAndRoundTrip() throws {
+        let url = tempStoreURL()
+        defer { removeStore(url) }
+
+        // A store written the old way, with no review columns at all.
+        let legacy = try ModelContainer(for: legacyBareSchema,
+                                        configurations: ModelConfiguration(url: url))
+        let legacyContext = ModelContext(legacy)
+        let thread = JesseThread(mode: .ask)
+        legacyContext.insert(thread)
+        try legacyContext.save()
+
+        // Opened under the live schema: a message the user typed reads the defaults.
+        let ctx = ModelContext(AppModelContainer.load(url: url).container)
+        let typed = OutboxItem(threadID: thread.id, turnID: UUID(), text: "hi", mode: .ask,
+                               voice: false)
+        ctx.insert(typed)
+        let review = OutboxItem(threadID: thread.id, turnID: UUID(), text: "the review",
+                                mode: .ask, voice: false)
+        review.isOfflineReview = true
+        review.offlineReviewPairs = Data([0x5B, 0x5D]) // "[]" — opaque to this layer
+        ctx.insert(review)
+        try ctx.save()
+        XCTAssertFalse(typed.isOfflineReview, "a message the user typed is not a review")
+        XCTAssertNil(typed.offlineReviewPairs)
+
+        // And both survive a reopen.
+        let ctx2 = ModelContext(AppModelContainer.load(url: url).container)
+        let items = try ctx2.fetch(FetchDescriptor<OutboxItem>())
+        XCTAssertEqual(items.count, 2)
+        let reopenedReview = try XCTUnwrap(items.first { $0.isOfflineReview })
+        XCTAssertEqual(reopenedReview.text, "the review")
+        XCTAssertEqual(reopenedReview.offlineReviewPairs, Data([0x5B, 0x5D]),
+                       "the pairs a later answer is appended to survive a relaunch")
+        XCTAssertEqual(items.filter { !$0.isOfflineReview }.count, 1)
+    }
 }
 
 /// A frozen copy of a PRIOR `JesseThread` shape (no archive fields), used ONLY to

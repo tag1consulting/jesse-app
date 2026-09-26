@@ -64,12 +64,16 @@ final class LookupGateTests: XCTestCase {
         XCTAssertEqual(LookupGate.Refusal.noWords.because, "it has no words to look up")
     }
 
+    /// Forty words, question-shaped, because length is the only thing under test here: a
+    /// rambling question is still a question, and a pasted paragraph is not one however it
+    /// opens.
     func testQuestionLongerThanFortyWordsIsRefused() {
-        let forty = Array(repeating: "word", count: 40).joined(separator: " ")
+        let forty = (["what"] + Array(repeating: "word", count: 39)).joined(separator: " ")
         XCTAssertEqual(LookupGate.rule(forty), .passed,
                        "exactly forty words is still a question")
-        let fortyOne = Array(repeating: "word", count: 41).joined(separator: " ")
-        XCTAssertEqual(LookupGate.rule(fortyOne), .refused(.tooLong))
+        let fortyOne = (["what"] + Array(repeating: "word", count: 40)).joined(separator: " ")
+        XCTAssertEqual(LookupGate.rule(fortyOne), .refused(.tooLong),
+                       "length is decided before the question rule, so this is 'too long'")
         XCTAssertEqual(LookupGate.Refusal.tooLong.because, "it is longer than a lookup")
     }
 
@@ -83,7 +87,7 @@ final class LookupGateTests: XCTestCase {
             XCTAssertTrue(verb.because.hasPrefix("it asks "),
                           "\(verb.verb): '\(verb.because)' must read as a reason")
         }
-        XCTAssertEqual(LookupGate.requestVerbs.count, 13,
+        XCTAssertEqual(LookupGate.requestVerbs.count, 29,
                        "the list is the contract; a change here is a behaviour change")
     }
 
@@ -110,6 +114,66 @@ final class LookupGateTests: XCTestCase {
     func testPunctuationAroundAVerbStillCounts() {
         XCTAssertNotEqual(LookupGate.rule("can you (draft) something"), .passed)
         XCTAssertNotEqual(LookupGate.rule("plan, then tell me"), .passed)
+    }
+
+    // MARK: - A lookup has to read as a question
+
+    /// THE SENTENCE THAT VANISHED. "Track two cups of coffee. 6:50 and 7:20." passed this
+    /// gate on 2026-09-26 — no listed verb, so nothing refused it — and a 3B model answered
+    /// it with a café's opening hours out of a Scotland trip guide. The two coffees reached
+    /// nobody. It is refused twice over now: `track` is a request verb, and the sentence is
+    /// not a question.
+    func testTheCoffeeSentenceIsRefusedWithTheClauseTheReplyShows() {
+        let verdict = LookupGate.rule("Track two cups of coffee. 6:50 and 7:20.")
+        guard case .refused(let refusal) = verdict else {
+            return XCTFail("a write must never be answered on the device")
+        }
+        XCTAssertEqual(refusal.because, "it asks to track something")
+        XCTAssertEqual(refusal.rule, "request verb: track")
+    }
+
+    /// The general rule under that one case: a statement is not a lookup, whatever it is
+    /// about. Before this the gate was all refusals, so anything with no listed verb in it
+    /// passed by DEFAULT — which is how a write dressed as a statement got answered.
+    func testAStatementWithNoRequestVerbIsRefusedAsNotAQuestion() {
+        for statement in ["two coffees at 6:50 and 7:20",
+                          "the kiln reached 1240 this morning",
+                          "Marta called about the fiber contract"] {
+            XCTAssertEqual(LookupGate.rule(statement), .refused(.notAQuestion), statement)
+        }
+        XCTAssertEqual(LookupGate.Refusal.notAQuestion.because, "it is not a question")
+        XCTAssertEqual(LookupGate.Refusal.notAQuestion.rule, "not a question")
+    }
+
+    /// The two ways to qualify, and no third: the mark at the end, or an interrogative at
+    /// the front. Both are shapes, which is what keeps this a rule.
+    func testAQuestionQualifiesByItsMarkOrByItsFirstWord() {
+        XCTAssertEqual(LookupGate.rule("the concert, is it Thursday?"), .passed,
+                       "a question mark is enough on its own")
+        XCTAssertEqual(LookupGate.rule("when is the concert"), .passed,
+                       "an interrogative first word is enough on its own")
+        XCTAssertEqual(LookupGate.rule("What's my favorite cheese?"), .passed)
+        XCTAssertEqual(LookupGate.rule("Whose birthday is in May"), .passed)
+        XCTAssertEqual(LookupGate.rule("the concert is Thursday"), .refused(.notAQuestion))
+    }
+
+    /// Every interrogative, individually, for the reason the verb list is checked that
+    /// way: a list like this grows a typo and loses one entry silently.
+    func testEveryInterrogativeOpensAQuestion() {
+        for word in LookupGate.interrogatives {
+            XCTAssertEqual(LookupGate.rule("\(word) the thing about bricks"), .passed, word)
+        }
+        XCTAssertEqual(LookupGate.interrogatives.count, 25,
+                       "the list is the contract; a change here is a behaviour change")
+    }
+
+    /// A verb's own reason wins, because "it asks to log something" tells the reader what
+    /// to do next and "it is not a question" does not.
+    func testTheVerbRuleRunsBeforeTheQuestionRule() {
+        guard case .refused(let refusal) = LookupGate.rule("log two coffees") else {
+            return XCTFail("a write must be refused")
+        }
+        XCTAssertEqual(refusal.rule, "request verb: log")
     }
 
     // MARK: - What a refusal is for
