@@ -285,8 +285,10 @@ pub struct Strand {
     pub path: String,
     #[serde(skip)]
     pub items: Vec<StrandItem>,
-    /// Every wiki target anywhere in the note, vault relative, `.md` appended.
-    /// This is what answers "does this note link that draft".
+    /// Every wiki target anywhere in the note, vault relative. [`parse_strand`]
+    /// leaves each as written; [`resolve_targets`], run wherever the note is
+    /// loaded from disk, replaces them with the files they resolve to. This is
+    /// what answers "does this note link that draft".
     #[serde(skip)]
     pub targets: Vec<String>,
     #[serde(skip)]
@@ -540,9 +542,9 @@ pub fn parse_strand(slug: &str, src: &str) -> Strand {
     }
 
     for target in wiki_targets(src) {
-        let resolved = resolve_target(&target);
-        if !resolved.is_empty() && !strand.targets.contains(&resolved) {
-            strand.targets.push(resolved);
+        let written = target_path(&target);
+        if !written.is_empty() && !strand.targets.contains(&written) {
+            strand.targets.push(written);
         }
     }
 
@@ -616,7 +618,7 @@ pub fn parse_strand(slug: &str, src: &str) -> Strand {
     for reference in &strand.link_refs {
         if reference.in_queue
             && is_archived(&reference.target)
-            && names_a_prompt(&resolve_target(&reference.target))
+            && names_a_prompt(&target_path(&reference.target))
         {
             strand.findings.push(Finding::at(
                 QUEUE_ARCHIVED,
@@ -825,10 +827,14 @@ fn parent_slug(line: &str) -> Option<String> {
     if label.trim() != "parent" {
         return None;
     }
-    let resolved = resolve_target(wiki_targets(rest).first()?);
-    let file = resolved.strip_prefix(&format!("{STRANDS_DIR}/"))?;
-    let stem = Path::new(file).file_stem()?.to_str()?;
-    (!stem.is_empty()).then(|| stem.to_string())
+    // Shape only: a strand note is `Strands/<slug>.md` by definition, so the
+    // slug is the file name with a written `.md` dropped, never a file stem,
+    // which would cut a dotted slug at its last dot.
+    let written = target_path(wiki_targets(rest).first()?);
+    let file = written.strip_prefix(&format!("{STRANDS_DIR}/"))?;
+    let name = file.rsplit('/').next()?;
+    let slug = name.strip_suffix(".md").unwrap_or(name);
+    (!slug.is_empty()).then(|| slug.to_string())
 }
 
 fn push_link_refs(out: &mut Vec<LinkRef>, line: &str, line_no: usize, in_queue: bool) {
@@ -858,22 +864,54 @@ fn date_after(hay: &str, key: &str) -> Option<String> {
     None
 }
 
-/// A wiki target as a notes-root-relative file path: the `todo-list/` name
+/// A wiki target as written, notes-root relative: the `todo-list/` name
 /// stripped (see [`crate::today::vault_relative`], which this shares so both
-/// spellings of the vault prefix stay accepted in one place) and `.md` appended.
-pub fn resolve_target(target: &str) -> String {
-    let rel = vault_relative(target);
+/// spellings of the vault prefix stay accepted in one place) and nothing else.
+/// For callers that only look at the path's shape and never decide existence;
+/// whether a link resolves is [`resolve_target`]'s question.
+fn target_path(target: &str) -> String {
+    vault_relative(target)
+}
+
+/// The file a wiki target names under `notes_root`, asked of the disk rather
+/// than guessed from the string. With `T` the target, `todo-list/` stripped:
+///
+/// 1. If `T.md` is a regular file under the notes root, the link resolves to `T.md`.
+/// 2. Else, if `T` as written is a regular file, the link resolves to `T`.
+/// 3. Else the link is dead.
+///
+/// So `T.md` wins when both exist, a folder never resolves (it is not a regular
+/// file under either step), and a dotted note name such as `Bridge-0.153.0`
+/// resolves through step 1 like any other note. No extension list: the disk
+/// decides. `None` is a dead link, and an empty target is `None` too.
+pub fn resolve_target(notes_root: &Path, target: &str) -> Option<String> {
+    let rel = target_path(target);
     if rel.is_empty() {
-        return String::new();
+        return None;
     }
-    match rel.ends_with(".md") {
-        true => rel,
-        false => format!("{rel}.md"),
+    [format!("{rel}.md"), rel]
+        .into_iter()
+        .find(|candidate| notes_root.join(candidate).is_file())
+}
+
+/// Every wiki target in the note, resolved against the disk by
+/// [`resolve_target`], into [`Strand::targets`]; a dead link names no file and
+/// is left out. Called where a note is loaded from disk, because
+/// [`parse_strand`] has no notes root and stays a pure function of the source.
+pub fn resolve_targets(strand: &mut Strand, notes_root: &Path) {
+    let mut targets = Vec::new();
+    for target in std::mem::take(&mut strand.targets) {
+        if let Some(resolved) = resolve_target(notes_root, &target) {
+            if !targets.contains(&resolved) {
+                targets.push(resolved);
+            }
+        }
     }
+    strand.targets = targets;
 }
 
 fn is_archived(target: &str) -> bool {
-    resolve_target(target).contains(&format!("/{ARCHIVE_SEGMENT}/"))
+    target_path(target).contains(&format!("/{ARCHIVE_SEGMENT}/"))
 }
 
 /// Whether a file is a prompt, by its name: the file name, lowercased, contains
@@ -1002,8 +1040,9 @@ pub fn audit_strand(strand: &mut Strand, notes_root: &Path, today: &str) {
     }
 
     for reference in &strand.link_refs {
-        let resolved = resolve_target(&reference.target);
-        if resolved.is_empty() || notes_root.join(&resolved).is_file() {
+        if target_path(&reference.target).is_empty()
+            || resolve_target(notes_root, &reference.target).is_some()
+        {
             continue;
         }
         strand.findings.push(Finding::at(
@@ -1084,6 +1123,7 @@ pub fn snapshot(notes_root: &Path, today: &str) -> StrandsSnapshot {
             continue;
         };
         let mut strand = parse_strand(slug, &src);
+        resolve_targets(&mut strand, notes_root);
         strand.modified = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
         audit_strand(&mut strand, notes_root, today);
         parsed.push(strand);
@@ -1555,6 +1595,7 @@ pub async fn jesse_strand(
     };
     let (today, generated_at) = zoned_now(&st);
     let mut strand = parse_strand(&slug, &markdown);
+    resolve_targets(&mut strand, &notes_root);
     audit_strand(&mut strand, &notes_root, &today);
     resolve_parents(&mut strand, &live_slugs(&notes_root));
     let value = json!({ "markdown": markdown, "strand": strand });
@@ -1912,6 +1953,71 @@ mod tests {
         audit_strand(&mut t, &fixture_root(), "2026-09-23");
         assert!(codes(&t.findings).contains(&LINK_DEAD));
         assert!(codes(&t.findings).contains(&QUEUE_ARCHIVED));
+    }
+
+    /// A clean v2 note whose `## Status` holds one wiki link to `target`,
+    /// audited against the fixture vault. The link sits on line 14.
+    fn linking(target: &str) -> Strand {
+        let src = format!(
+            "---\ngroup: tag1\nstate: active\nupdated: 2026-09-23\n---\n# T\n\n**Now:** x\n\n## Drafts\n- [ ] **A1** In.\n\n## Status\n- See [[{target}]]\n"
+        );
+        let mut t = parse_strand("T", &src);
+        audit_strand(&mut t, &fixture_root(), "2026-09-23");
+        t
+    }
+
+    fn link_dead_lines(t: &Strand) -> Vec<usize> {
+        t.findings
+            .iter()
+            .filter(|f| f.code == LINK_DEAD)
+            .filter_map(|f| f.line)
+            .collect()
+    }
+
+    #[test]
+    fn link_resolves_an_existing_image() {
+        let t = linking("todo-list/Projects/drafts/2026-09-21-diagram.png");
+        assert!(link_dead_lines(&t).is_empty(), "{:?}", t.findings);
+    }
+
+    #[test]
+    fn link_resolves_an_existing_csv() {
+        let t = linking("todo-list/Projects/drafts/2026-09-21-numbers.csv");
+        assert!(link_dead_lines(&t).is_empty(), "{:?}", t.findings);
+    }
+
+    #[test]
+    fn link_dead_reports_a_missing_image_once() {
+        let t = linking("todo-list/Projects/drafts/2026-09-21-no-such-diagram.png");
+        assert_eq!(link_dead_lines(&t), vec![14], "{:?}", t.findings);
+    }
+
+    #[test]
+    fn link_resolves_a_dotted_note_name_to_its_md() {
+        let t = linking("todo-list/Projects/drafts/Bridge-0.153.0");
+        assert!(link_dead_lines(&t).is_empty(), "{:?}", t.findings);
+        assert_eq!(
+            resolve_target(&fixture_root(), "todo-list/Projects/drafts/Bridge-0.153.0"),
+            Some("Projects/drafts/Bridge-0.153.0.md".to_string())
+        );
+    }
+
+    #[test]
+    fn link_to_a_folder_is_dead() {
+        let t = linking("todo-list/Projects/drafts/a-folder");
+        assert_eq!(link_dead_lines(&t), vec![14], "{:?}", t.findings);
+        assert_eq!(
+            resolve_target(&fixture_root(), "todo-list/Projects/drafts/a-folder"),
+            None
+        );
+    }
+
+    #[test]
+    fn link_prefers_the_md_when_both_exist() {
+        assert_eq!(
+            resolve_target(&fixture_root(), "todo-list/Projects/drafts/Both"),
+            Some("Projects/drafts/Both.md".to_string())
+        );
     }
 
     #[test]

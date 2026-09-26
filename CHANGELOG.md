@@ -67,6 +67,39 @@ captures and every other tick could exist only on the phone.
   a bridge without the write route, which still receives strand ticks the old way; any
   ticks left in the old queue are moved into the new outbox on first launch.
 
+## [Bridge 0.154.1] - 2026-09-26
+
+**The strands audit resolves a wiki link to the file that actually exists, so an image, a
+CSV or any other attachment linked from a strand note is no longer reported as
+`LINK-DEAD`, and a link that points at nothing still is.**
+
+**Root cause: `resolve_target` in `bridge/src/strands.rs` appended `.md` to every target
+that did not already end in it, without checking the disk.** A link to
+`Projects/drafts/2026-09-21-diagram.png` became `…diagram.png.md`, the existence check
+failed, and the nightly audit called an existing image dead. The same guessed value went
+into `Strand::targets`, so a strand's targets never matched an attachment either.
+
+### Fixed
+
+- `resolve_target` now takes the notes root and asks the disk: `T.md` if it is a regular
+  file, else `T` as written if it is, else the link is dead (`None`). `T.md` wins when
+  both exist, a folder never resolves, and a dotted note name such as `Bridge-0.153.0`
+  resolves to its `.md`. No extension list. `LINK-DEAD` fires exactly when it returns
+  `None`; the message text is unchanged.
+- `Strand::targets` is filesystem resolved by a new `resolve_targets`, run where a note is
+  loaded from disk (the board walk and the single strand route); `parse_strand` stays a
+  pure function of the source and records each target as written.
+- The shape only checks (`is_archived`, the prompt name test behind `QUEUE-ARCHIVED`,
+  and the `parent` slug) use the target as written, prefix stripped, and never decide
+  existence. The parent slug drops a written `.md` rather than taking a file stem, so a
+  dotted slug keeps its dots.
+
+### Tests
+
+- Six regression tests beside `finding_link_dead_and_queue_archived`, against new fixture
+  files: an existing image and CSV resolve, a missing image is dead once, a dotted note
+  name resolves to its `.md`, a folder is dead, and `T.md` wins over `T`.
+
 ## [Bridge 0.154.0] - 2026-09-26
 
 **Two routes so the app stops trusting the phone's Obsidian folder: one note served by path
