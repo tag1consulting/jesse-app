@@ -1067,12 +1067,74 @@ fn should_push(job: &ScheduleJob, outcome: Outcome, reason: &str, cascaded: bool
     if outcome == Outcome::Ran && reason == SPEECH_MODELS_CURRENT {
         return false;
     }
+    // A turn that looked and found nothing is the machine working too, and it said so with
+    // the sentinel. Only a CLEAN run can carry this reason (see `settle_clean_turn`), so a
+    // failure, a skip or a fire that wrote nothing still pushes whatever its reply said.
+    if outcome == Outcome::Ran && reason == QUIET_REASON {
+        return false;
+    }
     true
 }
 
 /// The reason a weekly speech-model check records when every tier already had its target.
 /// Compared by value in [`should_push`].
 pub const SPEECH_MODELS_CURRENT: &str = "speech models current";
+
+/// The whole reply a scheduled turn gives to say "nothing changed, nothing needs Jeremy".
+/// Matched against the TRIMMED reply as a whole, never as a substring or a prefix: a reply
+/// that mentions the word while reporting something is a report, and is pushed.
+pub const QUIET_SENTINEL: &str = "JESSE_QUIET";
+
+/// The reason a quiet run records. Compared by value in [`should_push`].
+pub const QUIET_REASON: &str = "quiet: nothing to report";
+
+/// Whether a scheduled turn's reply is the quiet sentinel.
+pub fn is_quiet_reply(reply: &str) -> bool {
+    reply.trim() == QUIET_SENTINEL
+}
+
+/// Settle the outcome of a turn that finished CLEANLY, from the output contract's verdict
+/// and the reply. A quiet reply wins over both the contract and the operator reason: the
+/// turn looked and said there was nothing to do, so an unmatched `expect_output` is the
+/// absence of work, not a job that failed to write it. Everything else is as before.
+fn settle_clean_turn(
+    contract: (Outcome, String),
+    reply: &str,
+    operator: bool,
+) -> (Outcome, String) {
+    if is_quiet_reply(reply) {
+        return (Outcome::Ran, QUIET_REASON.to_string());
+    }
+    let (outcome, reason) = contract;
+    if operator && outcome == Outcome::Ran {
+        (outcome, OPERATOR_FIRE_REASON.to_string())
+    } else {
+        (outcome, reason)
+    }
+}
+
+/// Mark a quiet run's conversation READ through its latest reply, so it raises neither
+/// the badge nor an unread dot. The conversation and its transcript are kept; this only
+/// moves the read mark, the same register a device moves when it opens the transcript,
+/// with the bridge's clock as the last-writer-wins stamp.
+fn mark_conversation_read(
+    conversations: &ConversationStore,
+    flags: &FlagStore,
+    conversation_id: &str,
+    now_ms: u64,
+) {
+    let Some(rec) = conversations.get(conversation_id) else {
+        return;
+    };
+    flags.apply(
+        conversation_id,
+        &FlagUpdate {
+            read_through_ms: Some(rec.last_reply_ms),
+            read_updated_ms: Some(now_ms),
+            ..Default::default()
+        },
+    );
+}
 
 /// The consecutive-failure counts that send an escalation push, and nothing between them.
 ///
@@ -1569,7 +1631,7 @@ async fn run_one(
                 // the job DID ITS WORK is a separate question, and one only the job's own
                 // declaration can answer. A job with no `expect_output` skips all of this
                 // and is `ran`, exactly as before.
-                let (outcome, reason) = match verify_output(sched, st, job, run, start_ms) {
+                let contract = match verify_output(sched, st, job, run, start_ms) {
                     OutputVerdict::NoContract => (Outcome::Ran, String::new()),
                     OutputVerdict::Satisfied(path) => {
                         sched.state.set_output_path(&job.id, Some(path));
@@ -1586,11 +1648,17 @@ async fn run_one(
                         )
                     }
                 };
-                let reason = if run.is_operator() && outcome == Outcome::Ran {
-                    OPERATOR_FIRE_REASON.to_string()
-                } else {
-                    reason
-                };
+                let (outcome, reason) = settle_clean_turn(contract, response, run.is_operator());
+                // A QUIET RUN LEAVES NOTHING UNREAD. Its reply was stamped on the way into
+                // the job store, so the read mark goes through that stamp.
+                if reason == QUIET_REASON {
+                    mark_conversation_read(
+                        &st.conversations,
+                        &st.flags,
+                        &conversation_id,
+                        system_time_to_ms(SystemTime::now()),
+                    );
+                }
                 return RunResult {
                     outcome,
                     reason,
@@ -2739,6 +2807,122 @@ mod tests {
             ..Default::default()
         }]);
         s.jobs.into_iter().next().unwrap()
+    }
+
+    // ---- quiet runs: the `JESSE_QUIET` sentinel ------------------------------
+
+    /// A clean run whose whole reply is the sentinel, bare or padded with whitespace, is
+    /// recorded as quiet and not pushed.
+    #[test]
+    fn a_quiet_reply_does_not_push_even_with_surrounding_whitespace() {
+        let j = job("archive", true);
+        for reply in ["JESSE_QUIET", "  JESSE_QUIET\n", "\n\n\tJESSE_QUIET \r\n"] {
+            let (outcome, reason) = settle_clean_turn((Outcome::Ran, String::new()), reply, false);
+            assert_eq!(outcome, Outcome::Ran, "{reply:?}");
+            assert_eq!(reason, QUIET_REASON, "{reply:?}");
+            assert!(!should_push(&j, outcome, &reason, false), "{reply:?}");
+        }
+    }
+
+    /// The sentinel is the whole reply or nothing: inside a report, or as a prefix, it is
+    /// a report, and a report is pushed.
+    #[test]
+    fn a_reply_that_merely_contains_the_sentinel_pushes() {
+        let j = job("archive", true);
+        for reply in [
+            "Archived 3 notes. JESSE_QUIET",
+            "JESSE_QUIET but one file could not be moved",
+            "JESSE_QUIETLY",
+            "jesse_quiet",
+            "",
+        ] {
+            let (outcome, reason) = settle_clean_turn((Outcome::Ran, String::new()), reply, false);
+            assert_ne!(reason, QUIET_REASON, "{reply:?}");
+            assert!(should_push(&j, outcome, &reason, false), "{reply:?}");
+        }
+    }
+
+    /// A failure is never silenced. A failed turn never reaches `settle_clean_turn`, and
+    /// its reason is the error, so whatever the reply said it pushes — and a failure that
+    /// somehow carried the quiet reason still pushes, because the rule is keyed on `ran`.
+    #[test]
+    fn a_failure_whose_reply_is_the_sentinel_still_pushes() {
+        let j = job("archive", true);
+        assert!(should_push(
+            &j,
+            Outcome::Failed,
+            "the turn was cancelled",
+            false
+        ));
+        assert!(should_push(&j, Outcome::Failed, QUIET_REASON, false));
+        assert!(should_push(&j, Outcome::FiredNoOutput, QUIET_REASON, false));
+    }
+
+    /// A quiet reply wins over an unmatched output contract: the turn looked and found
+    /// nothing to write, which is not a job that failed to write it.
+    #[test]
+    fn a_quiet_run_with_unmatched_expect_output_is_quiet_not_fired_no_output() {
+        let contract = (
+            Outcome::FiredNoOutput,
+            "the turn completed but wrote nothing matching [\"Inbox/x.md\"]".to_string(),
+        );
+        let (outcome, reason) = settle_clean_turn(contract.clone(), "JESSE_QUIET\n", false);
+        assert_eq!(outcome, Outcome::Ran);
+        assert_eq!(reason, QUIET_REASON);
+
+        // Without the sentinel the contract stands, exactly as before.
+        assert_eq!(settle_clean_turn(contract.clone(), "done", false), contract);
+        // And the operator reason is unchanged for a non-quiet clean run.
+        assert_eq!(
+            settle_clean_turn((Outcome::Ran, String::new()), "done", true),
+            (Outcome::Ran, OPERATOR_FIRE_REASON.to_string())
+        );
+    }
+
+    /// A quiet run is recorded as `ran` with the quiet reason in the record and the
+    /// ledger, and resets the failure streak like any other clean run.
+    #[test]
+    fn a_quiet_run_records_its_reason_and_resets_the_streak() {
+        let ledger = std::env::temp_dir().join(format!(
+            "jesse-quiet-{}/Inbox/scheduled-jobs-ledger.jsonl",
+            random_hex()
+        ));
+        let s = ScheduleStateStore::new(None).with_ledger(Some(ledger.clone()));
+        s.finished("archive", Outcome::Failed, "boom", 1, None);
+        s.finished("archive", Outcome::FiredNoOutput, "nothing", 2, Some(1));
+        assert_eq!(s.get("archive").consecutive_failures, 2);
+
+        s.finished("archive", Outcome::Ran, QUIET_REASON, 3, Some(1));
+        let rec = s.get("archive");
+        assert_eq!(rec.consecutive_failures, 0);
+        assert_eq!(rec.outcome(), Some(Outcome::Ran));
+        assert_eq!(rec.last_reason, QUIET_REASON);
+
+        let text = std::fs::read_to_string(&ledger).unwrap();
+        let last: Value = serde_json::from_str(text.lines().last().unwrap()).unwrap();
+        assert_eq!(last["outcome"], "fired");
+        assert_eq!(last["reason"], QUIET_REASON);
+        let _ = std::fs::remove_dir_all(ledger.parent().unwrap().parent().unwrap());
+    }
+
+    /// A quiet run's conversation is marked read through its reply: no badge, no dot, and
+    /// the conversation itself is kept.
+    #[test]
+    fn a_quiet_runs_conversation_is_marked_read() {
+        let convs = ConversationStore::new(None);
+        let flags = FlagStore::new(None);
+        let cid = convs.mint(Some("scheduled"), 1_000).conversation_id;
+        convs.note_reply(&cid, 5_000);
+        assert_eq!(unread_conversation_count(&convs, &flags), 1);
+
+        mark_conversation_read(&convs, &flags, &cid, 6_000);
+        assert_eq!(unread_conversation_count(&convs, &flags), 0);
+        assert_eq!(flags.get(&cid).read_through_ms, 5_000);
+        assert!(convs.get(&cid).is_some(), "the conversation is kept");
+
+        // An unknown conversation is a no-op, not a flags row.
+        mark_conversation_read(&convs, &flags, "no-such-conversation", 6_000);
+        assert_eq!(flags.get("no-such-conversation"), SessionFlags::default());
     }
 
     // ---- built-in jobs: the weekly speech-model check -------------------------

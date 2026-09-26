@@ -14,6 +14,35 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [Bridge 0.155.0] - 2026-09-26
+
+**A scheduled run can end with the single word `JESSE_QUIET` to say "nothing changed,
+nothing needs Jeremy", and when it does the bridge records the run as normal, sends no
+push and leaves nothing unread.**
+
+**Root cause: every clean scheduled run pushed its reply, with no way for a run that found
+nothing to stay silent.** `should_push` in `bridge/src/scheduler.rs` returned true for any
+`ran` outcome except the hard coded speech model check, and the push body was the turn's
+reply. The archive job and the strands sweep each fire eight times a day and most fires
+find nothing, so frequent jobs trained the reader to ignore the channel the scheduler
+exists to keep readable.
+
+### Added
+
+- `QUIET_SENTINEL` (`JESSE_QUIET`) beside `SPEECH_MODELS_CURRENT`. A turn that finished
+  cleanly and whose whole trimmed reply is the sentinel is QUIET; the word inside a longer
+  reply, as a prefix, or in another case is not. No config key: any job may use it.
+- A quiet run is recorded as `ran` with reason `quiet: nothing to report` in
+  `schedule.json`, the fire ledger and `GET /jesse/schedule`, and resets
+  `consecutive_failures` like any clean run. A quiet reply outranks an unmatched
+  `expect_output` (quiet, not `fired-no-output`) and the operator fire reason.
+- `should_push` returns false for a quiet `ran`. Failed, skipped and `fired-no-output`
+  outcomes push exactly as before whatever the reply said; the escalation push, the
+  prefetch hint and every non quiet payload are unchanged.
+- A quiet run's conversation is marked read through its reply (the same `read_through_ms`
+  register a device moves), so it raises neither the badge nor an unread dot. The
+  conversation and transcript are kept.
+
 ## [App 1.0 (170)] - 2026-09-26
 
 **A question about Jeremy was answered out of somebody else's archived notes.** With the
