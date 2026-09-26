@@ -14,6 +14,35 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [App 1.0 (172)] - 2026-09-26
+
+**Telling Jesse about an unlogged meal from a Health tab reading got a refusal and a
+request to say it again somewhere else.** On 2026-09-23 the reading was Caffeine at 0mg,
+the reply was "I had three Americanos today as normal", and the agent, obeying the "Ask
+about this" prompt's "Do not log a meal, a weigh-in, or a workout" clause, refused to log
+them and asked for the same words again as a separate message. The prompt treated the
+whole conversation as read-only when only the reading is data.
+
+The ask now logs what the owner reports, in the first message or any follow-up, exactly as
+a plain chat message would and without asking first, then answers with the updated figures
+and says what changed against the snapshot. Nothing beyond that logging is written: the
+scope sentence still keeps the dashboard and Today.md out of reach and still names the
+routines the turn must not run, and the routine names still appear only there.
+
+### Changed
+
+- `HealthAskPrompt`: the scope paragraph's "Do not log a meal, a weigh-in, or a workout;
+  do not edit the diet log, rewrite the dashboard, or touch Today.md" clause is gone.
+- `HealthAskPrompt`: a new paragraph before the scope sentence ("If {owner} tells you
+  about something eaten or drunk, a workout, or a weight reading ...") tells the agent to
+  log it, answer with the updated figures, and change nothing else; the scope sentence now
+  reads "Do not rebuild the dashboard by hand or touch Today.md". The header comment says
+  why the turn is no longer read-only.
+- `HealthAskPromptTests`: `testForbidsEveryWrite` is replaced by
+  `testLogsWhatTheOwnerReportsAndWritesNothingElse`, and
+  `testLoggingParagraphCarriesNoRoutineName` asserts no routine name appears before the
+  scope sentence. The Ops ask stays read-only and is untouched.
+
 ## [Bridge 0.155.0] - 2026-09-26
 
 **A scheduled run can end with the single word `JESSE_QUIET` to say "nothing changed,
