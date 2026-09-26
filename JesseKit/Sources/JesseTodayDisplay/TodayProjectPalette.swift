@@ -40,40 +40,54 @@ import JesseNetworking
 //
 // ## Strand family tones
 //
-// A strand does not wear its topic's colour flat. It wears a TONE derived from it
-// (`StrandTone`), so Tag1, Jesse and Strands System read as three blues of one family
-// rather than three identical blues:
+// A strand does NOT wear its topic's colour, and that is the whole of the rule. It wears
+// its FAMILY's colour (`StrandTone`), keyed on the slug of the root strand it hangs
+// under. Five topics cannot tell eight roots apart: while a root took its topic's base,
+// Family and Trovato were the same green and Health and Tangent were the same green as
+// each other, because all four file under Personal.
 //
-//   * **A root is its topic's base, exactly.** A strand whose parent is absent from the
-//     snapshot, or files under another topic, draws the value in this table, so a root
-//     strand and a Today item of the same topic still match. An older bridge that sends
-//     no `parent` makes every strand a root, which is the board as it was.
-//   * **A child is one step from its parent.** One lightness step, a little less chroma,
-//     and a hue turn. The step is a row per topic and appearance in
-//     `StrandTone.tuning`, because the room each topic has is set by its neighbours:
-//     most lighten, but dark Perseido and dark Via Con Me darken (lighter is where
-//     Personal sits under deuteranopia and protanopia), and `unfiled` darkens in both,
-//     stepping by lightness alone because a grey must never grow a hue. When a step
-//     would cross the contrast floor (or the dark ceiling) the part it cannot spend on
-//     lightness goes to the hue instead. Levels below the fourth wear the fourth's tone.
-//   * **The turn comes from a slot, not from order.** Each strand hashes its own slug
-//     (FNV 1a over the UTF 8 bytes, never the per launch seeded `hashValue`) into one of
-//     four slots, one or two hue units either side of its parent, so siblings fan out
-//     around their parent and a strand keeps its tone when a sibling is added, renamed
-//     or reordered. Recency, lens and collapse state never touch a tone.
+//   * **A root strand is a colour of its own.** `StrandTone.roots` holds one slot per top
+//     level strand, keyed by its slug lowercased, each with a hue and a root lightness
+//     and chroma per appearance. Eight slots for the eight roots the vault holds; the four
+//     that had a topic colour kept its family (Tag1 blue, Homelab purple, Perseido red,
+//     Via Con Me orange), and Family, Trovato, Health and Tangent gained green, teal,
+//     pink and gold. A root the table does not name takes one of four SPARE slots by
+//     FNV 1a over its slug (never the per launch seeded `hashValue`), so an unknown root
+//     still gets a colour and keeps it when other strands come and go.
+//   * **A child is its root's hue, stepped by depth.** Same hue, same chroma, one
+//     lightness step per level: DARKER in the light appearance, LIGHTER in the dark one,
+//     which in both cases is away from the background, because that is the only direction
+//     with room before the 3:1 floor. Siblings at one depth share a tone — their names
+//     tell them apart — so a tone never depends on who a strand's siblings are, on the
+//     lens, or on what is collapsed. Stepping stops at the third level below the root and
+//     anything deeper wears the third level's tone.
+//   * **A hue that does not move is what keeps a family in its lane.** Roots differ
+//     almost entirely in hue and chroma and a child moves almost entirely in lightness,
+//     so a child is further from every other root than from its own by construction, not
+//     by luck. It is asserted anyway.
 //   * **OKLCH, not HSL**, because equal steps in it look equal: an HSL lighten drifts
 //     blue toward purple, and a family would stop reading as a family.
+//   * **One bar per row.** A strand's tone is drawn once on a row, as the accent bar, in
+//     every lens. The `Tree` lens used to draw a rail per ancestor level in the disclosure
+//     column as well; two parallel lines a few points apart read as a mistake, and the
+//     indent already says the same thing. See `StrandsListView.treeRow`.
 //
-// Tones are only ever NON TEXT marks (the row's bar, the `Tree` rail, the caption's
-// dot), so their floor is the 3:1 non text threshold; text keeps the topic base and its
-// 4.5:1. `StrandToneTests` walks every path to the fourth level in both appearances and
-// asserts that every tone clears 3:1 against its background, stays at least ΔE*ab 10
-// from every OTHER topic's base under normal vision and the three dichromacies, and
-// differs from its parent by at least ΔE 5 under normal vision. The hue budget is where
-// those bite: Via Con Me light has no turn at all, Network light and Perseido light one
-// degree a unit, Network dark four, against six for the rest. Colour is still never the only cue: the
-// `Tree` lens draws the relation as a rail, the flat lenses caption it `in <parent>`,
-// and VoiceOver says the same.
+// Tones are only ever NON TEXT marks (the row's bar, the caption's dot), so their floor
+// is the 3:1 non text threshold; text keeps the topic base and its 4.5:1. `StrandToneTests`
+// walks every level to the third in both appearances and asserts that every tone clears
+// 3:1 against its background, that every pair of the eight named ROOTS is at least ΔE*ab
+// 20 apart under normal vision, that each level is at least ΔE*ab 12 from the level above
+// it, and that every child is closer to its own root than to any other. Colour vision
+// deficiency is MEASURED and PRINTED rather than gated: eight hues cannot all survive
+// deuteranopia, and the strand's name is on every row that carries a tone. Colour is
+// still never the only cue — the `Tree` lens draws the relation as indentation, the flat
+// lenses caption it `in <parent>`, and VoiceOver says the same.
+//
+// Two surfaces name a strand and deliberately draw NO tone. A Today row's strand chip
+// (`TodayStrandChip`) has only the slug and title the day file carries, not the strands
+// snapshot, so it cannot know the family the slug belongs to and draws the tint instead;
+// the Vault tab's strand rows are `JesseVault`'s, and that target depends on nothing in
+// this one, by design. Both carry the strand's NAME, which is the cue that matters.
 
 // MARK: - A colour, as data
 
@@ -244,7 +258,9 @@ public struct TodayRowAccent: Equatable, Hashable, Sendable {
 /// say its project twice. Colour is never the only cue here; it is the SECOND cue.
 public struct TodayProjectAccentBar: View {
     @Environment(\.colorScheme) private var scheme
-    private let accent: TodayRowAccent
+    /// A Today row's topic accent. Nil on a strand row, which wears its family's tone
+    /// and has no topic in its bar at all.
+    private let accent: TodayRowAccent?
     /// A strand's family tone, already resolved for the current appearance by
     /// `StrandTone`. Nil on a Today row, which wears its topic.
     private let tone: TodayProjectColor?
@@ -254,18 +270,23 @@ public struct TodayProjectAccentBar: View {
         self.tone = nil
     }
 
-    /// A strand's bar: the same shape, width and strength as its topic's, in the tone
-    /// `StrandTone` derived for it. The caller resolves the tone for the appearance it
-    /// is drawing in; nothing here computes a colour.
-    public init(project: TodayProject, tone: TodayProjectColor) {
-        self.accent = TodayProjectPalette.rowAccent(for: project)
-        self.tone = tone
+    /// A strand's bar: the same shape and width as a Today row's, in the tone
+    /// `StrandTone` derived for its family. The caller resolves the tone for the
+    /// appearance it is drawing in; nothing here computes a colour.
+    ///
+    /// Always FULL strength, and it takes no project. A Today row draws `unfiled` faint
+    /// because "no project" is an absence; a strand's colour comes from its family and
+    /// never from its topic, so there is no absence to draw faint — a strand filed under
+    /// no project still belongs to a family with a colour of its own.
+    public init(strandTone: TodayProjectColor) {
+        self.accent = nil
+        self.tone = strandTone
     }
 
     public var body: some View {
         Capsule()
-            .fill(tone?.color ?? accent.color(scheme))
-            .opacity(accent.opacity)
+            .fill(tone?.color ?? accent?.color(scheme) ?? Color.clear)
+            .opacity(accent?.opacity ?? 1)
             .frame(width: 3)
             .accessibilityHidden(true)
     }
