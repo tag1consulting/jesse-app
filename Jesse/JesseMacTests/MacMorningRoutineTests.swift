@@ -112,7 +112,7 @@ final class MacMorningRoutineTests: XCTestCase {
         let prunable = thread.turns.isEmpty
             && (thread.sessionId ?? "").isEmpty
             && thread.registeredAt == nil
-            && !(coordinator.isRunning && coordinator.activeThreadID == thread.id)
+            && !coordinator.isRunning(thread.id)
         XCTAssertFalse(prunable, "a thread that has been sent to is never abandoned")
     }
 

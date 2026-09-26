@@ -141,12 +141,48 @@ final class MacModelListStore {
     }
 }
 
+// MARK: - Stream liveness
+
+/// When anything last arrived on a turn's stream, and whether the watchdog has given up on it.
+///
+/// A class because two tasks share it — the task reading the stream and the watchdog timing it —
+/// and a local `var` cannot be shared. Main-actor, like everything else the coordinator touches,
+/// so both tasks read and write it on one actor and no lock is needed.
+@MainActor
+private final class StreamTicker {
+    /// The last time ANY byte arrived: a frame, or one of the bridge's keep-alive comments.
+    private(set) var lastArrival = Date()
+    private(set) var gaveUp = false
+
+    func tick() { lastArrival = Date() }
+    func giveUp() { gaveUp = true }
+}
+
 // MARK: - Coordinator
+
+/// One conversation's running turn: everything that used to be a single app-wide slot.
+///
+/// Nothing here is persisted. The Mac has no send outbox and does not re-attach a job after a
+/// relaunch (the phone's `InFlightJob` does, and is stored for that reason); a turn this Mac
+/// loses is recovered by hydrating the conversation, not by resuming the stream.
+struct MacTurnRun: Equatable {
+    /// Whether the bridge has ACCEPTED this turn (its 202 came back), as opposed to the POST
+    /// still being in flight. A spinner covers both, which is why the delivery caption reads
+    /// `phase` instead.
+    var accepted = false
+    /// Live assistant text for this turn (a `reset` frame REPLACES it, a `delta` APPENDS).
+    var streamingText = ""
+    /// The current tool-activity LINE, already human ("Reading the vault…"), from
+    /// `ToolActivity.displayLabel` — the same mapping the iOS app uses. Empty until this turn
+    /// reports any activity.
+    var activity = ""
+}
 
 /// App-scoped runner + sync. `@MainActor` (the UI binds to it and it mutates the
 /// main-actor `ModelContext`); network calls hop off-main inside the `nonisolated`
-/// client. One turn runs at a time on the Mac MVP — which also matches the bridge's
-/// single global write lock.
+/// client. Turns run CONCURRENTLY, one per conversation, exactly as they do on the phone —
+/// the bridge has always accepted that, and the single slot this used to keep was what made
+/// Send silently do nothing in every conversation but the busy one.
 @MainActor
 @Observable
 final class MacCoordinator {
@@ -157,18 +193,47 @@ final class MacCoordinator {
     /// conversation renders the same list. Fetched lazily on first picker appearance.
     let modelList = MacModelListStore()
 
-    /// The thread whose turn is currently running, if any.
-    private(set) var activeThreadID: UUID?
-    /// Live assistant text for the active turn (reset REPLACES, delta APPENDS).
-    private(set) var streamingText: String = ""
-    /// The current tool-activity LINE for the active turn, already human ("Reading the
-    /// vault…"), from `ToolActivity.displayLabel` — the same mapping the iOS app uses.
-    /// Empty when the turn has not reported any activity yet.
-    private(set) var activity: String = ""
-    private(set) var isRunning = false
-    /// Last user-facing error (send/stream failure, sync failure). Cleared on the next
-    /// successful action.
+    /// The turns in flight, one entry per CONVERSATION — the phone's `RunCoordinator.inFlight`
+    /// shape, and for the same reason.
+    ///
+    /// This used to be one global slot (`isRunning`, `activeThreadID`, `streamingText`,
+    /// `activity`, `accepted`), which made a Mac that was answering one conversation unable to
+    /// send in any other: the composer's gate was per conversation and staging's was global, so
+    /// Send stayed live and silently did nothing. The bridge has run concurrent turns in
+    /// different conversations since the phone started doing it; the single slot was this
+    /// client's own limit, not the server's.
+    private(set) var runs: [UUID: MacTurnRun] = [:]
+
+    /// Per-conversation errors: a refused or failed TURN, reported in the conversation it
+    /// belongs to. App-wide failures (the session list, a hydrate) stay in `lastError` below,
+    /// because they belong to no single conversation.
+    ///
+    /// Separate from `lastError` because concurrent turns made one shared string wrong: a send
+    /// that failed in one conversation would paint its error across every other, and would
+    /// silence the delivery caption of a turn that was running perfectly well elsewhere.
+    private(set) var errors: [UUID: String] = [:]
+
+    /// Bumped every time a turn settles, in any conversation. Screens that reload when the
+    /// agent has finished acting (the Today tab, whose turns rewrite `Today.md`) watch THIS
+    /// rather than a global "is anything running" Bool: with turns overlapping, such a Bool can
+    /// go from true to true and never report the settle in between.
+    private(set) var settleCount = 0
+
+    /// Last user-facing error that belongs to no one conversation (a session-list or hydrate
+    /// failure). Cleared on the next successful round trip.
     var lastError: String?
+
+    /// How long a live stream may be COMPLETELY silent — no frames and no keep-alive comments —
+    /// before this Mac treats the connection as dead and resolves the turn by polling instead.
+    ///
+    /// 60 seconds is four missed keep-alives: the bridge's SSE responder comments every 15
+    /// seconds, so a healthy stream is never quiet for this long. Injectable so the stall test
+    /// runs in milliseconds.
+    let streamStallWindow: TimeInterval
+
+    /// How long the completion poll waits between attempts. One second in production; injectable
+    /// only so the test that spends the poll's whole 600-attempt budget takes under a second.
+    let pollSpacing: TimeInterval
 
     /// Fires when a turn completes, so the app can post a local notification.
     var onTurnFinished: (@MainActor (JesseThread, _ reply: String) -> Void)?
@@ -233,16 +298,11 @@ final class MacCoordinator {
         attachedContexts[threadID] = nil
     }
 
-    /// Whether the bridge has ACCEPTED the running turn (its 202 came back), as opposed to the
-    /// POST still being in flight. `isRunning` deliberately covers both, which is why it cannot
-    /// answer this; the detail view's delivery caption reads `phase` below.
-    private(set) var accepted = false
-
-    /// Where the running turn is between "typed" and "answered", or nil when nothing is
+    /// Where this conversation's turn is between "typed" and "answered", or nil when nothing is
     /// running on `threadID`. Mirrors the phone's `RunCoordinator.phase`.
     func phase(_ threadID: UUID) -> TurnPhase? {
-        guard isRunning, activeThreadID == threadID, lastError == nil else { return nil }
-        return accepted ? .accepted : .sending
+        guard let run = runs[threadID], errors[threadID] == nil else { return nil }
+        return run.accepted ? .accepted : .sending
     }
 
     /// Adopt the bridge's authoritative conversation id and stamp the first-ACK time. The
@@ -288,6 +348,8 @@ final class MacCoordinator {
          offline: OfflineAnswerService? = nil,
          offlineLedger: OfflineAnswerLedger = .shared,
          capture: InboxCaptureService? = nil,
+         streamStallWindow: TimeInterval = 60,
+         pollSpacing: TimeInterval = 1,
          save: @escaping @MainActor (ModelContext) throws -> Void = { try $0.save() }) {
         // Resolved in the body, not in a default argument: the service's default is
         // main-actor-isolated and a default argument is evaluated off the actor.
@@ -297,6 +359,8 @@ final class MacCoordinator {
         self.configStore = configStore
         self.makeClient = makeClient
         self.sessionDeletionStore = sessionDeletionStore
+        self.streamStallWindow = streamStallWindow
+        self.pollSpacing = pollSpacing
         self.save = save
     }
 
@@ -311,7 +375,37 @@ final class MacCoordinator {
         return makeClient(cfg)
     }
 
-    func isRunning(_ threadID: UUID) -> Bool { isRunning && activeThreadID == threadID }
+    /// Whether THIS conversation has a turn in flight. The only question the composer, the
+    /// sidebar spinner and the empty-thread reaper ever mean.
+    func isRunning(_ threadID: UUID) -> Bool { runs[threadID] != nil }
+
+    /// Whether anything at all is in flight on this Mac. Deliberately rare: the answer is
+    /// almost never what a screen wants, and reading it where `isRunning(_:)` was meant is the
+    /// defect this whole change is about.
+    var isRunning: Bool { !runs.isEmpty }
+
+    /// This conversation's live assistant text, empty when it has none.
+    func streamingText(for threadID: UUID) -> String { runs[threadID]?.streamingText ?? "" }
+
+    /// This conversation's current activity line, empty when it has none.
+    func activity(for threadID: UUID) -> String { runs[threadID]?.activity ?? "" }
+
+    /// The error to show in this conversation: its own turn's, else the app-wide one.
+    func error(for threadID: UUID) -> String? { errors[threadID] ?? lastError }
+
+    /// Open this conversation's run slot. Its error goes with it: a send that is going out is
+    /// the answer to whatever the last one said.
+    private func beginRun(_ threadID: UUID) {
+        runs[threadID] = MacTurnRun()
+        errors[threadID] = nil
+    }
+
+    /// Close this conversation's run slot and report the settle. Never touches another
+    /// conversation's, which is the whole point.
+    private func endRun(_ threadID: UUID) {
+        runs[threadID] = nil
+        settleCount += 1
+    }
 
     // MARK: Sending a turn
 
@@ -389,17 +483,19 @@ final class MacCoordinator {
     func captureToInbox(text: String, thread: JesseThread,
                         context: ModelContext) async -> Bool {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, !isRunning else { return false }
+        // Per CONVERSATION, like every other gate here: a capture is a local write and a turn
+        // running in another conversation has nothing to do with it.
+        guard !trimmed.isEmpty, !isRunning(thread.id) else { return false }
 
         let outcome = await capture.capture(trimmed)
         guard case .success(let write) = outcome else {
-            if case .failure(let failure) = outcome { lastError = failure.description }
+            if case .failure(let failure) = outcome { errors[thread.id] = failure.description }
             return false
         }
 
         // A staged thread is not in the store until its first send. A capture is one.
         if thread.modelContext == nil { context.insert(thread) }
-        lastError = nil
+        errors[thread.id] = nil
 
         // The user's own half, then the local turn that says where it went. Two turns rather
         // than one: what they typed is theirs, and the badge is the app reporting back.
@@ -417,7 +513,7 @@ final class MacCoordinator {
             // capture, not the capture — and the write log still holds it, which is why this
             // says so rather than inviting a second attempt that would append a second
             // identical line.
-            lastError = "Captured to \(write.relativePath), but this conversation couldn't be saved."
+            errors[thread.id] = "Captured to \(write.relativePath), but this conversation couldn't be saved."
             return true
         }
         return true
@@ -480,8 +576,9 @@ final class MacCoordinator {
                                 mode: JesseMode, thread: JesseThread,
                                 context: ModelContext) async {
         if case .answered(let answer) = outcome {
-            isRunning = false
-            activeThreadID = nil
+            // This conversation's run only. An on-device answer settles one turn; whatever the
+            // bridge is doing for another conversation keeps its own slot and its own spinner.
+            endRun(thread.id)
             let reply = Turn(role: .jesse,
                              text: OfflineLookupReply.body(.answered(answer), queued: false))
             reply.thread = thread
@@ -531,11 +628,21 @@ final class MacCoordinator {
         let typed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         let trimmed = attached.map { TodayThreadContext.firstMessage(context: $0.body, typed: text) }
             ?? typed
-        // The guards run on the COMPOSED text and before the attachment is spent, so a
-        // send refused because a turn is already running leaves the context attached for
-        // the send that does go through — and leaves the composer's draft untouched, since
-        // nothing below has run.
-        guard !trimmed.isEmpty, !isRunning, configStore.isConfigured else { return nil }
+        // The gate is the SHARED one the composer's `canSend` reads, asked about THIS
+        // conversation. It runs before the attachment is spent, so a refused send leaves the
+        // context attached for the send that does go through — and leaves the composer's draft
+        // untouched, since nothing below has run.
+        //
+        // And it SAYS WHY. A refusal that wrote nothing to the screen is the bug: an enabled
+        // button, a pressed Return, and a message that stayed in the composer with no
+        // explanation anywhere. The one silent refusal left is an empty composer, which is not
+        // an error.
+        if let refusal = MacSendGate.refusal(typed: text, hasAttachment: attached != nil,
+                                             isConfigured: configStore.isConfigured,
+                                             isRunningInThisConversation: isRunning(thread.id)) {
+            if let message = refusal.message { errors[thread.id] = message }
+            return nil
+        }
         attachedContexts[thread.id] = nil
 
         // A staged thread is not in the store until its first send (the Chats list reaps
@@ -575,15 +682,13 @@ final class MacCoordinator {
             // draft, sent again, went WITHOUT the reading the conversation was opened
             // about — the same message turning into a different one.
             attachedContexts[thread.id] = attached
-            lastError = "Couldn't save your message — try sending it again."
+            errors[thread.id] = "Couldn't save your message — try sending it again."
             return nil
         }
 
-        activeThreadID = thread.id
-        isRunning = true
-        accepted = false
-        streamingText = ""
-        activity = ""
+        beginRun(thread.id)
+        // A staged send is a completed round trip with the local store, which is the one thing
+        // that can take an app-wide "couldn't reach the Studio" off the screen from here.
         lastError = nil
         return trimmed
     }
@@ -592,13 +697,10 @@ final class MacCoordinator {
     /// composed text `stage` already persisted as the user turn.
     private func deliver(_ trimmed: String, mode: JesseMode, thread: JesseThread,
                          context: ModelContext) async {
-        defer {
-            isRunning = false
-            accepted = false
-            activeThreadID = nil
-            streamingText = ""
-            activity = ""
-        }
+        // THIS conversation's slot, and nothing else's. The defer used to clear the app's one
+        // slot, so the turn that finished first opened the gate for every conversation and
+        // closed the spinner on turns that were still running.
+        defer { endRun(thread.id) }
 
         let cli = client
         // The PER-TURN model this conversation sends on: its own stored selection, else this
@@ -628,87 +730,148 @@ final class MacCoordinator {
                 await finalize(thread: thread, reply: reply, streamedText: nil,
                                context: context, client: cli)
             case let .running(jobId, _):
-                accepted = true
+                runs[thread.id]?.accepted = true
                 await runStream(jobId: jobId, thread: thread, context: context, client: cli)
             }
         } catch {
-            lastError = Self.friendly(error)
+            errors[thread.id] = Self.friendly(error)
         }
+    }
+
+    /// How reading a turn's live stream ended.
+    private enum StreamOutcome {
+        /// A terminal frame arrived. `reply` nil with `failure` nil is a cancel, which keeps
+        /// whatever had streamed.
+        case terminal(reply: JesseReply?, failure: String?)
+        /// The stream ended, or threw, with no terminal frame — the dropped-connection case.
+        case dropped
+        /// Nothing arrived at all for `streamStallWindow`, so the connection is treated as dead
+        /// and abandoned. Resolved by polling, exactly as a dropped stream is.
+        case stalled
     }
 
     private func runStream(jobId: String, thread: JesseThread, context: ModelContext,
                            client cli: any BridgeClientProtocol) async {
-        // The full terminal reply (text + session + structured provenance), so the model
-        // badge chip survives the stream path exactly as it does on the poll path.
-        var terminalReply: JesseReply?
-        var sawTerminal = false
-        var failure: String?
-
-        do {
-            for try await ev in cli.stream(jobId: jobId) {
-                switch ev {
-                case let .reset(s): streamingText = s
-                case let .delta(s): streamingText += s
-                case let .activity(a): activity = a.displayLabel
-                case let .done(reply):
-                    terminalReply = reply
-                    sawTerminal = true
-                case let .failed(msg):
-                    failure = msg
-                    sawTerminal = true
-                case .cancelled:
-                    sawTerminal = true
-                }
-            }
-        } catch {
-            // Stream dropped — fall through to a poll, which resolves what actually
-            // happened to the job.
-        }
-
-        if sawTerminal {
+        switch await readStream(jobId: jobId, thread: thread, client: cli) {
+        case let .terminal(reply, failure):
             if let failure {
-                lastError = failure
-            } else {
-                // A `done` frame with an empty final response falls back to the live
-                // accumulator (already badge-free); a cancel with no terminal reply keeps
-                // whatever streamed, exactly as before.
-                let reply = terminalReply ?? JesseReply(text: streamingText, sessionId: nil)
-                await finalize(thread: thread, reply: reply, streamedText: streamingText,
-                               context: context, client: cli)
+                errors[thread.id] = failure
+                return
             }
-            return
+            // A `done` frame with an empty final response falls back to the live accumulator
+            // (already badge-free); a cancel with no terminal reply keeps whatever streamed,
+            // exactly as before.
+            let streamed = runs[thread.id]?.streamingText ?? ""
+            await finalize(thread: thread,
+                           reply: reply ?? JesseReply(text: streamed, sessionId: nil),
+                           streamedText: streamed, context: context, client: cli)
+        case .dropped, .stalled:
+            // Both are "this stream will not tell us how the turn ended" — the poll resolves
+            // what actually happened to the job.
+            await pollToCompletion(jobId: jobId, thread: thread, context: context, client: cli)
+        }
+    }
+
+    /// Read `jobId`'s live stream into this conversation's run state, and say how it ended.
+    ///
+    /// The read runs in its OWN task so a watchdog can end it. A stream whose connection dies
+    /// without closing — a lid shut, a Wi-Fi change, the Studio off the network — leaves the
+    /// read suspended for as long as the stream session allows, which is a day by design
+    /// (`JesseBridgeClient.streamingSession`, because an agent turn legitimately runs for
+    /// hours). Before this, that day was also how long the conversation kept saying a reply was
+    /// coming, and how long the global run slot stayed shut: the reported symptom that only a
+    /// relaunch cleared.
+    ///
+    /// Silence is measurable because the bridge is never silent: its SSE responder comments
+    /// every 15 seconds, and `streamItems` reports those comments as `alive` (the parser drops
+    /// them as frames, correctly — they are not events). So nothing arriving for four keep-alive
+    /// periods is evidence about the socket, not about the model, and the turn is resolved by
+    /// polling instead. The day-long ceiling stays: a long turn is legitimate, a silent one is
+    /// not.
+    private func readStream(jobId: String, thread: JesseThread,
+                            client cli: any BridgeClientProtocol) async -> StreamOutcome {
+        let ticker = StreamTicker()
+        let reader = Task { @MainActor () -> StreamOutcome in
+            // The full terminal reply (text + session + structured provenance), so the model
+            // badge chip survives the stream path exactly as it does on the poll path.
+            var terminal: (reply: JesseReply?, failure: String?)?
+            do {
+                for try await item in cli.streamItems(jobId: jobId) {
+                    ticker.tick()
+                    guard case let .event(ev) = item else { continue }
+                    switch ev {
+                    case let .reset(s): self.runs[thread.id]?.streamingText = s
+                    case let .delta(s): self.runs[thread.id]?.streamingText += s
+                    case let .activity(a): self.runs[thread.id]?.activity = a.displayLabel
+                    case let .done(reply): terminal = (reply, nil)
+                    case let .failed(msg): terminal = (nil, msg)
+                    case .cancelled: terminal = (nil, nil)
+                    }
+                }
+            } catch {
+                // Transport failure — the poll below resolves what happened to the job.
+            }
+            if let terminal { return .terminal(reply: terminal.reply, failure: terminal.failure) }
+            return .dropped
         }
 
-        // No terminal frame (stream dropped mid-run): poll the job to resolution.
-        await pollToCompletion(jobId: jobId, thread: thread, context: context, client: cli)
+        let watchdog = Task { @MainActor in
+            while !Task.isCancelled {
+                let quiet = Date().timeIntervalSince(ticker.lastArrival)
+                let remaining = self.streamStallWindow - quiet
+                guard remaining > 0 else {
+                    ticker.giveUp()
+                    // Tearing the read down cancels the URL task with it (the stream's
+                    // `onTermination`), so the dead socket is released rather than held for the
+                    // rest of the day.
+                    reader.cancel()
+                    return
+                }
+                try? await Task.sleep(for: .seconds(remaining))
+            }
+        }
+
+        let outcome = await reader.value
+        watchdog.cancel()
+        // A terminal frame that DID arrive wins, even if the socket then went quiet before
+        // closing: what the turn ended in is already known and a poll would only re-learn it.
+        if case .terminal = outcome { return outcome }
+        // Otherwise a cancelled read reports `dropped`, and the watchdog is the only thing that
+        // knows whether that was a close or a silence. Both go to the poll.
+        return ticker.gaveUp ? .stalled : outcome
     }
 
     private func pollToCompletion(jobId: String, thread: JesseThread, context: ModelContext,
                                   client cli: any BridgeClientProtocol) async {
-        for _ in 0..<600 {  // ~10 min ceiling at 1s spacing
+        for _ in 0..<600 {  // ~10 min ceiling at the 1s production spacing
             if Task.isCancelled { return }
             do {
                 switch try await cli.result(jobId: jobId) {
                 case .running:
-                    try? await Task.sleep(for: .seconds(1))
+                    try? await Task.sleep(for: .seconds(pollSpacing))
                 case let .done(reply):
                     await finalize(thread: thread, reply: reply, streamedText: nil,
                                    context: context, client: cli)
                     return
                 case let .failed(msg):
-                    lastError = msg
+                    errors[thread.id] = msg
                     return
                 case .cancelled:
                     return
                 case .expired:
-                    lastError = "That reply is no longer available on the bridge."
+                    errors[thread.id] = "That reply is no longer available on the bridge."
                     return
                 }
             } catch {
-                lastError = Self.friendly(error)
+                errors[thread.id] = Self.friendly(error)
                 return
             }
         }
+        // THE CEILING RAN OUT, and it used to run out in silence: the spinner stopped, no turn
+        // was appended, and nothing on screen said the reply was still owed. The job itself is
+        // fine — it is the bridge's, and a hydrate will bring its answer in.
+        errors[thread.id] =
+            "Still waiting on the bridge. The reply will appear when this conversation next syncs."
     }
 
     /// The `(text, provenanceJSON)` a Jesse turn persists from a delivered reply: the

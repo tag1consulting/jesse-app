@@ -65,6 +65,7 @@ final class MacFakeBridgeClient: BridgeClientProtocol, @unchecked Sendable {
     private var hydrateHandler: (String, String?) throws -> (turns: [HydratedTurn], nextCursor: String)
 
     private var _hydrateCalls: [(conversationId: String, after: String?)] = []
+    private var _resultCalls: [String] = []
     private var _deleted: [String] = []
     private var _sentConversationIds: [String] = []
     private var _sentTexts: [String] = []
@@ -82,6 +83,9 @@ final class MacFakeBridgeClient: BridgeClientProtocol, @unchecked Sendable {
     var sentModes: [JesseMode] { lock.withLock { _sentModes } }
     /// The `session_id` each turn resumed, if any — nil is a conversation that resumes nothing.
     var sentSessionIds: [String?] { lock.withLock { _sentSessionIds } }
+    /// Every `result(jobId:)` poll, in order — so a test can assert that an abandoned stream
+    /// was actually resolved through the poll path rather than by luck.
+    var resultCalls: [String] { lock.withLock { _resultCalls } }
 
     /// Awaited at the top of `send`, before anything is recorded. A test that needs to observe the
     /// in-flight state (the send gate while a turn runs) holds the send open here.
@@ -89,6 +93,14 @@ final class MacFakeBridgeClient: BridgeClientProtocol, @unchecked Sendable {
     /// When set, every `send` throws it instead of answering — the delivery-failure seam.
     /// The text is still recorded, so a test can assert what was attempted.
     private let sendError: (any Error)?
+    /// Answers `send` from the TEXT being sent, when a test needs two conversations to get
+    /// different answers (two job ids, so their streams can be driven apart).
+    private let sendHandler: (@Sendable (String) -> JesseSendResult)?
+    /// Answers `stream(jobId:)`. A test supplies a stream it drives itself — one that stays
+    /// open, or one that goes silent without finishing.
+    private let streamHandler: (@Sendable (String) -> AsyncThrowingStream<JesseStreamEvent, Error>)?
+    /// Answers `result(jobId:)`, the poll the coordinator falls back to.
+    private let resultHandler: (@Sendable (String) -> JesseResultState)?
 
     nonisolated init(
         conversations: ConversationsResult = .notModified,
@@ -97,13 +109,19 @@ final class MacFakeBridgeClient: BridgeClientProtocol, @unchecked Sendable {
         hydrate: @escaping (String, String?) throws -> (turns: [HydratedTurn], nextCursor: String)
             = { _, after in ([], after ?? "0:0") },
         beforeSend: (@Sendable () async -> Void)? = nil,
-        sendError: (any Error)? = nil
+        sendError: (any Error)? = nil,
+        sendHandler: (@Sendable (String) -> JesseSendResult)? = nil,
+        streamHandler: (@Sendable (String) -> AsyncThrowingStream<JesseStreamEvent, Error>)? = nil,
+        resultHandler: (@Sendable (String) -> JesseResultState)? = nil
     ) {
         self.conversations = conversations
         self.sendResult = sendResult
         self.hydrateHandler = hydrate
         self.beforeSend = beforeSend
         self.sendError = sendError
+        self.sendHandler = sendHandler
+        self.streamHandler = streamHandler
+        self.resultHandler = resultHandler
     }
 
     nonisolated var config: JesseConfig { JesseConfig(host: "studio", port: 8765, token: "tok") }
@@ -143,7 +161,7 @@ final class MacFakeBridgeClient: BridgeClientProtocol, @unchecked Sendable {
             _sentSessionIds.append(sessionId)
             // Echo the id back the way the bridge does, so the Mac's adopt-and-stamp path is
             // exercised rather than bypassed.
-            switch sendResult {
+            switch sendHandler?(text) ?? sendResult {
             case let .reply(reply, jobId, _):
                 return .reply(reply, jobId: jobId, conversationId: conversationId)
             case let .running(jobId, _):
@@ -154,9 +172,13 @@ final class MacFakeBridgeClient: BridgeClientProtocol, @unchecked Sendable {
     nonisolated func sendPrepared(_ request: JesseRequest) async throws -> JesseSendResult {
         lock.withLock { sendResult }
     }
-    nonisolated func result(jobId: String) async throws -> JesseResultState { .cancelled }
+    nonisolated func result(jobId: String) async throws -> JesseResultState {
+        lock.withLock { _resultCalls.append(jobId) }
+        return lock.withLock { resultHandler?(jobId) ?? .cancelled }
+    }
     nonisolated func stream(jobId: String) -> AsyncThrowingStream<JesseStreamEvent, Error> {
-        AsyncThrowingStream { $0.finish() }
+        if let streamHandler { return streamHandler(jobId) }
+        return AsyncThrowingStream { $0.finish() }
     }
     nonisolated func title(text: String, conversationId: String?) async -> String? { nil }
     nonisolated func cancelJob(jobId: String) async throws {}

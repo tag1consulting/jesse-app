@@ -219,7 +219,8 @@ struct MacThreadDetailView: View {
                         MacDeliveryCaption(phase: phase)
                     }
                     if running {
-                        MacStreamingBubble(text: coordinator.streamingText, activity: coordinator.activity)
+                        MacStreamingBubble(text: coordinator.streamingText(for: thread.id),
+                                           activity: coordinator.activity(for: thread.id))
                             .id(Self.streamAnchor)
                     }
                     Color.clear.frame(height: 1).id(Self.bottomAnchor)
@@ -228,7 +229,7 @@ struct MacThreadDetailView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
             .onChange(of: thread.orderedTurns.count) { scrollToBottom(proxy) }
-            .onChange(of: coordinator.streamingText) { scrollToBottom(proxy) }
+            .onChange(of: coordinator.streamingText(for: thread.id)) { scrollToBottom(proxy) }
             .onAppear { scrollToBottom(proxy) }
         }
     }
@@ -271,7 +272,10 @@ struct MacThreadDetailView: View {
                 .foregroundStyle(.secondary)
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
-            if let error = coordinator.lastError ?? recording.errorMessage {
+            // This conversation's own error first, then the app-wide one (a failed sync), which
+            // is what `error(for:)` resolves: an error belonging to another conversation's turn
+            // never appears here.
+            if let error = coordinator.error(for: thread.id) ?? recording.errorMessage {
                 Text(error).font(.caption).foregroundStyle(.red)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
@@ -436,9 +440,10 @@ struct MacThreadDetailView: View {
     /// coordinator composes and re-checks either way; this only decides whether the
     /// button is live.
     private var canSend: Bool {
-        coordinator.configStore.isConfigured && !running
-            && (!draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                || coordinator.attachedContext(for: thread.id) != nil)
+        MacSendGate.refusal(typed: draft,
+                            hasAttachment: coordinator.attachedContext(for: thread.id) != nil,
+                            isConfigured: coordinator.configStore.isConfigured,
+                            isRunningInThisConversation: running) == nil
     }
 
     /// THE COMPOSER IS CLEARED ONLY ON A DURABLE STAGE. `stageAndSend` persists the user

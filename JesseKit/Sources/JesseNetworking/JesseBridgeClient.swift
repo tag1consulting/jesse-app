@@ -39,6 +39,11 @@ public protocol BridgeClientProtocol: FlagSyncing, Sendable {
     /// `.unknown` — the app renders those differently, and neither is retryable.
     func artifact(id: String) async throws -> Data
     func stream(jobId: String) -> AsyncThrowingStream<JesseStreamEvent, Error>
+    /// The same stream, with the connection's LIVENESS in it: every decoded frame, plus an
+    /// `alive` for each line that carried no frame (the bridge's keep-alive comments). A
+    /// caller that has to tell a quiet turn from a dead socket reads this one; a caller that
+    /// only wants frames keeps reading `stream` above.
+    func streamItems(jobId: String) -> AsyncThrowingStream<JesseStreamItem, Error>
     func listConversations(since: UInt64?, etag: String?) async throws -> ConversationsResult
     /// Hydrate a conversation's history across every transcript bound to it. `after` is the
     /// bridge's OPAQUE cursor (nil for the whole history); the returned `nextCursor` is
@@ -63,6 +68,26 @@ public extension BridgeClientProtocol {
     /// view writes onto the store and never revisits, and a default must never be able to
     /// reach it.
     func artifact(id: String) async throws -> Data { throw ArtifactFetchError.unknown }
+
+    /// Default "this conformer reports no liveness": the frames alone, each wrapped as an
+    /// `event`. A conformer that does not read the socket itself (every test fake) has no
+    /// keep-alive to report, and a stall watchdog over this default is then measuring frames
+    /// only — which is the conservative reading, not a wrong one: a real stream ticks between
+    /// frames and a silent fake does not.
+    func streamItems(jobId: String) -> AsyncThrowingStream<JesseStreamItem, Error> {
+        let events = stream(jobId: jobId)
+        return AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    for try await ev in events { continuation.yield(.event(ev)) }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
 }
 
 public struct JesseBridgeClient: BridgeClientProtocol {
@@ -667,7 +692,37 @@ public struct JesseBridgeClient: BridgeClientProtocol {
     /// The inner URL task is cancelled when the returned stream is torn down. Any
     /// transport/HTTP failure finishes the stream with a throw, signalling the
     /// coordinator to fall back to polling.
+    ///
+    /// The frames only — `streamItems` below is the one reader, and this drops its liveness
+    /// ticks. Two spellings of the SSE read would be two chances to fix a framing bug once.
     public func stream(jobId: String) -> AsyncThrowingStream<JesseStreamEvent, Error> {
+        let items = streamItems(jobId: jobId)
+        return AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    for try await item in items {
+                        if case let .event(ev) = item { continuation.yield(ev) }
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+
+    /// The SSE read itself: every decoded frame, and an `alive` for every line that produced
+    /// none.
+    ///
+    /// The `alive` ticks are what make a DEAD stream detectable. This session has a day-long
+    /// ceiling (`streamingSession`) because an agent turn legitimately runs for hours, so a
+    /// connection that dies without a close — a lid closed, a Wi-Fi change, the Studio off the
+    /// network — leaves `bytes.lines` suspended and yielding nothing, indistinguishable from a
+    /// model that has not spoken yet. A live bridge is never silent for long (it comments every
+    /// 15 seconds), so a caller can time the gap out; it just needs to be TOLD about lines that
+    /// are not frames, which is all this adds.
+    public func streamItems(jobId: String) -> AsyncThrowingStream<JesseStreamItem, Error> {
         AsyncThrowingStream { continuation in
             let task = Task {
                 do {
@@ -692,9 +747,16 @@ public struct JesseBridgeClient: BridgeClientProtocol {
                     var parser = SSEParser()
                     for try await line in bytes.lines {
                         if Task.isCancelled { break }
-                        if let ev = parser.consume(line) { continuation.yield(ev) }
+                        // A line is evidence the connection is up whether or not it completes a
+                        // frame: a keep-alive comment, an `event:`/`data:` half of a frame, and
+                        // a swallowed blank all say the same thing about the socket.
+                        if let ev = parser.consume(line) {
+                            continuation.yield(.event(ev))
+                        } else {
+                            continuation.yield(.alive)
+                        }
                     }
-                    if let ev = parser.finish() { continuation.yield(ev) }
+                    if let ev = parser.finish() { continuation.yield(.event(ev)) }
                     continuation.finish()
                 } catch {
                     continuation.finish(throwing: error)
