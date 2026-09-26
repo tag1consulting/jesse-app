@@ -14,6 +14,43 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [App 1.0 (167)] - 2026-09-26
+
+**A child strand wears a shade of its parent's colour, so a family reads as a family.** Every
+Tag1 strand used to carry the identical blue, so Tag1, Jesse and Strands System could not be
+told apart by colour, and in the `Most recent` lens nothing showed that two rows were related at
+all. Each strand now has its own tone: its topic's colour at the root of its family, and one
+step per level below it.
+
+### Added
+
+- **`StrandTone`**, the derivation, inside the palette's contract. A root (no parent in the
+  snapshot, or a parent under another topic) draws its topic's base exactly, so it still
+  matches that topic's Today items. A child takes one step from its parent's tone: a lightness
+  step, a little less chroma, and a hue turn from a slot picked by an FNV 1a hash of its own
+  slug (one or two units either side of the parent), so siblings fan out and a strand keeps its
+  tone when a sibling is added, renamed or reordered. The maths is OKLCH, with gamut mapping by
+  chroma at fixed lightness and hue, because equal steps in it look equal. Levels below the
+  fourth wear the fourth's tone.
+- **The step is a row per topic and appearance**, tuned by exhaustive search so that every tone
+  at every depth to four and every slot clears 3:1 against its background, stays at least
+  ΔE 10 from every other topic under normal vision and simulated protanopia, deuteranopia and
+  tritanopia, and differs from its parent by at least ΔE 5. Most topics lighten a level at a
+  time and turn six degrees a unit. The budget is tighter where the palette's own pairs are
+  close: Via Con Me in light has no turn at all, Network and Perseido in light one degree a
+  unit, Network in dark four; dark Perseido and dark Via Con Me darken, because lighter is
+  where Personal sits for a colour blind eye; `unfiled` darkens in both and never grows a hue.
+- **A rail down every `Tree` subtree**, the way a code editor draws indent guides: one thin line
+  per level, in the parent's tone, under the parent's chevron. It is position, not hue, so it
+  survives a colour vision deficiency.
+- **`in Jesse` under a child's title** in the `Most recent` and `By group` lenses, with a dot in
+  the parent's tone. VoiceOver says the same relation in every lens, right after the title.
+- `StrandToneTests`: the OKLCH round trip, gamut mapping, roots, an older bridge, the pinned
+  hash, sibling stability, the depth cap, and the three contract properties over all 340 paths
+  per topic per appearance. `TodayProjectPaletteTests` is unchanged and still passes.
+
+Today item rows, their strand chip and the Dashboard keep their topic colour. No bridge change.
+
 ## [App 1.0 (166)] - 2026-09-26
 
 **On the Mac, a message typed in one conversation would not send while another conversation was

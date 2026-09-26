@@ -57,6 +57,9 @@ public struct StrandsListView: View {
     /// preview, in which case those entries are listed and inert; the shells inject both.
     @Environment(\.strandDiscuss) private var discussAction
     @Environment(\.strandRecord) private var recordAction
+    /// Which appearance the board is drawn in, because a strand's tone is resolved per
+    /// appearance before it reaches a row.
+    @Environment(\.colorScheme) private var scheme
 
     public init(model: StrandsModel,
                 opener: StrandOpener,
@@ -111,6 +114,9 @@ public struct StrandsListView: View {
 
     @ViewBuilder
     private func list(_ groups: [StrandsGroup]) -> some View {
+        // Every tone on the board, from the WHOLE snapshot, once per redraw: a tone never
+        // depends on the lens, on what is collapsed, or on which rows are on screen.
+        let family = StrandFamily(strands: model.snapshot?.strands ?? [], scheme: scheme)
         List {
             if let notice = opener.notice {
                 TodayNoticeRow(message: notice) { opener.notice = nil }
@@ -124,18 +130,18 @@ public struct StrandsListView: View {
                     .listRowSeparator(.hidden)
             }
             ForEach(groups) { group in
-                section(group)
+                section(group, family: family)
             }
         }
         .listStyle(.plain)
     }
 
     @ViewBuilder
-    private func section(_ group: StrandsGroup) -> some View {
+    private func section(_ group: StrandsGroup, family: StrandFamily) -> some View {
         if let title = group.title {
             Section {
                 if !collapsed.contains(group.id) {
-                    ForEach(group.strands) { row($0) }
+                    ForEach(group.strands) { row($0, family: family, showsParent: true) }
                 }
             } header: {
                 StrandsGroupHeader(title: title,
@@ -149,12 +155,12 @@ public struct StrandsListView: View {
             let folded = StrandsSemantics.decodeCollapsed(collapsedTreeStored)
             Section {
                 ForEach(StrandsSemantics.visibleTreeRows(treeRows, collapsed: folded)) {
-                    treeRow($0, isCollapsed: folded.contains($0.strand.slug))
+                    treeRow($0, isCollapsed: folded.contains($0.strand.slug), family: family)
                 }
             }
         } else {
             Section {
-                ForEach(group.strands) { row($0) }
+                ForEach(group.strands) { row($0, family: family, showsParent: true) }
             }
         }
     }
@@ -162,8 +168,29 @@ public struct StrandsListView: View {
     /// A `Tree` row: indented by depth, with a disclosure control of its own OUTSIDE the
     /// row's combined accessibility element, so the chevron stays a separate control and
     /// the row's tap still opens the note.
-    private func treeRow(_ tree: StrandsTreeRow, isCollapsed: Bool) -> some View {
-        HStack(alignment: .top, spacing: 2) {
+    ///
+    /// The indent is drawn, not left blank: one thin rail per level, each in the tone of
+    /// the ancestor at that level and centred under that ancestor's chevron, the way a
+    /// code editor draws indent guides. Consecutive rows join their rails into one line
+    /// down the whole subtree, which is what says "these belong to that". It is position
+    /// rather than hue, so it survives a colour vision deficiency; a screen reader hears
+    /// the same relation as `in <parent>` in the row's label.
+    private func treeRow(_ tree: StrandsTreeRow, isCollapsed: Bool,
+                         family: StrandFamily) -> some View {
+        let ancestors = family.ancestors(of: tree.strand, depth: tree.depth)
+        return HStack(alignment: .top, spacing: 2) {
+            HStack(spacing: 0) {
+                // A chain the snapshot cannot finish leaves its top levels blank rather
+                // than drawing a rail in a tone nobody owns.
+                if ancestors.count < tree.depth {
+                    Color.clear
+                        .frame(width: CGFloat(tree.depth - ancestors.count) * Self.treeIndent)
+                }
+                ForEach(ancestors) { ancestor in
+                    StrandTreeRail(tone: family.tone(ancestor.slug), width: Self.treeIndent)
+                }
+            }
+            .accessibilityHidden(true)
             Group {
                 if tree.hasChildren {
                     Button {
@@ -183,12 +210,20 @@ public struct StrandsListView: View {
                     Color.clear.frame(width: 20, height: 24)
                 }
             }
-            .padding(.leading, CGFloat(tree.depth) * Self.treeIndent)
-            row(tree.strand,
+            .padding(.vertical, Self.treeRowPadding)
+            row(tree.strand, family: family, showsParent: false,
                 insideCaption: tree.hasChildren && isCollapsed
                     ? StrandsSemantics.insideCaption(tree.descendants) : nil)
+                .padding(.vertical, Self.treeRowPadding)
         }
+        // The rails fill the row's full height, and the row gives up its vertical inset
+        // (the padding above stands in for it) so one row's rail meets the next one's.
+        .fixedSize(horizontal: false, vertical: true)
+        .listRowInsets(.vertical, 0)
     }
+
+    /// The vertical space a `Tree` row keeps inside itself, in place of the list's inset.
+    static let treeRowPadding: CGFloat = 5
 
     /// One level of the tree, in points.
     static let treeIndent: CGFloat = 16
@@ -199,8 +234,16 @@ public struct StrandsListView: View {
         collapsedTreeStored = StrandsSemantics.encodeCollapsed(folded)
     }
 
-    private func row(_ strand: Strand, insideCaption: String? = nil) -> some View {
-        StrandRow(strand: strand,
+    /// One board row. `showsParent` is the flat lenses' caption naming the strand this one
+    /// sits under; the `Tree` lens draws that relation as position instead.
+    private func row(_ strand: Strand, family: StrandFamily, showsParent: Bool,
+                     insideCaption: String? = nil) -> some View {
+        let parent = family.parent(of: strand)
+        return StrandRow(strand: strand,
+                  tone: family.tone(strand.slug),
+                  parentTitle: parent?.title,
+                  showsParentCaption: showsParent,
+                  parentTone: parent.map { family.tone($0.slug) },
                   referenceDay: model.referenceDay,
                   onTodayCaption: StrandOnToday.caption(count: onTodayCount(strand.slug)),
                   insideCaption: insideCaption,
@@ -267,6 +310,15 @@ public enum StrandNoteSource: Equatable, Identifiable, Sendable {
 /// One strand: its group, its title, where it stands, and what runs next.
 struct StrandRow: View {
     let strand: Strand
+    /// The strand's family tone, resolved for the current appearance by `StrandTone`.
+    let tone: TodayProjectColor
+    /// The title of the strand this one sits under, or nil for a top level strand.
+    var parentTitle: String? = nil
+    /// Whether the row says `in <parent>` under its title: the flat lenses do, the
+    /// `Tree` lens draws the relation as a rail instead.
+    var showsParentCaption = false
+    /// The parent's tone, for the caption's mark.
+    var parentTone: TodayProjectColor? = nil
     /// The day every `updated` stamp is measured against.
     let referenceDay: String
     /// `N on Today`, or nil when no open Today item names this strand.
@@ -279,13 +331,28 @@ struct StrandRow: View {
 
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
-            // The SAME accent the day rows carry, from the same palette, because it
-            // stands for the same five topics. A second colour table for the same
-            // taxonomy is the fork that disagrees with itself in the dark.
-            TodayProjectAccentBar(project: strand.group)
+            // The day rows' accent bar, from the same palette, in the strand's family
+            // tone: its topic's colour at the root, one step per level below it. The
+            // tone is computed in `StrandTone`, inside the palette's contract, never here.
+            TodayProjectAccentBar(project: strand.group, tone: tone)
             Button(action: onOpen) {
                 VStack(alignment: .leading, spacing: 3) {
                     header
+                    if showsParentCaption, let parentTitle {
+                        // Relatedness never rests on colour alone: the name says it, and
+                        // the mark in the parent's tone ties it to the parent's bar.
+                        HStack(spacing: 5) {
+                            if let parentTone {
+                                Circle()
+                                    .fill(parentTone.color)
+                                    .frame(width: 6, height: 6)
+                            }
+                            Text(StrandsSemantics.parentCaption(parentTitle))
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                        }
+                    }
                     if let now = strand.now, !now.isEmpty {
                         Text(now)
                             .font(.subheadline)
@@ -371,9 +438,33 @@ struct StrandRow: View {
     /// One sentence for a screen reader — the row's content, computed where a test can
     /// reach it.
     private var accessibilityLabel: String {
-        let sentence = StrandsSemantics.rowAccessibilityLabel(strand, today: referenceDay)
+        let sentence = StrandsSemantics.rowAccessibilityLabel(strand, today: referenceDay,
+                                                              parentTitle: parentTitle)
         guard let insideCaption else { return sentence }
         return "\(sentence), \(insideCaption)"
+    }
+}
+
+// MARK: - A tree rail
+
+/// One level of a `Tree` row's indent: a thin rule in the tone of the ancestor at that
+/// level, centred under where that ancestor's chevron sits, full row height. A non text
+/// mark, so its floor is the 3:1 every derived tone clears.
+struct StrandTreeRail: View {
+    let tone: TodayProjectColor
+    let width: CGFloat
+
+    var body: some View {
+        // A rectangle, not a capsule: rounded ends would break the line at every row.
+        Rectangle()
+            .fill(tone.color)
+            .frame(width: 2)
+            .frame(maxHeight: .infinity)
+            // The chevron column is 20 points wide and starts at the level's edge, so
+            // its centre is 10 points in.
+            .padding(.leading, 9)
+            .frame(width: width, alignment: .leading)
+            .accessibilityHidden(true)
     }
 }
 
