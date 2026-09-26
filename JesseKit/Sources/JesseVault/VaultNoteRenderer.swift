@@ -208,9 +208,29 @@ public enum VaultNoteRenderer {
         return components.url
     }
 
+    /// The host of a link that names a wiki TARGET rather than a path: one in the Studio's
+    /// copy of a note that the local index could not resolve, which the Studio resolves
+    /// when it is tapped.
+    static let targetHost = "wiki"
+
+    public static func linkURL(forTarget target: String) -> URL? {
+        var components = URLComponents()
+        components.scheme = linkScheme
+        components.host = targetHost
+        components.queryItems = [URLQueryItem(name: "target", value: target)]
+        return components.url
+    }
+
+    /// The wiki target a link URL names, or nil when it names a path or is not ours.
+    public static func target(fromLinkURL url: URL) -> String? {
+        guard url.scheme == linkScheme, url.host == targetHost else { return nil }
+        return URLComponents(url: url, resolvingAgainstBaseURL: false)?
+            .queryItems?.first(where: { $0.name == "target" })?.value
+    }
+
     /// The relative path a link URL names, or nil when it is not one of ours.
     public static func path(fromLinkURL url: URL) -> String? {
-        guard url.scheme == linkScheme else { return nil }
+        guard url.scheme == linkScheme, url.host != targetHost else { return nil }
         let path = url.path
         return path.hasPrefix("/") ? String(path.dropFirst()) : path
     }
@@ -314,7 +334,9 @@ public enum VaultNoteRenderer {
     private static func link(label: String, target: String,
                              resolved: [String: String]) -> AttributedString {
         var run = AttributedString(label)
-        if let path = resolved[target], let url = linkURL(forPath: path) {
+        // An EMPTY path is a target the Studio resolves on the tap (see `linkURL(forTarget:)`).
+        if let path = resolved[target],
+           let url = path.isEmpty ? linkURL(forTarget: target) : linkURL(forPath: path) {
             run.link = url
         } else {
             // Plain, and deliberately not styled as disabled: it is ordinary text now,

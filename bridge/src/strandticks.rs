@@ -494,6 +494,34 @@ pub struct TickReport {
     pub checked: bool,
 }
 
+/// The app ticked (or unticked) step `id` of `Strands/<slug>.md`: record it in the ledger
+/// and answer the one word state, or `None` for a slug that is not a live note or an id
+/// that is not a step in it.
+///
+/// THE ONE CODE PATH for an app tick, whichever route carried it: this route, and a tick
+/// record applied by `POST /jesse/vault/writes` (see [`crate::vaultwrites`]). Both land in
+/// the same (note, id) ledger through here, so a tick reported both ways starts one turn.
+pub fn report_app_tick(st: &AppState, slug: &str, id: &str, checked: bool) -> Option<&'static str> {
+    if !crate::strands::is_safe_slug(slug)
+        || id.is_empty()
+        || id.len() > MAX_ID_LEN
+        || id.chars().any(|c| c.is_control())
+    {
+        return None;
+    }
+    let state = match step_state(&notes_root(&st.cfg), slug, id)? {
+        StepState::Done => "done",
+        StepState::Open => {
+            let now = system_time_to_ms(SystemTime::now());
+            st.strand_ticks
+                .report(TickKey::new(slug, id), checked, now)
+                .label()
+        }
+    };
+    eprintln!("jesse-bridge: strand ticks: app reported {slug}/{id} checked={checked} -> {state}");
+    Some(state)
+}
+
 /// `POST /jesse/strands/{slug}/ticks` — the app wrote a tick (or an untick) into
 /// its copy of a strand note.
 ///
@@ -515,27 +543,8 @@ pub async fn jesse_strand_tick(
         ));
     }
     let id = body.id.trim();
-    if !crate::strands::is_safe_slug(&slug)
-        || id.is_empty()
-        || id.len() > MAX_ID_LEN
-        || id.chars().any(|c| c.is_control())
-    {
-        return Err((StatusCode::NOT_FOUND, "no step by that id".to_string()));
-    }
-    let state = match step_state(&notes_root(&st.cfg), &slug, id) {
-        None => return Err((StatusCode::NOT_FOUND, "no step by that id".to_string())),
-        Some(StepState::Done) => "done",
-        Some(StepState::Open) => {
-            let now = system_time_to_ms(SystemTime::now());
-            st.strand_ticks
-                .report(TickKey::new(&slug, id), body.checked, now)
-                .label()
-        }
-    };
-    eprintln!(
-        "jesse-bridge: strand ticks: app reported {slug}/{id} checked={} -> {state}",
-        body.checked
-    );
+    let state = report_app_tick(&st, &slug, id, body.checked)
+        .ok_or((StatusCode::NOT_FOUND, "no step by that id".to_string()))?;
     Ok((StatusCode::ACCEPTED, Json(json!({ "state": state }))).into_response())
 }
 

@@ -1357,6 +1357,14 @@ impl Config {
     /// The strand tick ledger: every strand step that has started its turn, and the
     /// ticks still settling (a sibling of `device.json`), or `None` when persistence
     /// is disabled. See [`crate::strandticks`].
+    /// The ids of the app's vault writes already applied (`POST /jesse/vault/writes`), so a
+    /// resent record changes nothing. Sibling of `strand-ticks.json`.
+    pub fn vault_writes_file(&self) -> Option<PathBuf> {
+        self.state_dir
+            .as_deref()
+            .map(|d| PathBuf::from(d).join("vault-writes.json"))
+    }
+
     pub fn strand_ticks_file(&self) -> Option<PathBuf> {
         self.state_dir
             .as_deref()

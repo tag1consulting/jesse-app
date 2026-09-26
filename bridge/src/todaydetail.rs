@@ -12,9 +12,11 @@
 //! Detail is keyed by **item id**, never by a path. There is deliberately no
 //! `?path=` reader: the caller cannot name a file, it can only name an item, and
 //! the bridge re-parses `Today.md` to find out what that item links. Adding a
-//! path parameter later would turn this from "a fixed, file-derived set of notes"
+//! path parameter HERE would turn this from "a fixed, file-derived set of notes"
 //! into a general vault reader with a token in front of it — a different security
-//! object entirely. Don't.
+//! object entirely. That object now exists, deliberately and separately, as
+//! `GET /jesse/vault/note` in [`crate::vaultnotes`], with its own rules and its own
+//! SECURITY.md section; this route stays keyed by item id.
 //!
 //! ## What the sandbox actually guarantees
 //!

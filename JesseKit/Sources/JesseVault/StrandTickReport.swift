@@ -1,24 +1,17 @@
 import Foundation
 
-// A TICK IN A STRAND NOTE IS TOLD TO THE BRIDGE, NOT ONLY WRITTEN.
+// A TICK IN A STRAND NOTE, AS THE OLD STRAND ROUTE NEEDS IT.
 //
 // On 2026-09-24 a tick of Family P1 in this reader was written, logged and drawn, and never
-// reached the Studio. The file this app writes is Obsidian's own copy ON THE PHONE, and the
-// only thing that carries it to the Studio is Obsidian iOS's Sync, which does not see a
-// file another app changed inside its folder. So "written" here meant "written to a copy
-// nobody else would read", and the step it closed stayed open.
+// reached the Studio: the file this app writes is Obsidian's own copy ON THE PHONE, and
+// Obsidian iOS's Sync does not see a file another app changed inside its folder. Ticks were
+// first reported to `POST /jesse/strands/{slug}/ticks` from an outbox of their own.
 //
-// The tick still goes through the guarded write exactly as before: that is the change the
-// person sees, and the copy Obsidian opens next. What this adds is a REPORT of it — note,
-// step id, ticked or not — to `POST /jesse/strands/{slug}/ticks`, which starts the turn
-// that closes the step on the Studio. It does not depend on Obsidian at all, and the
-// bridge keys it on (note, id), so the same tick arriving later through Sync starts
-// nothing a second time.
-//
-// A REPORT THAT CANNOT BE SENT IS KEPT, not dropped. A tick made on a train is a tick, and
-// the bridge's settle window means one delivered an hour late is handled like one
-// delivered at once. The outbox is written before anything is sent, sent in order (an
-// untick must never overtake its own tick), and emptied only by an answer from the bridge.
+// That outbox is gone. Every write, a tick included, is now a record in `VaultWriteOutbox`,
+// applied by `POST /jesse/vault/writes`, which starts the same turn for a strand tick
+// through the same (note, id) ledger. What stays here is the REPORT: the note and step a
+// tick names, worked out on the device, which the outbox sends the old way only to a
+// bridge that does not have the write route yet.
 
 /// One tick, as the bridge needs it: which note, which step, which way.
 public struct StrandTickReport: Codable, Equatable, Sendable {
@@ -108,86 +101,4 @@ public enum StrandTickDelivery: Equatable, Sendable {
 /// Whatever can tell the bridge. A thrown error means "not reached": the report stays.
 public protocol StrandTickReporting: Sendable {
     func reportStrandTick(_ report: StrandTickReport) async throws -> StrandTickDelivery
-}
-
-/// The reports not yet answered, in order, persisted across launches.
-public actor StrandTickOutbox {
-
-    /// The one the reader uses. Configured by each app shell with its bridge client.
-    public static let shared = StrandTickOutbox()
-
-    public static let defaultsKey = "jesse.strands.tickOutbox"
-
-    private let defaults: UserDefaults
-    private let key: String
-    private var makeReporter: (@Sendable () async -> (any StrandTickReporting)?)?
-    /// The last flush started. Each new one waits for it, so flushes form a chain.
-    private var last: Task<Void, Never>?
-
-    /// `suiteName` nil is the app's standard defaults. A suite NAME rather than a
-    /// `UserDefaults`, so the actor opens its own and nothing unsendable crosses into it.
-    public init(suiteName: String? = nil, key: String = StrandTickOutbox.defaultsKey) {
-        self.defaults = suiteName.flatMap { UserDefaults(suiteName: $0) } ?? .standard
-        self.key = key
-    }
-
-    /// Hand the outbox a way to reach the bridge. A closure rather than a client because
-    /// the shells rebuild their client from settings on every call, and async because the
-    /// Mac's settings live on the main actor.
-    public func configure(reporter: @escaping @Sendable () async -> (any StrandTickReporting)?) {
-        makeReporter = reporter
-    }
-
-    /// Everything still waiting for an answer, oldest first.
-    public var queued: [StrandTickReport] {
-        guard let data = defaults.data(forKey: key),
-              let list = try? JSONDecoder().decode([StrandTickReport].self, from: data)
-        else { return [] }
-        return list
-    }
-
-    /// Keep `report`. Written before any send, so a crash or a dead network loses nothing.
-    public func enqueue(_ report: StrandTickReport) {
-        store(queued + [report])
-    }
-
-    /// Send what is waiting, in order, until the queue is empty or the bridge cannot be
-    /// reached. One send at a time: a call made while another is sending waits for it,
-    /// then sends whatever that one left, so two ticks in a row can never race each
-    /// other to the bridge or be sent twice.
-    ///
-    /// A CHAIN, not a flag: each flush waits for the one before it and then drains once,
-    /// so there is no marker to clear and nothing for a waiter to spin on.
-    public func flush() async {
-        let previous = last
-        let task = Task {
-            await previous?.value
-            await self.drain()
-        }
-        last = task
-        await task.value
-    }
-
-    private func drain() async {
-        guard let reporter = await makeReporter?() else { return }
-        while let next = queued.first {
-            do {
-                _ = try await reporter.reportStrandTick(next)
-            } catch {
-                // Not reached. It stays, first in line, for the next flush.
-                return
-            }
-            var rest = queued
-            if let at = rest.firstIndex(of: next) { rest.remove(at: at) }
-            store(rest)
-        }
-    }
-
-    private func store(_ list: [StrandTickReport]) {
-        if list.isEmpty {
-            defaults.removeObject(forKey: key)
-        } else if let data = try? JSONEncoder().encode(list) {
-            defaults.set(data, forKey: key)
-        }
-    }
 }

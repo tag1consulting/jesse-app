@@ -57,7 +57,8 @@ final class VaultNoteWriteIntegrationTests: XCTestCase {
         XCTAssertTrue(index.search(expression: "pyrometer").isEmpty)
 
         // Write, through the real path.
-        let writer = VaultNoteWriter(source: source, log: OfflineWriteLog(directory: logDirectory))
+        let writer = VaultNoteWriter(source: source, log: OfflineWriteLog(directory: logDirectory),
+                                     outbox: nil)
         let read = try await writer.readStamped(path: "Notes/Kiln.md")
         _ = try await writer.replace(path: "Notes/Kiln.md", expected: read.stamp,
                                      with: """
@@ -111,7 +112,8 @@ final class VaultNoteWriteIntegrationTests: XCTestCase {
         let original = "- [ ] a thing the bridge owns\n"
         VaultFixture.write(original, to: "Today.md", in: root)
         let source = try makeSource()
-        let writer = VaultNoteWriter(source: source, log: OfflineWriteLog(directory: logDirectory))
+        let writer = VaultNoteWriter(source: source, log: OfflineWriteLog(directory: logDirectory),
+                                     outbox: nil)
         let read = try await writer.readStamped(path: "Today.md")
 
         do {
@@ -130,7 +132,7 @@ final class VaultNoteWriteIntegrationTests: XCTestCase {
         VaultFixture.write("- [ ] one\n", to: "T.md", in: root)
         let source = try makeSource()
         let log = OfflineWriteLog(directory: logDirectory)
-        let writer = VaultNoteWriter(source: source, log: log)
+        let writer = VaultNoteWriter(source: source, log: log, outbox: nil)
 
         let read = try await writer.readStamped(path: "T.md")
         let after = try await writer.replace(path: "T.md", expected: read.stamp,
@@ -236,7 +238,8 @@ final class VaultNoteWriteIntegrationTests: XCTestCase {
         VaultFixture.write(draft, to: "Projects/drafts/2026-09-23-1200-yard.md", in: root)
         let source = try makeSource()
         let writer = VaultNoteWriter(source: source,
-                                     log: OfflineWriteLog(directory: logDirectory))
+                                     log: OfflineWriteLog(directory: logDirectory),
+                                     outbox: nil)
         let path = "Projects/drafts/2026-09-23-1200-yard.md"
         let read = try await writer.readStamped(path: path)
 

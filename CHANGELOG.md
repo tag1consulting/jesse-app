@@ -14,6 +14,102 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [App 1.0 (169)] - 2026-09-26
+
+**A note opened by name shows the Studio's current copy whenever the bridge is reachable,
+and every change the app makes to a note reaches the Studio, online or offline.** Tapping
+a strand, a wiki link in a reply, a citation or a search hit now asks the bridge first:
+the Obsidian folder on the device is shown only when it is byte-identical to the Studio's
+copy, or when the Studio cannot be asked. Every write (an edit, a CriticMarkup comment, a
+checkbox in any note, an Inbox capture, an offline review request) is also queued for the
+bridge, applied there against the current file, and a conflict is shown with both versions
+rather than lost.
+
+**Root cause one: the app treated the device's Obsidian folder as the source of truth for
+notes opened by name.** `StrandOpener.resolve` tried the local copy before the bridge, and
+the wiki and note routes resolved only against the local index. Obsidian on iOS syncs only
+while it is open in the foreground, so the app showed, and opened for editing, copies
+hours behind the Studio's, while the bridge had the current one; on 2026-09-24 a folder
+renamed on the Studio did not exist on the phone and strand taps failed.
+
+**Root cause two: every write except a strand tick relied on Obsidian iOS syncing a file
+another app changed, which it does not do.** `VaultNoteWriter` wrote into the device's
+folder and only a strand step's tick was also reported to the bridge, so edits, comments,
+captures and every other tick could exist only on the phone.
+
+### Added
+
+- **`VaultNoteOpener`**, the one opener every by-name open goes through: a conditional
+  `GET /jesse/vault/note` carrying the local copy's sha256, then the local reader when the
+  hashes match, the Studio's copy with "The Obsidian copy on this device is behind" when
+  they do not or the device has none, the local copy with an offline line when the bridge
+  is unreachable or too old for the route, and "doesn't exist on the Studio" (with the
+  local copy labelled local only) for a note the Studio lacks. The vault reader makes this
+  decision on every load, so strands, `jesse://wiki`, `jesse://note`, the Vault tab's
+  opens and links followed out of a Studio copy all share it, on iOS and the Mac.
+- **`VaultWriteOutbox`**, one persisted outbox (Application Support, never the vault) that
+  every `VaultNoteWriter` write, every capture and every offline review request feeds:
+  queued before the local write and taken back only if that write fails, sent in order to
+  `POST /jesse/vault/writes` on launch, after every write, on foreground and whenever the
+  bridge becomes reachable again. `applied` removes a record; `conflict` keeps it, shown on
+  the note and in Vault diagnostics with both versions and "Keep mine" (resend with
+  `force`) or "Take the Studio's"; `refused` is shown once and dropped.
+- **Changes to the Studio's copy go through the outbox and never into the folder.** A tick
+  or an edit made on a Studio copy is sent with the Studio's hash as its base, and the
+  reader then shows the Studio's copy again. A Studio copy cut at 64 KB is read only.
+- **Vault diagnostics** gains "Waiting for the Studio" (pending count, conflicts, refusals,
+  Send now), and capture and note write rows say "delivered to the bridge".
+
+### Changed
+
+- **`StrandTickOutbox` is deleted.** A strand tick is an ordinary write record now, and the
+  bridge starts the same turn for it. `StrandTickReport` stays as the record's payload for
+  a bridge without the write route, which still receives strand ticks the old way; any
+  ticks left in the old queue are moved into the new outbox on first launch.
+
+## [Bridge 0.154.0] - 2026-09-26
+
+**Two routes so the app stops trusting the phone's Obsidian folder: one note served by path
+or wiki target, and every write the app makes to a note applied here against the current
+file.**
+
+**Root cause one: the app treated the device's Obsidian folder as the source of truth for
+notes opened by name, and Obsidian on iOS syncs only in the foreground,** so the app showed
+and edited stale copies while the bridge had the current one. There was no route that
+served a note by path or target, so a note newer on the Studio, or missing on the phone,
+could not be reached at all.
+
+**Root cause two: every write except a strand tick relied on Obsidian iOS syncing a file
+another app changed, which it does not do,** so edits, comments, captures and non-strand
+ticks could exist only on the phone. Only `POST /jesse/strands/{slug}/ticks` carried
+anything from the app.
+
+### Added
+
+- **`GET /jesse/vault/note`** with exactly one of `path` or `target` (resolved by
+  `resolve_target`, the item detail resolver). Serves `path`, `markdown`, `modified`,
+  `sha256` of the whole file and `truncated`, capped at 64 KB like item detail, with the
+  sha256 as a strong ETag and `304` on a matching `If-None-Match`. A missing note is `404`
+  `{"error":"note_not_found"}`; a refused path is `400`. Only `.md` files under the notes
+  root: no absolute paths, no segment starting with `.`, nothing under `_to-purge/`, and
+  the canonical (symlink resolved) path is checked against the root and the same rules.
+- **`POST /jesse/vault/writes`**, a JSON array of records (`id`, `path`, `kind`,
+  `base_sha256`, `text`, `line`, `checked`, `made_at`, optional `base_text`, `force`,
+  `prologue`) applied in order, one answer per record: `applied`, `conflict` with
+  `current_text` and `current_sha256`, or `refused` with a reason, each with the file's
+  sha256. A matching base applies directly; an edit on a moved base is merged three ways
+  by line (the `diffy` crate) and overlapping hunks are a conflict; a tick on a moved base
+  is found by its line's content and applied only when exactly one line matches; a capture
+  is appended unless the entry is already in the file's last 50 lines. Applied ids are kept
+  30 days in `<state_dir>/vault-writes.json` so a resent record changes nothing. Never
+  `Today.md`, captures only under `Inbox/`, never git. While a turn holds a write lock on a
+  named file the request answers `503` and the app sends it again later.
+- **A strand tick applied by the write route starts the same turn** as the ticks route,
+  through `strandticks::report_app_tick`, now the one code path for both, so the (note, id)
+  ledger fires once however the tick arrived.
+- **SECURITY.md** records the path reader as its own security decision, as the item detail
+  section required.
+
 ## [App 1.0 (168)] - 2026-09-26
 
 **A request typed while the bridge was unreachable could vanish entirely.** On an iPhone in

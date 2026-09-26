@@ -29,8 +29,10 @@ public protocol StrandMarkdownProviding: AnyObject {
 
 extension StrandsModel: StrandMarkdownProviding {}
 
-/// **What opening a strand means**, in one place: the note on THIS device when it is here,
-/// the bridge's copy when it is not, and an honest line when neither answered.
+/// **What opening a strand means**, in one place: the vault reader on the strand's note,
+/// which shows the Studio's copy whenever the device's is behind; the strands endpoint's
+/// copy for a bridge too old to serve notes by path; and an honest line when neither
+/// answered.
 @MainActor
 @Observable
 public final class StrandOpener {
@@ -46,11 +48,14 @@ public final class StrandOpener {
 
     private let localNotes: (any TodayLocalNoteProviding)?
     private weak var remote: (any StrandMarkdownProviding)?
+    private let opener: VaultNoteOpener
 
     public init(localNotes: (any TodayLocalNoteProviding)? = nil,
-                remote: (any StrandMarkdownProviding)? = nil) {
+                remote: (any StrandMarkdownProviding)? = nil,
+                opener: VaultNoteOpener = .shared) {
         self.localNotes = localNotes
         self.remote = remote
+        self.opener = opener
     }
 
     /// Open a strand from a tap. Returns at once; the note arrives on `openedNote`.
@@ -73,9 +78,20 @@ public final class StrandOpener {
         // `Strands/<slug>` is an exact relative path, so the resolver's first step settles
         // it; the basename steps below it are what cover a vault whose folder is one level
         // in from the workspace root.
+        //
+        // THE READER DECIDES WHICH COPY, not this. `.local` opens the vault reader, and the
+        // reader asks the Studio first (`VaultNoteOpener`): the device's copy only when it
+        // is the Studio's, the Studio's copy with a line saying the device is behind
+        // otherwise. A strand note the device does not have at all still opens there,
+        // from the Studio, by the Studio's own path. The strands endpoint's markdown is
+        // what is left for a bridge too old to serve a note by path.
         let target = "\(Strand.directory)/\(slug)"
         if let local = await localNotes?.localNote(forTargets: [target]) {
             openedNote = .local(path: local.path, slug: slug, title: title)
+            return
+        }
+        if case .path(let path) = await opener.resolve(target: target, localPath: nil) {
+            openedNote = .local(path: path, slug: slug, title: title)
             return
         }
         if let markdown = await remote?.markdown(forSlug: slug) {

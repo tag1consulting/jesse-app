@@ -59,6 +59,14 @@ public final class VaultDiagnosticsModel {
     /// reindex running", and a screen that kept its own copy of that would be a second
     /// answer to the same question.
     public let indexer: VaultIndexer
+    /// The writes the Studio has not taken yet, conflicts included, oldest first.
+    public private(set) var outboxEntries: [VaultOutboxEntry] = []
+    /// Refusals the bridge sent, each shown on this screen once and then gone from the
+    /// outbox. Kept here only while the screen is.
+    public private(set) var refusals: [VaultWriteRefusal] = []
+    /// The write log rows the bridge has applied.
+    public private(set) var delivered: Set<UUID> = []
+    private let outbox: VaultWriteOutbox
 
     public init(folder: VaultFolder = VaultFolder(),
                 probeSession: any ProbeSessioning = FoundationModelProbeSession(),
@@ -66,7 +74,9 @@ public final class VaultDiagnosticsModel {
                 settings: OfflineLookupSettings = OfflineLookupSettings(),
                 offline: OfflineLookupDiagnostics = .shared,
                 capture: InboxCaptureService = .shared,
-                writeLog: OfflineWriteLog = .shared) {
+                writeLog: OfflineWriteLog = .shared,
+                outbox: VaultWriteOutbox = .shared) {
+        self.outbox = outbox
         self.folder = folder
         self.probeSession = probeSession
         self.indexer = indexer
@@ -107,7 +117,52 @@ public final class VaultDiagnosticsModel {
         guard !captures.isEmpty else {
             return ["Nothing has been captured into the vault from this device yet."]
         }
-        return captures.map { "\(Self.time($0.written))  \($0.line)" }
+        return captures.map { "\(Self.time($0.written))  \($0.line)\(deliveredSuffix($0))" }
+    }
+
+    /// Said after a write the bridge has applied: the question this screen is asked is
+    /// "did it reach the Studio", and "verified in the folder" alone cannot answer it.
+    private func deliveredSuffix(_ record: OfflineWriteRecord) -> String {
+        delivered.contains(record.id) ? " · delivered to the bridge" : ""
+    }
+
+    /// The outbox, as lines: how many are waiting, and every refusal not yet dismissed.
+    public var outboxLines: [String] {
+        let queued = outboxEntries.filter { !$0.isConflicted }.count
+        var lines = [queued == 0 && outboxEntries.isEmpty
+                     ? "Nothing is waiting: every write from this device has reached the Studio."
+                     : VaultWriteNoticeText.pending(queued)]
+        for refusal in refusals {
+            lines.append("Refused: \(refusal.path) · \(refusal.kind.display) · \(refusal.reason)")
+        }
+        return lines
+    }
+
+    public var outboxConflicts: [VaultOutboxEntry] { outboxEntries.filter(\.isConflicted) }
+
+    /// Read the outbox again, and collect any refusals it is holding (which it then drops).
+    public func refreshOutbox() async {
+        outboxEntries = await outbox.entries
+        refusals += (try? await outbox.takeRefusals()) ?? []
+        delivered = await outbox.delivered(among: (captures + edits).map(\.id))
+    }
+
+    /// Send what is waiting now, rather than at the next foreground or reconnect.
+    public func sendOutbox() async {
+        busy = "Sending to the Studio…"
+        defer { busy = nil }
+        await outbox.flush()
+        await refreshOutbox()
+    }
+
+    public func keepMine(_ entry: VaultOutboxEntry) async {
+        await outbox.keepMine(id: entry.id)
+        await refreshOutbox()
+    }
+
+    public func takeStudios(_ entry: VaultOutboxEntry) async {
+        await outbox.takeStudios(id: entry.id)
+        await refreshOutbox()
     }
 
     /// The captures the verification pass could not find. Each one keeps its text, so it
@@ -126,7 +181,7 @@ public final class VaultDiagnosticsModel {
         guard !edits.isEmpty else {
             return ["No note on this device has been edited from the app yet."]
         }
-        return edits.map { "\(Self.time($0.written))  \($0.line)" }
+        return edits.map { "\(Self.time($0.written))  \($0.line)\(deliveredSuffix($0))" }
     }
 
     public func refreshStatus() {
@@ -467,7 +522,29 @@ public struct VaultDiagnosticsView: View {
             }
 
             Section {
-                Text("Notes this device changed in place: a checkbox ticked in the reader, or a note saved from the editor. Each row shows the file's size before and after and the checksum of the result. Obsidian Sync carries these to the Studio; nothing here went through the bridge.")
+                Text("Every change this device makes to a note, a capture included, is also sent to the Studio, which applies it to its own copy. Obsidian on the phone does not carry a change another app made, so this is what does. A change the Studio could not place waits here with both versions until you choose.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                Button("Send now") { Task { await model.sendOutbox() } }
+                    .disabled(model.busy != nil)
+                ForEach(Array(model.outboxLines.enumerated()), id: \.offset) { _, line in
+                    Text(line)
+                        .font(.system(.footnote, design: .monospaced))
+                        .textSelection(.enabled)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                ForEach(model.outboxConflicts) { entry in
+                    VaultWriteConflictRow(
+                        entry: entry,
+                        keepMine: { Task { await model.keepMine(entry) } },
+                        takeStudios: { Task { await model.takeStudios(entry) } })
+                }
+            } header: {
+                Text("Waiting for the Studio")
+            }
+
+            Section {
+                Text("Notes this device changed in place: a checkbox ticked in the reader, or a note saved from the editor. Each row shows the file's size before and after and the checksum of the result, and says when the bridge has applied it.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
                 ForEach(Array(model.editLines.enumerated()), id: \.offset) { _, line in
@@ -498,6 +575,10 @@ public struct VaultDiagnosticsView: View {
             model.refreshStatus()
             model.indexer.refreshCounts()
             model.refreshCaptures()
+        }
+        .task { await model.refreshOutbox() }
+        .onReceive(NotificationCenter.default.publisher(for: VaultWriteOutbox.didChange)) { _ in
+            Task { await model.refreshOutbox() }
         }
     }
 

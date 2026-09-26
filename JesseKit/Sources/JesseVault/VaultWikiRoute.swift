@@ -169,13 +169,20 @@ public final class VaultWikiOpener {
     public private(set) var isResolving = false
 
     private let source: VaultIndexSource
+    private let opener: VaultNoteOpener
 
-    public init(source: VaultIndexSource = .shared) {
+    public init(source: VaultIndexSource = .shared, opener: VaultNoteOpener = .shared) {
         self.source = source
+        self.opener = opener
     }
 
-    /// Resolve `route` against the copy of the vault on this device and either open the
-    /// note or explain why it could not.
+    /// Resolve `route` and either open the note or explain why it could not.
+    ///
+    /// THE STUDIO FIRST, when it can be asked: a reply routinely links a note created or
+    /// renamed on the Studio in the last hour, which the phone's folder does not have until
+    /// Obsidian is next opened. The local index answers when the Studio cannot, exactly as
+    /// it always did, and the reader the route opens makes the same bridge first decision
+    /// about which copy to show.
     public func follow(_ route: VaultWikiRoute) async {
         guard !isResolving else { return }
         isResolving = true
@@ -195,10 +202,11 @@ public final class VaultWikiOpener {
             }) else { return nil }
             return VaultWikiLink.resolve(target: target, among: all)
         }.value
-        if let path {
-            opened = VaultNoteRoute(path: path)
-        } else {
-            missing = VaultWikiLink.missingCaption(targets: [target])
+        switch await opener.resolve(target: target, localPath: path) {
+        case .path(let resolved):
+            opened = VaultNoteRoute(path: resolved)
+        case .missing(let why):
+            missing = why
         }
     }
 }

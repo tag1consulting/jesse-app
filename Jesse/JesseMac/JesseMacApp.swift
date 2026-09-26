@@ -41,14 +41,9 @@ struct JesseMacApp: App {
         _coordinator = State(initialValue: MacCoordinator(configStore: cfg))
         store = MacModelContainer.open()
 
-        // A tick of a strand step in the vault reader is reported to the bridge, the
-        // phone's rule and the phone's reason; see `StrandTickReport`.
-        Task {
-            await StrandTickOutbox.shared.configure { @MainActor in
-                JesseBridgeClient(config: cfg.config)
-            }
-            await StrandTickOutbox.shared.flush()
-        }
+        // Notes open from the Studio first and every write to one is sent there, the
+        // phone's rule and the phone's reason; see `VaultNoteOpener` and `VaultWriteOutbox`.
+        VaultBridgeWiring.install { JesseBridgeClient(config: cfg.config) }
     }
 
     var body: some Scene {

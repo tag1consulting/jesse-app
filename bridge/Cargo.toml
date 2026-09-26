@@ -1,6 +1,6 @@
 [package]
 name = "jesse-bridge"
-version = "0.153.0"
+version = "0.154.0"
 edition = "2021"
 license = "Apache-2.0"
 
@@ -194,6 +194,13 @@ jesse-agent = { path = "../agent" }
 # `brew install cmake`). Linux CI's runner image carries cmake already. Bindings are generated
 # with libclang when it is present and fall back to the crate's bundled ones when it is not.
 whisper-rs = "0.16"
+# diffy: the THREE WAY MERGE behind `POST /jesse/vault/writes` (`src/vaultwrites.rs`). An
+# edit made on the phone against a note the Studio has since changed is merged by line
+# against the base the phone edited, and overlapping hunks are a conflict the app shows
+# rather than a guess. diffy's `merge` is diff3 over its own Myers diff, pure Rust with no
+# C, and small; a hand-rolled diff3 is exactly the kind of code that loses a line in the
+# one case nobody tested. Only `merge` is used.
+diffy = "0.4"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }   # ServiceExt::oneshot
