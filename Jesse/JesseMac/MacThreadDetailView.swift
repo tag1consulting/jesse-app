@@ -317,12 +317,7 @@ struct MacThreadDetailView: View {
             // WHAT THE SECOND CONTROL IS FOR. The Mac has no send outbox, so this row is
             // the difference between a thought that is on disk and one that is nowhere.
             if captureOffer.isOffered {
-                Label("The Studio can't be reached. Capture to Inbox writes this straight into the vault on this Mac.",
-                      systemImage: "tray.and.arrow.down")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .fixedSize(horizontal: false, vertical: true)
+                MacCaptureOfferNotice()
             }
             HStack(alignment: .bottom, spacing: 10) {
                 Picker("", selection: $mode) {
