@@ -169,28 +169,22 @@ public struct StrandsListView: View {
     /// row's combined accessibility element, so the chevron stays a separate control and
     /// the row's tap still opens the note.
     ///
-    /// The indent is drawn, not left blank: one thin rail per level, each in the tone of
-    /// the ancestor at that level and centred under that ancestor's chevron, the way a
-    /// code editor draws indent guides. Consecutive rows join their rails into one line
-    /// down the whole subtree, which is what says "these belong to that". It is position
-    /// rather than hue, so it survives a colour vision deficiency; a screen reader hears
-    /// the same relation as `in <parent>` in the row's label.
+    /// The indent is BLANK SPACE, and exactly one vertical mark is drawn on the row: its
+    /// own accent bar, in its own tone. It used to draw a rail per ancestor level as well,
+    /// centred under that ancestor's chevron — indent guides, in the manner of a code
+    /// editor. On a phone that read as a mistake rather than as a relation: the rail sits
+    /// in the disclosure column, LEFT of the parent's own bar and never joined to it, so
+    /// every nested row showed two parallel lines a few points apart and the outer one
+    /// looked like a stray. Depth is already carried by the indent, the chevron and the
+    /// row's own tone, and a screen reader hears it as `in <parent>` in the row's label.
     private func treeRow(_ tree: StrandsTreeRow, isCollapsed: Bool,
                          family: StrandFamily) -> some View {
-        let ancestors = family.ancestors(of: tree.strand, depth: tree.depth)
-        return HStack(alignment: .top, spacing: 2) {
-            HStack(spacing: 0) {
-                // A chain the snapshot cannot finish leaves its top levels blank rather
-                // than drawing a rail in a tone nobody owns.
-                if ancestors.count < tree.depth {
-                    Color.clear
-                        .frame(width: CGFloat(tree.depth - ancestors.count) * Self.treeIndent)
-                }
-                ForEach(ancestors) { ancestor in
-                    StrandTreeRail(tone: family.tone(ancestor.slug), width: Self.treeIndent)
-                }
+        HStack(alignment: .top, spacing: 2) {
+            if tree.depth > 0 {
+                Color.clear
+                    .frame(width: CGFloat(tree.depth) * Self.treeIndent)
+                    .accessibilityHidden(true)
             }
-            .accessibilityHidden(true)
             Group {
                 if tree.hasChildren {
                     Button {
@@ -216,8 +210,8 @@ public struct StrandsListView: View {
                     ? StrandsSemantics.insideCaption(tree.descendants) : nil)
                 .padding(.vertical, Self.treeRowPadding)
         }
-        // The rails fill the row's full height, and the row gives up its vertical inset
-        // (the padding above stands in for it) so one row's rail meets the next one's.
+        // The row keeps its own vertical inset (the padding above stands in for the
+        // list's) so the indent columns of consecutive rows line up exactly.
         .fixedSize(horizontal: false, vertical: true)
         .listRowInsets(.vertical, 0)
     }
@@ -310,12 +304,13 @@ public enum StrandNoteSource: Equatable, Identifiable, Sendable {
 /// One strand: its group, its title, where it stands, and what runs next.
 struct StrandRow: View {
     let strand: Strand
-    /// The strand's family tone, resolved for the current appearance by `StrandTone`.
+    /// The strand's family tone, resolved for the current appearance by `StrandTone`:
+    /// the one function every surface that draws a strand goes through.
     let tone: TodayProjectColor
     /// The title of the strand this one sits under, or nil for a top level strand.
     var parentTitle: String? = nil
     /// Whether the row says `in <parent>` under its title: the flat lenses do, the
-    /// `Tree` lens draws the relation as a rail instead.
+    /// `Tree` lens draws the relation as indentation instead.
     var showsParentCaption = false
     /// The parent's tone, for the caption's mark.
     var parentTone: TodayProjectColor? = nil
@@ -332,9 +327,10 @@ struct StrandRow: View {
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
             // The day rows' accent bar, from the same palette, in the strand's family
-            // tone: its topic's colour at the root, one step per level below it. The
-            // tone is computed in `StrandTone`, inside the palette's contract, never here.
-            TodayProjectAccentBar(project: strand.group, tone: tone)
+            // tone: its ROOT STRAND's colour, one step per level below it. The tone is
+            // computed in `StrandTone`, inside the palette's contract, never here, and
+            // it is the only vertical mark on the row.
+            TodayProjectAccentBar(strandTone: tone)
             Button(action: onOpen) {
                 VStack(alignment: .leading, spacing: 3) {
                     header
@@ -442,29 +438,6 @@ struct StrandRow: View {
                                                               parentTitle: parentTitle)
         guard let insideCaption else { return sentence }
         return "\(sentence), \(insideCaption)"
-    }
-}
-
-// MARK: - A tree rail
-
-/// One level of a `Tree` row's indent: a thin rule in the tone of the ancestor at that
-/// level, centred under where that ancestor's chevron sits, full row height. A non text
-/// mark, so its floor is the 3:1 every derived tone clears.
-struct StrandTreeRail: View {
-    let tone: TodayProjectColor
-    let width: CGFloat
-
-    var body: some View {
-        // A rectangle, not a capsule: rounded ends would break the line at every row.
-        Rectangle()
-            .fill(tone.color)
-            .frame(width: 2)
-            .frame(maxHeight: .infinity)
-            // The chevron column is 20 points wide and starts at the level's edge, so
-            // its centre is 10 points in.
-            .padding(.leading, 9)
-            .frame(width: width, alignment: .leading)
-            .accessibilityHidden(true)
     }
 }
 

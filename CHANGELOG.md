@@ -43,6 +43,55 @@ exists to keep readable.
   register a device moves), so it raises neither the badge nor an unread dot. The
   conversation and transcript are kept.
 
+## [App 1.0 (171)] - 2026-09-26
+
+**The strand board was a mess of near-identical colours with a stray line down every
+nested row.** On a phone in dark mode, Family and Trovato were the same green, Health and
+Tangent were the same green as each other, Homelab and K3s Cluster were one purple, and
+Trovato, Netgrasp, Argus and Trovato Core were one green. Every top level strand now wears
+a colour of its own, a child is a visibly lighter or darker shade of its family, and a row
+draws exactly one vertical mark.
+
+**Root cause one: a root strand took its TOPIC's colour, and there are five topics for
+eight roots.** `StrandTone` made a root exactly its topic's base from `TodayProjectPalette`,
+so the four roots filed under Personal — Family, Trovato, Health and Tangent — were issued
+the same green by construction, and no amount of stepping below them could undo it. A
+strand's colour now comes from a table keyed on the ROOT STRAND's own slug: eight slots for
+the eight roots the vault holds, each a hue with a root lightness and chroma per
+appearance, plus four spare slots a root the table has never heard of takes by a stable
+FNV 1a hash of its slug. The four roots that had a topic colour kept its family (Tag1 blue,
+Homelab purple, Perseido red, Via Con Me orange); Family, Trovato, Health and Tangent
+gained green, teal, pink and gold. Topic no longer touches a strand's colour at all, and
+Today items are untouched — they still wear their topic, exactly as before.
+
+**Root cause two: a child stepped below what the eye can see on a 3 point bar.** The old
+rule moved a child about 0.05 in OKLCH lightness and a few degrees of hue from its parent,
+and the only assertion on it was ΔE 5 from the parent — invisible at that width. A child
+now keeps its root's hue exactly and takes one lightness step per level, darker on white
+and lighter on `#1C1C1E` (in both cases away from the background, which is the only
+direction with room before the 3:1 floor), sized so each level is at least ΔE*ab 12 from
+the level above it. Siblings at one depth share a tone; their names tell them apart, and a
+tone no longer depends on who a strand's siblings are. Stepping stops three levels below
+the root. The per topic tuning table, the four hue slots and the slug hash fan out are gone.
+
+**Root cause three: the tree rail sat in the chevron column, not beside the bar it
+belonged to.** The `Tree` lens drew one rail per ancestor level, centred under that
+ancestor's chevron — indent guides, in the manner of a code editor. It sits LEFT of the
+parent's own accent bar and is never joined to it, so a nested row showed two parallel
+lines a few points apart and the outer one read as a stray. `StrandTreeRail` is deleted:
+the indent is blank space, and the row's own accent bar is the only vertical mark on it.
+
+**What is asserted.** `StrandToneTests` walks every level to the third in both appearances
+and requires every tone to clear 3:1 against its background, every pair of the eight named
+roots to be at least ΔE*ab 20 apart under normal vision, every level to be at least ΔE*ab
+12 from the level above it, and every child to be closer to its own root than to any other
+root. Colour vision deficiency is measured and PRINTED rather than gated — eight hues
+cannot all survive deuteranopia, and every row that carries a tone carries the strand's
+name. A new render test draws the `Tree` lens through the real `StrandRow` with
+`ImageRenderer` and writes a PNG per appearance, so the picture behind the numbers can be
+looked at. No bridge change and no wire change: the table keys on slugs the snapshot
+already sends.
+
 ## [App 1.0 (170)] - 2026-09-26
 
 **A question about Jeremy was answered out of somebody else's archived notes.** With the

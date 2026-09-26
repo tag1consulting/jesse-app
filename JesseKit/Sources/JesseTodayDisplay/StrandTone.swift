@@ -1,10 +1,10 @@
 import SwiftUI
 import JesseNetworking
 
-// A strand's own tone: its topic's colour, stepped once per level down the strand tree,
-// so a family reads as a family. The rule and its contract are stated in the header of
-// `TodayProjectPalette.swift`, next to the contract it lives inside; this file is the
-// arithmetic.
+// A strand's own tone: its ROOT STRAND's colour, stepped once per level down the strand
+// tree, so a family reads as a family and two families never read as one. The rule and
+// its contract are stated in the header of `TodayProjectPalette.swift`, next to the
+// contract it lives inside; this file is the table and the arithmetic.
 
 // MARK: - OKLCH
 
@@ -104,93 +104,128 @@ extension TodayProjectColor {
 
 // MARK: - The derivation
 
-/// How one topic steps down a level, in one appearance. Data, so the numbers the tests
-/// measure are the numbers the rows draw.
-public struct StrandToneTuning: Equatable, Sendable {
-    /// OKLCH lightness per level. Positive lightens. Signed because a topic's
-    /// neighbours decide which way it has room: see `StrandTone.tuning`.
-    public var lightnessStep: Double
-    /// Degrees of hue per slot unit.
-    public var hueUnit: Double
-    /// The share of chroma a child keeps from its parent.
-    public var chromaKeep: Double
+/// **One family's colour**: a hue, and where on the lightness axis that family's ROOT
+/// sits in each appearance. Data, so the numbers the tests measure are the numbers the
+/// rows draw.
+///
+/// The hue is shared by both appearances and the lightness and chroma are not: a family
+/// keeps its identity between light and dark (Trovato is teal in both), while each
+/// appearance puts the root where that appearance has room to step away from it.
+public struct StrandToneSlot: Equatable, Sendable {
+    /// OKLCH hue in degrees. One value, both appearances.
+    public var hue: Double
+    /// The root's OKLCH lightness and chroma in the light appearance.
+    public var lightLightness: Double
+    public var lightChroma: Double
+    /// The same in the dark appearance.
+    public var darkLightness: Double
+    public var darkChroma: Double
 
-    public init(lightnessStep: Double, hueUnit: Double, chromaKeep: Double) {
-        self.lightnessStep = lightnessStep
-        self.hueUnit = hueUnit
-        self.chromaKeep = chromaKeep
+    public init(hue: Double, lightLightness: Double, lightChroma: Double,
+                darkLightness: Double, darkChroma: Double) {
+        self.hue = hue
+        self.lightLightness = lightLightness
+        self.lightChroma = lightChroma
+        self.darkLightness = darkLightness
+        self.darkChroma = darkChroma
+    }
+
+    /// The root's colour in one appearance, in OKLCH.
+    public func root(_ scheme: ColorScheme) -> OKLCH {
+        scheme == .dark ? OKLCH(lightness: darkLightness, chroma: darkChroma, hue: hue)
+                        : OKLCH(lightness: lightLightness, chroma: lightChroma, hue: hue)
     }
 }
 
-/// **A strand's tone**: its topic's base colour at the root of its family, and one step
-/// per level below it. Pure and total; the rule is documented in the palette's header.
+/// **A strand's tone**: its ROOT STRAND's own colour, stepped once per level down to it.
+/// Pure and total; the rule is documented in the palette's header.
 public enum StrandTone {
 
     /// The deepest level that takes a step of its own. A strand below it wears its
-    /// ancestor's tone at this depth: the tests cover every path this deep, and a tone
-    /// no test has measured is a tone that may be Network purple.
-    public static let maxDepth = 4
+    /// ancestor's tone at this depth: the tests cover every level this deep, and a tone
+    /// no test has measured is a tone that may be somebody else's family.
+    public static let maxDepth = 3
 
-    /// The hue offsets a child can take, in hue units, both sides of its parent. A
-    /// strand's slot is a hash of its own slug, so siblings fan out around the parent
-    /// and a strand's tone never depends on who its siblings are.
-    public static let slots: [Double] = [1, -1, 2, -2]
+    /// **The root table.** One slot per top level strand, keyed by its slug LOWERCASED
+    /// (the bridge sends `Via-Con-Me`; the table reads `via-con-me`, so the two spellings
+    /// cannot disagree). Eight entries, the eight roots the vault holds, each its own
+    /// colour rather than its topic's — the fault this table exists to fix is that five
+    /// topics cannot tell eight roots apart.
+    ///
+    /// The values were searched, not chosen by eye, against the four properties
+    /// `StrandToneTests` asserts; the four that had a topic colour before kept its
+    /// family (Tag1 blue, Homelab purple, Perseido red, Via Con Me orange).
+    public static let roots: [String: StrandToneSlot] = [
+        "perseido":   StrandToneSlot(hue:  24.0, lightLightness: 0.540, lightChroma: 0.198,
+                                     darkLightness: 0.587, darkChroma: 0.168),
+        "via-con-me": StrandToneSlot(hue:  50.4, lightLightness: 0.620, lightChroma: 0.132,
+                                     darkLightness: 0.530, darkChroma: 0.128),
+        "tangent":    StrandToneSlot(hue:  95.1, lightLightness: 0.606, lightChroma: 0.221,
+                                     darkLightness: 0.600, darkChroma: 0.187),
+        "family":     StrandToneSlot(hue: 153.9, lightLightness: 0.545, lightChroma: 0.124,
+                                     darkLightness: 0.554, darkChroma: 0.111),
+        "trovato":    StrandToneSlot(hue: 198.3, lightLightness: 0.588, lightChroma: 0.106,
+                                     darkLightness: 0.530, darkChroma: 0.238),
+        "tag1":       StrandToneSlot(hue: 241.4, lightLightness: 0.601, lightChroma: 0.167,
+                                     darkLightness: 0.583, darkChroma: 0.240),
+        "homelab":    StrandToneSlot(hue: 301.9, lightLightness: 0.540, lightChroma: 0.231,
+                                     darkLightness: 0.530, darkChroma: 0.120),
+        "health":     StrandToneSlot(hue: 352.0, lightLightness: 0.607, lightChroma: 0.240,
+                                     darkLightness: 0.576, darkChroma: 0.172),
+    ]
 
-    /// **The step table.** One row per topic and appearance, each the widest sweep that
-    /// keeps every tone at every depth and slot at least ΔE 10 from every other topic
-    /// under all four visions (asserted in `StrandToneTests`). The palette header says
-    /// why some rows darken and some sweep less.
-    public static func tuning(_ project: TodayProject, _ scheme: ColorScheme) -> StrandToneTuning {
-        let dark = scheme == .dark
-        switch project {
-        case .tag1:
-            return dark ? StrandToneTuning(lightnessStep: 0.05, hueUnit: 6, chromaKeep: 0.96)
-                        : StrandToneTuning(lightnessStep: 0.05, hueUnit: 6, chromaKeep: 0.84)
-        case .personal:
-            return dark ? StrandToneTuning(lightnessStep: 0.07, hueUnit: 6, chromaKeep: 1)
-                        : StrandToneTuning(lightnessStep: 0.07, hueUnit: 6, chromaKeep: 0.96)
-        case .network:
-            // Light: one degree a unit. Network's light purple sits ΔE 17.5 from Tag1's
-            // blue under protanopia, and a wider turn toward blue closes that gap.
-            return dark ? StrandToneTuning(lightnessStep: 0.05, hueUnit: 4, chromaKeep: 0.80)
-                        : StrandToneTuning(lightnessStep: 0.06, hueUnit: 1, chromaKeep: 0.80)
-        case .viaConMe:
-            // Light: no sweep at all. The orange clears 4.5:1 with little to spare, so
-            // lightening stops at the 3:1 floor within two levels; darker walks into
-            // Perseido under deuteranopia and any turn walks into Personal under
-            // protanopia. Its children step by lightness, then by chroma, and siblings
-            // share a tone. Dark: it darkens, because lighter is where Personal is.
-            return dark ? StrandToneTuning(lightnessStep: -0.07, hueUnit: 6, chromaKeep: 1)
-                        : StrandToneTuning(lightnessStep: 0.08, hueUnit: 0, chromaKeep: 0.84)
-        case .perseido:
-            // Light: one degree a unit, for the same reason as Via Con Me in miniature.
-            // Dark: it darkens, because its light red and Personal's light green are only
-            // ΔE 11.5 apart under deuteranopia and lighter closes that gap.
-            return dark ? StrandToneTuning(lightnessStep: -0.06, hueUnit: 6, chromaKeep: 1)
-                        : StrandToneTuning(lightnessStep: 0.09, hueUnit: 1, chromaKeep: 0.84)
-        case .unfiled:
-            // A grey has no hue to turn and must never grow one, so a child steps by
-            // lightness alone, and toward the side with room: darker in both appearances.
-            return dark ? StrandToneTuning(lightnessStep: -0.06, hueUnit: 0, chromaKeep: 1)
-                        : StrandToneTuning(lightnessStep: -0.07, hueUnit: 0, chromaKeep: 1)
-        }
+    /// **The four spare slots**, for a root the table has never heard of. Their hues sit
+    /// in the four widest gaps the eight leave, so a new root is at least ΔE 12 from
+    /// every named one rather than a repeat of it — a weaker promise than the ΔE 20 the
+    /// eight keep between themselves, and deliberately so: twelve hues cannot all be
+    /// twenty apart, and the eight that exist are the ones that must be.
+    public static let spares: [StrandToneSlot] = [
+        StrandToneSlot(hue: 138.2, lightLightness: 0.600, lightChroma: 0.202,
+                       darkLightness: 0.560, darkChroma: 0.206),
+        StrandToneSlot(hue: 174.8, lightLightness: 0.600, lightChroma: 0.126,
+                       darkLightness: 0.624, darkChroma: 0.238),
+        StrandToneSlot(hue: 222.4, lightLightness: 0.600, lightChroma: 0.130,
+                       darkLightness: 0.576, darkChroma: 0.254),
+        StrandToneSlot(hue: 264.0, lightLightness: 0.600, lightChroma: 0.198,
+                       darkLightness: 0.560, darkChroma: 0.250),
+    ]
+
+    /// **What one level down costs, in OKLCH lightness.** Signed, and the sign is the
+    /// whole of it: in the light appearance a child DARKENS and in the dark appearance it
+    /// LIGHTENS, because that is the direction each appearance has room in. Lightening on
+    /// white walks into the 3:1 floor within a level and a half; darkening on `#1C1C1E`
+    /// does the same. Both directions therefore move AWAY from the background, and a
+    /// deeper strand is a stronger mark rather than a fainter one.
+    ///
+    /// The magnitudes are the smallest that keep every level at least ΔE*ab 12 from the
+    /// level above it at every hue in the table — including teal, which has the least
+    /// chroma to spare and so sets the floor.
+    public static func step(_ scheme: ColorScheme) -> Double {
+        scheme == .dark ? 0.108 : -0.100
     }
 
-    /// The lightest a tone may go in the dark appearance: above it everything washes
-    /// toward white and the family stops reading as a colour.
-    public static let darkCeiling = 0.93
-
-    /// The non text contrast floor every derived tone clears against its background,
-    /// with a hair of margin over WCAG's 3:1.
+    /// The non text contrast floor every tone in the table clears against its background,
+    /// with a hair of margin over WCAG's 3:1. Asserted, not enforced at runtime: these
+    /// are fixed values, so a tone that fails is a test failure rather than something to
+    /// clamp behind Jeremy's back.
     public static let contrastFloor = 3.05
 
     /// The backgrounds tones are drawn on: the palette's own.
     public static let lightBackground = TodayProjectColor(hex: 0xFFFFFF)
     public static let darkBackground = TodayProjectColor(hex: 0x1C1C1E)
 
+    /// The tone a strand draws when its family cannot be resolved at all — a slug the
+    /// board does not hold. A grey, so "no family" reads as an absence.
+    public static func neutral(_ scheme: ColorScheme) -> TodayProjectColor {
+        let role = TodayProjectPalette.role(for: .unfiled)
+        return scheme == .dark ? role.dark : role.light
+    }
+
+    // MARK: Resolving one strand
+
     /// **The tone for one strand** in one appearance. A slug the snapshot does not hold
-    /// has no topic to read and draws the neutral; every strand from a bridge that sends
-    /// no `parent` is a root and draws its topic's base.
+    /// draws the neutral; every strand from a bridge that sends no `parent` is a root and
+    /// draws its own slot.
     public static func color(for slug: String, in snapshot: StrandsSnapshot,
                              scheme: ColorScheme) -> TodayProjectColor {
         color(for: slug, in: snapshot.strands, scheme: scheme)
@@ -200,8 +235,9 @@ public enum StrandTone {
     public static func color(for slug: String, in strands: [Strand],
                              scheme: ColorScheme) -> TodayProjectColor {
         let bySlug = index(strands)
-        guard let strand = bySlug[slug] else { return base(.unfiled, scheme) }
-        return color(path: path(to: strand, in: bySlug), project: strand.group, scheme: scheme)
+        guard let strand = bySlug[slug] else { return neutral(scheme) }
+        let family = family(of: strand, in: bySlug)
+        return color(root: family.root, depth: family.depth, scheme: scheme)
     }
 
     /// Every strand's tone at once, by slug: what a board draws from, so a redraw walks
@@ -211,8 +247,8 @@ public enum StrandTone {
         let bySlug = index(strands)
         var out: [String: TodayProjectColor] = [:]
         for strand in bySlug.values {
-            out[strand.slug] = color(path: path(to: strand, in: bySlug),
-                                     project: strand.group, scheme: scheme)
+            let family = family(of: strand, in: bySlug)
+            out[strand.slug] = color(root: family.root, depth: family.depth, scheme: scheme)
         }
         return out
     }
@@ -221,93 +257,43 @@ public enum StrandTone {
         Dictionary(strands.map { ($0.slug, $0) }, uniquingKeysWith: { first, _ in first })
     }
 
-    /// The slots from the family's root down to `strand`, root excluded, capped at
-    /// `maxDepth` steps. A strand is a root when its parent is absent from the snapshot
-    /// or files under a different topic: a Personal strand under a Tag1 parent starts a
-    /// Personal family of its own rather than wearing a Tag1 blue.
-    static func path(to strand: Strand, in bySlug: [String: Strand]) -> [Double] {
-        var slots: [Double] = []
+    /// **Which family a strand belongs to, and how far down it sits.** The walk is
+    /// STRUCTURAL and nothing else: it follows `parent` to the top of the chain, whatever
+    /// topics it passes through, because a strand's colour is its family's and a family is
+    /// not a topic. A strand whose parent the snapshot does not hold is its own root, and
+    /// so is one whose chain loops (the guard the bridge's own resolver leaves to the
+    /// client). Depth is edges from the root, capped at `maxDepth`.
+    static func family(of strand: Strand, in bySlug: [String: Strand]) -> (root: String, depth: Int) {
+        var depth = 0
         var seen: Set<String> = [strand.slug]
         var current = strand
         while let parentSlug = current.parent, let parent = bySlug[parentSlug],
-              parent.group == current.group, seen.insert(parent.slug).inserted {
-            slots.append(slot(for: current.slug))
+              seen.insert(parent.slug).inserted {
+            depth += 1
             current = parent
         }
-        // `slots` runs child to root; the walk down from the root takes the first ones.
-        return Array(slots.reversed().prefix(maxDepth))
+        return (current.slug, min(depth, maxDepth))
     }
 
-    /// A tone from its topic's base and the slots of the levels below the root.
-    public static func color(path: [Double], project: TodayProject,
+    /// **A tone, from its root's slug and its depth below that root.** The one place a
+    /// strand's colour is computed: the board's rows, the flat lenses' `in <parent>` dot
+    /// and the table above all end up here.
+    public static func color(root: String, depth: Int,
                              scheme: ColorScheme) -> TodayProjectColor {
-        color(path: path, base: base(project, scheme), tuning: tuning(project, scheme),
-              scheme: scheme)
-    }
-
-    /// The same, from any base and tuning: what the tuning search measures.
-    public static func color(path: [Double], base: TodayProjectColor,
-                             tuning: StrandToneTuning, scheme: ColorScheme) -> TodayProjectColor {
-        // A root draws the table's value itself, not a round trip of it, so a root
-        // strand and a Today item of the same topic match to the last bit.
-        guard !path.isEmpty else { return base }
-        var tone = OKLCH(base)
-        for slot in path {
-            tone = step(tone, slot: slot, tuning: tuning, scheme: scheme)
-        }
+        let slot = slot(forRoot: root)
+        var tone = slot.root(scheme)
+        // A root draws its slot's own value, not a round trip of it.
+        guard depth > 0 else { return tone.sRGB }
+        tone.lightness += Double(min(depth, maxDepth)) * step(scheme)
         return tone.sRGB
     }
 
-    /// **One level down.** One lightness step, a little less chroma, and turned by the
-    /// slot's hue offset. When the lightness step cannot be taken in full (the contrast
-    /// floor, or the dark appearance's ceiling) the part that could not be spent on
-    /// lightness goes to the hue instead, so a deep child still differs from its parent
-    /// by about as much as a shallow one does.
-    static func step(_ parent: OKLCH, slot: Double, tuning: StrandToneTuning,
-                     scheme: ColorScheme) -> OKLCH {
-        let dL = tuning.lightnessStep
-        var child = parent
-        child.chroma = parent.chroma * tuning.chromaKeep
-        child.hue = wrap(parent.hue + slot * tuning.hueUnit)
-        child.lightness = furthestLightness(from: parent.lightness, toward: parent.lightness + dL,
-                                            shape: child, scheme: scheme)
-        let unspent = dL == 0 ? 0 : 1 - (child.lightness - parent.lightness) / dL
-        if unspent > 1e-9, tuning.hueUnit > 0 {
-            child.hue = wrap(child.hue + slot * tuning.hueUnit * unspent)
-            // The turn can move the contrast a hair; settle the lightness again at the
-            // final hue, never past where it already stopped.
-            child.lightness = furthestLightness(from: parent.lightness, toward: child.lightness,
-                                                shape: child, scheme: scheme)
-        }
-        return child
-    }
-
-    /// The lightness furthest along `from` to `toward` at which `shape` (its chroma and
-    /// hue) still clears the contrast floor and, in the dark, the ceiling.
-    static func furthestLightness(from start: Double, toward end: Double, shape: OKLCH,
-                                  scheme: ColorScheme) -> Double {
-        let background = scheme == .dark ? darkBackground : lightBackground
-        func fits(_ lightness: Double) -> Bool {
-            var probe = shape
-            probe.lightness = lightness
-            if scheme == .dark, lightness > darkCeiling { return false }
-            return probe.sRGB.contrast(with: background) >= contrastFloor
-        }
-        if fits(end) { return end }
-        guard fits(start) else { return start }
-        var (good, bad) = (start, end)
-        for _ in 0..<40 {
-            let mid = (good + bad) / 2
-            if fits(mid) { good = mid } else { bad = mid }
-        }
-        return good
-    }
-
-    /// A strand's slot: FNV 1a over the slug's UTF 8 bytes, modulo the slot count. Not
-    /// Swift's `hashValue`, which is seeded per launch and would repaint the board every
-    /// time the app started.
-    public static func slot(for slug: String) -> Double {
-        slots[Int(fnv1a(slug) % UInt32(slots.count))]
+    /// The slot a root slug takes: its own if the table names it, otherwise one of the
+    /// four spares chosen by FNV 1a over the slug's UTF 8 bytes. Not Swift's `hashValue`,
+    /// which is seeded per launch and would repaint the board every time the app started.
+    public static func slot(forRoot slug: String) -> StrandToneSlot {
+        if let named = roots[slug.lowercased()] { return named }
+        return spares[Int(fnv1a(slug.lowercased()) % UInt32(spares.count))]
     }
 
     static func fnv1a(_ text: String) -> UInt32 {
@@ -317,16 +303,6 @@ public enum StrandTone {
             hash = hash &* 0x0100_0193
         }
         return hash
-    }
-
-    static func wrap(_ degrees: Double) -> Double {
-        let r = degrees.truncatingRemainder(dividingBy: 360)
-        return r < 0 ? r + 360 : r
-    }
-
-    static func base(_ project: TodayProject, _ scheme: ColorScheme) -> TodayProjectColor {
-        let role = TodayProjectPalette.role(for: project)
-        return scheme == .dark ? role.dark : role.light
     }
 }
 
@@ -350,7 +326,7 @@ public struct StrandFamily: Sendable {
 
     /// The strand's tone; a slug this board does not hold draws the neutral.
     public func tone(_ slug: String) -> TodayProjectColor {
-        tones[slug] ?? StrandTone.base(.unfiled, scheme)
+        tones[slug] ?? StrandTone.neutral(scheme)
     }
 
     /// The strand this one sits under, when the snapshot holds it. Any topic: a caption
@@ -358,19 +334,5 @@ public struct StrandFamily: Sendable {
     public func parent(of strand: Strand) -> Strand? {
         guard let slug = strand.parent, slug != strand.slug else { return nil }
         return bySlug[slug]
-    }
-
-    /// The `depth` strands above this one, nearest last: what the `Tree` lens draws a
-    /// rail for at each indent level. Shorter than `depth` only for a chain the snapshot
-    /// cannot finish, in which case the missing rails are simply not drawn.
-    public func ancestors(of strand: Strand, depth: Int) -> [Strand] {
-        var chain: [Strand] = []
-        var current = strand
-        while chain.count < depth, let parent = parent(of: current),
-              !chain.contains(where: { $0.slug == parent.slug }) {
-            chain.append(parent)
-            current = parent
-        }
-        return chain.reversed()
     }
 }
