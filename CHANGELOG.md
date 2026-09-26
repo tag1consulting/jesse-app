@@ -14,6 +14,43 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [App 1.0 (173)] - 2026-09-26
+
+**Whenever the Studio could not be reached, the Mac's window grew taller than the screen and
+the composer went off the bottom edge.** Opening any conversation, new or existing, did it;
+resizing the window snapped it back; relaunching did not help while it lasted, and it stopped
+on its own when the Studio came back. The composer's "Capture to Inbox" notice is now bounded
+at two lines, and the window's minimum height is a caption's worth again.
+
+**Root cause: a vertically fixed `Text` in window level content sets the window's minimum
+height, measured at the near zero width AppKit probes with.** The notice added in App 1.0
+(149) carried `.fixedSize(horizontal: false, vertical: true)`, the ordinary way to stop a
+caption being clipped to one line. The composer is the `VStack` sibling of the transcript's
+`ScrollView`, so nothing between it and the window absorbs its height — and when AppKit asks
+the SwiftUI content how short the window may be, it proposes a width of about one point. A
+vertically fixed `Text` must answer with its fully wrapped height for the width it is given,
+which at that width is roughly one character per line: **1015 pt** for this one sentence.
+That became the window's minimum content height, taller than the laptop's screen, so the
+window could not be made short enough to show its own composer. iOS never takes that
+measurement, which is why the same pattern is harmless on the phone, and every other
+vertically fixed `Text` in the Mac's thread detail is inside the transcript's `ScrollView`,
+which does not pass its content's height up.
+
+**The fix is the notice's own layout and nothing else.** `MacCaptureOfferNotice` is a view of
+its own now, with `.lineLimit(2)` and tail truncation in place of the vertical `fixedSize`,
+and the whole sentence in `.help(…)` so nothing is lost on a window narrow enough to
+truncate it. When the notice and its Capture to Inbox button are offered is untouched, and
+the window is not clamped, resized or given a maximum anywhere.
+
+**What is asserted.** `MacComposerNoticeLayoutTests` measures the minimum, rather than
+inspecting modifiers, because the unbounded height at a near zero proposed width IS the
+defect: it hosts the notice in an `NSHostingController` and asks for
+`sizeThatFits(in: CGSize(width: 1, height: 0))`, the same question the window asks. The
+notice reports **14 pt** (1015 pt before), and the smallest composer shaped stack — a
+flexible `ScrollView` above, a `Divider`, the notice — **15 pt** (1016 pt before). A third
+case pins the control row beside it, whose `.fixedSize()` on a one line `Label` is bounded at
+17 pt, so a longer label there cannot quietly become the same defect.
+
 ## [App 1.0 (172)] - 2026-09-26
 
 **Telling Jesse about an unlogged meal from a Health tab reading got a refusal and a
