@@ -26,6 +26,18 @@ import Foundation
 // by other people, sitting in the vault, that would otherwise be lifted verbatim into a
 // model prompt. Excluding it is not tidiness, it is the boundary that keeps this path
 // from reading instructions off an email.
+//
+// `archive/` IS RETRIEVED FROM LAST. Not excluded — a closed research report is the only
+// source for what it concluded — but every live note first, because a question asked today
+// is almost never answered by finished work. Two archived notes answering "what's my
+// birthday?" with the start date of a trip is what put this rule here.
+//
+// A FIRST PERSON QUESTION IS ABOUT SOMEBODY, and the vault knows his name. "my", "me" and
+// "I" are grammar with no counterpart in a note: nothing in this vault refers to its owner
+// as "my". So the question's own first-person words are replaced by the owner's NAME from
+// the app's setting, and `what's my birthday` goes to the index as `birthday Jeremy` —
+// which is how the precise pass finds the one heading that answers it instead of every
+// note that says "birthday".
 
 /// One chunk, retrieved whole, with the two facts that let a citation open it.
 public struct RetrievedChunk: Equatable, Sendable {
@@ -164,17 +176,24 @@ public struct VaultRetriever: Sendable {
     public static let expansionThreshold = 5
     /// The one directory that is never retrieved from, with its whole subtree.
     public static let excludedPrefix = "Inbox/"
+    /// The directory name that means finished work, anywhere in a path.
+    public static let archiveSegment = "archive"
 
     private let index: VaultIndex
     private let expander: any VaultQueryExpanding
     private let embedding: any ChunkEmbedding
+    /// How the vault names the person asking, from the app's owner-name setting. Nil on a
+    /// device that has no name for him, where every question behaves as it always did.
+    private let ownerName: String?
 
     public init(index: VaultIndex,
                 expander: any VaultQueryExpanding = NoVaultExpansion(),
-                embedding: any ChunkEmbedding = NoChunkEmbedding()) {
+                embedding: any ChunkEmbedding = NoChunkEmbedding(),
+                ownerName: String? = nil) {
         self.index = index
         self.expander = expander
         self.embedding = embedding
+        self.ownerName = ownerName
     }
 
     /// What one question retrieved, and what it cost — the numbers the diagnostics
@@ -215,7 +234,7 @@ public struct VaultRetriever: Sendable {
         let searcher = VaultSearcher(index: index,
                                      expansionThreshold: Self.expansionThreshold,
                                      limit: Self.searchLimit)
-        let keywords = LookupQuery.keywords(question)
+        let keywords = LookupQuery.keywords(question, ownerName: ownerName)
         let query = keywords.joined(separator: " ")
 
         var hits = Self.allowed(searcher.base(query).hits)
@@ -251,7 +270,13 @@ public struct VaultRetriever: Sendable {
             return Result(chunks: [], hitCount: hits.count, embedded: false)
         }
 
-        let ordered = Self.fused(bodies, question: question, embedding: embedding)
+        // ARCHIVED NOTES RANK BEHIND LIVE ONES, ALWAYS. Fusing the two groups separately
+        // and concatenating is what makes that absolute: the embedding reorders WITHIN a
+        // group and can never lift a finished draft back above a note in use.
+        let live = bodies.filter { !Self.isArchived($0.hit.path) }
+        let archived = bodies.filter { Self.isArchived($0.hit.path) }
+        let ordered = Self.fused(live, question: question, embedding: embedding)
+            + Self.fused(archived, question: question, embedding: embedding)
         let kept = ordered.prefix(budget.chunkCount)
         let chunks = kept.map { entry in
             RetrievedChunk(path: entry.hit.path,
@@ -269,6 +294,25 @@ public struct VaultRetriever: Sendable {
     /// Everything outside `Inbox/`, in the order it arrived.
     public static func allowed(_ hits: [VaultSearchHit]) -> [VaultSearchHit] {
         hits.filter { !$0.path.hasPrefix(excludedPrefix) }
+    }
+
+    /// Whether a note is FINISHED WORK: anywhere under an `archive/` directory.
+    ///
+    /// DEMOTED, NEVER EXCLUDED. `Projects/drafts/archive/` and `Projects/Research/archive/`
+    /// hold delivered drafts and closed research, and on 2026-09-26 two of them answered
+    /// "what's my birthday?" with the start date of a trip — they were ranked exactly like
+    /// a note in use. They are still the only source for plenty of questions ("what did
+    /// that report conclude"), so they stay retrievable and simply queue behind every live
+    /// note.
+    ///
+    /// The test is a PATH SEGMENT, not a substring, for `allowed`'s reason: a note called
+    /// `Archive-Policy.md` is not archived, and neither is `Workshop/archive.md`. Only
+    /// directory components count, folded for case because the same folder is spelled both
+    /// ways across a vault this old.
+    public static func isArchived(_ path: String) -> Bool {
+        path.split(separator: "/").dropLast().contains {
+            $0.caseInsensitiveCompare(archiveSegment) == .orderedSame
+        }
     }
 
     /// The bm25 order and the embedding order, fused.
@@ -357,14 +401,81 @@ public enum LookupQuery {
         "you", "your", "yours",
     ]
 
-    /// The words worth searching for, in the order they were typed.
+    /// The words that mean "the person asking", which is the one thing a personal vault
+    /// never writes down.
+    ///
+    /// Every one of them is also a stop word above, and that is exactly the incident: they
+    /// were dropped and NOTHING was put in their place, so "what's my birthday" went to the
+    /// index as `birthday` and retrieval had no idea whose birthday was wanted. The vault
+    /// says the owner's NAME, so the name is what these have to be replaced by.
+    ///
+    /// The contracted forms are here spelled the way `VaultSearchQuery.tokens` produces
+    /// them — apostrophe intact — and a typed curly apostrophe is folded to a straight one
+    /// before the comparison, because a phone's keyboard produces `I’m` and not `I'm`.
+    public static let firstPersonWords: Set<String> = [
+        "i", "i'm", "i've", "i'd", "i'll", "me", "my", "mine", "myself",
+    ]
+
+    /// Whether the question is about the person asking it.
+    ///
+    /// Read from the RAW question rather than from `VaultSearchQuery.tokens`, because that
+    /// tokenizer drops every token shorter than two characters — so a bare "I" ("when was
+    /// I born") does not survive to be recognised.
+    public static func isFirstPerson(_ question: String) -> Bool {
+        question.split(whereSeparator: \.isWhitespace).contains {
+            firstPersonWords.contains(bareWord($0))
+        }
+    }
+
+    /// One typed word, as the stop list and the first-person list spell words: lower case,
+    /// no surrounding punctuation, straight apostrophe.
+    static func bareWord(_ word: some StringProtocol) -> String {
+        word.replacingOccurrences(of: "\u{2019}", with: "'")
+            .trimmingCharacters(in: CharacterSet.alphanumerics.inverted)
+            .lowercased()
+    }
+
+    /// Whether a token carries no retrieval signal.
+    ///
+    /// The stop list is a list of WORDS, and the tokenizer hands over contractions whole,
+    /// so `what's` was not on it — and on 2026-09-26 that alone was enough to wreck a
+    /// question: `what's` became a required keyword, no note contains it, the precise pass
+    /// found nothing, and the answer came from the single-keyword fallback. A token whose
+    /// stem before the apostrophe is a stop word is a stop word: `what's`, `when's`,
+    /// `it's`, `we're`, `I've`. A possessive of a MEANINGFUL word is untouched, because its
+    /// stem is not on the list — `Marta's` stays `Marta's`.
+    static func isStopWord(_ token: String) -> Bool {
+        let bare = bareWord(token)
+        if stopWords.contains(bare) { return true }
+        guard let apostrophe = bare.firstIndex(of: "'") else { return false }
+        return stopWords.contains(String(bare[bare.startIndex..<apostrophe]))
+    }
+
+    /// The owner's name as searchable tokens, or empty when there is no usable name.
+    ///
+    /// Tokenized by the same rule as a query, so a name written `Jeremy` matches a note's
+    /// `Jeremy's` — FTS5's own tokenizer splits the possessive, and the prefix term the
+    /// search builds from `Jeremy` matches its first half.
+    static func ownerTokens(_ ownerName: String?) -> [String] {
+        guard let ownerName else { return [] }
+        return VaultSearchQuery.tokens(ownerName).filter { !isStopWord($0) }
+    }
+
+    /// The words worth searching for, in the order they were typed, with the owner's name
+    /// appended when the question is about him.
     ///
     /// Falls back to the question's own tokens when every word is a stop word ("what is
     /// it"), because an empty query retrieves nothing and "nothing" is a worse answer
     /// than a bad one here — the abstain downstream is what catches a bad one.
-    public static func keywords(_ question: String) -> [String] {
+    ///
+    /// With no owner name, or an empty one, this is exactly what it always was.
+    public static func keywords(_ question: String, ownerName: String? = nil) -> [String] {
         let tokens = VaultSearchQuery.tokens(question)
-        let kept = tokens.filter { !stopWords.contains($0.lowercased()) }
-        return kept.isEmpty ? tokens : kept
+        let kept = tokens.filter { !isStopWord($0) }
+        let base = kept.isEmpty ? tokens : kept
+        guard isFirstPerson(question) else { return base }
+        let present = Set(base.map { bareWord($0) })
+        let owner = ownerTokens(ownerName).filter { !present.contains(bareWord($0)) }
+        return base + owner
     }
 }

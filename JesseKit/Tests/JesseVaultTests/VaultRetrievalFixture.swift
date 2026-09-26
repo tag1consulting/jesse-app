@@ -269,3 +269,96 @@ enum VaultRetrievalFixture {
              expectedPath: "House/Insurance.md"),
     ]
 }
+
+// A SECOND, SMALLER CORPUS: WHOSE BIRTHDAY, AND FROM WHICH NOTES.
+//
+// Kept apart from the twenty notes above on purpose. That corpus is the retrieval FLOOR's
+// corpus, and a note added to it moves fourteen unrelated expectations; this one exists to
+// reproduce one incident and holds only the notes that incident needs.
+//
+// The incident, 2026-09-26, bridge unreachable: "What's my birthday?" was answered with the
+// start date of a family trip, cited from two ARCHIVED notes. The owner's birthday is in a
+// live note, under a heading that names him — and the vault never says "my", it says the
+// name.
+//
+// So there are four notes, and three of them are distractors of three different kinds:
+//
+//   * a LIVE note that answers the question, under `### Jeremy's Birthday (Sep 4)`;
+//   * a LIVE note that is denser in the word "birthday" than the answer is and says
+//     nothing about the owner — the distractor a name-less query cannot get past;
+//   * an ARCHIVED draft about a trip that begins on a birthday;
+//   * an ARCHIVED research note that mentions the owner AND a birthday, so it competes
+//     with the answer on the owner's own name and only the archive demotion separates
+//     the two.
+//
+// Invented, like everything else in this file. The trip, the party, the valley and both
+// archived notes are made up; the owner's first name is the one real token in it, which is
+// the whole point of the test.
+enum VaultOwnerRetrievalFixture {
+
+    /// The live note that answers the question.
+    static let answer = "Family/Key-Dates.md"
+    /// The live note that is denser in "birthday" and names nobody.
+    static let liveDistractor = "Family/Party-Notes.md"
+    /// Finished work: a packing list for a trip that leaves on a birthday.
+    static let archivedDraft = "Projects/drafts/archive/2026-06-26-Perugia-Trip-Packing-List.md"
+    /// Finished work that mentions the owner and a birthday in the same sentence.
+    static let archivedResearch = "Projects/Research/archive/2026-05-26-Trip-Water-Risk-Notes.md"
+
+    /// The owner's name, as the app's setting holds it.
+    static let ownerName = "Jeremy"
+    /// The question exactly as it was typed on the phone.
+    static let question = "What's my birthday?"
+    /// The same question without the contraction, which is the shape the stop list was
+    /// written for.
+    static let plainQuestion = "What is my birthday?"
+
+    static func write(in root: URL) {
+        func note(_ text: String, _ path: String) {
+            VaultFixture.write(text, to: path, in: root)
+        }
+
+        note("""
+            ---
+            title: Key dates
+            ---
+
+            # Key dates
+
+            The ones that never move. Anything that depends on a trip lives with the trip.
+
+            ### Jeremy's Birthday (Sep 4)
+
+            Cake at the studio after throwing, and the candles counted wrong on purpose.
+            Marta brings the lemon one and the kiln stays cold that afternoon.
+
+            ### Marta's Birthday (Feb 3)
+
+            Dinner at the Brufani, booked a month ahead.
+            """, answer)
+
+        note("""
+            # Party notes
+
+            ## Birthday party
+
+            The birthday party is in the garden: birthday cake, birthday candles, and the
+            paper lanterns from last year. Fifteen children and two hours of it.
+            """, liveDistractor)
+
+        note("""
+            # Perugia trip packing list
+
+            The trip leaves on 26 June, which is the birthday itself, so the presents ride
+            in the top of the case. The birthday lunch is booked for the 27th.
+            """, archivedDraft)
+
+        note("""
+            # Trip water risk notes
+
+            Written before the 26 June trip. The birthday plans put Jeremy at the far end
+            of the valley, where the water is trucked in, and the birthday lunch on the
+            27th is at the same address.
+            """, archivedResearch)
+    }
+}

@@ -1,5 +1,6 @@
 import Foundation
 import JesseCore
+import JesseVault
 
 /// Per-mode custom prompts, persisted in UserDefaults (these aren't secret,
 /// unlike the bearer token, so not Keychain). Each mode has two *slots*:
@@ -52,7 +53,12 @@ enum PromptStore {
 
     /// UserDefaults key for the owner's display name — the personalization the app
     /// threads into locally-built prompt context (e.g. the diet-coach rollup).
-    private static let ownerNameKey = "jesse.owner.name"
+    ///
+    /// Defined in `OfflineLookupSettings` and read from there rather than spelled twice:
+    /// the offline vault answerer needs the same name (a first-person question is a
+    /// question about whoever this is), and two literals in two modules is how the two
+    /// halves would come to disagree about which setting they mean.
+    private static let ownerNameKey = OfflineLookupSettings.ownerNameKey
 
     /// How the app refers to the owner in prompt context it builds itself. Default
     /// "the user" (the generic identity a fresh install reads with). Set it in
