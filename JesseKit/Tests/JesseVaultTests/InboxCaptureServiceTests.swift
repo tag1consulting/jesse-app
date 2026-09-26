@@ -53,7 +53,10 @@ final class InboxCaptureServiceTests: XCTestCase {
         let zone = rome
         return InboxCaptureService(source: source, log: log, platform: .phone,
                                    deviceName: { "Jeremy-iPhone" },
-                                   now: { stamp }, timeZone: { zone })
+                                   now: { stamp }, timeZone: { zone },
+                                   outbox: VaultWriteOutbox(
+                                       fileURL: support.appendingPathComponent("outbox.json"),
+                                       migrateLegacy: false))
     }
 
     private func contents(_ relativePath: String) throws -> String {

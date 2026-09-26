@@ -5,13 +5,15 @@ import AppKit
 #endif
 import JesseMarkdown
 
-// ONE NOTE, OPEN, FROM THE COPY ON THIS DEVICE.
+// ONE NOTE, OPEN: THE STUDIO'S WHEN THE DEVICE IS BEHIND, THE DEVICE'S WHEN IT IS NOT.
 //
 // Everything about this screen is arranged around one honesty requirement: the reader must
-// never be able to mistake this for the bridge's view of the vault. It says LOCAL COPY in
-// the header, with the file's own modification time beside it, because a synced folder can
-// be hours behind the Studio and a note that is quietly stale is worse than a note that is
-// visibly old.
+// never be able to mistake one copy for the other. Obsidian on iOS syncs only in the
+// foreground, so the folder on the phone can be hours behind the Studio. Every load asks
+// `VaultNoteOpener` first: the device's copy opens only when it is byte-identical to the
+// Studio's, or when the Studio cannot be asked; otherwise the Studio's copy opens, with a
+// line saying the device is behind, and a change made to it goes to the Studio through the
+// write outbox and never into the folder. The header says which copy this is, every time.
 //
 // Links go through the index's three-step resolution, and the ones that resolve PUSH
 // another reader onto the same stack, which is what makes a vault navigable offline: a
@@ -88,13 +90,58 @@ public final class VaultNoteReaderModel {
     /// only `load` is handed it.
     public private(set) var route: String = ""
 
+    /// Which copy is on screen.
+    public enum Origin: Equatable, Sendable {
+        /// The device's copy, which is the Studio's (or no bridge is configured).
+        case local
+        /// The device's copy, because the Studio could not be asked.
+        case offline
+        /// The device's copy of a note the Studio does not have.
+        case localOnly
+        /// The Studio's copy: the device's is behind, or missing.
+        case bridge(modified: Date?, truncated: Bool)
+    }
+
+    public private(set) var origin: Origin = .local
+    /// The writes from this device to this note that the Studio has not taken yet, a
+    /// conflict included. Read from the outbox, never kept here.
+    public private(set) var pending: [VaultOutboxEntry] = []
+
     private let source: VaultIndexSource
     private let ticker: VaultNoteTicker
+    private let opener: VaultNoteOpener?
+    private let outbox: VaultWriteOutbox
 
     public init(source: VaultIndexSource = .shared,
-                writer: (any VaultNoteWriting)? = nil) {
+                writer: (any VaultNoteWriting)? = nil,
+                opener: VaultNoteOpener? = .shared,
+                outbox: VaultWriteOutbox = .shared) {
         self.source = source
         self.ticker = VaultNoteTicker(writer: writer ?? VaultNoteWriter(source: source))
+        self.opener = opener
+        self.outbox = outbox
+    }
+
+    /// The Studio's copy is on screen.
+    public var isBridgeCopy: Bool {
+        if case .bridge = origin { return true }
+        return false
+    }
+
+    /// The Studio's copy is on screen and is only the first part of the note: nothing may
+    /// change it here, because a change made to a prefix cannot be told apart from a change
+    /// that deletes the rest.
+    public var isBridgeTruncated: Bool {
+        if case .bridge(_, let truncated) = origin { return truncated }
+        return false
+    }
+
+    /// What a write to the note on screen goes through: nil for the device's own copy (the
+    /// usual writer), and a writer that never touches the folder for the Studio's.
+    public var bridgeWriter: (any VaultNoteWriting)? {
+        guard isBridgeCopy, let stamp else { return nil }
+        return VaultBridgeCopyWriter(localPath: route, text: text, stamp: stamp,
+                                     outbox: outbox, opener: opener)
     }
 
     public var document: VaultNoteDocument? {
@@ -110,32 +157,91 @@ public final class VaultNoteReaderModel {
     public func load(path: String) async {
         route = path
         state = .loading
-        // A strand tick that could not reach the bridge when it was made goes now. Free
-        // when the outbox is empty, and never in the way of the read: it is not awaited.
-        Task { await StrandTickOutbox.shared.flush() }
+        // A write that could not reach the Studio when it was made goes now. Free when the
+        // outbox is empty, and never in the way of the read: it is not awaited.
+        let outbox = self.outbox
+        Task { await outbox.flush() }
         let started = ContinuousClock.now
-        let source = self.source
-        let outcome = await Self.read(path: path, source: source)
-
+        await present(path: path, keepOnFailure: false)
         lastLoadMilliseconds = VaultRenderBenchmark.milliseconds(ContinuousClock.now - started)
-        switch outcome {
-        case .success(let read):
-            let (document, map, url, text, stamp) = read
-            resolved = map
-            fileURL = url
-            self.text = text
-            self.stamp = stamp
-            optimistic = [:]
-            messages = [:]
-            state = .loaded(document)
-            generation &+= 1
+        generation &+= 1
+        if let document {
             VaultReaderLog.loaded(path: path, blocks: document.blocks.count,
                                   bytes: document.rawLines.count,
                                   milliseconds: lastLoadMilliseconds ?? 0)
-        case .failure(let error):
-            state = .failed(VaultIndexer.describe(error))
-            generation &+= 1
         }
+    }
+
+    /// The local read, the bridge first decision, and whichever copy it chose, applied.
+    ///
+    /// `keepOnFailure` is `reload`'s: a note already on screen stays there rather than being
+    /// replaced by an error from a refresh.
+    private func present(path: String, keepOnFailure: Bool) async {
+        let source = self.source
+        let local = await Self.read(path: path, source: source)
+        var localStamp: VaultFileStamp?
+        if case .success(let read) = local { localStamp = read.4 }
+        let opening: VaultNoteOpening
+        if let opener {
+            opening = await opener.open(localPath: path, localStamp: localStamp)
+        } else {
+            opening = localStamp == nil ? .unavailable : .local
+        }
+        switch (opening, local) {
+        case (.local, .success(let read)):
+            apply(read, origin: .local)
+        case (.offline, .success(let read)):
+            apply(read, origin: .offline)
+        case (.localOnly, .success(let read)):
+            apply(read, origin: .localOnly)
+        case (.bridge(let note), _):
+            apply(await Self.parse(note: note, path: path, source: source),
+                  origin: .bridge(modified: note.modified, truncated: note.truncated))
+        case (.notOnStudio, _):
+            if !keepOnFailure || document == nil {
+                state = .failed(VaultNoteOpener.notOnStudioCaption(path))
+            }
+        case (_, .failure(let error)):
+            if !keepOnFailure || document == nil {
+                state = .failed(VaultIndexer.describe(error))
+            }
+        case (_, .success(let read)):
+            apply(read, origin: .offline)
+        }
+        pending = await outbox.entries(forPath: path)
+    }
+
+    private func apply(_ read: (VaultNoteDocument, [String: String], URL?, String, VaultFileStamp),
+                       origin: Origin) {
+        let (document, map, url, text, stamp) = read
+        resolved = map
+        fileURL = url
+        self.text = text
+        self.stamp = stamp
+        self.origin = origin
+        optimistic = [:]
+        messages = [:]
+        state = .loaded(document)
+    }
+
+    /// The Studio's copy, parsed like a local one, off the main actor.
+    ///
+    /// Its links resolve against the local index where they can; one that does not is kept
+    /// TAPPABLE (an empty path, which the renderer draws as a link by target) rather than
+    /// drawn as missing, because a note the device is behind on is exactly the note that
+    /// links to things the device has not got yet.
+    private static func parse(note: VaultBridgeNote, path: String, source: VaultIndexSource)
+        async -> (VaultNoteDocument, [String: String], URL?, String, VaultFileStamp) {
+        await Task.detached {
+            let document = VaultNoteDocument.parse(path: path, text: note.markdown,
+                                                   modified: note.modified)
+            let index = try? source.index()
+            var map: [String: String] = [:]
+            for target in document.wikiTargets {
+                map[target] = index?.resolve(target: target) ?? ""
+            }
+            return (document, map, nil, note.markdown, note.stamp)
+        }.value
     }
 
     /// One coordinated stamped read, parsed and resolved, entirely off the main actor.
@@ -183,16 +289,28 @@ public final class VaultNoteReaderModel {
             await load(path: route)
             return
         }
-        if case .success(let read) = await Self.read(path: route, source: source) {
-            let (document, map, url, text, stamp) = read
-            resolved = map
-            fileURL = url
-            self.text = text
-            self.stamp = stamp
-            optimistic = [:]
-            messages = [:]
-            state = .loaded(document)
-        }
+        await present(path: route, keepOnFailure: true)
+    }
+
+    /// Read the outbox again for this note: what the screen does when the outbox changes.
+    public func refreshPending() async {
+        guard !route.isEmpty else { return }
+        pending = await outbox.entries(forPath: route)
+    }
+
+    /// "Keep mine" on a conflict: send this device's version over the Studio's, then show
+    /// what the Studio has.
+    public func keepMine(_ entry: VaultOutboxEntry) async {
+        await outbox.keepMine(id: entry.id)
+        await opener?.forget(path: route)
+        await reload()
+    }
+
+    /// "Take the Studio's": drop this device's version and show the Studio's copy.
+    public func takeStudios(_ entry: VaultOutboxEntry) async {
+        await outbox.takeStudios(id: entry.id)
+        await opener?.forget(path: route)
+        await reload()
     }
 
     /// Tick or untick one box.
@@ -202,12 +320,20 @@ public final class VaultNoteReaderModel {
     /// either the document catches up with the glyph or the glyph goes back and says why.
     public func tick(block: VaultNoteBlock, to checked: Bool) async {
         guard case .checkbox = block.kind, let stamp else { return }
-        guard !VaultWriteExemption.isReadOnly(path: route) else { return }
+        guard canWrite else { return }
         optimistic[block.id] = checked
         messages[block.id] = nil
 
+        // THE STUDIO'S COPY is ticked through the outbox and never in the folder; the note
+        // is read again afterwards, so what is on screen is what the Studio now holds.
+        let ticker = bridgeWriter.map { VaultNoteTicker(writer: $0) } ?? self.ticker
         let outcome = await ticker.tick(path: route, line: block.line, to: checked,
                                         text: text, stamp: stamp)
+        if outcome.didWrite, isBridgeCopy {
+            await reload()
+            optimistic[block.id] = nil
+            return
+        }
         switch outcome {
         case .written(let newText, let newStamp):
             text = newText
@@ -232,6 +358,12 @@ public final class VaultNoteReaderModel {
             optimistic[block.id] = nil
             messages[block.id] = outcome.message
         }
+    }
+
+    /// Whether a box on screen may be ticked: never `Today.md`, and never a Studio copy that
+    /// is only the first part of its note.
+    public var canWrite: Bool {
+        !VaultWriteExemption.isReadOnly(path: route) && !isBridgeTruncated
     }
 
     /// The state a checkbox block should DRAW as: the tap's, while one is in flight,
@@ -286,6 +418,8 @@ public struct VaultNoteReaderView: View {
     @State private var expandedTables: Set<Int> = []
     /// The review request, and the one line it leaves behind.
     @State private var review = VaultNoteReviewModel()
+    /// Why a link tapped in the Studio's copy of a note led nowhere.
+    @State private var linkMissing: String?
     @Environment(\.openURL) private var openURL
     /// How this shell starts a conversation, and whether its bridge is there. Nil in a
     /// preview and in any window nobody wired, where a review request goes to the vault
@@ -425,7 +559,13 @@ public struct VaultNoteReaderView: View {
         // a file is, and "pops back to the reader" is its dismissal.
         .sheet(isPresented: $isEditing) {
             NavigationStack {
-                VaultNoteEditorView(path: route.path) {
+                // The Studio's copy is edited through a writer that never touches the
+                // folder; the device's own copy through the usual one.
+                VaultNoteEditorView(
+                    path: route.path,
+                    model: model.bridgeWriter.map {
+                        VaultNoteEditorModel(path: route.path, writer: $0)
+                    }) {
                     Task { await model.reload() }
                 }
             }
@@ -436,12 +576,34 @@ public struct VaultNoteReaderView: View {
         // EVERY link in this note arrives here. Ours is caught and pushed; anything else
         // (a real http link in a note) falls through to the system exactly as before.
         .environment(\.openURL, OpenURLAction { url in
+            // A link the local index could not resolve, in the Studio's copy of a note: the
+            // Studio resolves it, so following links out of a note the device is behind on
+            // never drops back to the stale folder.
+            if let target = VaultNoteRenderer.target(fromLinkURL: url) {
+                Task {
+                    switch await VaultNoteOpener.shared.resolve(target: target, localPath: nil) {
+                    case .path(let path): onOpenNote(VaultNoteRoute(path: path))
+                    case .missing(let why): linkMissing = why
+                    }
+                }
+                return .handled
+            }
             guard let path = VaultNoteRenderer.path(fromLinkURL: url) else {
                 return .systemAction
             }
             onOpenNote(VaultNoteRoute(path: path))
             return .handled
         })
+        .alert("Can't open that note",
+               isPresented: Binding(get: { linkMissing != nil },
+                                    set: { if !$0 { linkMissing = nil } })) {
+            Button("OK", role: .cancel) { linkMissing = nil }
+        } message: {
+            Text(linkMissing ?? "")
+        }
+        .onReceive(NotificationCenter.default.publisher(for: VaultWriteOutbox.didChange)) { _ in
+            Task { await model.refreshPending() }
+        }
         .task(id: route.path) { await model.load(path: route.path) }
     }
 
@@ -503,9 +665,45 @@ public struct VaultNoteReaderView: View {
                 .foregroundStyle(.tertiary)
                 .textSelection(.enabled)
                 .fixedSize(horizontal: false, vertical: true)
-            Label(Self.provenance(model.document?.modified), systemImage: "externaldrive")
-                .font(.caption)
-                .foregroundStyle(.secondary)
+            // WHICH COPY THIS IS, every time. The device's copy says so with its own
+            // modification time; the Studio's says the device is behind.
+            switch model.origin {
+            case .bridge(let modified, let truncated):
+                Label(VaultNoteOpener.behindCaption(modified: modified),
+                      systemImage: "arrow.triangle.2.circlepath")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                if truncated {
+                    Label(VaultNoteOpener.truncatedCaption, systemImage: "scissors")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            case .offline:
+                Label(Self.provenance(model.document?.modified), systemImage: "externaldrive")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Label(VaultNoteOpener.offlineCaption, systemImage: "wifi.slash")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            case .localOnly:
+                Label(Self.provenance(model.document?.modified), systemImage: "externaldrive")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Label(VaultNoteOpener.localOnlyCaption, systemImage: "questionmark.folder")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            case .local:
+                Label(Self.provenance(model.document?.modified), systemImage: "externaldrive")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            VaultWriteNotices(entries: model.pending,
+                              keepMine: { entry in Task { await model.keepMine(entry) } },
+                              takeStudios: { entry in Task { await model.takeStudios(entry) } })
             // ONE note gets one extra line. Said where the boxes are about to look
             // untappable, so the difference reads as a rule rather than as a bug.
             if let caption = VaultWriteExemption.caption(path: route.path) {
@@ -788,12 +986,17 @@ public struct VaultNoteReaderView: View {
     /// cannot come to disagree.
     private var editRefusal: String? {
         if let refused = VaultNoteEditorModel.refusal(path: route.path) { return refused }
-        if model.document?.truncated == true { return VaultNoteEditorModel.tooLongCaption }
+        if model.document?.truncated == true || model.isBridgeTruncated {
+            return VaultNoteEditorModel.tooLongCaption
+        }
         return nil
     }
 
-    /// True for the one note the reader shows but never writes.
-    private var isReadOnly: Bool { VaultWriteExemption.isReadOnly(path: route.path) }
+    /// True for the notes the reader shows but never writes: `Today.md`, and the Studio's
+    /// copy of a note too long to be served whole.
+    private var isReadOnly: Bool {
+        VaultWriteExemption.isReadOnly(path: route.path) || model.isBridgeTruncated
+    }
 
     /// A list row: its marker, its text, and the indent its depth earns.
     @ViewBuilder

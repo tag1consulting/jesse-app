@@ -77,13 +77,19 @@ public final class InboxCaptureService {
     private let deviceName: @Sendable () -> String
     private let now: @Sendable () -> Date
     private let timeZone: @Sendable () -> TimeZone
+    /// Where every capture is ALSO queued for the Studio. The capture is written into the
+    /// device's own Inbox folder, which on the phone reaches the Studio only if Obsidian iOS
+    /// syncs a file another app changed, and it does not. Nil only in a test not about it.
+    private let outbox: VaultWriteOutbox?
 
     public init(source: VaultIndexSource = .shared,
                 log: OfflineWriteLog = .shared,
                 platform: InboxCapturePlatform = .current,
                 deviceName: @escaping @Sendable () -> String = { VaultDiagnosticsModel.deviceName() },
                 now: @escaping @Sendable () -> Date = { Date() },
-                timeZone: @escaping @Sendable () -> TimeZone = { .current }) {
+                timeZone: @escaping @Sendable () -> TimeZone = { .current },
+                outbox: VaultWriteOutbox? = .shared) {
+        self.outbox = outbox
         self.source = source
         self.log = log
         self.platform = platform
@@ -124,6 +130,23 @@ public final class InboxCaptureService {
         let zone = timeZone()
         guard hasVaultFolder else { return .failure(.noFolder) }
 
+        // QUEUED FOR THE STUDIO FIRST, with the exact entry and file the append below will
+        // write (the same pure functions `InboxCapture.capture` calls), and taken back if the
+        // append fails. A capture that cannot be queued is not written.
+        let entry: String
+        do {
+            entry = try InboxCapture.entry(text: text, about: about, device: device,
+                                           now: stamp, timeZone: zone)
+        } catch {
+            return .failure(Self.failure(error))
+        }
+        let record = VaultWriteRecord.capture(
+            localPath: InboxCapture.relativePath(platform: platform, now: stamp, timeZone: zone),
+            entry: entry,
+            prologue: InboxCapture.fileHeader(platform: platform, now: stamp, timeZone: zone),
+            madeAt: stamp)
+        if let failure = await queue(record) { return .failure(failure) }
+
         let outcome: Result<InboxCaptureWrite, Error> = await Task.detached {
             do {
                 return .success(try folder.withAccess { root in
@@ -139,13 +162,33 @@ public final class InboxCaptureService {
         switch outcome {
         case .success(let write):
             log.record(OfflineWriteRecord(
+                id: record.id,
                 written: stamp, file: write.relativePath, bytes: write.bytesAppended,
                 checksum: write.checksum, text: write.entry,
                 about: InboxCapture.normalizedAbout(about), status: .written))
+            send()
             return .success(write)
         case .failure(let error):
+            await outbox?.remove(id: record.id)
             return .failure(Self.failure(error))
         }
+    }
+
+    /// Queue one record, or say why it could not be.
+    private func queue(_ record: VaultWriteRecord) async -> InboxCaptureFailure? {
+        guard let outbox else { return nil }
+        do {
+            try await outbox.enqueue(record)
+            return nil
+        } catch {
+            return .failed("It couldn't be queued for the Studio, so it wasn't written: \(error.localizedDescription)")
+        }
+    }
+
+    /// Send what is queued, without waiting: the composer that called this is on screen.
+    private func send() {
+        guard let outbox else { return }
+        Task { await outbox.flush() }
     }
 
     /// Write a logged capture's own entry back into its own file.
@@ -159,6 +202,15 @@ public final class InboxCaptureService {
         let stamp = now()
         let zone = timeZone()
         guard hasVaultFolder else { return .failure(.noFolder) }
+
+        // The SAME id as the original capture: a bridge that already has it answers
+        // `applied` and appends nothing, and one that does not appends it once.
+        let queued = VaultWriteRecord.capture(
+            id: record.id, localPath: record.file, entry: record.text,
+            prologue: InboxCapture.fileHeader(forRelativePath: record.file, fallbackNow: stamp,
+                                              timeZone: zone),
+            madeAt: record.written)
+        if let failure = await queue(queued) { return .failure(failure) }
 
         let outcome: Result<InboxCaptureWrite, Error> = await Task.detached {
             do {
@@ -175,8 +227,11 @@ public final class InboxCaptureService {
         switch outcome {
         case .success(let write):
             log.apply(statuses: [record.id: .written])
+            send()
             return .success(write)
         case .failure(let error):
+            // Left queued: the capture WAS made, on this device, and the Studio should have
+            // it whether or not the folder takes it back.
             return .failure(Self.failure(error))
         }
     }

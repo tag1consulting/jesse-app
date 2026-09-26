@@ -142,6 +142,9 @@ pub struct AppState {
     // `<state_dir>/strand-ticks.json`; in memory with no state dir. See
     // [`crate::strandticks`].
     pub strand_ticks: Arc<crate::strandticks::TickLedger>,
+    // The ids of the app's vault writes already applied, and the lock that serialises
+    // `POST /jesse/vault/writes`. See `vaultwrites`.
+    pub vault_writes: Arc<crate::vaultwrites::VaultWriteLedger>,
 }
 
 impl AppState {
@@ -155,6 +158,9 @@ impl AppState {
         let jobs_dir = cfg.jobs_dir();
         let device_file = cfg.device_file();
         let strand_ticks = Arc::new(crate::strandticks::TickLedger::new(cfg.strand_ticks_file()));
+        let vault_writes = Arc::new(crate::vaultwrites::VaultWriteLedger::new(
+            cfg.vault_writes_file(),
+        ));
         let titles_file = cfg.titles_file();
         let flags_file = cfg.flags_file();
         let conversations_file = cfg.conversations_file();
@@ -233,6 +239,7 @@ impl AppState {
             scheduler,
             artifacts,
             strand_ticks,
+            vault_writes,
         };
         // GIVE THE IN-PROCESS HARNESS ITS BROKER. This is the first point in the process where
         // both exist: the harness registry is built inside `Config::from_env`, and the broker

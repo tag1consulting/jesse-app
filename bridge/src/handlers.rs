@@ -2727,6 +2727,21 @@ pub fn app(state: AppState) -> Router {
             "/jesse/strands/:slug/ticks",
             post(crate::strandticks::jesse_strand_tick),
         )
+        // ONE NOTE BY PATH OR WIKI TARGET, so the app opens the Studio's current copy rather
+        // than the phone's Obsidian folder, which syncs only in the foreground. `.md` under
+        // the notes root only; see `vaultnotes` for the rules and SECURITY.md.
+        .route(
+            "/jesse/vault/note",
+            get(crate::vaultnotes::jesse_vault_note),
+        )
+        // Every write the app makes to a note, applied here against the current file:
+        // edits merged three ways, ticks found by content, captures deduplicated, and a
+        // conflict answered rather than written. Never `Today.md`, never git. See
+        // `vaultwrites`.
+        .route(
+            "/jesse/vault/writes",
+            post(crate::vaultwrites::jesse_vault_writes),
+        )
         // The conversation surface: the bridge's own thread identity, keyed on a stable
         // UUID registered at accept time rather than on a CLI transcript filename.
         .route("/jesse/conversations", get(jesse_conversations))

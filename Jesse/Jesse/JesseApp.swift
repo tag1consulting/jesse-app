@@ -39,15 +39,11 @@ struct JesseApp: App {
         // age and orphan rules from `ContentView`.
         RecordingWorkingCopy.standard().purge()
 
-        // A tick of a strand step in the vault reader is reported to the bridge, which
-        // starts the turn that closes it; see `StrandTickReport`. The client is rebuilt
-        // per send so a re-pair is picked up without a relaunch.
-        Task {
-            await StrandTickOutbox.shared.configure { @MainActor in
-                JesseBridgeClient(config: ConfigStore.load())
-            }
-            await StrandTickOutbox.shared.flush()
-        }
+        // A note opened by name is the Studio's copy whenever this phone's Obsidian folder
+        // is behind, and every write to a note is also sent to the Studio, because Obsidian
+        // iOS carries neither; see `VaultNoteOpener` and `VaultWriteOutbox`. The client is
+        // rebuilt per use so a re-pair is picked up without a relaunch.
+        VaultBridgeWiring.install { JesseBridgeClient(config: ConfigStore.load()) }
 
         let box = IntentReplayerBox()
         _replayerBox = State(initialValue: box)

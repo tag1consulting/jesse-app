@@ -48,13 +48,6 @@ final class StrandTickReportTests: XCTestCase {
         return (lines.firstIndex { $0.contains(needle) } ?? -1) + 1
     }
 
-    /// A defaults suite nobody else uses, so no test sees another's queue.
-    private func freshDefaults() -> String {
-        let name = "StrandTickReportTests-\(UUID().uuidString)"
-        UserDefaults(suiteName: name)?.removePersistentDomain(forName: name)
-        return name
-    }
-
     // MARK: - Which ticks are strand steps
 
     func testAQueueDraftsLaterAndRunningLineIsAStep() {
@@ -95,151 +88,34 @@ final class StrandTickReportTests: XCTestCase {
                                               line: 2, checked: true))
     }
 
-    // MARK: - The regression: a written tick is reported, once
+    // MARK: - The regression: a written strand tick reaches the bridge, once
+    //
+    // The outbox that used to carry only these is gone; every write is now a record in
+    // `VaultWriteOutbox`, and a strand tick's record carries its step so a bridge without
+    // the write route still hears of it the old way. See `VaultWriteOutboxTests`.
 
-    func testATickWrittenInAStrandNoteIsReportedExactlyOnce() async throws {
-        let outbox = StrandTickOutbox(suiteName: freshDefaults())
-        let reporter = FakeTickReporter()
-        await outbox.configure { reporter }
-        let writer = FakeNoteWriter(text: family)
-        let ticker = VaultNoteTicker(writer: writer, strandTicks: outbox)
-
-        let outcome = await ticker.tick(path: "Strands/Family.md",
-                                        line: line(of: "**P1**", in: family), to: true,
-                                        text: family, stamp: VaultFileStamp(text: family))
-
-        XCTAssertTrue(outcome.didWrite)
-        XCTAssertTrue(writer.diskText.contains("- [x] **P1**"))
-        await outbox.flush()
-        XCTAssertEqual(reporter.sent, [StrandTickReport(note: "Family", id: "P1", checked: true)])
-        let left = await outbox.queued
-        XCTAssertEqual(left, [])
+    func testATickWrittenInAStrandNoteCarriesItsStep() throws {
+        let at = line(of: "**P1**", in: family)
+        let ticked = try XCTUnwrap(VaultCheckboxEdit.setting(family, line: at, checked: true))
+        let record = VaultWriteRecord.replacing(localPath: "Strands/Family.md", base: family,
+                                                baseStamp: VaultFileStamp(text: family),
+                                                new: ticked, kind: .tick)
+        XCTAssertEqual(record.kind, .tick)
+        XCTAssertEqual(record.line, at)
+        XCTAssertEqual(record.checked, true)
+        XCTAssertEqual(record.strandTick, StrandTickReport(note: "Family", id: "P1", checked: true))
+        XCTAssertEqual(record.text, VaultCheckboxEdit.lines(family)[at - 1],
+                       "the line as the device saw it, so the bridge can find it by content")
+        XCTAssertNil(record.baseText, "a tick sends its line, not the whole note")
     }
 
-    func testATickThatWinsOnTheRetryIsReportedToo() async throws {
-        let outbox = StrandTickOutbox(suiteName: freshDefaults())
-        let reporter = FakeTickReporter()
-        await outbox.configure { reporter }
-        let writer = FakeNoteWriter(text: family)
-        writer.diskText = family + "\n- a line somebody else added\n"
-
-        let outcome = await VaultNoteTicker(writer: writer, strandTicks: outbox)
-            .tick(path: "Strands/Family.md", line: line(of: "**P1**", in: family), to: true,
-                  text: family, stamp: VaultFileStamp(text: family))
-
-        XCTAssertTrue(outcome.didWrite)
-        await outbox.flush()
-        XCTAssertEqual(reporter.sent.map(\.id), ["P1"])
-    }
-
-    func testATickThatDidNotWriteReportsNothing() async throws {
-        let outbox = StrandTickOutbox(suiteName: freshDefaults())
-        let reporter = FakeTickReporter()
-        await outbox.configure { reporter }
-        let writer = FakeNoteWriter(text: family)
-        writer.failNextWrites([VaultFileError.unwritable("Strands/Family.md", "disk full")])
-
-        let outcome = await VaultNoteTicker(writer: writer, strandTicks: outbox)
-            .tick(path: "Strands/Family.md", line: line(of: "**P1**", in: family), to: true,
-                  text: family, stamp: VaultFileStamp(text: family))
-
-        XCTAssertFalse(outcome.didWrite)
-        await outbox.flush()
-        XCTAssertEqual(reporter.sent, [])
-    }
-
-    func testATickOutsideAStrandNoteReportsNothing() async throws {
-        let outbox = StrandTickOutbox(suiteName: freshDefaults())
-        let reporter = FakeTickReporter()
-        await outbox.configure { reporter }
-        let writer = FakeNoteWriter(text: family)
-
-        _ = await VaultNoteTicker(writer: writer, strandTicks: outbox)
-            .tick(path: "Projects/Family.md", line: line(of: "**P1**", in: family), to: true,
-                  text: family, stamp: VaultFileStamp(text: family))
-
-        await outbox.flush()
-        XCTAssertEqual(reporter.sent, [])
-    }
-
-    // MARK: - The outbox
-
-    func testAReportThatCannotBeSentIsKeptAndSentInOrderLater() async throws {
-        let suite = freshDefaults()
-        let outbox = StrandTickOutbox(suiteName: suite)
-        let reporter = FakeTickReporter()
-        reporter.reachable = false
-        await outbox.configure { reporter }
-        let tick = StrandTickReport(note: "Family", id: "P1", checked: true)
-        let untick = StrandTickReport(note: "Family", id: "P1", checked: false)
-
-        await outbox.enqueue(tick)
-        await outbox.enqueue(untick)
-        await outbox.flush()
-        XCTAssertEqual(reporter.sent, [])
-
-        // A relaunch: a new outbox over the same defaults still holds both, in order.
-        let relaunched = StrandTickOutbox(suiteName: suite)
-        await relaunched.configure { reporter }
-        let kept = await relaunched.queued
-        XCTAssertEqual(kept, [tick, untick])
-
-        reporter.reachable = true
-        await relaunched.flush()
-        XCTAssertEqual(reporter.sent, [tick, untick])
-        let left = await relaunched.queued
-        XCTAssertEqual(left, [])
-    }
-
-    func testAReportTheBridgeRefusesLeavesTheOutbox() async throws {
-        let outbox = StrandTickOutbox(suiteName: freshDefaults())
-        let reporter = FakeTickReporter()
-        reporter.answer = .refused
-        await outbox.configure { reporter }
-        await outbox.enqueue(StrandTickReport(note: "Gone", id: "Z9", checked: true))
-        await outbox.flush()
-        let left = await outbox.queued
-        XCTAssertEqual(left, [])
-        XCTAssertEqual(reporter.sent.count, 1)
-    }
-
-    func testTwoFlushesAtOnceSendEachReportOnce() async throws {
-        let outbox = StrandTickOutbox(suiteName: freshDefaults())
-        let reporter = FakeTickReporter()
-        await outbox.configure { reporter }
-        await outbox.enqueue(StrandTickReport(note: "Family", id: "P1", checked: true))
-        await outbox.enqueue(StrandTickReport(note: "Family", id: "P2", checked: true))
-
-        async let first: Void = outbox.flush()
-        async let second: Void = outbox.flush()
-        _ = await (first, second)
-
-        XCTAssertEqual(reporter.sent.map(\.id), ["P1", "P2"])
-    }
-}
-
-/// The bridge, as far as a report is concerned.
-final class FakeTickReporter: StrandTickReporting, @unchecked Sendable {
-    private let lock = NSLock()
-    private var _sent: [StrandTickReport] = []
-    private var _reachable = true
-    private var _answer = StrandTickDelivery.delivered
-
-    var sent: [StrandTickReport] { lock.withLock { _sent } }
-    var reachable: Bool {
-        get { lock.withLock { _reachable } }
-        set { lock.withLock { _reachable = newValue } }
-    }
-    var answer: StrandTickDelivery {
-        get { lock.withLock { _answer } }
-        set { lock.withLock { _answer = newValue } }
-    }
-
-    func reportStrandTick(_ report: StrandTickReport) async throws -> StrandTickDelivery {
-        try lock.withLock {
-            guard _reachable else { throw URLError(.notConnectedToInternet) }
-            _sent.append(report)
-            return _answer
-        }
+    func testATickOutsideAStrandStepCarriesNoStep() throws {
+        let at = line(of: "stray box", in: family)
+        let ticked = try XCTUnwrap(VaultCheckboxEdit.setting(family, line: at, checked: true))
+        let record = VaultWriteRecord.replacing(localPath: "Strands/Family.md", base: family,
+                                                baseStamp: VaultFileStamp(text: family),
+                                                new: ticked, kind: .tick)
+        XCTAssertEqual(record.kind, .tick)
+        XCTAssertNil(record.strandTick)
     }
 }

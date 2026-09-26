@@ -177,8 +177,10 @@ mod todayjournal;
 mod todaywrite;
 mod turntrace;
 mod util;
+pub mod vaultnotes;
 mod vaultqa;
 mod vaultqagate;
+pub mod vaultwrites;
 mod vision;
 mod writelock;
 

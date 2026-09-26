@@ -2910,10 +2910,12 @@ module opens files for reading only, and creates, writes and removes nothing.
 - **The reachable set is "notes linked from `Today.md`", by construction.** Detail
   is keyed by **item id**, never by a path. The caller cannot name a file; it names
   an item, and the bridge re-parses the day file to discover what that item links.
-  **There is deliberately no `?path=` vault reader.** Adding one later would change
-  what this endpoint *is* — from a fixed, file-derived set of notes into a general
-  vault reader behind a token — and must be treated as a new security decision, not
-  as an extension of this one.
+  **There is deliberately no `?path=` vault reader on this endpoint.** Adding one
+  would change what this endpoint *is* — from a fixed, file-derived set of notes
+  into a general vault reader behind a token — and must be treated as a new security
+  decision, not as an extension of this one. That decision was taken separately in
+  bridge 0.154.0, as its own route with its own rules: see "Vault notes and note
+  writes" below.
 - **Vault-root confinement, two independent gates.** A target is refused unless it
   is relative (no absolute path, no root or prefix component) and contains no `..`
   component; and, separately, the **canonicalized** result must still sit under the
@@ -2946,6 +2948,49 @@ module opens files for reading only, and creates, writes and removes nothing.
   composed from a **constant table and the configured root**, so they are a fixed
   set of five and not a path surface; an unreadable one contributes nothing rather
   than erroring. The slug itself is a closed enum and carries no vault text.
+
+## Vault notes and note writes (`GET /jesse/vault/note`, `POST /jesse/vault/writes`, 0.154.0)
+
+Bridge 0.154.0 serves one note by path or wiki target, and applies the app's writes to
+notes. **This is the new security decision the item detail section asks for**, taken
+because the alternative was worse: Obsidian on iOS syncs only in the foreground and never
+syncs a file another app changed, so the app was showing and editing stale copies of
+notes and leaving edits, comments, ticks and captures on the phone alone.
+
+- **Same auth/rate posture as every endpoint.** Bearer-auth gated, on the shared rate
+  limiter. The token already grants turns that read and write any file in the vault
+  through the agent; these two routes add no reach inside the vault that the bearer did
+  not have, and the rules below keep them from adding any outside it.
+- **Markdown notes under the notes root, and nothing else.** A path must be relative,
+  every segment a normal name, no segment starting with `.` (which covers `..`,
+  `.obsidian/`, `.git/` and dot files), not under `_to-purge/`, and ending in `.md`. The
+  path is then canonicalized with every symlink resolved, must still sit under the
+  canonicalized notes root, and the canonical relative path is put through the same
+  segment rules again, so a symlink inside the vault that points at `.obsidian/`, at
+  `_to-purge/` or outside the root is refused like naming it directly. A wiki target is
+  resolved by the item detail route's own resolver and then held to the same rules.
+- **Bounded reads.** The markdown served is capped at 64 KiB on a char boundary, like the
+  item detail route. The file's sha256 is computed over every byte, streamed, so only the
+  prefix is ever held in memory. A missing note is `404` `{"error":"note_not_found"}`; a
+  path the rules refuse is `400` `{"error":"refused"}`, which reveals nothing about what
+  exists, because it is decided before the filesystem is touched.
+- **Writes: never `Today.md`, captures only into `Inbox/`, never git.** `Today.md` has its
+  own journaled write routes and is refused here. A capture outside `Inbox/` is refused.
+  A new file may only be created in a folder that already exists under the root. Every
+  write is a temp-file-and-rename (`write_atomic`); nothing here runs git, and the
+  Studio's own autocommit carries the change.
+- **Idempotent and bounded requests.** Each record carries a UUID; applied ids are kept
+  for 30 days in `<state_dir>/vault-writes.json`, and a resent id changes nothing. At most
+  500 records per request and 2 MiB per text field. Requests are serialised, and while a
+  running turn holds a write lock covering a named file the whole request answers `503`
+  rather than racing the agent; the app sends it again later.
+- **A conflict is answered, never guessed.** An edit on a moved base is merged three ways
+  against the base text the device sends, and only if that text hashes to the base the
+  record names; overlapping hunks are `conflict` with the Studio's current text, and
+  nothing is written. A tick on a moved base is applied only when exactly one checkbox
+  line matches by content. `force` (the app's "Keep mine", after a person has seen both
+  versions) writes the device's text.
+- **No containment-record change.** No MCP server, no tool grant, no child process.
 
 ## Session list (`GET /jesse/sessions`)
 
