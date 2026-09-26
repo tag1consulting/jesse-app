@@ -37,6 +37,43 @@ import JesseNetworking
 // The hues themselves are a design choice and Jeremy should feel free to move them:
 // the slugs are frozen wire, the colours are not. What must survive an edit is the two
 // properties above.
+//
+// ## Strand family tones
+//
+// A strand does not wear its topic's colour flat. It wears a TONE derived from it
+// (`StrandTone`), so Tag1, Jesse and Strands System read as three blues of one family
+// rather than three identical blues:
+//
+//   * **A root is its topic's base, exactly.** A strand whose parent is absent from the
+//     snapshot, or files under another topic, draws the value in this table, so a root
+//     strand and a Today item of the same topic still match. An older bridge that sends
+//     no `parent` makes every strand a root, which is the board as it was.
+//   * **A child is one step from its parent.** One lightness step, a little less chroma,
+//     and a hue turn. The step is a row per topic and appearance in
+//     `StrandTone.tuning`, because the room each topic has is set by its neighbours:
+//     most lighten, but dark Perseido and dark Via Con Me darken (lighter is where
+//     Personal sits under deuteranopia and protanopia), and `unfiled` darkens in both,
+//     stepping by lightness alone because a grey must never grow a hue. When a step
+//     would cross the contrast floor (or the dark ceiling) the part it cannot spend on
+//     lightness goes to the hue instead. Levels below the fourth wear the fourth's tone.
+//   * **The turn comes from a slot, not from order.** Each strand hashes its own slug
+//     (FNV 1a over the UTF 8 bytes, never the per launch seeded `hashValue`) into one of
+//     four slots, one or two hue units either side of its parent, so siblings fan out
+//     around their parent and a strand keeps its tone when a sibling is added, renamed
+//     or reordered. Recency, lens and collapse state never touch a tone.
+//   * **OKLCH, not HSL**, because equal steps in it look equal: an HSL lighten drifts
+//     blue toward purple, and a family would stop reading as a family.
+//
+// Tones are only ever NON TEXT marks (the row's bar, the `Tree` rail, the caption's
+// dot), so their floor is the 3:1 non text threshold; text keeps the topic base and its
+// 4.5:1. `StrandToneTests` walks every path to the fourth level in both appearances and
+// asserts that every tone clears 3:1 against its background, stays at least ΔE*ab 10
+// from every OTHER topic's base under normal vision and the three dichromacies, and
+// differs from its parent by at least ΔE 5 under normal vision. The hue budget is where
+// those bite: Via Con Me light has no turn at all, Network light and Perseido light one
+// degree a unit, Network dark four, against six for the rest. Colour is still never the only cue: the
+// `Tree` lens draws the relation as a rail, the flat lenses caption it `in <parent>`,
+// and VoiceOver says the same.
 
 // MARK: - A colour, as data
 
@@ -208,14 +245,26 @@ public struct TodayRowAccent: Equatable, Hashable, Sendable {
 public struct TodayProjectAccentBar: View {
     @Environment(\.colorScheme) private var scheme
     private let accent: TodayRowAccent
+    /// A strand's family tone, already resolved for the current appearance by
+    /// `StrandTone`. Nil on a Today row, which wears its topic.
+    private let tone: TodayProjectColor?
 
     public init(project: TodayProject) {
         self.accent = TodayProjectPalette.rowAccent(for: project)
+        self.tone = nil
+    }
+
+    /// A strand's bar: the same shape, width and strength as its topic's, in the tone
+    /// `StrandTone` derived for it. The caller resolves the tone for the appearance it
+    /// is drawing in; nothing here computes a colour.
+    public init(project: TodayProject, tone: TodayProjectColor) {
+        self.accent = TodayProjectPalette.rowAccent(for: project)
+        self.tone = tone
     }
 
     public var body: some View {
         Capsule()
-            .fill(accent.color(scheme))
+            .fill(tone?.color ?? accent.color(scheme))
             .opacity(accent.opacity)
             .frame(width: 3)
             .accessibilityHidden(true)

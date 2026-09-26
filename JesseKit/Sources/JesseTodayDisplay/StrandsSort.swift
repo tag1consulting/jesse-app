@@ -229,6 +229,11 @@ public enum StrandsSemantics {
         return out
     }
 
+    /// A child's caption in the flat lenses, naming the strand it sits under.
+    public nonisolated static func parentCaption(_ parentTitle: String) -> String {
+        "in \(parentTitle)"
+    }
+
     /// A collapsed parent's caption: how many strands it holds, at every depth.
     public nonisolated static func insideCaption(_ descendants: Int) -> String {
         "\(descendants) inside"
@@ -289,9 +294,13 @@ public enum StrandsSemantics {
     /// cannot reach is content nobody checks. The view draws the same pieces in the same
     /// order; this is what a screen reader hears, and what the row test asserts.
     public nonisolated static func rowAccessibilityLabel(_ strand: Strand,
-                                                         today: String) -> String {
+                                                         today: String,
+                                                         parentTitle: String? = nil) -> String {
         var parts = [TodayProjectPalette.role(for: strand.group).accessibilityLabel,
                      strand.title]
+        // The relation the rail and the caption draw, said out loud: neither the colour
+        // nor the indent reaches a screen reader.
+        if let parentTitle { parts.append(parentCaption(parentTitle)) }
         if let now = strand.now, !now.isEmpty { parts.append(now) }
         if let next = nextLine(strand) { parts.append("Next: \(next)") }
         if strand.isWaitingOnYou { parts.append(StrandsWording.waitingOnYou) }
