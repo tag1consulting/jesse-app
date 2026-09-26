@@ -14,6 +14,71 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [App 1.0 (170)] - 2026-09-26
+
+**A question about Jeremy was answered out of somebody else's archived notes.** With the
+bridge unreachable, "What's my birthday?" came back "June 26", citing
+`Projects/Research/archive/…-risk-assessment.md` and a packing list under
+`Projects/drafts/archive/`. His birthday is September 4 and it is in a live note, under a
+heading that names him; June 26 is the day a family trip left for somebody else's birthday,
+and both cited notes are finished work that mention that trip and the word "birthday". A
+first-person question now retrieves the owner's own notes, and a live note always outranks an
+archived one.
+
+**Root cause one: the first-person words were discarded and nothing took their place.**
+`LookupQuery.keywords` drops `my`, `me`, `mine` and `i` as stop words, so the index was asked
+for `birthday` alone. Nothing in retrieval knew whose birthday was wanted — and it could not
+have, because the vault never calls its owner "my". It uses his name, which the offline path
+held in a setting it never passed to the retriever.
+
+**Root cause two: `what's` was not a stop word, so the precise pass could not run at all.**
+The stop list is a list of WORDS and the tokenizer hands over contractions whole, so `what's`
+became a REQUIRED keyword. No note in the vault contains it, the all-keywords pass and the
+expansion pass therefore returned nothing, and the answer came out of the last-resort tier
+that searches each keyword alone — which for this question is the single word `birthday`.
+
+**Root cause three: an archived note ranked exactly like a note in use.** `Projects/drafts/
+archive/` and `Projects/Research/archive/` hold delivered drafts and closed research. They
+went into the fusion beside live notes, so two of them filled a four-chunk prompt about today.
+
+### Fixed
+
+- **A first-person question carries the owner's name to the index.** When a question contains
+  `i`, `me`, `my`, `mine`, `myself` or a contraction of one (`I'm`, `I've`, `I'd`, `I'll`,
+  with a phone's curly apostrophe folded to a straight one), the owner name from the app's
+  `jesse.owner.name` setting is appended to the keywords: `what's my birthday` goes to the
+  index as `birthday Jeremy`, which is what makes the precise pass find the one heading that
+  answers it. `Jeremy` matches the `Jeremy's` a note actually writes through FTS5's own
+  tokenizer, with no special case for possessives. **With no name set, or a blank one,
+  retrieval is exactly what it was** — the name is nil on such a device and every question
+  behaves as before.
+- **A contraction of a stop word is a stop word.** `what's`, `when's`, `who's`, `it's`,
+  `we're`, `I've`: a token whose stem before the apostrophe is on the list is on the list. A
+  possessive of a meaningful word is untouched, because its stem is not — `Marta's` is still
+  `Marta's`.
+- **Archived notes rank behind every live note.** Any hit with an `archive/` directory
+  anywhere in its path is fused as a separate group and concatenated after the live one, so
+  the sentence embedding can reorder within a group and can never lift finished work back
+  above a note in use. The test is a path SEGMENT, so `Archive-Policy.md` is not archived.
+  **Demoted, never excluded**: an archived note is still the only source for what a closed
+  report concluded, and it still comes back when nothing live matches.
+- `Inbox/` stays excluded exactly as it was, the gate is unchanged, the citation checks and
+  the grounding floor are unchanged, and the time limit is unchanged.
+
+### Internal
+
+- `VaultRetriever` takes an `ownerName`, defaulted nil, and `OfflineAnswerService` supplies it
+  from `OfflineLookupSettings.ownerName` — the same `jesse.owner.name` default `PromptStore`
+  reads for the prompts the app builds itself, whose key is now declared once and read from
+  there by both. Both apps reach the offline path through `OfflineAnswerService.shared`, so
+  iOS and the Mac are wired by that one read. Nothing on either platform WRITES that setting
+  yet: until a Settings field does, this fix is dormant on a device whose default is unset.
+- `VaultOwnerRetrievalTests` (11 cases) and the four-note `VaultOwnerRetrievalFixture`: one
+  live note that answers the question, one live note denser in "birthday" that names nobody,
+  and the two archived notes. The retrieval assertion fails on the pre-fix commit — the live
+  distractor comes first — and the answerer-level case shows the full path citing the live
+  note. The floor corpus is deliberately untouched.
+
 ## [App 1.0 (169)] - 2026-09-26
 
 **A note opened by name shows the Studio's current copy whenever the bridge is reachable,

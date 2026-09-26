@@ -24,6 +24,11 @@ import Observation
 public struct OfflineLookupSettings: @unchecked Sendable {
     public static let enabledKey = "vault.offlineLookup.enabled"
     public static let measuredPromptKey = "vault.offlineLookup.measuredPromptCharacters"
+    /// The app's owner-name setting. NOT a key of this feature's own — it is the app's
+    /// one personalization value, written by the Settings field that `PromptStore` reads
+    /// for the prompts it builds, and declared here because this package cannot see that
+    /// enum and the string must exist exactly once. `PromptStore` reads it back from here.
+    public static let ownerNameKey = "jesse.owner.name"
 
     private let defaults: UserDefaults
 
@@ -65,6 +70,18 @@ public struct OfflineLookupSettings: @unchecked Sendable {
     /// The budget this device's measurement implies.
     public var budget: VaultRetrievalBudget {
         VaultRetrievalBudget.forMeasuredPrompt(measuredPromptCharacters)
+    }
+
+    /// How the vault names the owner, or nil when this device has no name for him.
+    ///
+    /// Nil rather than a placeholder: `PromptStore.ownerName` answers "the user" on an
+    /// unset device because it is building a SENTENCE, and handing "the user" to the index
+    /// as a keyword would require a note to contain the word "user". A device with no name
+    /// set must retrieve exactly as it did before this existed.
+    public var ownerName: String? {
+        let value = (defaults.string(forKey: Self.ownerNameKey) ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return value.isEmpty ? nil : value
     }
 
     /// The Settings row's second line.
@@ -245,7 +262,12 @@ public final class OfflineAnswerService: OfflineAnswering {
             return finish(.unanswered(.noHits), gate: "passed")
         }
 
-        let retriever = VaultRetriever(index: index, expander: expander, embedding: embedding)
+        // THE OWNER'S NAME GOES IN HERE, from the same setting the app's own prompts read.
+        // A first-person question ("what's my birthday") means nothing to an index over
+        // notes that call him by name, and this is the one place on the offline path that
+        // knows both.
+        let retriever = VaultRetriever(index: index, expander: expander,
+                                       embedding: embedding, ownerName: settings.ownerName)
         let retrieved = await retriever.retrieve(question: question, budget: settings.budget)
         guard !retrieved.chunks.isEmpty else {
             return finish(.unanswered(.noHits), gate: "passed", hits: retrieved.hitCount)
