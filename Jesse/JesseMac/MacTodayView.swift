@@ -205,8 +205,9 @@ struct MacTodayView: View {
         // after the agent acts. A Process-updates batch does its own unconditional
         // refetch when it lands (`MacTodayProcessRun`), and this conditional load costs
         // one round trip either way.
-        .onChange(of: coordinator.isRunning) { was, now in
-            guard was, !now else { return }
+        // Counted rather than watched as a Bool: with turns overlapping across conversations,
+        // "is anything running" can go true → true and never report the settle in between.
+        .onChange(of: coordinator.settleCount) { _, _ in
             Task { await model.load() }
         }
         // A `410` from the detail read means the item left the day file while the list

@@ -270,7 +270,7 @@ struct MacRootView: View {
             && (t.sessionId ?? "").isEmpty
             && t.registeredAt == nil
             && ComposerDraftStore.shared.mayReap(t.id)
-            && !(coordinator.isRunning && coordinator.activeThreadID == t.id) {
+            && !coordinator.isRunning(t.id) {
             if selection == t.id { selection = nil }
             if let cid = t.conversationId, !cid.isEmpty { MacCursorStore.clear(cid) }
             ComposerDraftStore.shared.delete(t.id)

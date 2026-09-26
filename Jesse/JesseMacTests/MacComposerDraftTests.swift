@@ -222,7 +222,8 @@ final class MacComposerDraftTests: XCTestCase {
                        "the draft is still there")
         XCTAssertEqual(drafts.snapshot(for: thread.id).pendingRecording, "memo.m4a",
                        "with its marker")
-        XCTAssertNotNil(coord.lastError, "and the store failure is surfaced, not swallowed")
+        XCTAssertNotNil(coord.error(for: thread.id),
+                        "and the store failure is surfaced, not swallowed")
         XCTAssertTrue(fake.sentTexts.isEmpty, "nothing was transmitted on an unsaved turn")
         XCTAssertFalse(coord.isRunning, "and the run gate never opened")
     }
@@ -260,11 +261,11 @@ final class MacComposerDraftTests: XCTestCase {
         XCTAssertTrue(composerSend(coord, text: "goes out later", thread: thread,
                                    context: context))
         let deadline = Date().addingTimeInterval(4)
-        while coord.lastError == nil && Date() < deadline {
+        while coord.error(for: thread.id) == nil && Date() < deadline {
             try? await Task.sleep(for: .milliseconds(20))
         }
 
-        XCTAssertNotNil(coord.lastError, "the send failed")
+        XCTAssertNotNil(coord.error(for: thread.id), "the send failed")
         XCTAssertEqual(thread.orderedTurns.map(\.text), ["goes out later"],
                        "the message is still in the transcript")
         XCTAssertFalse(drafts.hasDraft(thread.id),
@@ -335,7 +336,7 @@ final class MacComposerDraftTests: XCTestCase {
         func reapable(_ t: JesseThread) -> Bool {
             t.turns.isEmpty && (t.sessionId ?? "").isEmpty && t.registeredAt == nil
                 && !ComposerDraftStore.shared.hasDraft(t.id)
-                && !(coord.isRunning && coord.activeThreadID == t.id)
+                && !coord.isRunning(t.id)
         }
 
         XCTAssertFalse(reapable(drafted), "a conversation with an unsent draft is spared")

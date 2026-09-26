@@ -335,6 +335,21 @@ public enum JesseStreamEvent: Equatable, Sendable {
     case cancelled
 }
 
+/// One item off a live turn's stream: a decoded frame, or evidence that the connection is
+/// still there.
+///
+/// `alive` is NOT a frame the bridge sends. The bridge sends SSE keep-alive COMMENTS (axum's
+/// `KeepAlive::default()`, a `:` line every 15 seconds) and `SSEParser` drops them, which is
+/// correct — a comment is not an event — but it also means a caller watching the event stream
+/// cannot tell a long quiet turn from a connection that died without closing. A dead socket
+/// then looks exactly like a model thinking, for as long as the stream session's ceiling
+/// allows (a day). `alive` is that distinction, reported at the LINE level where the bytes
+/// actually arrive, rather than as an invented event type.
+public enum JesseStreamItem: Sendable {
+    case event(JesseStreamEvent)
+    case alive
+}
+
 // MARK: - Sessions / hydration
 
 /// One session in `GET /jesse/sessions`. Matches the bridge `SessionSummary`.

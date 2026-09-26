@@ -14,6 +14,57 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [App 1.0 (166)] - 2026-09-26
+
+**On the Mac, a message typed in one conversation would not send while another conversation was
+answering** — Return did nothing, the send button did nothing, and no error appeared. Quitting
+and relaunching fixed it, and the typed text survived. It now sends: the Mac runs turns
+concurrently, one per conversation, exactly as the phone does.
+
+**Root cause: one global run slot, gated per conversation in the composer and globally in
+staging.** `MacCoordinator` kept a single `isRunning`/`activeThreadID`/`streamingText` slot for
+the whole app. The composer's `canSend` asked "is a turn running IN THIS CONVERSATION", so in any
+other conversation the button stayed live and Return reached `send`; `stage` then asked "is a turn
+running ANYWHERE", returned nil, and set no error — an enabled control that silently refused, with
+the draft kept (which is why the text came back after a relaunch).
+
+**And a second root cause is why it lasted for hours.** The slot was released only when the
+stream finished, the SSE session's ceiling is a day (an agent turn legitimately runs for hours),
+and the stream had no stall detection — so a connection that died without closing (a lid shut, a
+Wi-Fi change, the Studio off the network) held the slot, and with it every conversation on the
+Mac, until the app was relaunched. The spinner that explained it could be scrolled out of the
+sidebar, which is why the symptom usually arrived with nothing visible at all.
+
+### Fixed
+
+- **Per-conversation run state** (`MacTurnRun`, keyed by thread id), the phone's
+  `RunCoordinator.inFlight` shape: `accepted`, the live text and the activity line all belong to
+  one conversation. `isRunning(_:)`, `streamingText(for:)`, `activity(for:)` and `phase(_:)` read
+  it; the app-wide `isRunning` remains for the rare caller that really means "anything in flight".
+  The empty-thread reaper and the sidebar spinner are per conversation; the Today tab reloads on a
+  **settle counter**, because with turns overlapping a global Bool can go true → true and never
+  report the settle in between.
+- **One send gate** (`MacSendGate`), a pure function the composer's `canSend` and the
+  coordinator's `stage` both call for the same conversation, so the two cannot disagree again.
+- **Every refusal says why.** "A reply is still coming in this conversation.", "This Mac isn't
+  paired with the bridge — pair it in Settings.", and the staging-save failure already had its
+  own sentence. The one silent refusal left is an empty composer, which is not an error. Turn
+  errors are now per conversation as well, so a failure in one never paints red in another (nor
+  silences another's delivery caption); app-wide failures — a session-list pull, a hydrate — keep
+  the single `lastError`.
+- **A stall watchdog on the live stream.** Nothing arriving at all for 60 seconds — four missed
+  keep-alives — abandons the read, cancels the connection with it, and resolves the turn through
+  the poll path a dropped stream already used. The day-long timeouts are untouched: a long turn
+  is legitimate, a silent one is not.
+- **The liveness signal is taken at the line level**, in `JesseBridgeClient.streamItems`: the
+  bridge's keep-alive comments are dropped by `SSEParser` (correctly — a comment is not an
+  event), so a caller watching frames alone cannot tell a thinking model from a dead socket.
+  `JesseStreamItem` reports each non-frame line as `alive`; `stream(jobId:)` is now the
+  frame-only view of that one reader, so iOS is unchanged.
+- **The completion poll's own silence**, closed too: when its 600-attempt budget runs out it now
+  says the reply is still owed and will arrive on the next sync, instead of returning with the
+  spinner stopped and nothing on screen.
+
 ## [App 1.0 (165)] - 2026-09-25
 
 **A long press on a strand opens one menu, wherever the strand is listed**, and one of its
