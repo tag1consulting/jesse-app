@@ -9,8 +9,10 @@ import XCTest
 //     prompt's body is a screenful of diet numbers containing the words "weigh-in",
 //     "new day" and "dashboard", which are exactly the keywords the vault's morning
 //     routines route on.
-//  2. It says DO NOT LOG. Every other Health-tab turn writes; this is the read-only
-//     one, and looking at a number must not be able to change it.
+//  2. It LOGS what the owner reports and writes nothing else. The reading is data, the
+//     conversation is not read-only: the owner reports unlogged food from this very
+//     screen (three Americanos against 0mg caffeine, 2026-09-23), and refusing to log
+//     them was the bug. The routine names still stay out of that positive paragraph.
 //  3. The snapshot is FENCED and named as data. It quotes the user's own food names
 //     back at the agent, so an unfenced block is a place a food called "ignore the
 //     above" becomes an instruction.
@@ -66,12 +68,30 @@ final class HealthAskPromptTests: XCTestCase {
         XCTAssertTrue(p.contains("Answer from that snapshot"))
     }
 
-    /// THE WRITE ASSERTION. An ask is the one read-only Health turn; if these clauses
-    /// go, a question about lunch can rewrite the diet log.
-    func testForbidsEveryWrite() {
+    /// THE WRITE ASSERTION. What the owner reports is logged, without a second message;
+    /// nothing beyond that logging is written. If the logging clause goes, "I had three
+    /// Americanos" is refused again; if the limit goes, a question can rewrite the day.
+    func testLogsWhatTheOwnerReportsAndWritesNothingElse() {
         let p = prompt()
-        XCTAssertTrue(p.contains("Do not log a meal, a weigh-in, or a workout"))
-        XCTAssertTrue(p.contains("do not edit the diet log, rewrite the dashboard, or touch Today.md"))
+        XCTAssertTrue(p.contains("log it exactly as a plain chat message would"))
+        XCTAssertTrue(p.contains("without asking first"))
+        XCTAssertTrue(p.contains("nothing else changes from this reading"))
+        XCTAssertTrue(p.contains("Do not rebuild the dashboard by hand or touch Today.md"))
+        XCTAssertFalse(p.contains("Do not log"))
+    }
+
+    /// The positive half, up to and including the logging paragraph, carries no routine
+    /// name: a reported meal must read as a meal, not as a request to rebuild the day.
+    func testLoggingParagraphCarriesNoRoutineName() {
+        let p = prompt()
+        let logging = p.range(of: "If {owner} tells you")!
+        let scope = p.range(of: "Scope: this reading only.")!
+        XCTAssertTrue(logging.upperBound <= scope.lowerBound)
+        let positive = p[..<scope.lowerBound]
+        for phrase in ["start of day", "new-day health refresh"] {
+            XCTAssertFalse(positive.contains(phrase),
+                           "\(phrase) must not appear before the scope sentence")
+        }
     }
 
     /// THE ROUTING ASSERTION. Both routine phrases appear exactly once, and each of

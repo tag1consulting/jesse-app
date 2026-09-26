@@ -21,9 +21,12 @@ import Foundation
 // either phrase ever migrates into the positive half of the instruction, keyword-based
 // routing would read a question about lunch as a request to rebuild the day.
 //
-// It is also why this prompt says DO NOT LOG. Every other Health-tab turn in the app
-// writes (quick log, start new day); this one is the only read-only one, and the whole
-// point of the gesture is that looking at a number cannot change it.
+// It is NOT a read-only turn, and it once was. The reading is data; the conversation
+// around it is a normal conversation, and the owner reports unlogged food from exactly
+// this screen: on 2026-09-23 the reading was Caffeine at 0mg, the reply was three
+// Americanos, and the old "do not log" clause made the agent refuse and ask for the same
+// words again as a separate message. So the agent logs what the owner reports, exactly as
+// a plain chat message would, answers with the updated figures, and writes nothing else.
 //
 // WHO THE PROMPT IS ABOUT: the same deployment-data rule as `TodayDiscuss`. The owner's
 // name is not the app's to know, so the bridge's persona placeholders ride verbatim —
@@ -67,9 +70,14 @@ public enum HealthAskPrompt {
         question needs something the snapshot does not carry, and say so when you do. Engage \
         with {owner_pronoun} questions and follow-ups.
 
-        Scope: this reading only. Do not log a meal, a weigh-in, or a workout; do not edit \
-        the diet log, rewrite the dashboard, or touch Today.md; and do not run start of day, \
-        the new-day health refresh, the inbox or message scanners, currency, or cheatsheets.
+        If {owner} tells you about something eaten or drunk, a workout, or a weight reading, in \
+        this message or in any follow-up, log it exactly as a plain chat message would, without \
+        asking first, then answer with the updated figures and say what changed against the \
+        snapshot. Beyond what that logging itself writes, nothing else changes from this reading.
+
+        Scope: this reading only. Do not rebuild the dashboard by hand or touch Today.md, and do \
+        not run start of day, the new-day health refresh, the inbox or message scanners, currency, \
+        or cheatsheets.
         """
     }
 }
