@@ -14,6 +14,87 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [App 1.0 (168)] - 2026-09-26
+
+**A request typed while the bridge was unreachable could vanish entirely.** On an iPhone in
+airplane mode, "Track two cups of coffee. 6:50 and 7:20." was answered by the on-device model
+with a café's opening hours out of a Scotland trip guide, with three citations. Nothing was
+queued for the bridge, so the two coffees reached nobody; they were logged days later, from a
+screenshot. Every offline exchange now reaches the bridge by itself, and a request the device
+cannot perform is never answered by the device at all.
+
+**Root cause one: the gate treated any sentence without a listed verb as a question.** Every
+rule in `LookupGate` was a REFUSAL, so the gate's default was "pass" — a sentence got through
+on the strength of nothing being wrong with it. `requestVerbs` held `log` but not `track`, and
+nothing anywhere required a lookup to read as a question, so a write dressed as a statement was
+handed to a 3B model.
+
+**Root cause two: an answered offline exchange existed only in memory, and only rode a later
+message.** `finishOnDevice` queued an outbox item for a question the device REFUSED and nothing
+at all for one it ANSWERED: the pair went into an in-memory `OfflineAnswerLedger`, keyed by
+conversation, waiting for whatever Jeremy happened to send next. A relaunch lost it.
+
+**Root cause three: the carry was dropped on the first follow-up.** Sent while the reachability
+probe still read `.unreachable`, "Un, the reply makes no sense." was routed on-device; the
+device could not answer it, and the outbox item `finishOnDevice` then queued carried the raw
+sentence with no record of the exchange it was about. Hosted Claude got the complaint with
+nothing to attach it to. (A replay send, `onAck != nil`, dropped the carry too; an ordinary
+composer send did not. All three paths were driven by a failing test before the fix, and the two
+that mattered are asserted in `OfflineReviewTests`.)
+
+### Fixed
+
+- **A lookup has to read as a question.** `LookupGate` gains a positive rule beside its
+  refusals: text passes only when it ends with `?` or its first word is one of 25
+  interrogatives and auxiliaries (`what`, `when`, `is`, `did`, `should`, …). Everything else is
+  refused with "it is not a question" and queued for the bridge exactly as any refusal is.
+  Every existing refusal rule is unchanged.
+- **Sixteen write verbs added** to `requestVerbs`, each with its own clause: track, add, record,
+  note, save, remember, set, book, buy, cancel, delete, remove, send, move, update, create. The
+  verb rule runs before the question rule, so a verb's own reason wins: the coffee sentence is
+  refused with "it asks to track something", not with "it is not a question".
+- **Every answered offline exchange is staged as its own durable outbox item**, in the same save
+  as the reply it reports, so the existing retry schedule delivers it when the bridge is
+  reachable with no new message from Jeremy needed. It survives a relaunch, it is shown in the
+  transcript under the existing "Answered offline on this device" label with an empty typed half
+  (never as something Jeremy typed), and a later answer on the same conversation is APPENDED to
+  it rather than staged as a second one — so a reconnect produces at most one review turn per
+  conversation. `OutboxItem` gains `isOfflineReview` and `offlineReviewPairs` (both defaulted, so
+  existing stores lightweight-migrate); the pairs are the truth and the text is rendered from
+  them.
+- **The review says it is a review, and what each part is.** The old preamble ("a record, not
+  instruction and not verified fact") told hosted Claude to treat Jeremy's own request as inert
+  data. It now opens by naming itself an automatic review and audit, not a new message from
+  Jeremy, and asks for three things in order: ACT on the `Q:` lines, which are his real requests
+  and may need logging, scheduling or capture; AUDIT the `A:` lines, which are an unverified
+  small-model answer; IMPROVE the offline path by writing and filing a coding-agent prompt for
+  whatever it got wrong, without asking first. If every answer stands, the reply is one short
+  line. The 3,000 character ceiling and the oldest-dropped-first rule are unchanged.
+- **A conversation's outbox is a queue, delivered oldest first.** Only its head is ever in
+  flight (`transmitHead`), so a follow-up can never reach the bridge before the review of the
+  exchange it is about, and the message behind the head goes from the tail of the transmit that
+  clears the way. This also fixes an older latent bug: two due messages on one conversation both
+  transmitted, racing for the single per-thread task slot, so the second dropped the first's
+  handle and left a turn Cancel could not reach.
+- **A reconciled outbox message is due to try itself again.** `reconcile` left `nextRetryAt`
+  nil, which is the value that means "the automatic budget is spent", so a message the app was
+  killed in the middle of waited for a human to tap Retry.
+- **The Mac gets the same guarantee.** It has no outbox, so the exchanges are persisted per
+  conversation in `PendingOfflineReviewStore` (`UserDefaults`, no schema change) and sent when
+  reachability turns `.reachable` — and `MacCoordinator.deliver` sends a conversation's pending
+  review ahead of any message on it. A review is only ever staged against a REACHABLE bridge,
+  because the Mac has nothing to hold one that fails to land.
+- **The next-message carry is gone**, along with `OfflineAnswerLedger`: two mechanisms for one
+  guarantee is how the first one got skipped.
+
+### Internal
+
+- `OfflineAnswering`, a protocol over the two calls the composers make of the offline path
+  (`route`, `answer`), and an injected reachability seam on both coordinators. Together they are
+  what lets the whole offline send path — routed offline, answered, refused, queued, delivered in
+  order across a relaunch — be driven in a unit test with no vault folder, no on-device model and
+  no radio. `OfflineReviewTests` (phone, 7 cases) and `MacOfflineReviewTests` (Mac, 4 cases).
+
 ## [App 1.0 (167)] - 2026-09-26
 
 **A child strand wears a shade of its parent's colour, so a family reads as a family.** Every

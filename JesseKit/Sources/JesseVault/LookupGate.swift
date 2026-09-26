@@ -30,6 +30,14 @@ import Foundation
 // message the bridge answers properly a few minutes later, and every refusal now says
 // WHICH rule fired, in words, in the transcript.
 //
+// WHY THERE IS A POSITIVE RULE NOW. Every rule here used to be a refusal, which means the
+// gate's DEFAULT was "pass": a sentence with no listed verb in it got through whatever
+// shape it was. "Track two cups of coffee. 6:50 and 7:20." got through exactly that way on
+// 2026-09-26 and was answered with a café's opening hours out of a Scotland trip guide,
+// while the request to log two coffees reached nobody at all. A lookup has to READ AS A
+// QUESTION now — a question mark, or an interrogative first word — and everything else is
+// refused and queued for the bridge, which can actually perform it.
+//
 // This file imports no model framework and has no dependency surface at all. Every rule
 // below is a pure function over a string.
 
@@ -83,6 +91,44 @@ public enum LookupGate {
         RequestVerb(verb: "log", because: "it asks to log something"),
         RequestVerb(verb: "schedule", because: "it asks to schedule something"),
         RequestVerb(verb: "remind", because: "it asks for a reminder"),
+        // ── THE WRITES. Every one of these was missing on 2026-09-26, and the sentence
+        //    that got through was "Track two cups of coffee. 6:50 and 7:20." — a write the
+        //    device answered instead of queueing, with a café's opening hours. A verb here
+        //    names work only the bridge can do, so it must reach the bridge.
+        RequestVerb(verb: "track", because: "it asks to track something"),
+        RequestVerb(verb: "add", because: "it asks to add something"),
+        RequestVerb(verb: "record", because: "it asks to record something"),
+        RequestVerb(verb: "note", because: "it asks for a note"),
+        RequestVerb(verb: "save", because: "it asks to save something"),
+        RequestVerb(verb: "remember", because: "it asks to remember something"),
+        RequestVerb(verb: "set", because: "it asks to set something"),
+        RequestVerb(verb: "book", because: "it asks to book something"),
+        RequestVerb(verb: "buy", because: "it asks to buy something"),
+        RequestVerb(verb: "cancel", because: "it asks to cancel something"),
+        RequestVerb(verb: "delete", because: "it asks to delete something"),
+        RequestVerb(verb: "remove", because: "it asks to remove something"),
+        RequestVerb(verb: "send", because: "it asks to send something"),
+        RequestVerb(verb: "move", because: "it asks to move something"),
+        RequestVerb(verb: "update", because: "it asks to update something"),
+        RequestVerb(verb: "create", because: "it asks to create something"),
+    ]
+
+    /// The words that open a question.
+    ///
+    /// A LOOKUP IS A QUESTION, and until this list existed the gate had no way to say so.
+    /// Every rule above it is a REFUSAL, so anything with no listed verb in it passed by
+    /// default — and on 2026-09-26 "Track two cups of coffee. 6:50 and 7:20." passed that
+    /// way and was answered with a café's opening hours. A write dressed as a statement is
+    /// the common shape of that mistake, and a statement is what this rule catches.
+    ///
+    /// Interrogatives, plus the auxiliaries that open a yes/no question. It is a SHAPE test
+    /// and not a meaning test, which is what keeps it a rule: the alternative is asking a
+    /// 3B model "is this a question", which is the coin flip this whole file exists instead
+    /// of.
+    public static let interrogatives: Set<String> = [
+        "what", "when", "where", "who", "whom", "whose", "which", "why", "how",
+        "is", "are", "am", "was", "were", "do", "does", "did",
+        "can", "could", "will", "would", "should", "has", "have", "had",
     ]
 
     /// A refusal, in the two registers the two readers need.
@@ -107,6 +153,9 @@ public enum LookupGate {
                                      because: "it has no words to look up")
         static let tooLong = Refusal(rule: "too long",
                                      because: "it is longer than a lookup")
+
+        static let notAQuestion = Refusal(rule: "not a question",
+                                          because: "it is not a question")
 
         static func request(_ verb: RequestVerb) -> Refusal {
             Refusal(rule: "request verb: \(verb.verb)", because: verb.because)
@@ -138,12 +187,40 @@ public enum LookupGate {
         if words.count > maxWords {
             return .refused(.tooLong)
         }
+        // THE VERB RULE RUNS FIRST, and that order is the point: "it asks to track
+        // something" tells the reader what happens next, and "it is not a question" does
+        // not. Both refuse the same sentence; the verb's own reason wins.
         for word in words {
             if let verb = requestVerb(in: word) {
                 return .refused(.request(verb))
             }
         }
+        guard readsAsAQuestion(trimmed, words: words) else {
+            return .refused(.notAQuestion)
+        }
         return .passed
+    }
+
+    /// Whether this text asks something.
+    ///
+    /// Two ways to qualify and no third: it ENDS with a question mark, or its FIRST word is
+    /// an interrogative. "Aurora?" has only the first, "when is the concert" only the
+    /// second, and "the kiln reached 1240 this morning" has neither.
+    static func readsAsAQuestion(_ trimmed: String, words: [some StringProtocol]) -> Bool {
+        if trimmed.hasSuffix("?") { return true }
+        guard let first = words.first else { return false }
+        return interrogatives.contains(firstWordStem(first))
+    }
+
+    /// The first word as the interrogative list spells it: lowercased, stripped of
+    /// surrounding punctuation, and cut at an apostrophe so "What's" is "what".
+    static func firstWordStem(_ word: some StringProtocol) -> String {
+        let cleaned = word.lowercased()
+            .trimmingCharacters(in: CharacterSet.letters.inverted)
+        guard let cut = cleaned.firstIndex(where: { $0 == "'" || $0 == "\u{2019}" }) else {
+            return cleaned
+        }
+        return String(cleaned[cleaned.startIndex..<cut])
     }
 
     /// Whether this send is a lookup at all.

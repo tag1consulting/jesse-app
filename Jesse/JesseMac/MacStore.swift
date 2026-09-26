@@ -264,11 +264,16 @@ final class MacCoordinator {
     /// state offers. The shared type lives in JesseCore, so the phone and this Mac cannot
     /// grow two ideas of what a screen attached.
     private var attachedContexts: [UUID: AttachedContext] = [:]
-    // ── THE OFFLINE ANSWER PATH, the phone's shape exactly. Both answer "no" on a Mac
-    //    with no vault folder and no usable model, which is what keeps this invisible
-    //    until a folder is picked.
-    let offline: OfflineAnswerService
-    let offlineLedger: OfflineAnswerLedger
+    // ── THE OFFLINE ANSWER PATH, the phone's shape exactly, behind the same protocol. It
+    //    answers "no" on a Mac with no vault folder and no usable model, which is what keeps
+    //    this invisible until a folder is picked.
+    let offline: any OfflineAnswering
+    // ── THE PENDING OFFLINE REVIEW. The Mac has no send outbox — `OutboxItem` is an iOS-only
+    //    entity and this store's schema deliberately does not carry it — so the smallest
+    //    durable thing that fits is the EXCHANGES, keyed by conversation, in `UserDefaults`.
+    //    They are rendered into a turn and sent the moment the bridge is reachable again.
+    //    Injectable so a test uses a scratch suite.
+    let reviewStore: PendingOfflineReviewStore
     // ── THE OFFLINE CAPTURE PATH, and its one asymmetry with the answer path above: it needs
     //    no model at all. A capture is a coordinated append to one file under `Inbox/`, so the
     //    only thing it asks of this Mac is the vault folder.
@@ -335,6 +340,11 @@ final class MacCoordinator {
     /// the session reconciler's resurrection guard. Injectable so a test uses a scratch suite.
     private let sessionDeletionStore: PendingSessionDeletionStore
 
+    /// Whether this Mac can currently reach the bridge, as `JesseVault` states it. Injected
+    /// so a test drives the offline path without a network and without touching the one shared
+    /// probe; production reads exactly that probe (`reachabilityState`).
+    private let reachability: @MainActor () -> BridgeReachabilityState
+
     /// The store write, as one seam. Production is `try $0.save()`; a test injects a throw
     /// to drive the staging failure the composer's draft handoff has to survive — the phone
     /// has had this seam since the outbox landed, and the Mac's staging used to swallow its
@@ -345,8 +355,10 @@ final class MacCoordinator {
          makeClient: @escaping @MainActor (JesseConfig) -> any BridgeClientProtocol
             = { JesseBridgeClient(config: $0) },
          sessionDeletionStore: PendingSessionDeletionStore = PendingSessionDeletionStore(),
-         offline: OfflineAnswerService? = nil,
-         offlineLedger: OfflineAnswerLedger = .shared,
+         offline: (any OfflineAnswering)? = nil,
+         reviewStore: PendingOfflineReviewStore = PendingOfflineReviewStore(),
+         reachability: @escaping @MainActor () -> BridgeReachabilityState
+            = { MacCoordinator.reachabilityState() },
          capture: InboxCaptureService? = nil,
          streamStallWindow: TimeInterval = 60,
          pollSpacing: TimeInterval = 1,
@@ -354,7 +366,8 @@ final class MacCoordinator {
         // Resolved in the body, not in a default argument: the service's default is
         // main-actor-isolated and a default argument is evaluated off the actor.
         self.offline = offline ?? OfflineAnswerService.shared
-        self.offlineLedger = offlineLedger
+        self.reviewStore = reviewStore
+        self.reachability = reachability
         self.capture = capture ?? InboxCaptureService.shared
         self.configStore = configStore
         self.makeClient = makeClient
@@ -444,21 +457,13 @@ final class MacCoordinator {
             return stageAndAnswerOnDevice(text: text, mode: mode, thread: thread,
                                           context: context)
         }
-        // ── CARRY, with the same two guards the phone's has. It is composed only when
-        //    there is a message to compose it onto — a thread holding offline answers and
-        //    an empty composer is not a turn — and the PRE-carry attachment is what goes
-        //    back if the stage refuses or fails, because the pairs are not marked carried
-        //    until the stage succeeds and restoring the combined value would double them.
-        let existing = attachedContexts[thread.id]
-        let hasSomethingToSend =
-            !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || existing != nil
-        let carried = hasSomethingToSend ? carryOfflineAnswers(threadID: thread.id) : false
+        // ── NO CARRY HERE ANY MORE. What this Mac answered while the Studio was asleep used
+        //    to ride this message as attached context, in memory, on one conversation, until
+        //    something happened to be sent. It is persisted the moment the Mac answers now
+        //    (`reviewStore`) and `deliver` sends it ahead of this message.
         guard let composed = stage(text: text, thread: thread, context: context) else {
-            if carried { attachedContexts[thread.id] = existing }
             return false
         }
-        // Spent only on a durable stage, exactly as on the phone.
-        if carried { offlineLedger.markCarried(threadID: thread.id) }
         Task { await deliver(composed, mode: mode, thread: thread, context: context) }
         return true
     }
@@ -467,7 +472,7 @@ final class MacCoordinator {
 
     /// Whether this composer offers a capture beside the ordinary send.
     func captureOffer() -> InboxCaptureOffer {
-        capture.offer(reachability: Self.reachabilityState())
+        capture.offer(reachability: reachability())
     }
 
     /// Write the composer's text into the vault's `Inbox/` on this Mac, and put it in the
@@ -532,18 +537,7 @@ final class MacCoordinator {
     }
 
     private func offlineRoute() -> OfflineSendRoute {
-        offline.route(reachability: Self.reachabilityState())
-    }
-
-    /// Stage this thread's uncarried offline answers onto its next online turn.
-    private func carryOfflineAnswers(threadID: UUID) -> Bool {
-        guard let carry = offlineLedger.carryBody(threadID: threadID) else { return false }
-        let existing = attachedContexts[threadID]
-        attachedContexts[threadID] = AttachedContext(
-            body: existing.map { carry + "\n\n" + $0.body } ?? carry,
-            title: existing?.title ?? OfflineAnswerCarry.title,
-            starters: existing?.starters ?? [])
-        return true
+        offline.route(reachability: reachability())
     }
 
     /// Stage the user's turn, then answer it from the copy of the vault on this Mac.
@@ -585,9 +579,20 @@ final class MacCoordinator {
             context.insert(reply)
             thread.updatedAt = Date()
             try? save(context)
-            offlineLedger.record(threadID: thread.id, pair: OfflineAnswerPair(
-                question: question, answer: answer.text,
-                paths: answer.citations.map(\.path)))
+            // ── THE REVIEW, PERSISTED. An answered exchange is not a message the bridge owes
+            // a reply to, but it is one the bridge has to see: the question was Jeremy's and
+            // may be a request only the bridge can perform, and the answer is a 3B model's
+            // unverified guess at it. It used to be an in-memory pair waiting for whatever
+            // was sent next, so a quit lost it. It goes out by itself now, the moment this Mac
+            // can reach the bridge (`sendPendingOfflineReviews`, and `deliver`'s own drain).
+            //
+            // AFTER the save, and appended even if that save threw: the review lives in
+            // `UserDefaults` and cannot ride a SwiftData save, and of the two ways to be wrong
+            // here — a review reporting an exchange whose reply turn did not persist, or a
+            // request reaching nobody — only the second is the defect this exists to fix.
+            reviewStore.append(OfflineAnswerPair(question: question, answer: answer.text,
+                                                 paths: answer.citations.map(\.path)),
+                               threadID: thread.id)
             return
         }
         // Both unanswered outcomes say so before the ordinary send takes over, and they
@@ -693,15 +698,31 @@ final class MacCoordinator {
         return trimmed
     }
 
-    /// The network half of a send: the POST, then the stream or the poll. `trimmed` is the
-    /// composed text `stage` already persisted as the user turn.
+    /// The network half of a send: this conversation's pending offline review first, if it has
+    /// one, then the POST for `trimmed` — the composed text `stage` already persisted as the
+    /// user turn.
+    ///
+    /// THE REVIEW GOES FIRST, and under the same run: a follow-up delivered ahead of the
+    /// exchange it is about is the non sequitur this whole path exists to prevent, and the Mac
+    /// has no outbox to order the two in. Every Mac send path goes through here, so the
+    /// morning routine and the Today actions honour it too.
     private func deliver(_ trimmed: String, mode: JesseMode, thread: JesseThread,
                          context: ModelContext) async {
         // THIS conversation's slot, and nothing else's. The defer used to clear the app's one
         // slot, so the turn that finished first opened the gate for every conversation and
         // closed the spinner on turns that were still running.
         defer { endRun(thread.id) }
+        if let review = stagePendingReview(thread: thread, context: context) {
+            await post(review, mode: mode, thread: thread, context: context)
+        }
+        await post(trimmed, mode: mode, thread: thread, context: context)
+    }
 
+    /// One POST and whatever it turns into. Split out of `deliver` so a conversation's pending
+    /// review and the message behind it are two posts inside ONE run, rather than two runs
+    /// whose spinners and error lines fight each other.
+    private func post(_ trimmed: String, mode: JesseMode, thread: JesseThread,
+                      context: ModelContext) async {
         let cli = client
         // The PER-TURN model this conversation sends on: its own stored selection, else this
         // device's default (`LastUsedModelStore`). Local to this Mac and this thread — it never
@@ -736,6 +757,78 @@ final class MacCoordinator {
         } catch {
             errors[thread.id] = Self.friendly(error)
         }
+    }
+
+    /// Stage this conversation's pending offline review as a turn and return its text, or nil
+    /// when there is nothing pending or nowhere to send it.
+    ///
+    /// REACHABLE ONLY. A review staged against a bridge that is not there would be spent (the
+    /// store is cleared on a durable stage) on a POST that cannot land, and this Mac has no
+    /// outbox to hold it — so the exchanges stay where they are until there is somewhere for
+    /// them to go. That is also why `finishOnDevice`'s own fall-through to `deliver`, which
+    /// runs while unreachable by definition, never spends one.
+    ///
+    /// The turn is a user turn with an EMPTY typed half and the review's label, exactly as on
+    /// the phone: the transcript shows that this went out and what it was, and never claims
+    /// Jeremy typed it.
+    private func stagePendingReview(thread: JesseThread, context: ModelContext) -> String? {
+        guard reachability() == .reachable else { return nil }
+        let pairs = reviewStore.pairs(threadID: thread.id)
+        guard let body = OfflineAnswerCarry.body(pairs) else {
+            // Nothing pending, or pairs that render to nothing — either way this conversation
+            // owes no review, and a store entry that renders to nothing would be retried for
+            // ever.
+            if !pairs.isEmpty { reviewStore.clear(threadID: thread.id) }
+            return nil
+        }
+        let turn = Turn(role: .user, text: body)
+        turn.displayText = ""
+        turn.contextLabel = OfflineAnswerCarry.title
+        turn.thread = thread
+        context.insert(turn)
+        thread.updatedAt = Date()
+        do {
+            try save(context)
+        } catch {
+            // Nothing spent: the exchanges stay in the store for the next attempt.
+            return nil
+        }
+        // Spent only on a durable stage, the rule the phone's outbox item follows too.
+        reviewStore.clear(threadID: thread.id)
+        return body
+    }
+
+    /// Send every conversation's pending offline review, with no new message from Jeremy.
+    ///
+    /// This is the Mac's half of "nothing said offline vanishes": the phone has an outbox and a
+    /// retry schedule that deliver a review by themselves, and this is what stands in for them
+    /// here. Called when reachability turns `.reachable` (see `MacRootView`), which on a laptop
+    /// is a lid opening, a network coming back, or the Studio waking up.
+    func sendPendingOfflineReviews(context: ModelContext) {
+        guard reachability() == .reachable else { return }
+        for threadID in reviewStore.all.keys {
+            // A conversation with a turn in flight is left for the next trigger: its own
+            // `deliver` drains the review anyway, and staging a second turn into a running
+            // conversation is how two spinners end up fighting.
+            guard !isRunning(threadID),
+                  let thread = fetchThread(threadID, context: context),
+                  let review = stagePendingReview(thread: thread, context: context)
+            else { continue }
+            beginRun(threadID)
+            Task { [weak self] in
+                guard let self else { return }
+                defer { self.endRun(threadID) }
+                await self.post(review, mode: thread.modeValue, thread: thread, context: context)
+            }
+        }
+    }
+
+    /// One conversation by id. The reviews are keyed by id (they outlive the process), so this
+    /// is how the drain finds the thread each one belongs to.
+    private func fetchThread(_ id: UUID, context: ModelContext) -> JesseThread? {
+        var d = FetchDescriptor<JesseThread>(predicate: #Predicate { $0.id == id })
+        d.fetchLimit = 1
+        return (try? context.fetch(d))?.first
     }
 
     /// How reading a turn's live stream ended.

@@ -106,13 +106,12 @@ final class RunCoordinator {
     // transcript) and the STARTERS the empty state offers. The Today tab's Discuss is
     // untouched: it attaches a title-less, starter-less value through the same call.
     private var attachedContexts: [UUID: AttachedContext] = [:]
-    // ── THE OFFLINE ANSWER PATH. Two shared objects, injectable for the same reason
-    //    every other seam here is: a test must be able to drive the decision without a
-    //    vault folder and without an on-device model. In production both are the app's
-    //    one instance, and both answer "no" on a device that has neither — which is what
-    //    makes this whole path invisible until a folder is picked.
-    @ObservationIgnored let offline: OfflineAnswerService
-    @ObservationIgnored let offlineLedger: OfflineAnswerLedger
+    // ── THE OFFLINE ANSWER PATH, behind a protocol for the same reason every other seam
+    //    here is one: a test must be able to drive the decision without a vault folder and
+    //    without an on-device model. In production it is the app's one
+    //    `OfflineAnswerService`, which answers "no" on a device that has neither — and that
+    //    is what makes this whole path invisible until a folder is picked.
+    @ObservationIgnored let offline: any OfflineAnswering
     // ── THE OFFLINE CAPTURE PATH, and its one asymmetry with the answer path above: this
     //    one needs no model at all. A capture is a coordinated append to one file under
     //    `Inbox/`, so the only thing it asks of the device is the vault folder.
@@ -289,6 +288,10 @@ final class RunCoordinator {
     // so a test drives the table without a radio; production reads the live path plus the
     // Settings toggle.
     private let frugal: @MainActor () -> FrugalPolicy
+    // Whether this device can currently reach the bridge, as `JesseVault` states it.
+    // Injected so a test drives the offline path without a radio and without touching the
+    // one shared probe; production reads exactly that probe (`reachabilityState`).
+    private let reachability: @MainActor () -> BridgeReachabilityState
     // Whether this device currently has a usable network. Distinct from "the bridge is
     // reachable" — see `ConnectivityMonitor` — and consulted at exactly one place: the
     // poll loop, deciding whether a transport error is "the bridge is asleep" (surface
@@ -327,15 +330,16 @@ final class RunCoordinator {
          awaitPath: @escaping @MainActor (TimeInterval) async -> Bool
              = { await ConnectivityMonitor.shared.awaitSatisfied(timeout: $0) },
          intentReplayer: (any IntentReplaying)? = nil,
-         offline: OfflineAnswerService? = nil,
-         offlineLedger: OfflineAnswerLedger = .shared,
+         offline: (any OfflineAnswering)? = nil,
+         reachability: @escaping @MainActor () -> BridgeReachabilityState
+             = { RunCoordinator.reachabilityState() },
          capture: InboxCaptureService? = nil,
          onFirstSuccess: @escaping @MainActor () -> Void = {}) {
         // Same rationale as the in-flight store and the Live Activity controller: the
         // service's default is main-actor-isolated and a default argument is evaluated
         // off the actor.
         self.offline = offline ?? OfflineAnswerService.shared
-        self.offlineLedger = offlineLedger
+        self.reachability = reachability
         // Same rationale: `.shared` is main-actor-isolated and a default argument is
         // evaluated off the actor.
         self.capture = capture ?? InboxCaptureService.shared
@@ -674,17 +678,12 @@ final class RunCoordinator {
             return sendOnDevice(thread: thread, trimmed: composed, typed: typed,
                                 attached: existing, voice: voice, context: context)
         }
-        // ── CARRY: what this thread was answered while the bridge was away rides its
-        //    next online turn, through the SAME attachment mechanism a screen's ask uses.
-        //    Composed AHEAD of any attachment already waiting rather than replacing it —
-        //    a Health ask and an offline answer are both context this message needs, and
-        //    dropping either would make the message mean something else.
-        let carried = carryOfflineAnswers(threadID: threadID, onAck: onAck, route: route)
-        let attached = attachedContexts[threadID]
-        let trimmed = carried
-            ? (attached.map { TodayThreadContext.firstMessage(context: $0.body, typed: text) }
-                ?? typed)
-            : composed
+        // ── NO CARRY HERE ANY MORE. What the device answered while the bridge was away used
+        //    to ride this message as attached context, which meant it existed in memory only,
+        //    on one conversation only, and only until something happened to be sent — so a
+        //    relaunch lost it and a follow-up could reach the bridge ahead of the exchange it
+        //    was about. It is staged as its own durable outbox item the moment the device
+        //    answers now (`stageOfflineReview`), and this send simply waits its turn behind it.
         attachedContexts[threadID] = nil
         errors[threadID] = nil
         // A new turn is a "next turn" drain point for any meal writes that failed
@@ -716,24 +715,24 @@ final class RunCoordinator {
         // post-downscale — attachment bytes) OWNS the message until the bridge ACKs.
         // Attachments are shown as persisted thumbnail previews (see `attachPreviews`)
         // rather than an appended "📎 Attached:" text line.
-        let userTurn = Turn(role: .user, text: trimmed)
-        // `trimmed` is what the MODEL is sent — the screen's context composed ahead of
+        let userTurn = Turn(role: .user, text: composed)
+        // `composed` is what the MODEL is sent — the screen's context composed ahead of
         // whatever was typed — and it stays that, because it is the turn's identity for
         // the outbox and for hydration. What the TRANSCRIPT shows is the user's own half:
         // a Health snapshot is a page of numbers, and pasting it into their message bubble
         // would both drown the conversation and claim they typed it. An empty typed half
         // is the explicit "just look at it" send and renders as the context label alone.
-        if let attached {
+        if let existing {
             userTurn.displayText = typed
-            userTurn.contextLabel = attached.contextLabel
+            userTurn.contextLabel = existing.contextLabel
         }
         thread.turns.append(userTurn)
         if thread.title.isEmpty {
-            thread.title = JesseThread.deriveTitle(from: trimmed)
+            thread.title = JesseThread.deriveTitle(from: composed)
         }
         thread.updatedAt = Date()
         let mode = thread.modeValue
-        let item = OutboxItem(threadID: threadID, turnID: userTurn.id, text: trimmed,
+        let item = OutboxItem(threadID: threadID, turnID: userTurn.id, text: composed,
                               mode: mode, voice: voice)
         for att in attachments {
             item.attachments.append(
@@ -763,11 +762,6 @@ final class RunCoordinator {
             // assumption that this send was going to happen; leaving it spent would mean
             // the preserved draft, sent again, went WITHOUT the reading the conversation
             // was opened about — the same message turning into a different one.
-            //
-            // The PRE-CARRY value, not the composed one: the offline pairs were never
-            // marked carried (that happens only on a true return), so the next attempt
-            // composes them on again, and restoring the combined value here would put
-            // them in twice.
             attachedContexts[threadID] = existing
             errors[threadID] = "Couldn't save your message — try sending it again."
             onAck?(false)
@@ -783,10 +777,22 @@ final class RunCoordinator {
         // 202 or the legacy inline `.reply` 200) deletes the item — after that the
         // existing InFlight/consume/Re-check machinery owns the turn unchanged; a
         // throw before that ACK flips the item to `.failed` for the per-message Retry.
-        transmit(item: item, thread: thread, context: context, onAck: onAck)
-        // The carry is SPENT, and only now: a send that was refused or whose staging save
-        // threw left the pairs where they were, for the next attempt.
-        if carried { offlineLedger.markCarried(threadID: threadID) }
+        //
+        // OLDEST FIRST. This conversation may already owe the bridge something staged
+        // earlier — a review of what the device answered while it was away, or a question it
+        // queued — and a follow-up delivered ahead of the exchange it is about is precisely
+        // the non sequitur this whole path exists to prevent. When that is the case the HEAD
+        // goes instead, and this message is transmitted by the queue, from the tail of the
+        // transmit that clears the way (see `transmitHead`).
+        //
+        // NOT for a replay (`onAck`): the quick-log replayer mints a NEW conversation per
+        // message, so its item is always its own conversation's head, and it is waiting on an
+        // ACK only its own transmit can give it.
+        if onAck == nil, outboxHead(threadID: threadID, context: context)?.id != item.id {
+            transmitHead(threadID: threadID, context: context)
+        } else {
+            transmit(item: item, thread: thread, context: context, onAck: onAck)
+        }
         // Durably staged. From here the outbox owns delivery — a network failure flips the
         // item to `.failed` for its own Retry and never comes back to the composer, so a
         // retry can never produce a second sendable copy of this message.
@@ -801,7 +807,7 @@ final class RunCoordinator {
     /// Jesse, and they still queue exactly as they did. This adds a destination for the ones
     /// that only need to be written down.
     func captureOffer() -> InboxCaptureOffer {
-        capture.offer(reachability: Self.reachabilityState())
+        capture.offer(reachability: reachability())
     }
 
     /// Write the composer's text into the vault's `Inbox/` on this device, and put it in the
@@ -868,27 +874,7 @@ final class RunCoordinator {
     }
 
     private func offlineRoute() -> OfflineSendRoute {
-        offline.route(reachability: Self.reachabilityState())
-    }
-
-    /// Stage this thread's uncarried offline answers onto its next online turn, and say
-    /// whether anything was staged.
-    ///
-    /// Not for a replay (`onAck`), and not when this send is about to be answered on the
-    /// device — carrying an offline answer into another offline answer would put the last
-    /// reply in front of a 3B model as if it were a note.
-    private func carryOfflineAnswers(threadID: UUID,
-                                     onAck: (@MainActor (Bool) -> Void)?,
-                                     route: OfflineSendRoute) -> Bool {
-        guard onAck == nil, route == .bridge,
-              let carry = offlineLedger.carryBody(threadID: threadID)
-        else { return false }
-        let existing = attachedContexts[threadID]
-        attachedContexts[threadID] = AttachedContext(
-            body: existing.map { carry + "\n\n" + $0.body } ?? carry,
-            title: existing?.title ?? OfflineAnswerCarry.title,
-            starters: existing?.starters ?? [])
-        return true
+        offline.route(reachability: reachability())
     }
 
     /// Stage the user's turn, then answer it from the copy of the vault on this device.
@@ -946,8 +932,15 @@ final class RunCoordinator {
         return true
     }
 
-    /// Put the device's answer in the transcript, and queue the question when the device
-    /// did not answer it.
+    /// Put the device's answer in the transcript, stage whatever the bridge still has to
+    /// see because of it, and move this conversation's queue along.
+    ///
+    /// EVERY OUTCOME LEAVES THE BRIDGE A MESSAGE now, which is the whole change: a question
+    /// the device refused or could not find is queued as it always was, and a question it
+    /// ANSWERED is staged as an offline review. Before this, an answered exchange left
+    /// nothing on disk at all — a pair in an in-memory ledger, waiting for a message Jeremy
+    /// happened to send next — so "Track two cups of coffee. 6:50 and 7:20." was answered
+    /// with a café's opening hours and the two coffees reached nobody.
     private func finishOnDevice(_ outcome: VaultAnswerOutcome, question: String,
                                 thread: JesseThread, userTurn: Turn, voice: Bool,
                                 context: ModelContext) {
@@ -956,12 +949,11 @@ final class RunCoordinator {
 
         let kind: OfflineLookupReply.Kind
         var queue = false
+        var answered: VaultAnswer?
         switch outcome {
         case .answered(let answer):
             kind = .answered(answer)
-            offlineLedger.record(threadID: threadID, pair: OfflineAnswerPair(
-                question: question, answer: answer.text,
-                paths: answer.citations.map(\.path)))
+            answered = answer
             // A voice send is answered OUT LOUD, as every other voice turn is. The badge
             // and the citation list are not spoken — they are the transcript's half.
             if voice { speak(answer.text) }
@@ -981,29 +973,86 @@ final class RunCoordinator {
         thread.turns.append(reply)
         thread.updatedAt = Date()
 
-        // The phone HAS a send outbox, so "queued for the bridge" is literally true here:
-        // the same user turn gets its outbox item now and the existing machinery owns it
-        // from this point exactly as it would have. It is TRANSMITTED rather than merely
-        // inserted, because an item left `.sending` is only reconciled on the next
-        // foreground — the transmit fails against an unreachable bridge, `failOutbox`
-        // flips it to `.failed`, and the automatic retry schedule picks it up from there,
-        // which is precisely what an offline send does today.
-        var queued: OutboxItem?
+        // ── QUEUED: the phone HAS a send outbox, so "queued for the bridge" is literally
+        // true here — the same user turn gets its outbox item now and the existing machinery
+        // owns it from this point exactly as it would have.
         if queue {
-            let item = OutboxItem(threadID: threadID, turnID: userTurn.id, text: question,
-                                  mode: thread.modeValue, voice: voice)
-            context.insert(item)
-            queued = item
+            context.insert(OutboxItem(threadID: threadID, turnID: userTurn.id, text: question,
+                                      mode: thread.modeValue, voice: voice))
+        }
+        // ── ANSWERED: staged as an offline REVIEW, in THIS SAME SAVE as the reply it
+        // reports. An answered exchange is not a message the bridge owes a reply to, but it
+        // is one the bridge has to see: the question was Jeremy's and may be a request only
+        // the bridge can perform, and the answer is a 3B model's unverified guess at it.
+        if let answered {
+            stageOfflineReview(
+                pair: OfflineAnswerPair(question: question, answer: answered.text,
+                                        paths: answered.citations.map(\.path)),
+                thread: thread, context: context)
         }
         do {
             try save(context)
         } catch {
+            // One save, so the review is staged with the reply or not at all. Nothing was
+            // transmitted, and nothing claims it was.
             Log.run.error("offline reply save failed for thread \(threadID): \(error.localizedDescription)")
             return
         }
-        if let queued {
-            transmit(item: queued, thread: thread, context: context, onAck: nil)
+        // Whatever this conversation now owes the bridge, oldest first. TRANSMITTED rather
+        // than merely inserted, because an item left `.sending` is only reconciled on the
+        // next foreground: the transmit fails against an unreachable bridge, `failOutbox`
+        // flips it to `.failed`, and the automatic retry schedule owns it from there — which
+        // is precisely what an offline send has always done.
+        transmitHead(threadID: threadID, context: context)
+    }
+
+    /// Add one answered exchange to this conversation's offline review, staging the review
+    /// itself if there is not one yet.
+    ///
+    /// ONE REVIEW PER CONVERSATION, grown rather than repeated: three questions answered
+    /// while the laptop slept are one review with three exchanges in it, so the reconnect
+    /// produces one turn upstream and not three. The PAIRS are the truth — stored on the item
+    /// so a fourth answer after a relaunch can still be appended — and the text is rendered
+    /// from them every time.
+    ///
+    /// Appending can never race the review's own send: a transmit marks its conversation
+    /// running, `send` refuses a send on a running conversation, and an on-device answer can
+    /// only start from a send. So an item being appended to here is never one whose text has
+    /// already been read into a POST.
+    private func stageOfflineReview(pair: OfflineAnswerPair, thread: JesseThread,
+                                   context: ModelContext) {
+        let threadID = thread.id
+        if let existing = pendingOfflineReview(threadID: threadID, context: context) {
+            let pairs = OfflineAnswerCarry.decode(existing.offlineReviewPairs) + [pair]
+            guard let body = OfflineAnswerCarry.body(pairs) else { return }
+            existing.offlineReviewPairs = OfflineAnswerCarry.encode(pairs)
+            existing.text = body
+            // The turn IS the message, so the transcript's copy grows with it.
+            thread.turns.first { $0.id == existing.turnID }?.text = body
+            return
         }
+        guard let body = OfflineAnswerCarry.body([pair]) else { return }
+        // A user turn with an EMPTY typed half and the review's own label: the transcript
+        // shows that this went out and what it was, and never claims Jeremy typed it. The
+        // same shape a screen's "just look at it" send has had since `AttachedContext`.
+        let turn = Turn(role: .user, text: body)
+        turn.displayText = ""
+        turn.contextLabel = OfflineAnswerCarry.title
+        thread.turns.append(turn)
+        let item = OutboxItem(threadID: threadID, turnID: turn.id, text: body,
+                              mode: thread.modeValue, voice: false)
+        item.isOfflineReview = true
+        item.offlineReviewPairs = OfflineAnswerCarry.encode([pair])
+        context.insert(item)
+    }
+
+    /// This conversation's staged-but-undelivered offline review, if it has one. There is at
+    /// most one: `stageOfflineReview` appends rather than staging a second.
+    private func pendingOfflineReview(threadID: UUID, context: ModelContext) -> OutboxItem? {
+        var d = FetchDescriptor<OutboxItem>(
+            predicate: #Predicate { $0.threadID == threadID && $0.isOfflineReview })
+        d.fetchLimit = 1
+        return (try? context.fetch(d))?.first
     }
 
     /// The bridge round-trip for one staged (or retried) `OutboxItem`, keyed by its
@@ -1124,6 +1173,15 @@ final class RunCoordinator {
             }
             self.tasks[threadID] = nil
             self.backgroundGuard.end(threadID)
+            // ── THE QUEUE MOVES ON. This conversation's outbox is delivered oldest first
+            // (`transmitHead`), so anything staged behind this message has been waiting for
+            // it, and this is the moment it stops waiting. Only when this message actually
+            // LEFT the queue: a failure leaves it at the head with the backoff `failOutbox`
+            // has just armed, and draining here would spend its whole automatic budget in one
+            // breath.
+            if self.fetchOutboxItem(requestId, context: context) == nil {
+                self.transmitHead(threadID: threadID, context: context, queueJustMoved: true)
+            }
         }
     }
 
@@ -1191,6 +1249,85 @@ final class RunCoordinator {
         if speakFailure, voice { Speaker.shared.speak("Sorry, that didn't work. " + message) }
     }
 
+    // MARK: - A conversation's outbox is a queue
+
+    /// The oldest message this conversation has staged and not yet delivered, or nil when it
+    /// owes the bridge nothing.
+    ///
+    /// A CONVERSATION'S OUTBOX IS A QUEUE, and it did not used to be: every due message was
+    /// transmitted, so two on one conversation raced for the single per-thread task slot and
+    /// arrived in whatever order the fetch happened to return. That was invisible while a
+    /// conversation held at most one undelivered message, and it stopped being true the day an
+    /// offline review was staged beside a queued question — an audit of what the device
+    /// answered, and the follow-up that only makes sense after it.
+    ///
+    /// Ordered by `createdAt` and tie-broken by `id`, so the answer is the same on every call.
+    private func outboxHead(threadID: UUID, context: ModelContext) -> OutboxItem? {
+        let descriptor = FetchDescriptor<OutboxItem>(
+            predicate: #Predicate { $0.threadID == threadID })
+        guard let items = try? context.fetch(descriptor) else { return nil }
+        return items.min {
+            $0.createdAt == $1.createdAt
+                ? $0.id.uuidString < $1.id.uuidString
+                : $0.createdAt < $1.createdAt
+        }
+    }
+
+    /// Whether `item` is its conversation's head, i.e. whether it may be transmitted at all.
+    private func isOutboxHead(_ item: OutboxItem, context: ModelContext) -> Bool {
+        outboxHead(threadID: item.threadID, context: context)?.id == item.id
+    }
+
+    /// Transmit the next message this conversation owes the bridge, if it may go now.
+    ///
+    /// `queueJustMoved` says the message in front of this one has just landed, which is news
+    /// about the network in the same way a path recovery is: the head is due whatever its
+    /// backoff said, because it was waiting on the QUEUE and not on the radio.
+    private func transmitHead(threadID: UUID, context: ModelContext,
+                             queueJustMoved: Bool = false) {
+        guard tasks[threadID] == nil, !isRunning(threadID),
+              let head = outboxHead(threadID: threadID, context: context),
+              let thread = fetchThread(threadID, context: context)
+        else { return }
+        if !transmitIfDue(head, thread: thread, pathJustRecovered: queueJustMoved,
+                          context: context) {
+            // Not yet. Arm the wakeup for when it is, rather than leave the queue standing
+            // behind a backoff nobody is waiting out.
+            scheduleOutboxRetry(context: context)
+        }
+    }
+
+    /// Transmit `item` if the schedule allows it, spending an automatic attempt when it had
+    /// already failed. Returns whether it went.
+    ///
+    /// Deliberately does NOT arm the retry timer on a "not yet": this is called from inside
+    /// that timer's own drain, and re-arming there for a date already waited out would be a
+    /// spin rather than a wakeup. `transmitHead` arms it, and `failOutbox` arms it.
+    @discardableResult
+    private func transmitIfDue(_ item: OutboxItem, thread: JesseThread,
+                              pathJustRecovered: Bool, context: ModelContext) -> Bool {
+        if item.state == .failed {
+            guard OutboxRetrySchedule.isDue(automaticAttempts: item.automaticAttempts,
+                                            nextDue: item.nextRetryAt, now: now(),
+                                            pathJustRecovered: pathJustRecovered)
+            else { return false }
+            item.automaticAttempts += 1
+            item.stateRaw = OutboxState.sending.rawValue
+            item.lastError = nil
+            item.nextRetryAt = nil
+            // Saved BEFORE the transmit, so a crash between the two leaves the item marked
+            // `.sending` with no live task — which is precisely the state `reconcile` resolves
+            // on the next launch.
+            do {
+                try context.save()
+            } catch {
+                Log.run.error("outbox queue-advance flip save failed: \(error.localizedDescription)")
+            }
+        }
+        transmit(item: item, thread: thread, context: context)
+        return true
+    }
+
     // MARK: - Send outbox (recover / retry / discard)
 
     /// Recover the send outbox after a relaunch/foreground: for every `OutboxItem`
@@ -1213,6 +1350,13 @@ final class RunCoordinator {
             } else {
                 item.stateRaw = OutboxState.failed.rawValue
                 item.lastError = "Jesse never received this."
+                // ...and it may try itself again, on the schedule a pre-ACK failure gets.
+                // `nextRetryAt` nil is the value that means "the automatic budget is spent",
+                // so leaving it nil here made a message the app was killed in the middle of —
+                // or one staged behind another and never attempted — wait for a human to tap
+                // Retry.
+                item.nextRetryAt = OutboxRetrySchedule.nextDue(
+                    after: now(), automaticAttempts: item.automaticAttempts)
             }
             changed = true
         }
@@ -1733,6 +1877,11 @@ final class RunCoordinator {
     /// if the original POST actually landed), reusing the existing user `Turn` — never
     /// a second bubble. Guarded: the item must be `.failed` and its thread not
     /// running; session/instructions/floor/config are re-resolved fresh in `transmit`.
+    ///
+    /// DELIBERATELY NOT QUEUE-AWARE, unlike every automatic path: this transmits the message
+    /// the button was tapped on, even when something older on the conversation is still
+    /// waiting. A human tapping Retry on a specific message is an override, and sending a
+    /// different message than the one they tapped would be worse than the ordering it protects.
     func retry(itemID: UUID, context: ModelContext) {
         guard let item = fetchOutboxItem(itemID, context: context),
               item.state == .failed,
@@ -1784,6 +1933,14 @@ final class RunCoordinator {
         let stamp = now()
         var due: [OutboxItem] = []
         for item in items where tasks[item.threadID] == nil && !isRunning(item.threadID) {
+            // ONE PER CONVERSATION, ITS OLDEST. Two messages on one conversation are two
+            // halves of one exchange — an offline review and the follow-up that only makes
+            // sense after it — and delivering them in the other order changes what both of
+            // them mean. They also race for the single per-thread task slot, so the second
+            // would drop the first's handle and leave a turn Cancel could not reach. The one
+            // behind the head goes from the tail of the head's own transmit
+            // (`transmitHead(queueJustMoved:)`).
+            guard isOutboxHead(item, context: context) else { continue }
             guard OutboxRetrySchedule.isDue(automaticAttempts: item.automaticAttempts,
                                             nextDue: item.nextRetryAt,
                                             now: stamp,

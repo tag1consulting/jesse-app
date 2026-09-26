@@ -2,6 +2,7 @@ import SwiftUI
 import JesseOps
 import SwiftData
 import JesseCore
+import JesseNetworking
 import JesseConversations
 import JesseSearch
 import JesseTodayDisplay
@@ -232,6 +233,14 @@ struct MacRootView: View {
         // button. See `MacWake`.
         .onReconnect {
             Task { await coordinator.refreshSessions(context: context) }
+        }
+        // AND WHAT THIS MAC ANSWERED WHILE IT WAS AWAY. An exchange the on-device model
+        // handled with the Studio asleep is persisted, not sent, because there was nowhere to
+        // send it; the bridge coming back is the moment it goes, with no message from Jeremy
+        // needed. `initial: true` so a launch that finds the bridge already there drains too.
+        .onChange(of: BridgeReachabilityModel.shared.state, initial: true) { _, state in
+            guard state == .reachable else { return }
+            coordinator.sendPendingOfflineReviews(context: context)
         }
         // THE DOCK TILE FOLLOWS THE LIST, the Mac's half of the phone's icon badge, from
         // the same count. `nil` at zero, because `"0"` on a Dock tile is a badge saying

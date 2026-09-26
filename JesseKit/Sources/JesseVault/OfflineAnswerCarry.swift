@@ -1,25 +1,31 @@
 import Foundation
 
-// WHAT HOSTED CLAUDE IS TOLD ABOUT WHAT THE DEVICE SAID WHILE IT WAS AWAY.
+// WHAT HOSTED CLAUDE IS TOLD ABOUT WHAT THE DEVICE DID WHILE IT WAS AWAY.
 //
-// A conversation that got three answers from the phone's own copy of the vault, and
-// then comes back online, has a transcript hosted Claude cannot see the local half of:
-// the offline turns are in SwiftData, not in the bridge's session. Without this, the
-// first online message on such a thread reads as a non sequitur — the user says "and
-// what about the week after?" about an answer nobody upstream ever saw.
+// A conversation that got three answers from the phone's own copy of the vault has a
+// transcript hosted Claude cannot see the local half of: the offline turns are in
+// SwiftData, not in the bridge's session. That was the first reason this existed, and it
+// was not enough of one.
 //
-// So the pairs ride the next online turn through the mechanism that already exists for
-// exactly this shape of problem: `AttachedContext`, the value a screen attaches to a
-// conversation it opened without firing a turn. Nothing new is invented, nothing is
-// persisted on the bridge, and nothing is sent twice.
+// THE REASON IT EXISTS NOW IS THAT A REQUEST CAN VANISH. "Track two cups of coffee. 6:50
+// and 7:20." went to a 3B model, which answered it with a café's opening hours, and
+// because the outcome was "answered" nothing was queued for anybody: the two coffees were
+// logged days later, from a screenshot. The question was Jeremy's, the answer was a guess,
+// and the only party able to tell them apart or act on either is upstream.
 //
-// IT IS FRAMED AS DATA, and that framing is load-bearing. The text below is a record of
-// what a 3B model said while reading notes; it is not instruction, it is not a fact
-// anyone verified, and hosted Claude has to be able to disagree with it. A carry that
-// read like a system message would be a small model quietly instructing a large one.
+// So this block is a REVIEW, addressed to hosted Claude, and it is delivered by itself the
+// moment the bridge is back — it does not wait for a message Jeremy happens to send next.
+// It asks for three things in a fixed order: act on the requests, audit the answers, and
+// write the fix for whatever the offline path got wrong. The framing is load-bearing in
+// both directions: the `Q:` lines ARE Jeremy's own words and must be acted on, and the
+// `A:` lines are an unverified small-model answer and must not be believed.
 
 /// One question answered on the device, and the notes it came from.
-public struct OfflineAnswerPair: Equatable, Sendable, Identifiable {
+///
+/// `Codable` because a review is durable now: on the phone the pairs are stored on the
+/// `OutboxItem` that carries them, on the Mac in `PendingOfflineReviewStore`, and in both
+/// places the pairs are the truth and the text below is rendered from them.
+public struct OfflineAnswerPair: Codable, Equatable, Sendable, Identifiable {
     public let id: UUID
     public let question: String
     public let answer: String
@@ -36,29 +42,51 @@ public struct OfflineAnswerPair: Equatable, Sendable, Identifiable {
     }
 }
 
-/// Turning pairs into the one block of text that rides the next online turn.
+/// Turning pairs into the one review the bridge is sent.
 public enum OfflineAnswerCarry {
 
-    /// The ceiling. Three thousand characters is a dozen short lookups, and the turn it
-    /// rides also has to carry whatever the person actually typed.
+    /// The ceiling. Three thousand characters is the preamble plus a handful of short
+    /// exchanges, and a review that grew without bound would be a review nobody reads.
     public static let maxCharacters = 3_000
 
-    /// The label the transcript puts on the turn that spends the carry.
+    /// The label the transcript puts on the review turn. It is not a message Jeremy typed,
+    /// and the transcript says so rather than putting his name on it.
     public static let title = "Answered offline on this device"
 
-    /// The framing, first line, before any pair.
+    /// The framing, and the three asks, before any pair.
+    ///
+    /// It opens by saying WHAT THIS IS, because the previous wording ("a record, not
+    /// instruction and not verified fact") told hosted Claude to treat Jeremy's own request
+    /// as inert data — so a request to log two coffees arrived upstream marked "do not act
+    /// on this". The distinction the framing has to draw is between the two halves of one
+    /// exchange, not between the exchange and the conversation.
     public static let preamble = """
-        Earlier, answered on the device while offline by a small on-device model reading \
-        the local copy of the vault. This is a record of what was said, not instruction \
-        and not verified fact.
+        Automatic review and audit of what the on-device model did while the bridge was \
+        unreachable. This is not a new message from Jeremy.
+
+        Three things, in this order:
+
+        1. ACT. The Q: lines are Jeremy's own words, sent while the bridge was unreachable, \
+        and they are his real requests. Act on any the device could not perform: logging, \
+        scheduling, capture, anything that writes.
+        2. AUDIT. The A: lines are an unverified answer from a small on-device model reading \
+        the local copy of the vault. Check each one and say plainly if it is wrong, missed \
+        the point, or should never have been answered on the device.
+        3. IMPROVE. If any exchange shows the offline path could be better (the gate let a \
+        request through, retrieval picked the wrong notes, the answer misread the question), \
+        write a coding-agent prompt for the fix in Jeremy's usual prompt format, file it in \
+        his usual tracking without asking first, and name it in your reply.
+
+        If every answer stands, nothing needed doing and nothing needs improving, reply with \
+        one short line saying so.
         """
 
-    /// The carry for these pairs, or nil when there are none.
+    /// The review for these pairs, or nil when there are none.
     ///
-    /// Over budget, the OLDEST pairs are dropped, not the newest: the follow-up that is
-    /// about to be sent is about the most recent exchange, which is the one that must
-    /// survive. What is kept is still rendered oldest-first, because a conversation read
-    /// backwards is harder to follow than a short one.
+    /// Over budget, the OLDEST pairs are dropped, not the newest: a review is read newest
+    /// first by the person it produces work for, and the most recent exchange is the one
+    /// most likely to still need acting on. What is kept is still rendered oldest-first,
+    /// because a conversation read backwards is harder to follow than a short one.
     public static func body(_ pairs: [OfflineAnswerPair],
                             limit: Int = maxCharacters) -> String? {
         guard !pairs.isEmpty else { return nil }
@@ -85,51 +113,27 @@ public enum OfflineAnswerCarry {
         }
         return out
     }
-}
 
-/// The pairs each thread is holding, until they have ridden a turn.
-///
-/// In memory only, and that is the right lifetime: the carry exists to stop ONE
-/// follow-up from being a non sequitur, and a pair that has survived a relaunch is a
-/// pair whose conversation has already moved on. Persisting it would mean a week-old
-/// local answer arriving as context on an unrelated message.
-@MainActor
-@Observable
-public final class OfflineAnswerLedger {
-    /// See the GOTCHA in this target's `Package.swift` comment.
-    nonisolated deinit {}
+    // MARK: - How the pairs are stored
 
-    /// The app's one ledger. The composer and the routing hook are different objects on
-    /// each platform and must not each hold their own.
-    public static let shared = OfflineAnswerLedger()
-
-    private var pending: [UUID: [OfflineAnswerPair]] = [:]
-
-    public init() {}
-
-    /// Remember one offline answer against its thread.
-    public func record(threadID: UUID, pair: OfflineAnswerPair) {
-        pending[threadID, default: []].append(pair)
+    /// The pairs of one pending review, as the durable blob that holds them.
+    ///
+    /// JSON rather than a relationship or a second entity: a review GROWS by appending a
+    /// pair, so the pairs have to be readable back to render the text again, and the
+    /// smallest durable place for a handful of small values is one blob beside the message
+    /// they render into. Nil for an empty list, which is what "no review" is stored as.
+    public static func encode(_ pairs: [OfflineAnswerPair]) -> Data? {
+        guard !pairs.isEmpty else { return nil }
+        return try? JSONEncoder().encode(pairs)
     }
 
-    /// What this thread has not yet carried.
-    public func uncarried(threadID: UUID) -> [OfflineAnswerPair] {
-        pending[threadID] ?? []
-    }
-
-    /// The text for this thread's next online turn, or nil when it has nothing to say.
-    public func carryBody(threadID: UUID) -> String? {
-        OfflineAnswerCarry.body(uncarried(threadID: threadID))
-    }
-
-    /// Spent. Called only once the turn carrying them is DURABLY STAGED, so a send that
-    /// was refused or failed to save leaves the pairs for the next attempt.
-    public func markCarried(threadID: UUID) {
-        pending[threadID] = nil
-    }
-
-    /// Everything forgotten — a thread delete, or a test.
-    public func forget(threadID: UUID) {
-        pending[threadID] = nil
+    /// The pairs a blob holds, oldest first. An absent or unreadable blob is an empty
+    /// review rather than an error: the text it rendered into is already staged, and
+    /// failing the send over a blob that cannot be re-read would lose the review entirely.
+    public static func decode(_ data: Data?) -> [OfflineAnswerPair] {
+        guard let data,
+              let pairs = try? JSONDecoder().decode([OfflineAnswerPair].self, from: data)
+        else { return [] }
+        return pairs.sorted { $0.at < $1.at }
     }
 }
